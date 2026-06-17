@@ -1,0 +1,29 @@
+{
+  "name": "agent-controller",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Cloud control plane for remote agent controller devices and T3 Code environments.",
+  "scripts": {
+    "start": "node src/server.mjs",
+    "manufacture:batch": "node scripts/manufacture-batch.mjs",
+    "firmware:publish": "node scripts/publish-firmware-release.mjs",
+    "convex:dev": "convex dev",
+    "convex:deploy": "convex deploy",
+    "simulate:device": "node scripts/simulate-device.mjs",
+    "smoke:local": "node scripts/smoke-local.mjs",
+    "smoke:convex": "node scripts/smoke-convex.mjs",
+    "test": "node --test"
+  },
+  "engines": {
+    "node": ">=22"
+  },
+  "dependencies": {
+    "@clerk/backend": "^3.7.0"
+  },
+  "devDependencies": {
+    "@types/node": "^25.9.3",
+    "convex": "^1.41.0",
+    "typescript": "^6.0.3"
+  }
+}

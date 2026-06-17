@@ -1,0 +1,284 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>Agent Controller</title>
+    <link rel="stylesheet" href="/styles.css">
+  </head>
+  <body>
+    <main class="shell">
+      <section class="topbar">
+        <div>
+          <p class="eyebrow">Agent Controller</p>
+          <h1>Remote agent control plane</h1>
+        </div>
+        <div class="status-strip" id="connectionStatus">No token</div>
+      </section>
+
+      <section class="grid">
+        <aside class="panel identity-panel">
+          <div class="panel-head">
+            <h2>Access</h2>
+            <span class="pill">Platform</span>
+          </div>
+          <div id="clerkControls" class="auth-box" hidden>
+            <div class="capture-head">
+              <span>Clerk account</span>
+              <span id="clerkStatus" class="meta">Not loaded</span>
+            </div>
+            <div id="clerkUser" class="meta">No active session.</div>
+            <div class="button-row">
+              <button id="clerkSignInButton" class="primary">Sign in</button>
+              <button id="clerkUseSessionButton">Use session</button>
+              <button id="clerkSignOutButton">Sign out</button>
+            </div>
+          </div>
+          <label>
+            User ID
+            <input id="userId" value="user_dev" autocomplete="off">
+          </label>
+          <label>
+            Email
+            <input id="email" value="dev@example.local" autocomplete="off">
+          </label>
+          <button id="createTokenButton" class="primary">Create token</button>
+          <label>
+            Platform token
+            <textarea id="platformToken" rows="4" placeholder="Bearer token"></textarea>
+          </label>
+          <button id="saveTokenButton">Save token</button>
+        </aside>
+
+        <section class="panel command-panel">
+          <div class="panel-head">
+            <h2>Prompt</h2>
+            <span class="pill">T3 Code</span>
+          </div>
+          <div class="split">
+            <label>
+              Environment
+              <select id="environmentSelect"></select>
+            </label>
+            <label>
+              Thread ID
+              <input id="threadId" placeholder="thread_...">
+            </label>
+          </div>
+          <div class="split">
+            <label>
+              T3 thread
+              <select id="t3ThreadSelect"></select>
+            </label>
+            <button id="loadT3SessionsButton">Load sessions</button>
+          </div>
+          <label>
+            Prompt text
+            <textarea id="promptText" rows="7" placeholder="Ask Codex or Claude to continue, inspect, run tests, or use uploaded media as context."></textarea>
+          </label>
+          <div class="split">
+            <label>
+              Media
+              <select id="mediaSelect"></select>
+            </label>
+            <label>
+              Prompt type
+              <select id="intentType">
+                <option value="agent_prompt">Text prompt</option>
+                <option value="camera_prompt">Camera/image prompt</option>
+                <option value="audio_prompt">Audio prompt</option>
+                <option value="shell_input">Shell input</option>
+              </select>
+            </label>
+          </div>
+          <div class="button-row">
+            <button id="sendPromptButton" class="primary">Send</button>
+            <button id="statusButton">Status</button>
+            <button id="stopButton">Stop</button>
+          </div>
+          <hr>
+          <label>
+            Macro label
+            <input id="macroLabel" placeholder="Run tests">
+          </label>
+          <button id="createMacroButton">Save macro</button>
+          <div id="macroList" class="list compact-list"></div>
+        </section>
+
+        <section class="panel setup-panel">
+          <div class="panel-head">
+            <h2>Setup</h2>
+            <span class="pill">Devices</span>
+          </div>
+          <div class="split">
+            <label>
+              Device label
+              <input id="deviceLabel" value="Desk controller">
+            </label>
+            <label>
+              Profile
+              <select id="deviceProfile">
+                <option value="agent-controller">Agent controller</option>
+                <option value="read-only">Read only</option>
+                <option value="power-controller">Power controller</option>
+              </select>
+            </label>
+          </div>
+          <button id="createDeviceButton">Register device</button>
+          <button id="preprovisionDeviceButton">Pre-provision demo device</button>
+          <div class="secret-box" id="deviceSecretBox">No new device secret.</div>
+          <label>
+            Claim code
+            <input id="claimCode" placeholder="ABCDE-23456">
+          </label>
+          <button id="claimDeviceButton">Claim device</button>
+
+          <hr>
+
+          <label>
+            Configure device
+            <select id="deviceConfigDevice"></select>
+          </label>
+          <label>
+            Default environment
+            <select id="deviceConfigEnvironment"></select>
+          </label>
+          <label>
+            Default thread ID
+            <input id="deviceConfigThread" placeholder="thread_...">
+          </label>
+          <label>
+            Default prompt
+            <textarea id="deviceDefaultPrompt" rows="3"></textarea>
+          </label>
+          <label>
+            Shell command
+            <input id="deviceShellCommand" value="npm test" placeholder="npm test">
+          </label>
+          <div class="check-grid" aria-label="Device menu">
+            <label><input type="checkbox" data-menu-item="status" checked> Status</label>
+            <label><input type="checkbox" data-menu-item="prompt" checked> Prompt</label>
+            <label><input type="checkbox" data-menu-item="shell" checked> Shell</label>
+            <label><input type="checkbox" data-menu-item="macro" checked> Macro</label>
+            <label><input type="checkbox" data-menu-item="approve"> Approve</label>
+            <label><input type="checkbox" data-menu-item="reject"> Reject</label>
+            <label><input type="checkbox" data-menu-item="media" checked> Media</label>
+            <label><input type="checkbox" data-menu-item="stop" checked> Stop</label>
+          </div>
+          <button id="saveDeviceConfigButton">Save device config</button>
+
+          <hr>
+
+          <label>
+            T3 label
+            <input id="t3Label" value="Mac T3 Code">
+          </label>
+          <label>
+            T3 base URL
+            <input id="t3BaseUrl" placeholder="https://mac.tailnet.ts.net">
+          </label>
+          <label>
+            Pairing token or access token
+            <textarea id="t3Token" rows="3"></textarea>
+          </label>
+          <div class="button-row">
+            <button id="pairT3Button">Pair token</button>
+            <button id="accessT3Button">Access token</button>
+          </div>
+        </section>
+
+        <section class="panel media-panel">
+          <div class="panel-head">
+            <h2>Media</h2>
+            <span class="pill">Phone/Web</span>
+          </div>
+          <div class="capture-grid">
+            <div class="capture-box">
+              <div class="capture-head">
+                <span>Microphone</span>
+                <span id="audioCaptureStatus" class="meta">Idle</span>
+              </div>
+              <div class="button-row">
+                <button id="startAudioButton">Record</button>
+                <button id="stopAudioButton" disabled>Stop</button>
+              </div>
+            </div>
+            <div class="capture-box">
+              <div class="capture-head">
+                <span>Camera</span>
+                <span id="cameraCaptureStatus" class="meta">Idle</span>
+              </div>
+              <video id="cameraPreview" class="camera-preview" playsinline muted></video>
+              <div class="button-row">
+                <button id="startCameraButton">Open</button>
+                <button id="captureCameraButton" disabled>Capture</button>
+              </div>
+            </div>
+          </div>
+          <label>
+            Capture file
+            <input id="mediaFile" type="file" accept="image/png,image/jpeg,image/webp,audio/wav,audio/mpeg,audio/mp4,audio/webm,audio/ogg" capture>
+          </label>
+          <label>
+            Audio transcript
+            <textarea id="mediaTranscript" rows="3" placeholder="Optional transcript for audio uploads"></textarea>
+          </label>
+          <button id="uploadMediaButton">Upload media</button>
+          <hr>
+          <label>
+            Media retention days
+            <input id="mediaRetentionDays" type="number" min="1" max="365" value="30" placeholder="Blank keeps media until manual deletion">
+          </label>
+          <div class="button-row">
+            <button id="savePrivacyButton">Save retention</button>
+            <button id="purgeExpiredMediaButton">Purge expired</button>
+          </div>
+          <div id="mediaList" class="list compact-list"></div>
+        </section>
+
+        <section class="panel list-panel">
+          <div class="panel-head">
+            <h2>Inventory</h2>
+            <button id="refreshButton" class="mini">Refresh</button>
+          </div>
+          <div class="columns">
+            <div>
+              <h3>Environments</h3>
+              <div id="environmentList" class="list"></div>
+            </div>
+            <div>
+              <h3>Devices</h3>
+              <div id="deviceList" class="list"></div>
+            </div>
+          </div>
+        </section>
+
+        <section class="panel audit-panel">
+          <div class="panel-head">
+            <h2>Activity</h2>
+            <button id="diagnosticsButton" class="mini">Diagnostics</button>
+          </div>
+          <h3>Approvals</h3>
+          <div id="approvalList" class="list compact-list"></div>
+          <h3>Recent commands</h3>
+          <div id="commandList" class="list compact-list"></div>
+          <h3>Command timeline</h3>
+          <div id="commandTimeline" class="list compact-list"></div>
+          <h3>Audit</h3>
+          <div id="auditList" class="list audit-list"></div>
+        </section>
+      </section>
+
+      <section class="panel live-panel">
+        <div class="panel-head">
+          <h2>Display State</h2>
+          <span class="pill">Live</span>
+        </div>
+        <div id="displayState" class="secret-box">Waiting for token.</div>
+      </section>
+
+      <section class="console" id="consoleOutput">Ready.</section>
+    </main>
+    <script src="/app.js"></script>
+  </body>
+</html>

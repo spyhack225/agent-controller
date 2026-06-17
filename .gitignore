@@ -1,0 +1,11 @@
+node_modules/
+.data/
+.manufacturing/
+firmware/esp32-controller/.pio/
+firmware/esp32-controller/include/controller_config.h
+.env
+.DS_Store
+coverage/
+*.log
+
+.env.local
