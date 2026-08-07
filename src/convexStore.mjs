@@ -16,6 +16,7 @@ const DEFAULT_FUNCTIONS = {
   preprovisionDevice: { type: "mutation", name: "gatewayStore:preprovisionDevice" },
   claimDevice: { type: "mutation", name: "gatewayStore:claimDevice" },
   revokeDevice: { type: "mutation", name: "gatewayStore:revokeDevice" },
+  deleteDevice: { type: "mutation", name: "gatewayStore:deleteDevice" },
   rotateDeviceSecret: { type: "mutation", name: "gatewayStore:rotateDeviceSecret" },
   updateDeviceProfile: { type: "mutation", name: "gatewayStore:updateDeviceProfile" },
   resetDeviceForTransfer: { type: "mutation", name: "gatewayStore:resetDeviceForTransfer" },
@@ -169,6 +170,7 @@ export function createConvexStoreAdapter({
       claimCodeHash: hashSecret(normalizeClaimCode(args.claimCode)),
     }),
     revokeDevice: (args) => call("revokeDevice", args),
+    deleteDevice: (args) => call("deleteDevice", args),
     updateDeviceProfile: (args) => call("updateDeviceProfile", args),
     rotateDeviceSecret: async (args) => {
       const secret = createSecret();

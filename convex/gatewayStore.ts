@@ -382,6 +382,33 @@ export const revokeDevice = gatewayMutation({
   },
 });
 
+/**
+ * Permanently removes a device record. Only a revoked device qualifies — see deleteDevice() in
+ * src/store.mjs, which is the reference implementation. Commands and audit entries reference the
+ * device by id and are intentionally left in place.
+ */
+export const deleteDevice = gatewayMutation({
+  args: {
+    userId: v.string(),
+    deviceId: v.id("devices"),
+  },
+  handler: async (ctx, args) => {
+    const device = await getDeviceForOwner(ctx, args.userId, args.deviceId);
+    if (!device) return null;
+    if (!device.revokedAt) return { device: null, reason: "not_revoked" };
+    const removed = publicDevice(device);
+    await ctx.db.delete(device._id);
+    await audit(ctx, {
+      userExternalId: args.userId,
+      actorType: "user",
+      action: "device.deleted",
+      targetId: device._id,
+      metadata: { label: device.label, profile: device.profile, revokedAt: device.revokedAt },
+    });
+    return { device: removed, reason: null };
+  },
+});
+
 export const rotateDeviceSecret = gatewayMutation({
   args: {
     userId: v.string(),
@@ -1755,6 +1782,7 @@ function deviceActions(device: any) {
     updateConfig: !revoked,
     updateProfile: !revoked,
     revoke: !revoked,
+    delete: revoked,
   };
 }
 

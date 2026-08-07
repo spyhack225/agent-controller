@@ -176,6 +176,7 @@ export interface Device {
     updateConfig?: boolean;
     updateProfile?: boolean;
     revoke?: boolean;
+    delete?: boolean;
   };
   status?: DeviceStatus;
   config?: DeviceConfig;

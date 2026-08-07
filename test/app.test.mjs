@@ -2720,6 +2720,8 @@ test("devices declare which owner operations the gateway will accept", async (t)
     updateConfig: true,
     updateProfile: true,
     revoke: true,
+    // Deleting is the inverse: unavailable until the credential is dead.
+    delete: false,
   });
 
   const revoked = await requestJson(originalFetch, baseUrl, `/v1/devices/${created.device.id}/revoke`, {
@@ -2735,6 +2737,7 @@ test("devices declare which owner operations the gateway will accept", async (t)
     updateConfig: false,
     updateProfile: false,
     revoke: false,
+    delete: true,
   });
 
   // The declaration has to match what the routes actually do, or it is just a second thing to
@@ -2756,4 +2759,107 @@ test("devices declare which owner operations the gateway will accept", async (t)
     body: JSON.stringify({ threadId: "thread_x" }),
   });
   assert.equal(config.status, 404, "config updates must refuse a revoked device");
+});
+
+test("a revoked device can be deleted, and an active one cannot", async (t) => {
+  const originalFetch = globalThis.fetch;
+  const { server } = createApp();
+  await listen(server);
+  t.after(() => server.close());
+  const baseUrl = `http://127.0.0.1:${server.address().port}`;
+  const authHeaders = await createAuthHeaders(originalFetch, baseUrl);
+
+  const created = await requestJson(originalFetch, baseUrl, "/v1/devices", {
+    method: "POST",
+    headers: authHeaders,
+    body: { label: "Retired controller", profile: "agent-controller" },
+  });
+  const deviceHeaders = {
+    "x-device-id": created.device.id,
+    "x-device-secret": created.secret,
+  };
+  assert.equal(created.device.actions.delete, false, "an active device is not deletable");
+
+  // Deleting before revoking would drop the record while the credential still authenticates,
+  // leaving hardware in the field the owner can no longer see or revoke.
+  const premature = await originalFetch(new URL(`/v1/devices/${created.device.id}`, baseUrl), {
+    method: "DELETE",
+    headers: authHeaders,
+  });
+  assert.equal(premature.status, 409);
+
+  const revoked = await requestJson(originalFetch, baseUrl, `/v1/devices/${created.device.id}/revoke`, {
+    method: "POST",
+    headers: authHeaders,
+    body: {},
+  });
+  assert.equal(revoked.device.actions.delete, true, "revoking is what unlocks deletion");
+
+  const deleted = await requestJson(originalFetch, baseUrl, `/v1/devices/${created.device.id}`, {
+    method: "DELETE",
+    headers: authHeaders,
+  });
+  assert.equal(deleted.deleted, true);
+  assert.equal(deleted.device.id, created.device.id);
+
+  const listed = await requestJson(originalFetch, baseUrl, "/v1/devices", { headers: authHeaders });
+  assert.equal(listed.devices.length, 0, "the device is gone from the inventory");
+
+  // The credential dies with the record rather than falling back to unclaimed-but-valid.
+  const orphaned = await originalFetch(new URL("/v1/device/heartbeat", baseUrl), {
+    method: "POST",
+    headers: { ...deviceHeaders, "content-type": "application/json" },
+    body: "{}",
+  });
+  assert.equal(orphaned.status, 401);
+
+  const again = await originalFetch(new URL(`/v1/devices/${created.device.id}`, baseUrl), {
+    method: "DELETE",
+    headers: authHeaders,
+  });
+  assert.equal(again.status, 404, "deleting twice is a 404, not a second success");
+
+  // Deleting the controller must not erase the record of what it did.
+  const audit = await requestJson(originalFetch, baseUrl, "/v1/audit", { headers: authHeaders });
+  const actions = audit.events.map((event) => event.action);
+  assert.ok(actions.includes("device.deleted"), "the deletion itself is audited");
+  assert.ok(actions.includes("device.revoked"), "earlier history survives the delete");
+});
+
+test("one owner cannot delete another owner's revoked device", async (t) => {
+  const originalFetch = globalThis.fetch;
+  const { server } = createApp();
+  await listen(server);
+  t.after(() => server.close());
+  const baseUrl = `http://127.0.0.1:${server.address().port}`;
+  const tokenFor = async (userId) => {
+    const created = await requestJson(originalFetch, baseUrl, "/v1/users/dev", {
+      method: "POST",
+      headers: {},
+      body: { userId, email: `${userId}@example.local` },
+    });
+    return { authorization: `Bearer ${created.apiToken.secret}` };
+  };
+  const owner = await tokenFor("user_owner");
+  const stranger = await tokenFor("user_stranger");
+
+  const created = await requestJson(originalFetch, baseUrl, "/v1/devices", {
+    method: "POST",
+    headers: owner,
+    body: { label: "Owned controller", profile: "agent-controller" },
+  });
+  await requestJson(originalFetch, baseUrl, `/v1/devices/${created.device.id}/revoke`, {
+    method: "POST",
+    headers: owner,
+    body: {},
+  });
+
+  const attempt = await originalFetch(new URL(`/v1/devices/${created.device.id}`, baseUrl), {
+    method: "DELETE",
+    headers: stranger,
+  });
+  assert.equal(attempt.status, 404);
+
+  const stillThere = await requestJson(originalFetch, baseUrl, "/v1/devices", { headers: owner });
+  assert.equal(stillThere.devices.length, 1, "the owner's device survives a stranger's delete");
 });

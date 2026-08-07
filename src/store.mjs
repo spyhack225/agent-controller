@@ -327,6 +327,31 @@ export function createStore(seed = {}, options = {}) {
     return publicDevice(device);
   }
 
+  /**
+   * Permanently removes a device record. Only a revoked device qualifies: revocation kills the
+   * credential, so deleting afterwards cannot strand hardware that is still able to authenticate.
+   * Requiring the two steps also makes the irreversible one deliberate.
+   *
+   * Commands and audit entries reference the device by id and are intentionally left in place —
+   * deleting the controller must not erase the record of what it did.
+   */
+  function deleteDevice({ userId, deviceId }) {
+    const device = devices.get(deviceId);
+    if (!device || device.userId !== userId) return null;
+    if (!device.revokedAt) return { device: null, reason: "not_revoked" };
+    const removed = publicDevice(device);
+    devices.delete(deviceId);
+    audit({
+      userId,
+      actorType: "user",
+      action: "device.deleted",
+      targetId: device.id,
+      metadata: { label: device.label, profile: device.profile, revokedAt: device.revokedAt },
+    });
+    notifyChanged();
+    return { device: removed, reason: null };
+  }
+
   function rotateDeviceSecret({ userId, deviceId }) {
     const device = devices.get(deviceId);
     if (!device || device.userId !== userId || device.revokedAt) return null;
@@ -1061,6 +1086,7 @@ export function createStore(seed = {}, options = {}) {
     preprovisionDevice,
     claimDevice,
     revokeDevice,
+    deleteDevice,
     rotateDeviceSecret,
     updateDeviceProfile,
     resetDeviceForTransfer,
@@ -1354,6 +1380,9 @@ function deviceActions(device) {
     // revokeDevice does not check, so revoking twice succeeds while changing nothing. A no-op
     // dressed as a destructive action is worse than a refusal.
     revoke: !revoked,
+    // The inverse of the rest: deleting is the one thing that only becomes available once the
+    // credential is dead.
+    delete: revoked,
   };
 }
 

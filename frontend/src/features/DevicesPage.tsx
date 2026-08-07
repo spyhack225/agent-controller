@@ -202,6 +202,25 @@ export function DevicesPage({ controller: c }: { controller: Controller }) {
     });
   };
 
+  const deleteDevice = async () => {
+    if (!c.selectedDevice) return;
+    const device = c.selectedDevice;
+    const accepted = await confirm({
+      title: `Delete ${device.label}?`,
+      description: "This permanently removes the controller from your inventory. Its command history "
+        + "and audit trail are kept. The credential is already revoked, so no hardware is affected.",
+      confirmLabel: "Delete permanently",
+    });
+    if (!accepted) return;
+    await c.run("delete-device", "Device deleted.", async () => {
+      const result = await c.api(`/v1/devices/${encodeURIComponent(device.id)}`, { method: "DELETE" });
+      // The selection points at a record that no longer exists.
+      c.setSelectedDeviceId("");
+      await c.refreshAll();
+      return result;
+    });
+  };
+
   const rotateSecret = async () => {
     if (!c.selectedDevice) return;
     const accepted = await confirm({
@@ -527,9 +546,26 @@ export function DevicesPage({ controller: c }: { controller: Controller }) {
                   disabled={!can("revoke")}
                   onClick={() => void revokeDevice()}
                 >
-                  <Trash2 className="size-4" /> Revoke
+                  <CircleOff className="size-4" /> Revoke
                 </Button>
               </div>
+              {can("delete") ? (
+                <div className="mt-3 border-t border-danger/20 pt-3">
+                  <p className="text-xs text-ink-muted">
+                    Revoked and no longer in use? Remove it from the inventory. Command history and
+                    audit records are kept.
+                  </p>
+                  <Button
+                    size="sm"
+                    variant="danger-ghost"
+                    className="mt-2"
+                    busy={c.busyAction === "delete-device"}
+                    onClick={() => void deleteDevice()}
+                  >
+                    <Trash2 className="size-4" /> Delete permanently
+                  </Button>
+                </div>
+              ) : null}
             </div>
           </Panel>
         ) : null}

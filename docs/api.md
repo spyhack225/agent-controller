@@ -279,6 +279,36 @@ POST /v1/devices/dev_.../revoke
 authorization: Bearer PLATFORM_TOKEN
 ```
 
+Permanently remove a revoked device from the inventory:
+
+```http
+DELETE /v1/devices/dev_...
+authorization: Bearer PLATFORM_TOKEN
+```
+
+Only a revoked device can be deleted; an active one returns `409`. Revocation kills the credential
+first, so the record can go without leaving hardware in the field that still authenticates against a
+device the owner can no longer see. Commands and audit entries reference the device by id and are
+kept — deleting the controller does not erase the record of what it did.
+
+Every device payload carries an `actions` block saying which of these the gateway will currently
+accept, so clients do not have to re-derive it from `revokedAt`:
+
+```json
+{
+  "actions": {
+    "rotateSecret": false,
+    "transferReset": false,
+    "updateConfig": false,
+    "updateProfile": false,
+    "revoke": false,
+    "delete": true
+  }
+}
+```
+
+An older gateway omits the block; treat a missing field as permitted and let the request fail.
+
 Update a claimed device's policy profile:
 
 ```http

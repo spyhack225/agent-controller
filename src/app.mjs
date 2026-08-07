@@ -417,6 +417,21 @@ export function createApp({
         return sendJson(res, 200, result);
       }
 
+      // Permanently removes a revoked device from the inventory. Revocation first is deliberate:
+      // it kills the credential, so the record can go without leaving hardware in the field that
+      // still authenticates against a device the owner can no longer see.
+      const deviceDeleteMatch = url.pathname.match(/^\/v1\/devices\/([^/]+)$/u);
+      if (req.method === "DELETE" && deviceDeleteMatch) {
+        const user = await authenticateUser(req, store, config, null, clerkAuth);
+        await enforceUserWrite(req, res, rateLimiter, config, user);
+        const result = await store.deleteDevice({ userId: user.id, deviceId: deviceDeleteMatch[1] });
+        if (!result) throw new HttpError(404, "Device not found.");
+        if (result.reason === "not_revoked") {
+          throw new HttpError(409, "Revoke the device before deleting it.");
+        }
+        return sendJson(res, 200, { device: result.device, deleted: true });
+      }
+
       const deviceConfigMatch = url.pathname.match(/^\/v1\/devices\/([^/]+)\/config$/u);
       if (deviceConfigMatch && req.method === "GET") {
         const user = await authenticateUser(req, store, config, null, clerkAuth);
