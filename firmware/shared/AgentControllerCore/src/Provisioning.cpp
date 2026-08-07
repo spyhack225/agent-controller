@@ -1,0 +1,322 @@
+#include "Provisioning.h"
+
+namespace {
+constexpr uint32_t kJoinTimeoutMs = 20000;
+// After this many consecutive failures the stored network is presumed wrong and the portal comes
+// back up. Three is enough to ride out a router still booting without stranding the owner.
+constexpr uint8_t kMaxJoinFailures = 3;
+// A unit left powered in a drawer must not sit as an open AP forever: the portal stands down, the
+// last known network is retried, and the portal re-raises only if that fails again.
+constexpr uint32_t kPortalIdleTimeoutMs = 15UL * 60UL * 1000UL;
+constexpr uint32_t kScanCacheMs = 20000;
+constexpr uint8_t kDnsPort = 53;
+
+String htmlEscape(const String& value) {
+  String out;
+  out.reserve(value.length() + 8);
+  for (size_t i = 0; i < value.length(); i += 1) {
+    const char c = value[i];
+    if (c == '&') out += "&amp;";
+    else if (c == '<') out += "&lt;";
+    else if (c == '>') out += "&gt;";
+    else if (c == '"') out += "&quot;";
+    else if (c == '\'') out += "&#39;";
+    else out += c;
+  }
+  return out;
+}
+}  // namespace
+
+const char* provisioningStateName(ProvisioningState state) {
+  switch (state) {
+    case ProvisioningState::Unprovisioned: return "unprovisioned";
+    case ProvisioningState::Provisioning: return "provisioning";
+    case ProvisioningState::Connecting: return "connecting";
+    case ProvisioningState::Online: return "online";
+    case ProvisioningState::Failed: return "failed";
+  }
+  return "unknown";
+}
+
+void Provisioning::begin(DeviceStore& store, const String& apNameSeed) {
+  store_ = &store;
+
+  String suffix = apNameSeed;
+  if (suffix.length() > 4) suffix = suffix.substring(suffix.length() - 4);
+  suffix.toLowerCase();
+  if (suffix.length() == 0) suffix = "0000";
+  apName_ = "agent-ctl-" + suffix;
+  status_.apName = apName_;
+  status_.portalUrl = "http://192.168.4.1";
+
+  if (store_->hasWifiCredentials()) enterConnecting();
+  else enterProvisioning();
+}
+
+void Provisioning::enterProvisioning() {
+  status_.state = ProvisioningState::Provisioning;
+  status_.detail = "Join " + apName_;
+  WiFi.disconnect(true);
+  startPortal();
+}
+
+void Provisioning::enterConnecting() {
+  stopPortal();
+  status_.state = ProvisioningState::Connecting;
+  status_.detail = store_->wifiSsid();
+  connectStartedAt_ = millis();
+  WiFi.mode(WIFI_STA);
+  WiFi.begin(store_->wifiSsid().c_str(), store_->wifiPassword().c_str());
+  Serial.printf("[wifi] joining %s\n", store_->wifiSsid().c_str());
+}
+
+void Provisioning::resetToProvisioning() {
+  if (store_ != nullptr) store_->resetForProvisioning();
+  status_.joinFailures = 0;
+  portalError_ = "";
+  enterProvisioning();
+}
+
+bool Provisioning::consumeJustConnected() {
+  const bool value = justConnected_;
+  justConnected_ = false;
+  return value;
+}
+
+ProvisioningState Provisioning::poll() {
+  switch (status_.state) {
+    case ProvisioningState::Unprovisioned:
+      enterProvisioning();
+      break;
+
+    case ProvisioningState::Provisioning: {
+      dns_.processNextRequest();
+      server_.handleClient();
+      // A liveness tick, so an idle portal is distinguishable from a wedged loop() on the bench.
+      static uint32_t lastTickAt = 0;
+      if (millis() - lastTickAt > 10000) {
+        lastTickAt = millis();
+        Serial.printf(
+          "[wifi] portal alive ssid=%s clients=%u mode=%d ip=%s\n",
+          apName_.c_str(),
+          static_cast<unsigned>(WiFi.softAPgetStationNum()),
+          static_cast<int>(WiFi.getMode()),
+          WiFi.softAPIP().toString().c_str()
+        );
+      }
+      const bool hadClient = WiFi.softAPgetStationNum() > 0;
+      if (hadClient) portalLastClientAt_ = millis();
+      if (portalLastClientAt_ == 0) portalLastClientAt_ = millis();
+      if (store_->hasWifiCredentials() && millis() - portalLastClientAt_ > kPortalIdleTimeoutMs) {
+        Serial.println("[wifi] portal idle; retrying the stored network");
+        status_.joinFailures = 0;
+        enterConnecting();
+      }
+      break;
+    }
+
+    case ProvisioningState::Connecting: {
+      if (WiFi.status() == WL_CONNECTED) {
+        status_.state = ProvisioningState::Online;
+        status_.joinFailures = 0;
+        status_.detail = WiFi.localIP().toString();
+        justConnected_ = true;
+        Serial.printf("[wifi] connected: %s\n", WiFi.localIP().toString().c_str());
+        break;
+      }
+      // The timeout is the whole point: the previous firmware's `while (status != CONNECTED)` loop
+      // made a wrong password unrecoverable without USB.
+      if (millis() - connectStartedAt_ > kJoinTimeoutMs) {
+        status_.joinFailures += 1;
+        Serial.printf("[wifi] join failed (%u/%u)\n", status_.joinFailures, kMaxJoinFailures);
+        if (status_.joinFailures >= kMaxJoinFailures) {
+          portalError_ = "Could not join " + store_->wifiSsid() + ". Check the password.";
+          status_.detail = "Join failed";
+          enterProvisioning();
+        } else {
+          enterConnecting();
+        }
+      }
+      break;
+    }
+
+    case ProvisioningState::Online:
+      // A drop is a return to Connecting, never a return to the portal: the credentials are known
+      // good, so re-raising the AP on a router reboot would be actively unhelpful.
+      if (WiFi.status() != WL_CONNECTED) {
+        Serial.println("[wifi] link lost; reconnecting");
+        enterConnecting();
+      }
+      break;
+
+    case ProvisioningState::Failed:
+      enterProvisioning();
+      break;
+  }
+  return status_.state;
+}
+
+void Provisioning::startPortal() {
+  if (portalUp_) return;
+  // Every step is checked and logged. A portal that reports itself up while the radio silently
+  // refused to start is indistinguishable, from the owner's side, from a dead device.
+  const bool modeOk = WiFi.mode(WIFI_AP);
+  const bool apOk = WiFi.softAP(apName_.c_str());
+  delay(100);
+  const IPAddress ip = WiFi.softAPIP();
+  Serial.printf(
+    "[wifi] softAP mode=%d ap=%d ip=%s channel=%d\n",
+    modeOk ? 1 : 0, apOk ? 1 : 0, ip.toString().c_str(), WiFi.channel()
+  );
+  if (!apOk) {
+    status_.detail = "Radio failed";
+    Serial.println("[wifi] softAP() refused; the portal is NOT broadcasting");
+  }
+  dns_.start(kDnsPort, "*", ip);
+
+  // Routes are registered once for the lifetime of the object. WebServer::on() appends rather than
+  // replaces, so re-registering on every retry would leak a handler per failed join attempt.
+  if (!routesRegistered_) {
+    server_.on("/", HTTP_GET, [this]() { handlePortalRoot(); });
+    server_.on("/save", HTTP_POST, [this]() { handlePortalSubmit(); });
+    server_.onNotFound([this]() { handlePortalNotFound(); });
+    routesRegistered_ = true;
+  }
+  server_.begin();
+
+  portalUp_ = true;
+  portalLastClientAt_ = millis();
+  Serial.printf("[wifi] portal up: SSID %s at %s\n", apName_.c_str(), status_.portalUrl.c_str());
+}
+
+void Provisioning::stopPortal() {
+  if (!portalUp_) return;
+  server_.stop();
+  dns_.stop();
+  WiFi.softAPdisconnect(true);
+  portalUp_ = false;
+  Serial.println("[wifi] portal down");
+}
+
+String Provisioning::scanOptionsHtml() {
+  if (scanCache_.length() > 0 && millis() - scanCachedAt_ < kScanCacheMs) return scanCache_;
+
+  String options;
+  const int found = WiFi.scanNetworks();
+  for (int i = 0; i < found; i += 1) {
+    const String ssid = WiFi.SSID(i);
+    if (ssid.length() == 0) continue;
+    options += "<option value=\"" + htmlEscape(ssid) + "\">" + htmlEscape(ssid)
+      + " (" + String(WiFi.RSSI(i)) + " dBm)</option>";
+  }
+  WiFi.scanDelete();
+  scanCache_ = options;
+  scanCachedAt_ = millis();
+  return scanCache_;
+}
+
+void Provisioning::handlePortalRoot() {
+  portalLastClientAt_ = millis();
+  String page =
+    "<!doctype html><html><head><meta charset=\"utf-8\">"
+    "<meta name=\"viewport\" content=\"width=device-width,initial-scale=1\">"
+    "<title>Agent Controller setup</title><style>"
+    "body{font-family:system-ui,sans-serif;margin:0;padding:1.5rem;background:#111211;color:#f1f1ef}"
+    "main{max-width:24rem;margin:0 auto}h1{font-size:1.25rem}"
+    "label{display:block;margin:1rem 0 .35rem;font-size:.8rem;color:#969795}"
+    "input,select{width:100%;padding:.6rem;border-radius:.5rem;border:1px solid #343a38;"
+    "background:#202120;color:#f1f1ef;font-size:1rem;box-sizing:border-box}"
+    "button{width:100%;margin-top:1.25rem;padding:.75rem;border:0;border-radius:.5rem;"
+    "background:#a9e85e;color:#0e1220;font-weight:600;font-size:1rem}"
+    ".err{margin-top:1rem;padding:.75rem;border-radius:.5rem;background:#3a1d21;color:#ef8993;font-size:.85rem}"
+    ".hint{margin-top:1.25rem;font-size:.75rem;color:#626360;line-height:1.5}"
+    "</style></head><body><main>"
+    "<h1>Connect this controller</h1>"
+    "<p style=\"color:#969795;font-size:.85rem\">This page talks only to the controller. "
+    "It never asks for your Agent Controller account.</p>";
+
+  if (portalError_.length() > 0) page += "<div class=\"err\">" + htmlEscape(portalError_) + "</div>";
+
+  page += "<form method=\"POST\" action=\"/save\">"
+    "<label for=\"ssid\">Wi-Fi network</label>"
+    "<select id=\"ssid\" name=\"ssid\">" + scanOptionsHtml() + "</select>"
+    "<label for=\"password\">Password</label>"
+    "<input id=\"password\" name=\"password\" type=\"password\" autocomplete=\"off\">"
+    "<label for=\"gateway\">Gateway URL (optional)</label>"
+    "<input id=\"gateway\" name=\"gateway\" type=\"url\" placeholder=\""
+    + htmlEscape(store_->gatewayUrl()) + "\">"
+    "<button type=\"submit\">Connect</button></form>"
+    "<p class=\"hint\">The controller tries the network before saving it, so a wrong password "
+    "brings you back here instead of locking the device.</p>"
+    "</main></body></html>";
+
+  server_.send(200, "text/html; charset=utf-8", page);
+}
+
+void Provisioning::handlePortalSubmit() {
+  portalLastClientAt_ = millis();
+  const String ssid = server_.arg("ssid");
+  const String password = server_.arg("password");
+  const String gateway = server_.arg("gateway");
+
+  if (ssid.length() == 0) {
+    portalError_ = "Choose a network.";
+    handlePortalRoot();
+    return;
+  }
+
+  // Join first, persist second. Writing credentials that do not work would put the device into a
+  // reboot loop the owner cannot see the cause of.
+  server_.send(
+    200,
+    "text/html; charset=utf-8",
+    "<!doctype html><meta charset=\"utf-8\"><meta http-equiv=\"refresh\" content=\"12;url=/\">"
+    "<body style=\"font-family:system-ui;background:#111211;color:#f1f1ef;padding:1.5rem\">"
+    "<p>Trying that network… the controller screen shows the result. "
+    "This page returns in a moment if it did not work.</p></body>"
+  );
+  server_.client().flush();
+
+  if (attemptJoin(ssid, password, kJoinTimeoutMs)) {
+    if (gateway.length() > 0) store_->setGatewayUrl(gateway);
+    store_->setWifiCredentials(ssid, password);
+    portalError_ = "";
+    status_.joinFailures = 0;
+    stopPortal();
+    status_.state = ProvisioningState::Online;
+    status_.detail = WiFi.localIP().toString();
+    justConnected_ = true;
+    Serial.printf("[wifi] provisioned and connected: %s\n", WiFi.localIP().toString().c_str());
+    return;
+  }
+
+  portalError_ = "Could not join " + ssid + ". Check the password and try again.";
+  Serial.println("[wifi] portal join attempt failed; credentials not saved");
+  // The AP had to come down to attempt the join, so bring it back for the retry.
+  portalUp_ = false;
+  startPortal();
+}
+
+bool Provisioning::attemptJoin(const String& ssid, const String& password, uint32_t timeoutMs) {
+  // AP_STA keeps the portal client's socket alive for as long as possible while the STA interface
+  // negotiates, so the browser is not dropped the instant the owner presses Connect.
+  WiFi.mode(WIFI_AP_STA);
+  WiFi.begin(ssid.c_str(), password.c_str());
+  const uint32_t startedAt = millis();
+  while (millis() - startedAt < timeoutMs) {
+    if (WiFi.status() == WL_CONNECTED) {
+      WiFi.mode(WIFI_STA);
+      return true;
+    }
+    delay(200);
+  }
+  WiFi.disconnect(true);
+  return false;
+}
+
+void Provisioning::handlePortalNotFound() {
+  // Captive-portal detection probes (Apple's /hotspot-detect.html, Android's /generate_204) have to
+  // be redirected, not 404'd, or the "Sign in to network" sheet never appears.
+  server_.sendHeader("Location", status_.portalUrl, true);
+  server_.send(302, "text/plain", "");
+}

@@ -1,0 +1,7 @@
+{
+  "name": "AgentControllerCore",
+  "version": "0.2.0",
+  "description": "Device storage and provisioning shared by every Agent Controller board.",
+  "frameworks": "arduino",
+  "platforms": "espressif32"
+}
