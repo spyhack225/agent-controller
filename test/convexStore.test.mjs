@@ -17,7 +17,9 @@ test("Convex store adapter maps Store API calls to configured Convex functions",
       if (name === "gatewayStore:createUserToken") return { id: "tok_1" };
       if (name === "gatewayStore:rotateDeviceSecret") return { id: "dev_1" };
       if (name === "gatewayStore:resetDeviceForTransfer") return { id: "dev_1" };
-      if (name === "gatewayStore:rotateUnclaimedDeviceClaimCode") return { id: "dev_1", claimed: false };
+      if (name === "gatewayStore:ensureUnclaimedDeviceClaimCode") {
+        return { device: { id: "dev_1", claimed: false }, rotated: true };
+      }
       if (name === "gatewayStore:updateDeviceProfile") return { id: "dev_1", profile: args.profile };
       return { ok: true };
     },
@@ -91,7 +93,7 @@ test("Convex store adapter maps Store API calls to configured Convex functions",
   });
   const commandEvents = await store.listCommandEvents({ userId: "user_1", commandId: "cmd_1" });
   const deletedEnvironment = await store.deleteEnvironment({ userId: "user_1", environmentId: "env_1" });
-  const setupCode = await store.rotateUnclaimedDeviceClaimCode({ deviceId: "dev_1" });
+  const setupCode = await store.ensureUnclaimedDeviceClaimCode({ deviceId: "dev_1" });
 
   assert.deepEqual(created.device, { id: "dev_1" });
   assert.match(created.secret, /^[A-Za-z0-9_-]+$/u);
@@ -299,11 +301,14 @@ test("Convex store adapter maps Store API calls to configured Convex functions",
     args: { userId: "user_1", environmentId: "env_1", gatewaySecret: "gateway-secret" },
   });
   assert.equal(calls[22].type, "mutation");
-  assert.equal(calls[22].name, "gatewayStore:rotateUnclaimedDeviceClaimCode");
+  assert.equal(calls[22].name, "gatewayStore:ensureUnclaimedDeviceClaimCode");
   assert.equal(calls[22].args.deviceId, "dev_1");
   assert.equal(calls[22].args.gatewaySecret, "gateway-secret");
+  assert.equal(calls[22].args.rotate, false);
   assert.match(calls[22].args.claimCodeHash, /^[a-f0-9]{64}$/u);
   assert.notEqual(calls[22].args.claimCodeHash, setupCode.claimCode);
+  // The expiry is computed in Node, like every other timestamp the adapter sends.
+  assert.match(calls[22].args.claimCodeExpiresAt, /^\d{4}-\d{2}-\d{2}T/u);
 });
 
 test("Convex store requires CONVEX_URL", async () => {

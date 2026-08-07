@@ -1,5 +1,44 @@
 # Agent Controller Implementation Roadmap
 
+## Current Status
+
+Every phase is complete to the limit of what code can carry. What remains is physical and
+commercial execution, listed explicitly at the end.
+
+| Phase | Status | Notes |
+|---|---|---|
+| 0 Product scope | Done | All three v1 workflows; deferred items still deferred |
+| 1 Cloud foundation | Done | Convex/file/memory stores; S3-compatible media via `src/s3.mjs` |
+| 2 T3 integration | Done | HTTP orchestration **and** the WebSocket RPC API (`src/t3Ws.mjs`); background snapshot poller |
+| 3 Environment pairing | Done | Token exchange, encrypted storage, expiry handling, 4 connection modes |
+| 4 Device provisioning | Code done | QR claim labels; `REQUIRE_TLS` enforcement. **eFuse ceremony outstanding** |
+| 5 Firmware MVP | Code done | Compiles on 4 environments incl. audio/camera capture. **Unvalidated on hardware** |
+| 6 Text / audio / camera | Done | Real attachments, transcription, and OCR/vision; device capture compiles |
+| 7 Policy engine | Done | All 8 dimensions; credential/deletion/install screening; custom profiles |
+| 8 Phone and web apps | Done | PWA, mobile Quick page, profile editor, billing |
+| 9 Shell input | Done | Stages 1–4; `terminal:operate` opt-in, confirm-always, dispatched over WS |
+| 10 Observability | Done | Metrics plus alerts at the Phase 11 budgets |
+| 11 Beta launch | Measurable | `/v1/observability/beta-readiness`. **Needs real users** |
+| 12 Commercial | Code done | Billing, transfer/reset, diagnostics, OTA + rollback. **Rollback untested on hardware** |
+
+### Outstanding, and not completable by writing code
+
+1. **Secure boot / flash encryption** — irreversible eFuse operations. Build config ships; the key
+   ceremony is a human decision. See `docs/production-security.md`.
+2. **OTA rollback test** — four-step procedure documented; needs one board and a deliberately
+   broken image. Keep `ENABLE_OTA_APPLY=0` on shipping units until it passes.
+3. **Hardware capture validation** — I2S audio and camera compile but have never run on a board.
+4. **Beta** — 10–20 users and 50+ paired device-days is real adoption over real time.
+
+### Verified during implementation
+
+- T3's WebSocket RPC protocol reverse-engineered and confirmed live against T3 Code 0.0.28.
+- Provider catalogue read live from `server.getConfig`.
+- QR encoder checked byte-for-byte against two independent encoders and decoded by OpenCV.
+- SigV4 checked against official AWS vectors and round-tripped through MinIO.
+- Partition table confirmed byte-for-byte against the attached ESP32-S3.
+- Original local E2E on `/Users/example/Documents/Claude/Projects/Tacs` remains valid.
+
 ## Target Architecture
 
 ```text

@@ -1,6 +1,45 @@
 import { defineSchema, defineTable } from "convex/server";
 import { v } from "convex/values";
 
+// Per-environment provider catalogue: the T3 provider instances (agent harnesses) and
+// their models, collected on the T3 host and registered with the gateway. Cached
+// reference data only — it carries no credentials, and the strict object validators
+// below reject any extra field a future T3 build might add.
+export const providerCatalogueValidator = v.object({
+  updatedAt: v.string(),
+  source: v.string(),
+  instances: v.array(v.object({
+    instanceId: v.string(),
+    label: v.string(),
+    badge: v.union(v.string(), v.null()),
+    version: v.union(v.string(), v.null()),
+    status: v.string(),
+    enabled: v.boolean(),
+    installed: v.boolean(),
+    auth: v.object({
+      status: v.string(),
+      type: v.union(v.string(), v.null()),
+      label: v.union(v.string(), v.null()),
+    }),
+    models: v.array(v.object({
+      slug: v.string(),
+      name: v.string(),
+      isCustom: v.boolean(),
+      options: v.array(v.object({
+        id: v.string(),
+        label: v.string(),
+        type: v.string(),
+        currentValue: v.union(v.string(), v.null()),
+        choices: v.array(v.object({
+          id: v.string(),
+          label: v.string(),
+          isDefault: v.boolean(),
+        })),
+      })),
+    })),
+  })),
+});
+
 export default defineSchema({
   users: defineTable({
     externalId: v.string(),
@@ -9,6 +48,15 @@ export default defineSchema({
     privacy: v.optional(v.object({
       mediaRetentionDays: v.union(v.number(), v.null()),
     })),
+    subscription: v.optional(v.object({
+      tier: v.string(),
+      status: v.string(),
+      provider: v.union(v.string(), v.null()),
+      externalId: v.union(v.string(), v.null()),
+      currentPeriodEnd: v.union(v.string(), v.null()),
+      updatedAt: v.string(),
+    })),
+    onboarding: v.optional(v.any()),
     createdAt: v.string(),
     updatedAt: v.string(),
   }).index("byExternalId", ["externalId"]),
@@ -30,6 +78,7 @@ export default defineSchema({
     profile: v.string(),
     secretHash: v.string(),
     claimCodeHash: v.optional(v.string()),
+    claimCodeExpiresAt: v.optional(v.string()),
     claimedAt: v.optional(v.string()),
     revokedAt: v.optional(v.string()),
     lastSeenAt: v.optional(v.string()),
@@ -71,6 +120,7 @@ export default defineSchema({
       lastError: v.union(v.string(), v.null()),
       snapshot: v.any(),
     })),
+    providerCatalogue: v.optional(providerCatalogueValidator),
     createdAt: v.string(),
     updatedAt: v.string(),
   }).index("byUserExternalId", ["userExternalId"]),
@@ -99,6 +149,20 @@ export default defineSchema({
     createdAt: v.string(),
     updatedAt: v.string(),
   }).index("byUserExternalId", ["userExternalId"]),
+
+  // User-defined device profiles (roadmap Phase 8 profile editor). The three built-in profiles
+  // in src/profiles.mjs stay in code and are never stored here — this table only holds custom
+  // ones. Capability *values* are validated in Node against DEVICE_CAPABILITIES; storing a
+  // whitelist here would drift from it.
+  deviceProfiles: defineTable({
+    userExternalId: v.string(),
+    profileId: v.string(),
+    label: v.string(),
+    description: v.string(),
+    capabilities: v.array(v.string()),
+    createdAt: v.string(),
+    updatedAt: v.string(),
+  }).index("byUserExternalIdAndProfileId", ["userExternalId", "profileId"]),
 
   commands: defineTable({
     userExternalId: v.string(),

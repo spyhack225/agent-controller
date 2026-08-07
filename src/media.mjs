@@ -24,6 +24,7 @@ export async function normalizeMediaIntent(intent, context = {}) {
       media: media
         ? { kind: media.kind, mediaUploadId: media.id, contentType: media.contentType }
         : { kind: "audio", status: "stored" },
+      ...(media ? { mediaUploadId: media.id } : {}),
       source: "device-audio",
     };
   }
@@ -38,6 +39,7 @@ export async function normalizeMediaIntent(intent, context = {}) {
       media: media
         ? { kind: media.kind, mediaUploadId: media.id, contentType: media.contentType }
         : { kind: "image", status: "stored" },
+      ...(media ? { mediaUploadId: media.id } : {}),
       source: "device-camera",
     };
   }

@@ -32,8 +32,14 @@ export async function buildUserDisplayState(store, userId) {
 
 export async function buildDeviceDisplayState(store, device, options = {}) {
   const base = await buildUserDisplayState(store, device.userId);
+  const configuredMenu = Array.isArray(device.config?.menu) && device.config.menu.length > 0
+    ? device.config.menu
+    : base.menu;
   return {
     ...base,
+    // Firmware applies the display menu every poll and the config menu far less often,
+    // so a generic menu here silently overwrites whatever the owner configured.
+    menu: configuredMenu,
     title: device.label || "Controller",
     device: {
       id: device.id,

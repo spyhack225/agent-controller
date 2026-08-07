@@ -62,7 +62,7 @@ export async function dispatchT3Command(environment, command) {
   return response.json();
 }
 
-export function buildT3Command({ intent, threadId }) {
+export function buildT3Command({ intent, threadId, attachments = [] }) {
   const commandId = createId("t3cmd");
   const createdAt = nowIso();
 
@@ -77,7 +77,7 @@ export function buildT3Command({ intent, threadId }) {
           messageId: createId("msg"),
           role: "user",
           text: intent.text,
-          attachments: [],
+          attachments,
         },
         runtimeMode: "approval-required",
         interactionMode: "default",
@@ -92,7 +92,7 @@ export function buildT3Command({ intent, threadId }) {
           messageId: createId("msg"),
           role: "user",
           text: `Run this shell command if it is appropriate, explain the result, and stop if it is unsafe:\n\n${intent.command}`,
-          attachments: [],
+          attachments,
         },
         runtimeMode: "approval-required",
         interactionMode: "default",
@@ -131,6 +131,78 @@ export function buildT3Command({ intent, threadId }) {
     default:
       throw new Error(`Unsupported T3 command intent: ${intent.type}`);
   }
+}
+
+export function buildT3ProjectLaunchCommands({
+  project,
+  text,
+  modelSelection = project?.defaultModelSelection,
+  runtimeMode = "approval-required",
+  interactionMode = "default",
+  threadId = createId("thread"),
+}) {
+  if (!project?.id) throw new Error("T3 project id is required.");
+  if (!modelSelection?.instanceId || !modelSelection?.model) {
+    throw new Error("T3 project does not have a usable model selection.");
+  }
+
+  const createdAt = nowIso();
+  const title = deriveThreadTitle(text);
+  return {
+    threadId,
+    createThread: {
+      type: "thread.create",
+      commandId: createId("t3cmd"),
+      threadId,
+      projectId: project.id,
+      title,
+      modelSelection,
+      runtimeMode,
+      interactionMode,
+      branch: project.branch ?? null,
+      worktreePath: null,
+      createdAt,
+    },
+    startTurn: {
+      type: "thread.turn.start",
+      commandId: createId("t3cmd"),
+      threadId,
+      message: {
+        messageId: createId("msg"),
+        role: "user",
+        text,
+        attachments: [],
+      },
+      modelSelection,
+      titleSeed: title,
+      runtimeMode,
+      interactionMode,
+      createdAt,
+    },
+  };
+}
+
+export function compressSnapshot(snapshot) {
+  const projects = Array.isArray(snapshot?.projects) ? snapshot.projects.length : 0;
+  const threads = Array.isArray(snapshot?.threads) ? snapshot.threads.length : 0;
+  return {
+    title: "T3 Code",
+    state: "reachable",
+    line1: `${projects} projects`,
+    line2: `${threads} threads`,
+  };
+}
+
+export function isEnvironmentTokenExpired(environment, now = Date.now()) {
+  if (!environment?.accessTokenExpiresAt) return false;
+  const expiresAt = Date.parse(environment.accessTokenExpiresAt);
+  return Number.isFinite(expiresAt) && expiresAt <= now;
+}
+
+function deriveThreadTitle(text) {
+  const compact = String(text ?? "").trim().replace(/\s+/gu, " ");
+  if (!compact) return "Agent Controller session";
+  return compact.length <= 72 ? compact : `${compact.slice(0, 69).trimEnd()}...`;
 }
 
 function authorizationHeaders(accessToken) {

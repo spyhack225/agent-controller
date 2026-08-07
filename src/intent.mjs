@@ -28,6 +28,19 @@ export async function normalizeIntent(payload, context = {}) {
       }, context);
     case "shell_input":
       return { type, command: requireString(payload.command, "command") };
+    case "terminal_input": {
+      // T3 terminal ids are always chosen by the client, never allocated server-side.
+      const data = requireString(payload.data, "data");
+      if (data.length > 65_536) {
+        throw new HttpError(400, "terminal_input data exceeds 65536 characters.");
+      }
+      return {
+        type,
+        terminalId: requireString(payload.terminalId, "terminalId"),
+        data,
+        ...(typeof payload.cwd === "string" && payload.cwd.trim() ? { cwd: payload.cwd.trim() } : {}),
+      };
+    }
     case "session_control": {
       const action = requireString(payload.action, "action");
       if (!["continue", "stop", "interrupt"].includes(action)) {

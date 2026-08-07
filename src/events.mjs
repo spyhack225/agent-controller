@@ -19,6 +19,9 @@ export function createEventBroker() {
     const heartbeat = setInterval(() => {
       send(client, "heartbeat", { at: new Date().toISOString() });
     }, 25_000);
+    // The listening server keeps the process alive; a stream keepalive should never be what
+    // holds it open, or a leaked client blocks shutdown.
+    heartbeat.unref?.();
 
     res.on("close", () => {
       clearInterval(heartbeat);
@@ -53,7 +56,17 @@ export function createEventBroker() {
     }
   }
 
-  return { connect, broadcastToUser, broadcastStateChange };
+  // Used when the store cannot hand back a full snapshot to diff (Convex). Subscribers treat
+  // state.changed as a refetch trigger, so the lighter payload is equivalent for them.
+  function broadcastUserChange(userId, { action = null } = {}) {
+    broadcastToUser(userId, "state.changed", {
+      userId,
+      summary: { latestAction: action },
+      changedAt: new Date().toISOString(),
+    });
+  }
+
+  return { connect, broadcastToUser, broadcastStateChange, broadcastUserChange };
 }
 
 function send(client, type, payload) {

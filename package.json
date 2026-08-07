@@ -5,25 +5,54 @@
   "type": "module",
   "description": "Cloud control plane for remote agent controller devices and T3 Code environments.",
   "scripts": {
-    "start": "node src/server.mjs",
+    "prestart": "npm run build:app",
+    "start": "node --env-file-if-exists=.env --env-file-if-exists=.env.local src/server.mjs",
+    "dev:server": "node --env-file-if-exists=.env --env-file-if-exists=.env.local --watch src/server.mjs",
+    "dev:app": "vite --config frontend/vite.config.ts",
+    "dev:web": "npm run dev:app",
+    "build": "npm run build:app",
+    "build:app": "vite build --config frontend/vite.config.ts",
+    "build:web": "npm run build:app",
+    "typecheck:app": "tsc -p frontend/tsconfig.json --noEmit",
+    "typecheck:web": "npm run typecheck:app",
+    "test:app": "vitest run --config frontend/vitest.config.ts",
+    "test:web": "npm run test:app",
+    "test:server": "node --test test/*.test.mjs",
     "manufacture:batch": "node scripts/manufacture-batch.mjs",
     "firmware:publish": "node scripts/publish-firmware-release.mjs",
     "convex:dev": "convex dev",
     "convex:deploy": "convex deploy",
+    "setup:t3": "node scripts/setup-t3.mjs",
     "simulate:device": "node scripts/simulate-device.mjs",
     "smoke:local": "node scripts/smoke-local.mjs",
     "smoke:convex": "node scripts/smoke-convex.mjs",
-    "test": "node --test"
+    "test": "npm run build:app && npm run typecheck:app && npm run test:app && npm run test:server"
   },
   "engines": {
     "node": ">=22"
   },
   "dependencies": {
-    "@clerk/backend": "^3.7.0"
+    "@clerk/backend": "^3.7.0",
+    "@clerk/react": "^6.12.7",
+    "@fontsource/barlow": "^5.3.0",
+    "@fontsource/ibm-plex-mono": "^5.3.0",
+    "lucide-react": "^1.26.0",
+    "react": "^19.2.8",
+    "react-dom": "^19.2.8"
   },
   "devDependencies": {
+    "@tailwindcss/vite": "^4.3.3",
+    "@testing-library/jest-dom": "^7.0.0",
+    "@testing-library/react": "^16.3.2",
     "@types/node": "^25.9.3",
+    "@types/react": "^19.2.17",
+    "@types/react-dom": "^19.2.3",
+    "@vitejs/plugin-react": "^6.0.4",
     "convex": "^1.41.0",
-    "typescript": "^6.0.3"
+    "jsdom": "^29.1.1",
+    "tailwindcss": "^4.3.3",
+    "typescript": "^6.0.3",
+    "vite": "^8.1.5",
+    "vitest": "^4.1.10"
   }
 }

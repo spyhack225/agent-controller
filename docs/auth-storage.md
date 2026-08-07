@@ -1,4 +1,4 @@
-# Clerk And Convex Plan
+# Clerk And Convex Authentication
 
 The platform is moving to:
 
@@ -13,9 +13,11 @@ Set gateway environment:
 ```text
 AUTH_PROVIDER=clerk
 CLERK_SECRET_KEY=sk_live_or_test_...
-CLERK_PUBLISHABLE_KEY=pk_live_or_test_...
+VITE_CLERK_PUBLISHABLE_KEY=pk_live_or_test_...
 CLERK_AUTHORIZED_PARTIES=https://gateway.example.com
 ```
+
+For local development, use `clerk init --app YOUR_CLERK_APP_ID`. The CLI writes the two keys above to the gitignored `.env.local`.
 
 When `AUTH_PROVIDER=clerk`, platform routes expect:
 
@@ -23,7 +25,7 @@ When `AUTH_PROVIDER=clerk`, platform routes expect:
 authorization: Bearer CLERK_SESSION_OR_JWT
 ```
 
-The gateway verifies the bearer token with `@clerk/backend` and uses the Clerk `userId` as the platform user ID. Device credentials, factory credentials, and OTA signing keys are separate from Clerk sessions.
+The gateway verifies bearer tokens and same-origin session cookies with `@clerk/backend`, then synchronizes the verified Clerk `userId`, name, and primary email. Device credentials, factory credentials, and OTA signing keys are separate from Clerk sessions.
 
 The dashboard reads public auth settings from:
 
@@ -31,16 +33,16 @@ The dashboard reads public auth settings from:
 GET /v1/auth/config
 ```
 
-When Clerk is enabled and `CLERK_PUBLISHABLE_KEY` is set, the browser loads ClerkJS, opens Clerk sign-in, and calls `session.getToken()` for API requests. Clerk session tokens are kept in memory; only local development platform tokens are stored in `localStorage`.
+When Clerk is enabled, the React app opens Clerk sign-in and calls `getToken()` for each API request so Clerk can refresh the session. Live events authenticate with the same-origin Clerk cookie. No Clerk or platform bearer token is stored in `localStorage`.
 
-Local development can still use:
+Legacy integration tests and CLI-only development can explicitly use:
 
 ```text
 AUTH_PROVIDER=dev
 DEMO_MODE=1
 ```
 
-The development token endpoint `POST /v1/users/dev` is disabled automatically when `AUTH_PROVIDER=clerk`, unless `ENABLE_DEV_TOKENS=1` is explicitly set. Keep `ENABLE_DEV_TOKENS` unset or `0` on production gateways.
+The development token endpoint `POST /v1/users/dev` is disabled automatically when `AUTH_PROVIDER=clerk`. The React dashboard never exposes this endpoint or a fake development profile.
 
 ## Convex
 

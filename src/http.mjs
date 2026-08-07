@@ -19,6 +19,29 @@ export async function readJson(req) {
   }
 }
 
+// Webhook signatures are computed over the exact bytes sent, so re-serializing parsed JSON
+// would not reproduce them. Callers that verify a signature must read the raw body.
+export async function readRawBody(req, maxBytes = 1024 * 1024) {
+  const chunks = [];
+  let size = 0;
+  for await (const chunk of req) {
+    size += chunk.length;
+    if (size > maxBytes) throw new HttpError(413, "Request body is too large.");
+    chunks.push(chunk);
+  }
+  return Buffer.concat(chunks);
+}
+
+export function parseJsonBody(raw) {
+  const body = raw.toString("utf8").trim();
+  if (!body) return {};
+  try {
+    return JSON.parse(body);
+  } catch {
+    throw new HttpError(400, "Request body must be valid JSON.");
+  }
+}
+
 export function sendJson(res, status, body) {
   const payload = JSON.stringify(body, null, 2);
   res.writeHead(status, {

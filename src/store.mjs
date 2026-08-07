@@ -1,12 +1,31 @@
 import { createHash, timingSafeEqual } from "node:crypto";
 
+import { defaultSubscription, normalizeSubscription } from "./billing.mjs";
 import { createId, createSecret, nowIso } from "./ids.mjs";
+import { normalizeOnboarding, normalizeStoredOnboarding } from "./onboarding.mjs";
 import { createSecretBox } from "./secretBox.mjs";
 
 const DEFAULT_PRIVACY_SETTINGS = {
   mediaRetentionDays: 30,
 };
 const DEVICE_ONLINE_THRESHOLD_MS = 90_000;
+// A claim code has to outlive warehouse-to-customer transit, because the printed label is issued at
+// manufacture and read by the owner weeks later. Units that sit in inventory past this refresh from
+// the device menu (`rotate: true`) rather than silently on every boot.
+const CLAIM_CODE_TTL_MS = 30 * 24 * 60 * 60 * 1000;
+
+function claimCodeExpiryFrom(issuedAtMs) {
+  return new Date(issuedAtMs + CLAIM_CODE_TTL_MS).toISOString();
+}
+
+function claimCodeIsLive(device, now = Date.now()) {
+  if (!device.claimCodeHash) return false;
+  const expiresAt = Date.parse(device.claimCodeExpiresAt ?? "");
+  // A code minted before expiry tracking existed has no recorded end date. Treating it as live
+  // keeps already-shipped labels working instead of invalidating them on deploy.
+  if (!Number.isFinite(expiresAt)) return true;
+  return expiresAt > now;
+}
 
 function hashSecret(secret) {
   return createHash("sha256").update(secret, "utf8").digest("hex");
@@ -27,6 +46,10 @@ export function createStore(seed = {}, options = {}) {
   const firmwareReleases = new Map((seed.firmwareReleases ?? []).map((release) => [release.id, release]));
   const mediaUploads = new Map((seed.mediaUploads ?? []).map((media) => [media.id, media]));
   const macros = new Map((seed.macros ?? []).map((macro) => [macro.id, macro]));
+  // Keyed by user + slug: a profile id is unique per user, not globally.
+  const deviceProfiles = new Map(
+    (seed.deviceProfiles ?? []).map((profile) => [`${profile.userId}:${profile.profileId}`, profile]),
+  );
   const commands = new Map((seed.commands ?? []).map((command) => [command.id, command]));
   const commandEvents = new Map((seed.commandEvents ?? []).map((event) => [event.id, event]));
   const auditLogs = [...(seed.auditLogs ?? [])];
@@ -51,22 +74,28 @@ export function createStore(seed = {}, options = {}) {
       firmwareReleases: [...firmwareReleases.values()],
       mediaUploads: [...mediaUploads.values()],
       macros: [...macros.values()],
+      deviceProfiles: [...deviceProfiles.values()],
       commands: [...commands.values()],
       commandEvents: [...commandEvents.values()],
       auditLogs,
     };
   }
 
-  function ensureUser({ userId = "user_dev", email = "dev@example.local" } = {}) {
+  function ensureUser({ userId = "user_dev", email = "dev@example.local", name = null } = {}) {
     const existing = users.get(userId);
     if (existing) {
       existing.privacy = normalizePrivacySettings(existing.privacy);
+      existing.onboarding = normalizeStoredOnboarding(existing.onboarding);
+      if (email && existing.email !== email) existing.email = email;
+      if (name && existing.name !== name) existing.name = name;
       return publicUser(existing);
     }
     const user = {
       id: userId,
       email,
+      ...(name ? { name } : {}),
       privacy: DEFAULT_PRIVACY_SETTINGS,
+      onboarding: normalizeStoredOnboarding(null),
       createdAt: nowIso(),
     };
     users.set(user.id, user);
@@ -99,6 +128,64 @@ export function createStore(seed = {}, options = {}) {
     });
     notifyChanged();
     return user.privacy;
+  }
+
+  function getUserSubscription(userId) {
+    const user = users.get(userId);
+    if (!user) return null;
+    return user.subscription
+      ? normalizeSubscription(user.subscription, user.subscription, user.subscription.updatedAt)
+      : defaultSubscription(user.createdAt ?? nowIso());
+  }
+
+  function updateUserSubscription({ userId, ...input }) {
+    const user = users.get(userId);
+    if (!user) return null;
+    const previous = user.subscription ?? defaultSubscription(user.createdAt ?? nowIso());
+    user.subscription = normalizeSubscription(input, previous, nowIso());
+    audit({
+      userId,
+      actorType: "user",
+      action: "user.subscription_updated",
+      targetId: userId,
+      metadata: {
+        tier: user.subscription.tier,
+        status: user.subscription.status,
+        provider: user.subscription.provider,
+      },
+    });
+    notifyChanged();
+    return user.subscription;
+  }
+
+  function getUserOnboarding(userId) {
+    return normalizeStoredOnboarding(users.get(userId)?.onboarding);
+  }
+
+  function updateUserOnboarding({ userId, onboarding }) {
+    const user = users.get(userId);
+    if (!user) return null;
+    const previous = normalizeStoredOnboarding(user.onboarding);
+    user.onboarding = normalizeOnboarding(onboarding, previous);
+    const action = user.onboarding.status === "completed"
+      ? "user.onboarding_completed"
+      : user.onboarding.status === "paused"
+        ? "user.onboarding_paused"
+        : previous.status === "not_started"
+          ? "user.onboarding_started"
+          : "user.onboarding_updated";
+    audit({
+      userId,
+      actorType: "user",
+      action,
+      targetId: userId,
+      metadata: {
+        status: user.onboarding.status,
+        currentStep: user.onboarding.currentStep,
+      },
+    });
+    notifyChanged();
+    return user.onboarding;
   }
 
   function createUserToken({ userId, label = "Platform API token" }) {
@@ -177,6 +264,7 @@ export function createStore(seed = {}, options = {}) {
       profile,
       secretHash: hashSecret(secret),
       claimCodeHash: hashSecret(normalizeClaimCode(claimCode)),
+      claimCodeExpiresAt: claimCodeExpiryFrom(Date.now()),
       claimedAt: null,
       revokedAt: null,
       lastSeenAt: null,
@@ -203,8 +291,12 @@ export function createStore(seed = {}, options = {}) {
     for (const device of devices.values()) {
       if (device.revokedAt || device.claimedAt || !device.claimCodeHash) continue;
       if (!safeEqual(device.claimCodeHash, claimHash)) continue;
+      // An expired code is matched but refused, so the caller can say "expired" rather than the
+      // indistinguishable "no such code" a `continue` would produce.
+      if (!claimCodeIsLive(device)) return null;
       device.userId = user.id;
       device.claimCodeHash = null;
+      device.claimCodeExpiresAt = null;
       device.claimedAt = nowIso();
       if (label) device.label = label;
       audit({
@@ -277,6 +369,7 @@ export function createStore(seed = {}, options = {}) {
     device.label = label ?? device.label;
     device.secretHash = hashSecret(secret);
     device.claimCodeHash = hashSecret(normalizeClaimCode(claimCode));
+    device.claimCodeExpiresAt = claimCodeExpiryFrom(Date.now());
     device.claimedAt = null;
     device.lastSeenAt = null;
     device.status = createDefaultDeviceStatus();
@@ -303,21 +396,41 @@ export function createStore(seed = {}, options = {}) {
     return { device: publicDevice(device), secret, claimCode };
   }
 
-  function rotateUnclaimedDeviceClaimCode({ deviceId }) {
+  // Rotating on every call is what invalidated the printed label the moment a unit was powered on:
+  // firmware asks for a setup code on its first 403, seconds after boot. The code now survives until
+  // it expires, and only an explicit `rotate` — an owner or factory action — replaces it early.
+  function ensureUnclaimedDeviceClaimCode({ deviceId, rotate = false }) {
     const device = devices.get(deviceId);
     if (!device || device.revokedAt || device.claimedAt) return null;
+    const now = Date.now();
+    if (!rotate && claimCodeIsLive(device, now)) {
+      // Codes are stored hashed, so the plaintext cannot be handed back a second time — and should
+      // not be. The device caches the code it was issued; "still valid" is the whole answer.
+      return {
+        device: publicDevice(device),
+        claimCode: null,
+        rotated: false,
+        claimCodeExpiresAt: device.claimCodeExpiresAt ?? null,
+      };
+    }
     const claimCode = createHumanCode();
     device.claimCodeHash = hashSecret(normalizeClaimCode(claimCode));
+    device.claimCodeExpiresAt = claimCodeExpiryFrom(now);
     audit({
       userId: "system",
       actorType: "device",
       actorId: device.id,
       action: "device.setup_code_rotated",
       targetId: device.id,
-      metadata: { label: device.label, profile: device.profile },
+      metadata: { label: device.label, profile: device.profile, rotate },
     });
     notifyChanged();
-    return { device: publicDevice(device), claimCode };
+    return {
+      device: publicDevice(device),
+      claimCode,
+      rotated: true,
+      claimCodeExpiresAt: device.claimCodeExpiresAt,
+    };
   }
 
   function authenticateDevice(deviceId, secret) {
@@ -333,8 +446,25 @@ export function createStore(seed = {}, options = {}) {
     const device = devices.get(deviceId);
     if (!device || device.revokedAt) return null;
     const heartbeatAt = nowIso();
+
+    // A heartbeat arriving after the device had gone offline is a reconnect. Recording it is what
+    // makes "reliable device reconnect after Wi-Fi loss" measurable rather than guessed: an
+    // offline gap alone cannot distinguish a reconnect from a device that never came back.
+    const previousHeartbeatAt = Date.parse(device.status?.lastHeartbeatAt ?? "");
+    const gapMs = Number.isFinite(previousHeartbeatAt)
+      ? Date.parse(heartbeatAt) - previousHeartbeatAt
+      : null;
+    const reconnected = gapMs !== null && gapMs > DEVICE_ONLINE_THRESHOLD_MS;
+
     device.lastSeenAt = heartbeatAt;
     device.status = normalizeDeviceStatus(status, device.status, heartbeatAt);
+    device.connectivity = {
+      heartbeatCount: (device.connectivity?.heartbeatCount ?? 0) + 1,
+      reconnectCount: (device.connectivity?.reconnectCount ?? 0) + (reconnected ? 1 : 0),
+      lastReconnectAt: reconnected ? heartbeatAt : device.connectivity?.lastReconnectAt ?? null,
+      longestOfflineMs: Math.max(device.connectivity?.longestOfflineMs ?? 0, reconnected ? gapMs : 0),
+    };
+
     notifyChanged();
     return publicDevice(device);
   }
@@ -351,13 +481,17 @@ export function createStore(seed = {}, options = {}) {
     return publicDevice(device);
   }
 
-  function updateDeviceConfig({ userId, deviceId, config }) {
+  // actorType defaults to "user" because the owner-facing PUT is the common path.
+  // A device changing its own thread passes "device", so the audit trail does not
+  // credit the owner with something the hardware did on its own.
+  function updateDeviceConfig({ userId, deviceId, config, actorType = "user", actorId }) {
     const device = devices.get(deviceId);
     if (!device || device.userId !== userId || device.revokedAt) return null;
     device.config = normalizeDeviceConfig(config, device.config);
     audit({
       userId,
-      actorType: "user",
+      actorType,
+      ...(actorId ? { actorId } : {}),
       action: "device.config_updated",
       targetId: device.id,
       metadata: {
@@ -386,6 +520,8 @@ export function createStore(seed = {}, options = {}) {
       accessTokenExpiresAt: normalizeNullableString(input.accessTokenExpiresAt) ?? null,
       status: input.status ?? "unknown",
       health: normalizeEnvironmentHealth(input.health, existing?.health),
+      // Re-pairing must not discard the registered harness catalogue.
+      ...(existing?.providerCatalogue ? { providerCatalogue: existing.providerCatalogue } : {}),
       createdAt: input.createdAt ?? existing?.createdAt ?? nowIso(),
       updatedAt: nowIso(),
     };
@@ -396,6 +532,26 @@ export function createStore(seed = {}, options = {}) {
       action: "environment.upserted",
       targetId: environment.id,
       metadata: { label: environment.label, baseUrl: environment.baseUrl, scopes: environment.scopes },
+    });
+    notifyChanged();
+    return publicEnvironment(environment);
+  }
+
+  function updateEnvironmentCatalogue({ userId, environmentId, catalogue }) {
+    const environment = environments.get(environmentId);
+    if (!environment || environment.userId !== userId) return null;
+    environment.providerCatalogue = catalogue;
+    environment.updatedAt = nowIso();
+    audit({
+      userId,
+      actorType: "user",
+      action: "environment.catalogue_updated",
+      targetId: environment.id,
+      metadata: {
+        source: catalogue?.source ?? null,
+        instanceCount: catalogue?.instances?.length ?? 0,
+        instanceIds: (catalogue?.instances ?? []).map((instance) => instance.instanceId),
+      },
     });
     notifyChanged();
     return publicEnvironment(environment);
@@ -560,10 +716,106 @@ export function createStore(seed = {}, options = {}) {
     return publicMediaUpload(media);
   }
 
+  function createDeviceProfile({ userId, profileId, label, description, capabilities }) {
+    const key = `${userId}:${profileId}`;
+    if (deviceProfiles.has(key)) return null;
+    const profile = {
+      id: createId("dprof"),
+      userId,
+      profileId,
+      label,
+      description,
+      capabilities: [...capabilities],
+      createdAt: nowIso(),
+      updatedAt: nowIso(),
+    };
+    deviceProfiles.set(key, profile);
+    audit({
+      userId,
+      actorType: "user",
+      action: "device_profile.created",
+      targetId: profileId,
+      metadata: { label, capabilities: profile.capabilities },
+    });
+    notifyChanged();
+    return { ...profile };
+  }
+
+  function listUserDeviceProfiles(userId) {
+    return [...deviceProfiles.values()]
+      .filter((profile) => profile.userId === userId)
+      .map((profile) => ({ ...profile, capabilities: [...profile.capabilities] }));
+  }
+
+  function getUserDeviceProfile(userId, profileId) {
+    const profile = deviceProfiles.get(`${userId}:${profileId}`);
+    return profile ? { ...profile, capabilities: [...profile.capabilities] } : null;
+  }
+
+  function updateDeviceProfileDefinition({ userId, profileId, label, description, capabilities }) {
+    const profile = deviceProfiles.get(`${userId}:${profileId}`);
+    if (!profile) return null;
+    if (label !== undefined) profile.label = label;
+    if (description !== undefined) profile.description = description;
+    if (capabilities !== undefined) profile.capabilities = [...capabilities];
+    profile.updatedAt = nowIso();
+    audit({
+      userId,
+      actorType: "user",
+      action: "device_profile.updated",
+      targetId: profileId,
+      metadata: { label: profile.label, capabilities: profile.capabilities },
+    });
+    notifyChanged();
+    return { ...profile, capabilities: [...profile.capabilities] };
+  }
+
+  function deleteDeviceProfile({ userId, profileId }) {
+    const key = `${userId}:${profileId}`;
+    const profile = deviceProfiles.get(key);
+    if (!profile) return null;
+    deviceProfiles.delete(key);
+    audit({
+      userId,
+      actorType: "user",
+      action: "device_profile.deleted",
+      targetId: profileId,
+      metadata: { label: profile.label },
+    });
+    notifyChanged();
+    return { ...profile, capabilities: [...profile.capabilities] };
+  }
+
+  function updateMediaDescription({ userId, mediaId, description, source = "manual" }) {
+    const media = mediaUploads.get(mediaId);
+    if (!media || media.userId !== userId || media.kind !== "image") return null;
+    const previousLength = media.description?.length ?? 0;
+    media.description = normalizeTranscript(description) ?? null;
+    media.processing = normalizeMediaProcessing({
+      visionStatus: media.description ? "ready" : "pending",
+      descriptionSource: media.description ? source : null,
+      lastError: null,
+    }, media.kind, media.transcript, media.description);
+    audit({
+      userId,
+      actorType: "user",
+      action: "media.description_updated",
+      targetId: media.id,
+      metadata: {
+        previousLength,
+        descriptionLength: media.description?.length ?? 0,
+        source,
+      },
+    });
+    notifyChanged();
+    return publicMediaUpload(media);
+  }
+
   function updateMediaProcessing({ userId, mediaId, processing }) {
     const media = mediaUploads.get(mediaId);
-    if (!media || media.userId !== userId || media.kind !== "audio") return null;
-    media.processing = normalizeMediaProcessing(processing, media.kind, media.transcript);
+    if (!media || media.userId !== userId) return null;
+    if (media.kind !== "audio" && media.kind !== "image") return null;
+    media.processing = normalizeMediaProcessing(processing, media.kind, media.transcript, media.description);
     audit({
       userId,
       actorType: "system",
@@ -799,6 +1051,10 @@ export function createStore(seed = {}, options = {}) {
     ensureUser,
     getUserPrivacySettings,
     updateUserPrivacySettings,
+    getUserSubscription,
+    updateUserSubscription,
+    getUserOnboarding,
+    updateUserOnboarding,
     createUserToken,
     authenticateUserToken,
     createDevice,
@@ -808,7 +1064,7 @@ export function createStore(seed = {}, options = {}) {
     rotateDeviceSecret,
     updateDeviceProfile,
     resetDeviceForTransfer,
-    rotateUnclaimedDeviceClaimCode,
+    ensureUnclaimedDeviceClaimCode,
     authenticateDevice,
     recordDeviceHeartbeat,
     listDevices,
@@ -817,6 +1073,7 @@ export function createStore(seed = {}, options = {}) {
     upsertEnvironment,
     deleteEnvironment,
     updateEnvironmentHealth,
+    updateEnvironmentCatalogue,
     getEnvironmentForUser,
     listEnvironments,
     createFirmwareRelease,
@@ -824,7 +1081,13 @@ export function createStore(seed = {}, options = {}) {
     getLatestFirmwareRelease,
     createMediaUpload,
     getMediaForUser,
+    createDeviceProfile,
+    listUserDeviceProfiles,
+    getUserDeviceProfile,
+    updateDeviceProfileDefinition,
+    deleteDeviceProfile,
     updateMediaTranscript,
+    updateMediaDescription,
     updateMediaProcessing,
     listMediaUploads,
     listExpiredMediaUploads,
@@ -863,7 +1126,7 @@ function createDefaultDeviceConfig() {
     threadId: null,
     defaultPrompt: "Continue the current task, inspect progress, and run relevant tests.",
     shellCommand: "npm test",
-    menu: ["status", "prompt", "shell", "macro", "media", "stop"],
+    menu: ["status", "prompt", "shell", "macro", "thread", "media", "stop"],
   };
 }
 
@@ -925,13 +1188,15 @@ function normalizeDeviceConfig(input = {}, existing = null) {
     next.shellCommand = value || createDefaultDeviceConfig().shellCommand;
   }
   if (Object.hasOwn(input, "menu")) {
-    const allowed = new Set(["status", "prompt", "shell", "macro", "approve", "reject", "media", "stop"]);
+    const allowed = new Set(["status", "prompt", "shell", "macro", "approve", "reject", "media", "stop", "thread", "reset"]);
     const menu = Array.isArray(input.menu)
       ? input.menu
         .map((item) => normalizeNullableString(item))
         .filter((item) => item && allowed.has(item))
       : [];
-    next.menu = [...new Set(menu)].slice(0, 6);
+    // 8 matches kMaxMenuItems in the firmware. Anything beyond it is dropped here
+    // silently, so this cap must not be tighter than what the hardware can render.
+    next.menu = [...new Set(menu)].slice(0, 8);
     if (next.menu.length === 0) next.menu = createDefaultDeviceConfig().menu;
   }
 
@@ -1008,8 +1273,24 @@ function normalizeTranscript(value) {
   return transcript.length > 0 ? transcript.slice(0, 12000) : undefined;
 }
 
-function normalizeMediaProcessing(input = null, kind = "image", transcript = null) {
+const MEDIA_PROCESSING_STATUSES = new Set(["pending", "processing", "ready", "failed", "unavailable"]);
+
+function normalizeMediaProcessing(input = null, kind = "image", transcript = null, description = null) {
   const now = nowIso();
+  if (kind === "image") {
+    // Images carry vision state instead of transcription state.
+    const status = MEDIA_PROCESSING_STATUSES.has(input?.visionStatus)
+      ? input.visionStatus
+      : (description ? "ready" : "pending");
+    return {
+      transcriptionStatus: "not_applicable",
+      transcriptSource: null,
+      visionStatus: status,
+      descriptionSource: input?.descriptionSource ?? (description ? "upload" : null),
+      lastError: input?.lastError ?? null,
+      updatedAt: input?.updatedAt ?? now,
+    };
+  }
   if (kind !== "audio") {
     return {
       transcriptionStatus: "not_applicable",
@@ -1018,7 +1299,7 @@ function normalizeMediaProcessing(input = null, kind = "image", transcript = nul
       updatedAt: input?.updatedAt ?? now,
     };
   }
-  const allowed = new Set(["pending", "processing", "ready", "failed", "unavailable"]);
+  const allowed = MEDIA_PROCESSING_STATUSES;
   const status = allowed.has(input?.transcriptionStatus)
     ? input.transcriptionStatus
     : (transcript ? "ready" : "pending");
@@ -1034,19 +1315,45 @@ function publicUser(user) {
   return {
     id: user.id,
     email: user.email,
+    name: user.name ?? null,
     privacy: normalizePrivacySettings(user.privacy),
+    onboarding: normalizeStoredOnboarding(user.onboarding),
     createdAt: user.createdAt,
   };
 }
 
 function publicDevice(device) {
-  const { secretHash, claimCodeHash, ...publicFields } = device;
+  const { secretHash, claimCodeHash, pendingSecretHash, ...publicFields } = device;
   return {
     ...publicFields,
     config: normalizeDeviceConfig({}, device.config),
     status: normalizeDeviceStatus({}, device.status, device.status?.lastHeartbeatAt ?? null),
     presence: buildDevicePresence(device),
+    actions: deviceActions(device),
     claimed: Boolean(device.claimedAt),
+  };
+}
+
+/**
+ * Which owner operations this device can currently accept.
+ *
+ * Every store mutation below already refuses a revoked device, but a client has no way to know
+ * that and had to re-derive it from `revokedAt` — so each new guard here silently produced another
+ * control that looks live and returns 404. Declaring the answer keeps the UI honest without it
+ * having to mirror rules it cannot see.
+ */
+function deviceActions(device) {
+  const revoked = Boolean(device.revokedAt);
+  return {
+    // rotateDeviceSecret / resetDeviceForTransfer / updateDeviceConfig / updateDeviceProfile all
+    // bail on device.revokedAt and return null, which the routes surface as 404.
+    rotateSecret: !revoked,
+    transferReset: !revoked,
+    updateConfig: !revoked,
+    updateProfile: !revoked,
+    // revokeDevice does not check, so revoking twice succeeds while changing nothing. A no-op
+    // dressed as a destructive action is worse than a refusal.
+    revoke: !revoked,
   };
 }
 

@@ -1,0 +1,793 @@
+[
+  {
+    "instanceId": "claudeAgent",
+    "displayName": "Claude",
+    "enabled": true,
+    "installed": true,
+    "version": "2.1.219",
+    "status": "ready",
+    "auth": {
+      "status": "authenticated",
+      "type": "Claude Max",
+      "label": "Claude Max Subscription"
+    },
+    "models": [
+      {
+        "slug": "claude-fable-5",
+        "name": "Claude Fable 5",
+        "isCustom": false,
+        "capabilities": {
+          "optionDescriptors": [
+            {
+              "id": "effort",
+              "label": "Reasoning",
+              "type": "select",
+              "currentValue": "high",
+              "options": [
+                {
+                  "id": "low",
+                  "label": "Low"
+                },
+                {
+                  "id": "medium",
+                  "label": "Medium"
+                },
+                {
+                  "id": "high",
+                  "label": "High",
+                  "isDefault": true
+                },
+                {
+                  "id": "xhigh",
+                  "label": "Extra High"
+                },
+                {
+                  "id": "max",
+                  "label": "Max"
+                },
+                {
+                  "id": "ultracode",
+                  "label": "Ultracode"
+                },
+                {
+                  "id": "ultrathink",
+                  "label": "Ultrathink"
+                }
+              ]
+            },
+            {
+              "id": "contextWindow",
+              "label": "Context Window",
+              "type": "select",
+              "currentValue": "200k",
+              "options": [
+                {
+                  "id": "200k",
+                  "label": "200k",
+                  "isDefault": true
+                },
+                {
+                  "id": "1m",
+                  "label": "1M"
+                }
+              ]
+            }
+          ]
+        }
+      },
+      {
+        "slug": "claude-opus-4-8",
+        "name": "Claude Opus 4.8",
+        "isCustom": false,
+        "capabilities": {
+          "optionDescriptors": [
+            {
+              "id": "effort",
+              "label": "Reasoning",
+              "type": "select",
+              "currentValue": "high",
+              "options": [
+                {
+                  "id": "low",
+                  "label": "Low"
+                },
+                {
+                  "id": "medium",
+                  "label": "Medium"
+                },
+                {
+                  "id": "high",
+                  "label": "High",
+                  "isDefault": true
+                },
+                {
+                  "id": "xhigh",
+                  "label": "Extra High"
+                },
+                {
+                  "id": "max",
+                  "label": "Max"
+                },
+                {
+                  "id": "ultracode",
+                  "label": "Ultracode"
+                },
+                {
+                  "id": "ultrathink",
+                  "label": "Ultrathink"
+                }
+              ]
+            },
+            {
+              "id": "fastMode",
+              "label": "Fast Mode",
+              "type": "boolean"
+            }
+          ]
+        }
+      },
+      {
+        "slug": "claude-opus-4-7",
+        "name": "Claude Opus 4.7",
+        "isCustom": false,
+        "capabilities": {
+          "optionDescriptors": [
+            {
+              "id": "effort",
+              "label": "Reasoning",
+              "type": "select",
+              "currentValue": "xhigh",
+              "options": [
+                {
+                  "id": "low",
+                  "label": "Low"
+                },
+                {
+                  "id": "medium",
+                  "label": "Medium"
+                },
+                {
+                  "id": "high",
+                  "label": "High"
+                },
+                {
+                  "id": "xhigh",
+                  "label": "Extra High",
+                  "isDefault": true
+                },
+                {
+                  "id": "max",
+                  "label": "Max"
+                },
+                {
+                  "id": "ultrathink",
+                  "label": "Ultrathink"
+                }
+              ]
+            },
+            {
+              "id": "fastMode",
+              "label": "Fast Mode",
+              "type": "boolean"
+            }
+          ]
+        }
+      },
+      {
+        "slug": "claude-opus-4-6",
+        "name": "Claude Opus 4.6",
+        "isCustom": false,
+        "capabilities": {
+          "optionDescriptors": [
+            {
+              "id": "effort",
+              "label": "Reasoning",
+              "type": "select",
+              "currentValue": "high",
+              "options": [
+                {
+                  "id": "low",
+                  "label": "Low"
+                },
+                {
+                  "id": "medium",
+                  "label": "Medium"
+                },
+                {
+                  "id": "high",
+                  "label": "High",
+                  "isDefault": true
+                },
+                {
+                  "id": "max",
+                  "label": "Max"
+                },
+                {
+                  "id": "ultrathink",
+                  "label": "Ultrathink"
+                }
+              ]
+            },
+            {
+              "id": "fastMode",
+              "label": "Fast Mode",
+              "type": "boolean"
+            },
+            {
+              "id": "contextWindow",
+              "label": "Context Window",
+              "type": "select",
+              "currentValue": "200k",
+              "options": [
+                {
+                  "id": "200k",
+                  "label": "200k",
+                  "isDefault": true
+                },
+                {
+                  "id": "1m",
+                  "label": "1M"
+                }
+              ]
+            }
+          ]
+        }
+      },
+      {
+        "slug": "claude-opus-4-5",
+        "name": "Claude Opus 4.5",
+        "isCustom": false,
+        "capabilities": {
+          "optionDescriptors": [
+            {
+              "id": "effort",
+              "label": "Reasoning",
+              "type": "select",
+              "currentValue": "high",
+              "options": [
+                {
+                  "id": "low",
+                  "label": "Low"
+                },
+                {
+                  "id": "medium",
+                  "label": "Medium"
+                },
+                {
+                  "id": "high",
+                  "label": "High",
+                  "isDefault": true
+                },
+                {
+                  "id": "max",
+                  "label": "Max"
+                }
+              ]
+            },
+            {
+              "id": "fastMode",
+              "label": "Fast Mode",
+              "type": "boolean"
+            }
+          ]
+        }
+      },
+      {
+        "slug": "claude-sonnet-4-6",
+        "name": "Claude Sonnet 4.6",
+        "isCustom": false,
+        "capabilities": {
+          "optionDescriptors": [
+            {
+              "id": "effort",
+              "label": "Reasoning",
+              "type": "select",
+              "currentValue": "high",
+              "options": [
+                {
+                  "id": "low",
+                  "label": "Low"
+                },
+                {
+                  "id": "medium",
+                  "label": "Medium"
+                },
+                {
+                  "id": "high",
+                  "label": "High",
+                  "isDefault": true
+                },
+                {
+                  "id": "max",
+                  "label": "Max"
+                },
+                {
+                  "id": "ultrathink",
+                  "label": "Ultrathink"
+                }
+              ]
+            },
+            {
+              "id": "contextWindow",
+              "label": "Context Window",
+              "type": "select",
+              "currentValue": "200k",
+              "options": [
+                {
+                  "id": "200k",
+                  "label": "200k",
+                  "isDefault": true
+                },
+                {
+                  "id": "1m",
+                  "label": "1M"
+                }
+              ]
+            }
+          ]
+        }
+      },
+      {
+        "slug": "claude-haiku-4-5",
+        "name": "Claude Haiku 4.5",
+        "isCustom": false,
+        "capabilities": {
+          "optionDescriptors": [
+            {
+              "id": "thinking",
+              "label": "Thinking",
+              "type": "boolean"
+            }
+          ]
+        }
+      }
+    ]
+  },
+  {
+    "instanceId": "codex",
+    "displayName": "Codex",
+    "enabled": true,
+    "installed": true,
+    "version": "0.146.0",
+    "status": "ready",
+    "auth": {
+      "status": "authenticated",
+      "type": "chatgpt",
+      "label": "ChatGPT Pro 5x Subscription"
+    },
+    "models": [
+      {
+        "slug": "gpt-5.6-sol",
+        "name": "GPT-5.6-Sol",
+        "isCustom": false,
+        "capabilities": {
+          "optionDescriptors": [
+            {
+              "id": "reasoningEffort",
+              "label": "Reasoning",
+              "type": "select",
+              "currentValue": "low",
+              "options": [
+                {
+                  "id": "low",
+                  "label": "Low",
+                  "isDefault": true
+                },
+                {
+                  "id": "medium",
+                  "label": "Medium"
+                },
+                {
+                  "id": "high",
+                  "label": "High"
+                },
+                {
+                  "id": "xhigh",
+                  "label": "Extra High"
+                },
+                {
+                  "id": "max",
+                  "label": "max"
+                },
+                {
+                  "id": "ultra",
+                  "label": "ultra"
+                }
+              ]
+            },
+            {
+              "id": "serviceTier",
+              "label": "Service Tier",
+              "type": "select",
+              "currentValue": "default",
+              "options": [
+                {
+                  "id": "default",
+                  "label": "Standard",
+                  "isDefault": true
+                },
+                {
+                  "id": "priority",
+                  "label": "Fast",
+                  "description": "1.5x speed, increased usage"
+                }
+              ]
+            }
+          ]
+        }
+      },
+      {
+        "slug": "gpt-5.6-terra",
+        "name": "GPT-5.6-Terra",
+        "isCustom": false,
+        "capabilities": {
+          "optionDescriptors": [
+            {
+              "id": "reasoningEffort",
+              "label": "Reasoning",
+              "type": "select",
+              "currentValue": "medium",
+              "options": [
+                {
+                  "id": "low",
+                  "label": "Low"
+                },
+                {
+                  "id": "medium",
+                  "label": "Medium",
+                  "isDefault": true
+                },
+                {
+                  "id": "high",
+                  "label": "High"
+                },
+                {
+                  "id": "xhigh",
+                  "label": "Extra High"
+                },
+                {
+                  "id": "max",
+                  "label": "max"
+                },
+                {
+                  "id": "ultra",
+                  "label": "ultra"
+                }
+              ]
+            },
+            {
+              "id": "serviceTier",
+              "label": "Service Tier",
+              "type": "select",
+              "currentValue": "default",
+              "options": [
+                {
+                  "id": "default",
+                  "label": "Standard",
+                  "isDefault": true
+                },
+                {
+                  "id": "priority",
+                  "label": "Fast",
+                  "description": "1.5x speed, increased usage"
+                }
+              ]
+            }
+          ]
+        }
+      },
+      {
+        "slug": "gpt-5.6-luna",
+        "name": "GPT-5.6-Luna",
+        "isCustom": false,
+        "capabilities": {
+          "optionDescriptors": [
+            {
+              "id": "reasoningEffort",
+              "label": "Reasoning",
+              "type": "select",
+              "currentValue": "medium",
+              "options": [
+                {
+                  "id": "low",
+                  "label": "Low"
+                },
+                {
+                  "id": "medium",
+                  "label": "Medium",
+                  "isDefault": true
+                },
+                {
+                  "id": "high",
+                  "label": "High"
+                },
+                {
+                  "id": "xhigh",
+                  "label": "Extra High"
+                },
+                {
+                  "id": "max",
+                  "label": "max"
+                }
+              ]
+            },
+            {
+              "id": "serviceTier",
+              "label": "Service Tier",
+              "type": "select",
+              "currentValue": "default",
+              "options": [
+                {
+                  "id": "default",
+                  "label": "Standard",
+                  "isDefault": true
+                },
+                {
+                  "id": "priority",
+                  "label": "Fast",
+                  "description": "1.5x speed, increased usage"
+                }
+              ]
+            }
+          ]
+        }
+      },
+      {
+        "slug": "gpt-5.5",
+        "name": "GPT-5.5",
+        "isCustom": false,
+        "capabilities": {
+          "optionDescriptors": [
+            {
+              "id": "reasoningEffort",
+              "label": "Reasoning",
+              "type": "select",
+              "currentValue": "medium",
+              "options": [
+                {
+                  "id": "low",
+                  "label": "Low"
+                },
+                {
+                  "id": "medium",
+                  "label": "Medium",
+                  "isDefault": true
+                },
+                {
+                  "id": "high",
+                  "label": "High"
+                },
+                {
+                  "id": "xhigh",
+                  "label": "Extra High"
+                }
+              ]
+            },
+            {
+              "id": "serviceTier",
+              "label": "Service Tier",
+              "type": "select",
+              "currentValue": "default",
+              "options": [
+                {
+                  "id": "default",
+                  "label": "Standard",
+                  "isDefault": true
+                },
+                {
+                  "id": "priority",
+                  "label": "Fast",
+                  "description": "1.5x speed, increased usage"
+                }
+              ]
+            }
+          ]
+        }
+      },
+      {
+        "slug": "gpt-5.4",
+        "name": "GPT-5.4",
+        "isCustom": false,
+        "capabilities": {
+          "optionDescriptors": [
+            {
+              "id": "reasoningEffort",
+              "label": "Reasoning",
+              "type": "select",
+              "currentValue": "medium",
+              "options": [
+                {
+                  "id": "low",
+                  "label": "Low"
+                },
+                {
+                  "id": "medium",
+                  "label": "Medium",
+                  "isDefault": true
+                },
+                {
+                  "id": "high",
+                  "label": "High"
+                },
+                {
+                  "id": "xhigh",
+                  "label": "Extra High"
+                }
+              ]
+            },
+            {
+              "id": "serviceTier",
+              "label": "Service Tier",
+              "type": "select",
+              "currentValue": "default",
+              "options": [
+                {
+                  "id": "default",
+                  "label": "Standard",
+                  "isDefault": true
+                },
+                {
+                  "id": "priority",
+                  "label": "Fast",
+                  "description": "1.5x speed, increased usage"
+                }
+              ]
+            }
+          ]
+        }
+      },
+      {
+        "slug": "gpt-5.4-mini",
+        "name": "GPT-5.4-Mini",
+        "isCustom": false,
+        "capabilities": {
+          "optionDescriptors": [
+            {
+              "id": "reasoningEffort",
+              "label": "Reasoning",
+              "type": "select",
+              "currentValue": "medium",
+              "options": [
+                {
+                  "id": "low",
+                  "label": "Low"
+                },
+                {
+                  "id": "medium",
+                  "label": "Medium",
+                  "isDefault": true
+                },
+                {
+                  "id": "high",
+                  "label": "High"
+                },
+                {
+                  "id": "xhigh",
+                  "label": "Extra High"
+                }
+              ]
+            }
+          ]
+        }
+      },
+      {
+        "slug": "gpt-5.3-codex-spark",
+        "name": "GPT-5.3-Codex-Spark",
+        "isCustom": false,
+        "capabilities": {
+          "optionDescriptors": [
+            {
+              "id": "reasoningEffort",
+              "label": "Reasoning",
+              "type": "select",
+              "currentValue": "high",
+              "options": [
+                {
+                  "id": "low",
+                  "label": "Low"
+                },
+                {
+                  "id": "medium",
+                  "label": "Medium"
+                },
+                {
+                  "id": "high",
+                  "label": "High",
+                  "isDefault": true
+                },
+                {
+                  "id": "xhigh",
+                  "label": "Extra High"
+                }
+              ]
+            }
+          ]
+        }
+      },
+      {
+        "slug": "gpt-5.2",
+        "name": "GPT-5.2",
+        "isCustom": false,
+        "capabilities": {
+          "optionDescriptors": [
+            {
+              "id": "reasoningEffort",
+              "label": "Reasoning",
+              "type": "select",
+              "currentValue": "medium",
+              "options": [
+                {
+                  "id": "low",
+                  "label": "Low"
+                },
+                {
+                  "id": "medium",
+                  "label": "Medium",
+                  "isDefault": true
+                },
+                {
+                  "id": "high",
+                  "label": "High"
+                },
+                {
+                  "id": "xhigh",
+                  "label": "Extra High"
+                }
+              ]
+            }
+          ]
+        }
+      }
+    ]
+  },
+  {
+    "instanceId": "cursor",
+    "displayName": "Cursor",
+    "badgeLabel": "Early Access",
+    "enabled": false,
+    "installed": false,
+    "version": null,
+    "status": "disabled",
+    "message": "Cursor is disabled in T3 Code settings.",
+    "auth": {
+      "status": "unknown"
+    },
+    "models": []
+  },
+  {
+    "instanceId": "grok",
+    "displayName": "Grok",
+    "badgeLabel": "Early Access",
+    "enabled": true,
+    "installed": false,
+    "version": null,
+    "status": "error",
+    "message": "Grok CLI (`grok`) is not installed or not on PATH.",
+    "auth": {
+      "status": "unknown"
+    },
+    "models": [
+      {
+        "slug": "grok-build",
+        "name": "Grok Build",
+        "isCustom": false,
+        "capabilities": {
+          "optionDescriptors": []
+        }
+      }
+    ]
+  },
+  {
+    "instanceId": "opencode",
+    "displayName": "OpenCode",
+    "enabled": true,
+    "installed": true,
+    "version": "1.18.4",
+    "status": "error",
+    "message": "Failed to execute OpenCode CLI health check: OpenCode server exited before startup completed (code: 1).\n\nstderr:\n\u001b[91m\u001b[1mError: \u001b[0mUnexpected error\n\nno such column: name",
+    "auth": {
+      "status": "unknown"
+    },
+    "models": []
+  }
+]

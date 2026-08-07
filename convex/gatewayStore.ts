@@ -1,10 +1,11 @@
 import { v } from "convex/values";
 import { mutation, query } from "./_generated/server";
+import { providerCatalogueValidator } from "./schema";
 
 const defaultConfig = {
   defaultPrompt: "Continue the current task, inspect progress, and run relevant tests.",
   shellCommand: "npm test",
-  menu: ["status", "prompt", "shell", "macro", "media", "stop"],
+  menu: ["status", "prompt", "shell", "macro", "thread", "media", "stop"],
 };
 
 const defaultStatus = {
@@ -29,6 +30,29 @@ const defaultEnvironmentHealth = {
 
 const defaultPrivacySettings = {
   mediaRetentionDays: 30,
+};
+
+const subscriptionTiers = new Set(["free", "starter", "pro", "team", "enterprise"]);
+const subscriptionStatuses = new Set(["active", "trialing", "past_due", "canceled"]);
+
+const defaultSubscriptionTier = "free";
+const defaultSubscriptionStatus = "active";
+
+const defaultOnboarding = {
+  version: 2,
+  status: "not_started",
+  currentStep: "welcome",
+  networkMode: null,
+  networkUrl: null,
+  provider: { harness: null, instanceId: null, model: null },
+  workspace: { path: null, title: null, projectId: null },
+  environmentId: null,
+  firstThreadId: null,
+  device: { mode: null, deviceId: null, credentialConfirmed: false },
+  startedAt: null,
+  pausedAt: null,
+  completedAt: null,
+  updatedAt: null,
 };
 
 function gatewayQuery(definition: any) {
@@ -64,9 +88,15 @@ export const ensureUser = gatewayMutation({
   args: {
     userId: v.optional(v.string()),
     email: v.optional(v.string()),
+    name: v.optional(v.string()),
   },
   handler: async (ctx, args) => {
-    return publicUser(await ensureUserRecord(ctx, args.userId ?? "user_dev", args.email ?? "dev@example.local"));
+    return publicUser(await ensureUserRecord(
+      ctx,
+      args.userId ?? "user_dev",
+      args.email ?? "dev@example.local",
+      args.name,
+    ));
   },
 });
 
@@ -144,6 +174,93 @@ export const updateUserPrivacySettings = gatewayMutation({
   },
 });
 
+export const getUserSubscription = gatewayQuery({
+  args: {
+    userId: v.string(),
+  },
+  handler: async (ctx, args) => {
+    const user = await findUser(ctx, args.userId);
+    if (!user) return null;
+    return normalizeSubscription(user.subscription, user.createdAt);
+  },
+});
+
+export const updateUserSubscription = gatewayMutation({
+  args: {
+    userId: v.string(),
+    tier: v.optional(v.string()),
+    status: v.optional(v.string()),
+    provider: v.optional(v.union(v.string(), v.null())),
+    externalId: v.optional(v.union(v.string(), v.null())),
+    currentPeriodEnd: v.optional(v.union(v.string(), v.null())),
+  },
+  handler: async (ctx, args) => {
+    const user = await findUser(ctx, args.userId);
+    if (!user) return null;
+    const previous = normalizeSubscription(user.subscription, user.createdAt);
+    const subscription = { ...previous, updatedAt: nowIso() };
+
+    if (args.tier !== undefined) subscription.tier = requireSubscriptionTier(args.tier);
+    if (args.status !== undefined) subscription.status = requireSubscriptionStatus(args.status);
+    if (args.provider !== undefined) subscription.provider = normalizeNullableString(args.provider);
+    if (args.externalId !== undefined) subscription.externalId = normalizeNullableString(args.externalId);
+    if (args.currentPeriodEnd !== undefined) {
+      subscription.currentPeriodEnd = normalizeNullableString(args.currentPeriodEnd);
+    }
+
+    await ctx.db.patch(user._id, { subscription, updatedAt: nowIso() });
+    await audit(ctx, {
+      userExternalId: args.userId,
+      actorType: "user",
+      action: "user.subscription_updated",
+      targetId: args.userId,
+      metadata: subscription,
+    });
+    return subscription;
+  },
+});
+
+export const getUserOnboarding = gatewayQuery({
+  args: {
+    userId: v.string(),
+  },
+  handler: async (ctx, args) => {
+    const user = await findUser(ctx, args.userId);
+    return normalizeOnboarding(user?.onboarding);
+  },
+});
+
+export const updateUserOnboarding = gatewayMutation({
+  args: {
+    userId: v.string(),
+    onboarding: v.any(),
+  },
+  handler: async (ctx, args) => {
+    const user = await ensureUserRecord(ctx, args.userId);
+    const previous = normalizeOnboarding(user?.onboarding);
+    const onboarding = normalizeOnboardingInput(args.onboarding, previous);
+    await ctx.db.patch(user._id, { onboarding, updatedAt: nowIso() });
+    const action = onboarding.status === "completed"
+      ? "user.onboarding_completed"
+      : onboarding.status === "paused"
+        ? "user.onboarding_paused"
+        : previous.status === "not_started"
+          ? "user.onboarding_started"
+          : "user.onboarding_updated";
+    await audit(ctx, {
+      userExternalId: args.userId,
+      actorType: "user",
+      action,
+      targetId: args.userId,
+      metadata: {
+        status: onboarding.status,
+        currentStep: onboarding.currentStep,
+      },
+    });
+    return onboarding;
+  },
+});
+
 export const createDevice = gatewayMutation({
   args: {
     userId: v.string(),
@@ -182,6 +299,7 @@ export const preprovisionDevice = gatewayMutation({
     profile: v.optional(v.string()),
     secretHash: v.string(),
     claimCodeHash: v.string(),
+    claimCodeExpiresAt: v.optional(v.string()),
   },
   handler: async (ctx, args) => {
     const id = await ctx.db.insert("devices", {
@@ -189,6 +307,7 @@ export const preprovisionDevice = gatewayMutation({
       profile: args.profile ?? "agent-controller",
       secretHash: args.secretHash,
       claimCodeHash: args.claimCodeHash,
+      claimCodeExpiresAt: args.claimCodeExpiresAt,
       status: defaultStatus,
       config: defaultConfig,
       createdAt: nowIso(),
@@ -219,9 +338,13 @@ export const claimDevice = gatewayMutation({
       .withIndex("byClaimCodeHash", (q) => q.eq("claimCodeHash", args.claimCodeHash))
       .first();
     if (!device || device.revokedAt || device.claimedAt || !device.claimCodeHash) return null;
+    // Matched but expired is refused here rather than treated as "no such code", so the caller can
+    // report the difference. A code with no recorded expiry predates expiry tracking and stays live.
+    if (device.claimCodeExpiresAt && Date.parse(device.claimCodeExpiresAt) <= Date.now()) return null;
     await ctx.db.patch(device._id, {
       userExternalId: args.userId,
       claimCodeHash: undefined,
+      claimCodeExpiresAt: undefined,
       claimedAt: nowIso(),
       ...(args.label ? { label: args.label } : {}),
       updatedAt: nowIso(),
@@ -314,6 +437,7 @@ export const resetDeviceForTransfer = gatewayMutation({
     label: v.optional(v.string()),
     secretHash: v.string(),
     claimCodeHash: v.string(),
+    claimCodeExpiresAt: v.optional(v.string()),
   },
   handler: async (ctx, args) => {
     const device = await getDeviceForOwner(ctx, args.userId, args.deviceId);
@@ -323,6 +447,7 @@ export const resetDeviceForTransfer = gatewayMutation({
       ...(args.label ? { label: args.label } : {}),
       secretHash: args.secretHash,
       claimCodeHash: args.claimCodeHash,
+      claimCodeExpiresAt: args.claimCodeExpiresAt,
       claimedAt: undefined,
       lastSeenAt: undefined,
       status: defaultStatus,
@@ -352,16 +477,27 @@ export const resetDeviceForTransfer = gatewayMutation({
   },
 });
 
-export const rotateUnclaimedDeviceClaimCode = gatewayMutation({
+// The candidate hash is only written when a new code is actually needed. When the existing code is
+// still live the caller's plaintext is discarded unused, which is what stops a device's first-403
+// setup-code request from invalidating the label printed at manufacture.
+export const ensureUnclaimedDeviceClaimCode = gatewayMutation({
   args: {
     deviceId: v.id("devices"),
+    rotate: v.optional(v.boolean()),
     claimCodeHash: v.string(),
+    claimCodeExpiresAt: v.string(),
   },
   handler: async (ctx, args) => {
     const device = await ctx.db.get(args.deviceId);
     if (!device || device.revokedAt || device.claimedAt) return null;
+    const live = Boolean(device.claimCodeHash)
+      && (!device.claimCodeExpiresAt || Date.parse(device.claimCodeExpiresAt) > Date.now());
+    if (!args.rotate && live) {
+      return { device: publicDevice(device), rotated: false };
+    }
     await ctx.db.patch(device._id, {
       claimCodeHash: args.claimCodeHash,
+      claimCodeExpiresAt: args.claimCodeExpiresAt,
       updatedAt: nowIso(),
     });
     const updated = await ctx.db.get(device._id);
@@ -371,9 +507,9 @@ export const rotateUnclaimedDeviceClaimCode = gatewayMutation({
       actorId: device._id,
       action: "device.setup_code_rotated",
       targetId: device._id,
-      metadata: { label: device.label, profile: device.profile },
+      metadata: { label: device.label, profile: device.profile, rotate: args.rotate === true },
     });
-    return publicDevice(updated);
+    return { device: publicDevice(updated), rotated: true };
   },
 });
 
@@ -436,6 +572,10 @@ export const updateDeviceConfig = gatewayMutation({
     userId: v.string(),
     deviceId: v.id("devices"),
     config: v.any(),
+    // A device setting its own thread passes "device", so the audit trail does not
+    // credit the owner with something the hardware did on its own.
+    actorType: v.optional(v.string()),
+    actorId: v.optional(v.string()),
   },
   handler: async (ctx, args) => {
     const device = await getDeviceForOwner(ctx, args.userId, args.deviceId);
@@ -445,7 +585,8 @@ export const updateDeviceConfig = gatewayMutation({
     const updated = await ctx.db.get(device._id);
     await audit(ctx, {
       userExternalId: args.userId,
-      actorType: "user",
+      actorType: args.actorType ?? "user",
+      ...(args.actorId ? { actorId: args.actorId } : {}),
       action: "device.config_updated",
       targetId: device._id,
       metadata: {
@@ -562,6 +703,38 @@ export const updateEnvironmentHealth = gatewayMutation({
         label: environment.label,
         status: updated?.status,
         lastError: health.lastError,
+      },
+    });
+    return publicEnvironment(updated);
+  },
+});
+
+export const updateEnvironmentCatalogue = gatewayMutation({
+  args: {
+    userId: v.string(),
+    environmentId: v.id("environments"),
+    catalogue: providerCatalogueValidator,
+  },
+  handler: async (ctx, args) => {
+    const environment = await ctx.db.get(args.environmentId);
+    if (!environment || environment.userExternalId !== args.userId) return null;
+    const catalogue = args.catalogue;
+    await ctx.db.patch(environment._id, {
+      providerCatalogue: catalogue,
+      updatedAt: nowIso(),
+    });
+    const updated = await ctx.db.get(environment._id);
+    const instanceIds = catalogue.instances.map((instance: any) => instance.instanceId);
+    await audit(ctx, {
+      userExternalId: args.userId,
+      actorType: "user",
+      action: "environment.catalogue_updated",
+      targetId: environment._id,
+      metadata: {
+        label: environment.label,
+        source: catalogue.source,
+        instanceCount: instanceIds.length,
+        instanceIds,
       },
     });
     return publicEnvironment(updated);
@@ -917,6 +1090,121 @@ export const deleteMacro = gatewayMutation({
   },
 });
 
+// User-defined device profiles. Built-in profiles live in src/profiles.mjs and are never stored.
+// Capability *values* are validated on the Node side against DEVICE_CAPABILITIES — only shape,
+// type, and non-emptiness are enforced here so the two never drift.
+export const createDeviceProfile = gatewayMutation({
+  args: {
+    userId: v.string(),
+    profileId: v.string(),
+    label: v.string(),
+    description: v.string(),
+    capabilities: v.array(v.string()),
+  },
+  handler: async (ctx, args) => {
+    const profileId = requireProfileSlug(args.profileId);
+    const label = requireProfileLabel(args.label);
+    const description = normalizeProfileDescription(args.description);
+    const capabilities = normalizeProfileCapabilities(args.capabilities);
+    // Conflict convention matches the rest of this file (see claimDevice): null, not a throw.
+    // create has exactly one null path, so null here always means "profileId already taken".
+    const existing = await findDeviceProfile(ctx, args.userId, profileId);
+    if (existing) return null;
+    const id = await ctx.db.insert("deviceProfiles", {
+      userExternalId: args.userId,
+      profileId,
+      label,
+      description,
+      capabilities,
+      createdAt: nowIso(),
+      updatedAt: nowIso(),
+    });
+    const profile = await ctx.db.get(id);
+    await audit(ctx, {
+      userExternalId: args.userId,
+      actorType: "user",
+      action: "device_profile.created",
+      targetId: id,
+      metadata: { profileId, label, capabilities },
+    });
+    return publicDeviceProfile(profile);
+  },
+});
+
+// NOTE: named *Definition because `updateDeviceProfile` above is already taken — it assigns a
+// profile to a device. This one edits a stored custom profile record.
+export const updateDeviceProfileDefinition = gatewayMutation({
+  args: {
+    userId: v.string(),
+    profileId: v.string(),
+    label: v.optional(v.string()),
+    description: v.optional(v.string()),
+    capabilities: v.optional(v.array(v.string())),
+  },
+  handler: async (ctx, args) => {
+    const profileId = requireProfileSlug(args.profileId);
+    const profile = await findDeviceProfile(ctx, args.userId, profileId);
+    if (!profile || profile.userExternalId !== args.userId) return null;
+    const patch: Record<string, unknown> = { updatedAt: nowIso() };
+    if (args.label !== undefined) patch.label = requireProfileLabel(args.label);
+    if (args.description !== undefined) patch.description = normalizeProfileDescription(args.description);
+    if (args.capabilities !== undefined) patch.capabilities = normalizeProfileCapabilities(args.capabilities);
+    await ctx.db.patch(profile._id, patch);
+    const updated = await ctx.db.get(profile._id);
+    await audit(ctx, {
+      userExternalId: args.userId,
+      actorType: "user",
+      action: "device_profile.updated",
+      targetId: profile._id,
+      metadata: {
+        profileId,
+        label: updated?.label,
+        previousCapabilities: profile.capabilities,
+        capabilities: updated?.capabilities,
+      },
+    });
+    return publicDeviceProfile(updated);
+  },
+});
+
+export const listDeviceProfiles = gatewayQuery({
+  args: {
+    userId: v.string(),
+  },
+  handler: async (ctx, args) => {
+    const profiles = await ctx.db
+      .query("deviceProfiles")
+      .withIndex("byUserExternalIdAndProfileId", (q) => q.eq("userExternalId", args.userId))
+      .collect();
+    return profiles.map(publicDeviceProfile);
+  },
+});
+
+export const deleteDeviceProfile = gatewayMutation({
+  args: {
+    userId: v.string(),
+    profileId: v.string(),
+  },
+  handler: async (ctx, args) => {
+    const profileId = requireProfileSlug(args.profileId);
+    const profile = await findDeviceProfile(ctx, args.userId, profileId);
+    if (!profile || profile.userExternalId !== args.userId) return null;
+    await ctx.db.delete(profile._id);
+    await audit(ctx, {
+      userExternalId: args.userId,
+      actorType: "user",
+      action: "device_profile.deleted",
+      targetId: profile._id,
+      metadata: {
+        profileId,
+        label: profile.label,
+        capabilities: profile.capabilities,
+      },
+    });
+    return publicDeviceProfile(profile);
+  },
+});
+
 export const createCommand = gatewayMutation({
   args: {
     userId: v.string(),
@@ -1075,11 +1363,17 @@ export const listAuditLogs = gatewayQuery({
   },
 });
 
-async function ensureUserRecord(ctx: any, userId: string, email?: string) {
+async function ensureUserRecord(ctx: any, userId: string, email?: string, name?: string) {
   const existing = await findUser(ctx, userId);
   if (existing) {
-    if (!existing.privacy) {
-      await ctx.db.patch(existing._id, { privacy: defaultPrivacySettings, updatedAt: nowIso() });
+    const patch: Record<string, unknown> = {};
+    if (!existing.privacy) patch.privacy = defaultPrivacySettings;
+    if (!existing.onboarding) patch.onboarding = defaultOnboarding;
+    if (email && existing.email !== email) patch.email = email;
+    if (name && existing.name !== name) patch.name = name;
+    if (Object.keys(patch).length > 0) {
+      patch.updatedAt = nowIso();
+      await ctx.db.patch(existing._id, patch);
       return await ctx.db.get(existing._id);
     }
     return existing;
@@ -1087,7 +1381,9 @@ async function ensureUserRecord(ctx: any, userId: string, email?: string) {
   const id = await ctx.db.insert("users", {
     externalId: userId,
     ...(email ? { email } : {}),
+    ...(name ? { name } : {}),
     privacy: defaultPrivacySettings,
+    onboarding: defaultOnboarding,
     createdAt: nowIso(),
     updatedAt: nowIso(),
   });
@@ -1112,6 +1408,49 @@ async function getDeviceForOwner(ctx: any, userId: string, deviceId: any) {
   const device = await ctx.db.get(deviceId);
   if (!device || device.userExternalId !== userId) return null;
   return device;
+}
+
+// Scoped by user in the index range itself, so one user's slug can never reach another's record.
+async function findDeviceProfile(ctx: any, userId: string, profileId: string) {
+  return await ctx.db
+    .query("deviceProfiles")
+    .withIndex("byUserExternalIdAndProfileId", (q: any) =>
+      q.eq("userExternalId", userId).eq("profileId", profileId))
+    .unique();
+}
+
+function requireProfileSlug(value: any) {
+  const slug = normalizeNullableString(value);
+  if (!slug) throw new Error("Device profile requires a non-empty profileId");
+  if (slug.length > 64) throw new Error("Device profile profileId exceeds 64 characters");
+  return slug;
+}
+
+function requireProfileLabel(value: any) {
+  const label = normalizeNullableString(value);
+  if (!label) throw new Error("Device profile requires a non-empty label");
+  return label.slice(0, 120);
+}
+
+function normalizeProfileDescription(value: any) {
+  if (value === null || value === undefined) return "";
+  if (typeof value !== "string") throw new Error("Device profile description must be a string");
+  return value.trim().slice(0, 2000);
+}
+
+// Deliberately no capability whitelist: DEVICE_CAPABILITIES lives in src/profiles.mjs and is
+// enforced there. Here we only guarantee a deduped array of non-empty strings.
+function normalizeProfileCapabilities(value: any) {
+  if (!Array.isArray(value)) throw new Error("Device profile capabilities must be an array");
+  if (value.length > 32) throw new Error("Device profile lists too many capabilities");
+  const capabilities: string[] = [];
+  for (const entry of value) {
+    if (typeof entry !== "string") throw new Error("Device profile capabilities must be strings");
+    const capability = entry.trim();
+    if (!capability) throw new Error("Device profile capabilities must be non-empty strings");
+    if (!capabilities.includes(capability)) capabilities.push(capability);
+  }
+  return capabilities;
 }
 
 async function audit(ctx: any, input: any) {
@@ -1152,13 +1491,15 @@ function normalizeDeviceConfig(input: any = {}, existing: any = null) {
     next.shellCommand = value || defaultConfig.shellCommand;
   }
   if (Object.hasOwn(input, "menu")) {
-    const allowed = new Set(["status", "prompt", "shell", "macro", "approve", "reject", "media", "stop"]);
+    const allowed = new Set(["status", "prompt", "shell", "macro", "approve", "reject", "media", "stop", "thread", "reset"]);
     const menu = Array.isArray(input.menu)
       ? input.menu
         .map((item: any) => normalizeNullableString(item))
         .filter((item: string | null) => item && allowed.has(item))
       : [];
-    next.menu = [...new Set(menu)].slice(0, 6);
+    // 8 matches kMaxMenuItems in the firmware. Anything beyond it is dropped here
+    // silently, so this cap must not be tighter than what the hardware can render.
+    next.menu = [...new Set(menu)].slice(0, 8);
     if (next.menu.length === 0) next.menu = defaultConfig.menu;
   }
 
@@ -1244,6 +1585,54 @@ function normalizePrivacySettings(input: any = {}, existing: any = defaultPrivac
   return next;
 }
 
+function defaultSubscription(updatedAt: string) {
+  return {
+    tier: defaultSubscriptionTier,
+    status: defaultSubscriptionStatus,
+    provider: null as string | null,
+    externalId: null as string | null,
+    currentPeriodEnd: null as string | null,
+    updatedAt,
+  };
+}
+
+function normalizeSubscription(existing: any, fallbackUpdatedAt: any = null) {
+  const base = defaultSubscription(normalizeNullableString(fallbackUpdatedAt) ?? nowIso());
+  if (!existing || typeof existing !== "object") return base;
+  const tier = normalizeSubscriptionEnum(existing.tier);
+  const status = normalizeSubscriptionEnum(existing.status);
+  return {
+    ...base,
+    tier: tier && subscriptionTiers.has(tier) ? tier : base.tier,
+    status: status && subscriptionStatuses.has(status) ? status : base.status,
+    provider: normalizeNullableString(existing.provider),
+    externalId: normalizeNullableString(existing.externalId),
+    currentPeriodEnd: normalizeNullableString(existing.currentPeriodEnd),
+    updatedAt: normalizeNullableString(existing.updatedAt) ?? base.updatedAt,
+  };
+}
+
+function normalizeSubscriptionEnum(value: any) {
+  const normalized = normalizeNullableString(value);
+  return normalized ? normalized.toLowerCase() : null;
+}
+
+function requireSubscriptionTier(value: any) {
+  const tier = normalizeSubscriptionEnum(value);
+  if (!tier || !subscriptionTiers.has(tier)) {
+    throw new Error(`Unsupported subscription tier: ${String(value)}`);
+  }
+  return tier;
+}
+
+function requireSubscriptionStatus(value: any) {
+  const status = normalizeSubscriptionEnum(value);
+  if (!status || !subscriptionStatuses.has(status)) {
+    throw new Error(`Unsupported subscription status: ${String(value)}`);
+  }
+  return status;
+}
+
 function normalizeTranscript(value: any) {
   if (typeof value !== "string") return undefined;
   const transcript = value.trim();
@@ -1277,9 +1666,48 @@ function publicUser(user: any) {
   return {
     id: user.externalId,
     email: user.email,
+    name: user.name ?? null,
     privacy: normalizePrivacySettings(user.privacy),
+    onboarding: normalizeOnboarding(user.onboarding),
     createdAt: user.createdAt,
   };
+}
+
+function normalizeOnboarding(value: any) {
+  const input = value && typeof value === "object" ? value : {};
+  const provider = input.provider && typeof input.provider === "object" ? input.provider : {};
+  const workspace = input.workspace && typeof input.workspace === "object" ? input.workspace : {};
+  const device = input.device && typeof input.device === "object" ? input.device : {};
+  return {
+    ...defaultOnboarding,
+    ...input,
+    version: 2,
+    provider: { ...defaultOnboarding.provider, ...provider },
+    workspace: { ...defaultOnboarding.workspace, ...workspace },
+    device: { ...defaultOnboarding.device, ...device },
+  };
+}
+
+function normalizeOnboardingInput(value: any, previous: any) {
+  const input = value && typeof value === "object" ? value : {};
+  const now = nowIso();
+  const onboarding = normalizeOnboarding({
+    ...previous,
+    ...input,
+    provider: { ...previous.provider, ...(input.provider ?? {}) },
+    workspace: { ...previous.workspace, ...(input.workspace ?? {}) },
+    device: { ...previous.device, ...(input.device ?? {}) },
+    updatedAt: now,
+  });
+  if (onboarding.status !== "not_started" && !onboarding.startedAt) onboarding.startedAt = now;
+  if (onboarding.status === "paused") onboarding.pausedAt = now;
+  if (onboarding.status === "in_progress") onboarding.pausedAt = null;
+  if (onboarding.status === "completed") {
+    onboarding.currentStep = "ready";
+    onboarding.completedAt = onboarding.completedAt ?? now;
+    onboarding.pausedAt = null;
+  }
+  return onboarding;
 }
 
 function publicUserToken(token: any) {
@@ -1302,13 +1730,31 @@ function publicDevice(device: any) {
     label: device.label,
     profile: device.profile,
     claimedAt: device.claimedAt ?? null,
+    claimCodeExpiresAt: device.claimCodeExpiresAt ?? null,
     revokedAt: device.revokedAt ?? null,
     lastSeenAt: device.lastSeenAt ?? null,
     status: normalizeDeviceStatus({}, device.status, device.status?.lastHeartbeatAt ?? null),
     presence: buildDevicePresence(device),
     config: publicDeviceConfig(device.config),
+    actions: deviceActions(device),
     createdAt: device.createdAt,
     claimed: Boolean(device.claimedAt),
+  };
+}
+
+/**
+ * Which owner operations this device can currently accept. Mirrors deviceActions() in
+ * src/store.mjs — the memory store is the reference implementation, and a client that trusts this
+ * field must get the same answer from either backend.
+ */
+function deviceActions(device: any) {
+  const revoked = Boolean(device.revokedAt);
+  return {
+    rotateSecret: !revoked,
+    transferReset: !revoked,
+    updateConfig: !revoked,
+    updateProfile: !revoked,
+    revoke: !revoked,
   };
 }
 
@@ -1372,6 +1818,7 @@ function environmentForGateway(environment: any) {
     scopes: environment.scopes,
     status: environment.status,
     health: normalizeEnvironmentHealth(environment.health),
+    providerCatalogue: environment.providerCatalogue ?? null,
     createdAt: environment.createdAt,
     updatedAt: environment.updatedAt,
   };
@@ -1411,6 +1858,20 @@ function publicMacro(macro: any) {
     intent: macro.intent,
     createdAt: macro.createdAt,
     updatedAt: macro.updatedAt,
+  };
+}
+
+function publicDeviceProfile(profile: any) {
+  if (!profile) return null;
+  return {
+    id: profile._id,
+    userId: profile.userExternalId,
+    profileId: profile.profileId,
+    label: profile.label,
+    description: profile.description,
+    capabilities: Array.isArray(profile.capabilities) ? [...profile.capabilities] : [],
+    createdAt: profile.createdAt,
+    updatedAt: profile.updatedAt,
   };
 }
 

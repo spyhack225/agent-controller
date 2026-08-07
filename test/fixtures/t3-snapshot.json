@@ -1,0 +1,76 @@
+{
+  "snapshotSequence": 38,
+  "updatedAt": "2026-07-24T19:37:48.437Z",
+  "projects": [
+    {
+      "id": "59c3813d-fae6-4716-995a-919dc44e2535",
+      "title": "Tacs",
+      "defaultModelSelection": {
+        "instanceId": "codex",
+        "model": "gpt-5.4"
+      }
+    }
+  ],
+  "threads": [
+    {
+      "id": "thread_f772af99-1245-44bf-8b1c-f85f4dc4dd4a",
+      "projectId": "59c3813d-fae6-4716-995a-919dc44e2535",
+      "title": "Verify Workspace and Current Branch",
+      "modelSelection": {
+        "instanceId": "codex",
+        "model": "gpt-5..6"
+      },
+      "latestTurn": null,
+      "session": {
+        "threadId": "thread_f772af99-1245-44bf-8b1c-f85f4dc4dd4a",
+        "status": "stopped",
+        "providerName": "codex",
+        "providerInstanceId": "codex",
+        "runtimeMode": "approval-required",
+        "activeTurnId": null,
+        "lastError": "{\"type\":\"error\",\"status\":400,\"error\":{\"type\":\"invalid_request_error\",\"message\":\"The 'gpt-5..6' model is not supported when using Codex with a ChatGPT account.\"}}",
+        "updatedAt": "2026-07-24T19:27:48.334Z"
+      }
+    },
+    {
+      "id": "thread_ff2f4994-0631-4dd2-a800-5b0f330b0b4a",
+      "projectId": "59c3813d-fae6-4716-995a-919dc44e2535",
+      "title": "Open this project and report that the remote session is ready.",
+      "modelSelection": {
+        "instanceId": "codex",
+        "model": "gpt-5.6"
+      },
+      "latestTurn": null,
+      "session": {
+        "threadId": "thread_ff2f4994-0631-4dd2-a800-5b0f330b0b4a",
+        "status": "stopped",
+        "providerName": "codex",
+        "providerInstanceId": "codex",
+        "runtimeMode": "approval-required",
+        "activeTurnId": null,
+        "lastError": "{\"type\":\"error\",\"status\":400,\"error\":{\"type\":\"invalid_request_error\",\"message\":\"The 'gpt-5.6' model is not supported when using Codex with a ChatGPT account.\"}}",
+        "updatedAt": "2026-07-24T19:32:48.367Z"
+      }
+    },
+    {
+      "id": "thread_afb18f83-25db-40f2-9b91-3a3eda8d8372",
+      "projectId": "59c3813d-fae6-4716-995a-919dc44e2535",
+      "title": "Confirm this workspace is ready, identify the project, and report the...",
+      "modelSelection": {
+        "instanceId": "codex",
+        "model": "gpt-5..6"
+      },
+      "latestTurn": null,
+      "session": {
+        "threadId": "thread_afb18f83-25db-40f2-9b91-3a3eda8d8372",
+        "status": "stopped",
+        "providerName": "codex",
+        "providerInstanceId": "codex",
+        "runtimeMode": "approval-required",
+        "activeTurnId": null,
+        "lastError": "{\"type\":\"error\",\"status\":400,\"error\":{\"type\":\"invalid_request_error\",\"message\":\"The 'gpt-5..6' model is not supported when using Codex with a ChatGPT account.\"}}",
+        "updatedAt": "2026-07-24T19:37:48.437Z"
+      }
+    }
+  ]
+}

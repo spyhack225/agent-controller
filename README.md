@@ -23,14 +23,16 @@ The current implementation is the first vertical slice:
 - Factory batch provisioning and signed firmware update metadata.
 - Per-user, per-device, and factory rate limits.
 - Clerk auth and Convex storage integration.
+- React, Vite, and Tailwind operations console with route-level workspaces for control, fleet, environments, media, activity, and settings.
 
 ## Run
 
 ```bash
-node src/server.mjs
+npm install
+npm start
 ```
 
-The service listens on:
+`npm start` builds the React client and starts the gateway at:
 
 ```text
 http://127.0.0.1:3996
@@ -42,10 +44,19 @@ Open the dashboard at:
 http://127.0.0.1:3996/
 ```
 
+For frontend development with hot reload, run the gateway and Vite in separate terminals:
+
+```bash
+npm run dev:server
+npm run dev:app
+```
+
+Vite listens on `http://127.0.0.1:5173` and proxies gateway requests to port `3996`. Use `npm run build`, `npm run typecheck:web`, and `npm test` before shipping.
+
 To persist local platform state:
 
 ```bash
-DATA_FILE=.data/agent-controller.json node src/server.mjs
+DATA_FILE=.data/agent-controller.json npm start
 ```
 
 ## Create A Device
@@ -121,21 +132,37 @@ HTTP `429` responses include `x-ratelimit-*` and `retry-after` headers. For mult
 
 ## Clerk And Convex
 
-The gateway can use Clerk bearer sessions for platform user authentication:
+The React dashboard uses Clerk exclusively for platform user authentication. Link a Clerk application and pull its development keys:
+
+```bash
+clerk auth login
+clerk init --app YOUR_CLERK_APP_ID
+clerk doctor
+```
+
+The Clerk CLI writes the secret and Vite publishable key to the gitignored `.env.local`. Gateway configuration stays in `.env`:
 
 ```text
 AUTH_PROVIDER=clerk
-CLERK_SECRET_KEY=sk_test_replace
-CLERK_PUBLISHABLE_KEY=pk_test_replace
-CLERK_AUTHORIZED_PARTIES=https://gateway.example.com
+CLERK_AUTHORIZED_PARTIES=http://127.0.0.1:3996,https://gateway.example.com
+STORAGE_PROVIDER=convex
+CONVEX_URL=https://your-deployment.convex.cloud
 ```
 
-When Clerk is enabled, the built-in dashboard exposes a Clerk sign-in panel and uses `session.getToken()` as the bearer token for gateway API calls. Development platform tokens remain available for local testing.
-`POST /v1/users/dev` is disabled automatically in Clerk mode unless `ENABLE_DEV_TOKENS=1` is explicitly set. Leave that unset in production.
+The browser obtains fresh Clerk session tokens for API requests and uses the same-origin Clerk session cookie for live events. Tokens are never persisted in `localStorage`. The gateway verifies every session with `@clerk/backend` and synchronizes the verified Clerk ID, name, and primary email into the platform store.
+
+After the first Clerk sign-in, the React app opens a resumable six-step setup workbench. It
+configures the T3 host and network path, pairs and verifies the environment, selects a live
+project/provider/model, launches the first proof thread, and either configures a controller or
+records an explicit browser-only choice. Progress is user-scoped in the configured store, and
+the server refuses completion unless the operational evidence is present. The detailed flow is
+documented in [docs/onboarding-flow.md](docs/onboarding-flow.md).
+
+`POST /v1/users/dev` remains available only in explicit legacy/test mode. It is disabled in Clerk mode and is not exposed in the React dashboard.
 
 Convex schema/functions are scaffolded under `convex/`, including `gatewayStore:*` functions for the Node Store API. The gateway bridge in `src/convexStore.mjs` generates secrets locally, stores only hashes in Convex, encrypts T3 access tokens before storage, and authenticates store calls with `GATEWAY_CONVEX_SECRET`. See [docs/auth-storage.md](docs/auth-storage.md) for deployment validation steps.
 
-Run the Convex-backed HTTP smoke flow after `npx convex dev --once` has configured `.env.local`:
+Run the Convex-backed HTTP smoke flow after `npx convex dev --once --env-file .env` has deployed the functions:
 
 ```bash
 npm run smoke:convex
@@ -150,6 +177,42 @@ TRANSCRIPTION_PROVIDER=mock
 The mock provider produces deterministic transcripts for smoke tests. Production deployments should replace it with a real transcription worker/provider.
 
 ## Register A T3 Environment
+
+For guided local setup, run:
+
+```bash
+npm run setup:t3
+```
+
+The setup checks for T3 Code and installs the current `t3` CLI when needed. It then walks through provider harness selection, provider authentication, local/LAN/Tailscale/custom connectivity, optional project registration, T3 launch, and gateway pairing.
+
+Harness selection is not restricted to OpenAI. The built-in choices are automatic detection, Codex/OpenAI, Claude Code, Cursor, OpenCode, Grok, and a custom T3 provider instance. OpenAI/Codex is only the choice used by the current Mac test.
+
+Pairing also registers the host's **agent harness catalogue** with the gateway. T3's orchestration
+HTTP API does not expose which harnesses and models exist, so the setup script reads T3's own
+provider caches from the base directory and uploads them. That is what lets the dashboard show real
+harness and model dropdowns instead of free-text fields, and lets the gateway reject a model T3 does
+not offer before it is dispatched.
+
+Without this step the dashboard can only list harnesses and models already in use by an existing
+project or thread.
+
+Project registration is a convenience, not a requirement. Choose `--skip-project` to start T3 without adding one, then manage projects later in the T3 Code app or with `t3 project`.
+
+Example for the local Tacs test:
+
+```bash
+npm run setup:t3 -- \
+  --yes \
+  --project /Users/example/Documents/Claude/Projects/Tacs \
+  --provider openai \
+  --tunnel local \
+  --gateway-url http://127.0.0.1:3996 \
+  --gateway-dev-user user_t3_e2e \
+  --initial-prompt "Report that the remote session is ready."
+```
+
+For Tailnet access, use `--tunnel tailscale`. The script verifies or installs Tailscale, requires the user to finish Tailnet sign-in, and launches T3 with `--tailscale-serve`, following T3 Code's [remote access guidance](https://github.com/pingdotgg/t3code/blob/main/docs/user/remote-access.md).
 
 Use either a T3 pairing token:
 
@@ -204,6 +267,7 @@ The built-in dashboard supports:
 - Creating a local platform token.
 - Registering development devices, claiming factory devices, updating profiles, rotating secrets, transfer-resetting devices, and revoking devices.
 - Pairing, updating, unpairing, reachability-checking, and browsing T3 Code sessions.
+- Selecting any T3 project/provider instance/model and launching its first thread.
 - Uploading, deleting, and retention-managing image/audio media from phone or laptop.
 - Sending text, media, shell, status, and stop intents.
 - Saving and running prompt or shell macros.
@@ -215,9 +279,35 @@ The built-in dashboard supports:
 
 ## Test
 
+Run the full gate (client build, frontend typecheck, frontend tests, server tests):
+
 ```bash
-node --test
+npm test
 ```
+
+Run one layer at a time:
+
+```bash
+npm run test:server
+```
+
+```bash
+npm run test:app
+```
+
+Run a single server test file or a single test by name:
+
+```bash
+node --test test/policy.test.mjs
+```
+
+```bash
+node --test --test-name-pattern="claim" test/app.test.mjs
+```
+
+Do not run a bare `node --test` from the repository root. Node's default discovery also picks up the
+frontend `src/**/*.test.ts` files, which need the jsdom environment and setup that only
+`npm run test:app` provides.
 
 ## Local Mock T3
 

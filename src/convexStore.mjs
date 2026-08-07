@@ -6,6 +6,10 @@ const DEFAULT_FUNCTIONS = {
   ensureUser: { type: "mutation", name: "gatewayStore:ensureUser" },
   getUserPrivacySettings: { type: "query", name: "gatewayStore:getUserPrivacySettings" },
   updateUserPrivacySettings: { type: "mutation", name: "gatewayStore:updateUserPrivacySettings" },
+  getUserSubscription: { type: "query", name: "gatewayStore:getUserSubscription" },
+  updateUserSubscription: { type: "mutation", name: "gatewayStore:updateUserSubscription" },
+  getUserOnboarding: { type: "query", name: "gatewayStore:getUserOnboarding" },
+  updateUserOnboarding: { type: "mutation", name: "gatewayStore:updateUserOnboarding" },
   createUserToken: { type: "mutation", name: "gatewayStore:createUserToken" },
   authenticateUserToken: { type: "mutation", name: "gatewayStore:authenticateUserToken" },
   createDevice: { type: "mutation", name: "gatewayStore:createDevice" },
@@ -15,7 +19,7 @@ const DEFAULT_FUNCTIONS = {
   rotateDeviceSecret: { type: "mutation", name: "gatewayStore:rotateDeviceSecret" },
   updateDeviceProfile: { type: "mutation", name: "gatewayStore:updateDeviceProfile" },
   resetDeviceForTransfer: { type: "mutation", name: "gatewayStore:resetDeviceForTransfer" },
-  rotateUnclaimedDeviceClaimCode: { type: "mutation", name: "gatewayStore:rotateUnclaimedDeviceClaimCode" },
+  ensureUnclaimedDeviceClaimCode: { type: "mutation", name: "gatewayStore:ensureUnclaimedDeviceClaimCode" },
   authenticateDevice: { type: "mutation", name: "gatewayStore:authenticateDevice" },
   recordDeviceHeartbeat: { type: "mutation", name: "gatewayStore:recordDeviceHeartbeat" },
   listDevices: { type: "query", name: "gatewayStore:listDevices" },
@@ -24,6 +28,7 @@ const DEFAULT_FUNCTIONS = {
   upsertEnvironment: { type: "mutation", name: "gatewayStore:upsertEnvironment" },
   deleteEnvironment: { type: "mutation", name: "gatewayStore:deleteEnvironment" },
   updateEnvironmentHealth: { type: "mutation", name: "gatewayStore:updateEnvironmentHealth" },
+  updateEnvironmentCatalogue: { type: "mutation", name: "gatewayStore:updateEnvironmentCatalogue" },
   getEnvironmentForUser: { type: "query", name: "gatewayStore:getEnvironmentForUser" },
   listEnvironments: { type: "query", name: "gatewayStore:listEnvironments" },
   createFirmwareRelease: { type: "mutation", name: "gatewayStore:createFirmwareRelease" },
@@ -32,6 +37,12 @@ const DEFAULT_FUNCTIONS = {
   createMediaUpload: { type: "mutation", name: "gatewayStore:createMediaUpload" },
   getMediaForUser: { type: "query", name: "gatewayStore:getMediaForUser" },
   updateMediaTranscript: { type: "mutation", name: "gatewayStore:updateMediaTranscript" },
+  updateMediaDescription: { type: "mutation", name: "gatewayStore:updateMediaDescription" },
+  createDeviceProfile: { type: "mutation", name: "gatewayStore:createDeviceProfile" },
+  listUserDeviceProfiles: { type: "query", name: "gatewayStore:listDeviceProfiles" },
+  // Named to avoid colliding with updateDeviceProfile, which assigns a profile to a device.
+  updateDeviceProfileDefinition: { type: "mutation", name: "gatewayStore:updateDeviceProfileDefinition" },
+  deleteDeviceProfile: { type: "mutation", name: "gatewayStore:deleteDeviceProfile" },
   updateMediaProcessing: { type: "mutation", name: "gatewayStore:updateMediaProcessing" },
   listMediaUploads: { type: "query", name: "gatewayStore:listMediaUploads" },
   listExpiredMediaUploads: { type: "query", name: "gatewayStore:listExpiredMediaUploads" },
@@ -79,24 +90,49 @@ export function createConvexStoreAdapter({
     throw new Error("Convex store adapter requires a gatewaySecret.");
   }
   const t3TokenBox = createSecretBox(t3TokenEncryptionKey);
+  const listeners = new Set();
 
-  function call(method, args) {
+  function notify(change) {
+    for (const listener of listeners) {
+      try {
+        listener(change);
+      } catch {
+        // A broken subscriber must never fail the store write that triggered it.
+      }
+    }
+  }
+
+  async function call(method, args) {
     const fn = functions[method];
     const input = { ...(args ?? {}), gatewaySecret };
     if (!fn) {
       throw new Error(`Convex Store API function mapping is missing for ${method}.`);
     }
     if (fn.type === "query") return client.query(fn.name, input);
-    if (fn.type === "mutation") return client.mutation(fn.name, input);
+    if (fn.type === "mutation") {
+      const result = await client.mutation(fn.name, input);
+      // Convex holds the state, so there is no local store to diff. Emitting the affected user
+      // on every mutation is what keeps live dashboard updates working under STORAGE_PROVIDER=convex.
+      const userId = affectedUserId(args, result);
+      if (userId) notify({ userId, action: method });
+      return result;
+    }
     throw new Error(`Convex Store API function ${method} has unsupported type ${fn.type}.`);
   }
 
   return {
-    subscribe: () => () => {},
+    subscribe: (listener) => {
+      listeners.add(listener);
+      return () => listeners.delete(listener);
+    },
     exportState: emptyState,
     ensureUser: (args) => call("ensureUser", args),
     getUserPrivacySettings: (userId) => call("getUserPrivacySettings", { userId }),
     updateUserPrivacySettings: (args) => call("updateUserPrivacySettings", args),
+    getUserSubscription: (userId) => call("getUserSubscription", { userId }),
+    updateUserSubscription: (args) => call("updateUserSubscription", args),
+    getUserOnboarding: (userId) => call("getUserOnboarding", { userId }),
+    updateUserOnboarding: (args) => call("updateUserOnboarding", args),
     createUserToken: async (args) => {
       const secret = createSecret();
       const token = await call("createUserToken", {
@@ -123,6 +159,7 @@ export function createConvexStoreAdapter({
         ...args,
         secretHash: hashSecret(secret),
         claimCodeHash: hashSecret(normalizeClaimCode(claimCode)),
+        claimCodeExpiresAt: claimCodeExpiryFrom(Date.now()),
       });
       return { device, secret, claimCode };
     },
@@ -148,16 +185,28 @@ export function createConvexStoreAdapter({
         ...args,
         secretHash: hashSecret(secret),
         claimCodeHash: hashSecret(normalizeClaimCode(claimCode)),
+        claimCodeExpiresAt: claimCodeExpiryFrom(Date.now()),
       });
       return device ? { device, secret, claimCode } : null;
     },
-    rotateUnclaimedDeviceClaimCode: async (args) => {
+    // The candidate code is minted here and only its hash crosses to Convex, matching
+    // `preprovisionDevice`. Convex decides whether the existing code is still live; when it is, it
+    // ignores the candidate and reports `rotated: false`, so the plaintext is discarded unused.
+    ensureUnclaimedDeviceClaimCode: async ({ deviceId, rotate = false }) => {
       const claimCode = createHumanCode();
-      const device = await call("rotateUnclaimedDeviceClaimCode", {
-        ...args,
+      const result = await call("ensureUnclaimedDeviceClaimCode", {
+        deviceId,
+        rotate,
         claimCodeHash: hashSecret(normalizeClaimCode(claimCode)),
+        claimCodeExpiresAt: claimCodeExpiryFrom(Date.now()),
       });
-      return device ? { device, claimCode } : null;
+      if (!result) return null;
+      return {
+        device: result.device,
+        claimCode: result.rotated ? claimCode : null,
+        rotated: result.rotated,
+        claimCodeExpiresAt: result.device?.claimCodeExpiresAt ?? null,
+      };
     },
     authenticateDevice: (deviceId, secret) => call("authenticateDevice", {
       deviceId,
@@ -173,6 +222,7 @@ export function createConvexStoreAdapter({
     }),
     deleteEnvironment: (args) => call("deleteEnvironment", args),
     updateEnvironmentHealth: (args) => call("updateEnvironmentHealth", args),
+    updateEnvironmentCatalogue: (args) => call("updateEnvironmentCatalogue", args),
     getEnvironmentForUser: async (userId, environmentId) => {
       const environment = await call("getEnvironmentForUser", { userId, environmentId });
       if (!environment) return null;
@@ -188,6 +238,15 @@ export function createConvexStoreAdapter({
     createMediaUpload: (args) => call("createMediaUpload", args),
     getMediaForUser: (userId, mediaId) => call("getMediaForUser", { userId, mediaId }),
     updateMediaTranscript: (args) => call("updateMediaTranscript", args),
+    updateMediaDescription: (args) => call("updateMediaDescription", args),
+    createDeviceProfile: (args) => call("createDeviceProfile", args),
+    listUserDeviceProfiles: (userId) => call("listUserDeviceProfiles", { userId }),
+    getUserDeviceProfile: async (userId, profileId) => {
+      const profiles = await call("listUserDeviceProfiles", { userId });
+      return (profiles ?? []).find((profile) => profile.profileId === profileId) ?? null;
+    },
+    updateDeviceProfileDefinition: (args) => call("updateDeviceProfileDefinition", args),
+    deleteDeviceProfile: (args) => call("deleteDeviceProfile", args),
     updateMediaProcessing: (args) => call("updateMediaProcessing", args),
     listMediaUploads: (userId) => call("listMediaUploads", { userId }),
     listExpiredMediaUploads: (args) => call("listExpiredMediaUploads", args),
@@ -210,6 +269,17 @@ async function createConvexHttpClient(convexUrl, options = {}) {
   if (options.authToken) client.setAuth(options.authToken);
   if (options.adminAuth) client.setAdminAuth(options.adminAuth);
   return client;
+}
+
+// Mutations name their owner in different places: most take it directly, device and token
+// mutations only reveal it in the result.
+function affectedUserId(args, result) {
+  if (typeof args?.userId === "string" && args.userId) return args.userId;
+  if (typeof result?.userId === "string" && result.userId) return result.userId;
+  if (typeof result?.device?.userId === "string" && result.device.userId) return result.device.userId;
+  if (typeof result?.user?.id === "string" && result.user.id) return result.user.id;
+  if (typeof result?.id === "string" && typeof result?.email === "string") return result.id;
+  return null;
 }
 
 function emptyState() {
@@ -326,4 +396,10 @@ function createHumanCode() {
 
 function normalizeClaimCode(claimCode) {
   return String(claimCode).trim().toUpperCase().replace(/[^A-Z0-9]/gu, "");
+}
+
+// Mirrors CLAIM_CODE_TTL_MS in store.mjs. Kept local because convexStore.mjs deliberately does not
+// import the memory store, and the expiry is computed in Node so Convex never mints a timestamp.
+function claimCodeExpiryFrom(issuedAtMs) {
+  return new Date(issuedAtMs + 30 * 24 * 60 * 60 * 1000).toISOString();
 }

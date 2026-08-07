@@ -20,23 +20,15 @@ Profiles define the capabilities the policy engine will allow for a device:
 
 ## Platform User Auth
 
-Create a local development user and platform token:
-
-```bash
-curl -X POST http://127.0.0.1:8877/v1/users/dev \
-  -H 'content-type: application/json' \
-  -d '{"userId":"user_dev","email":"dev@example.local"}'
-```
-
-Use the returned token secret on user-owned routes:
+The React application authenticates through Clerk. API clients send a current Clerk session token:
 
 ```text
-authorization: Bearer PLATFORM_TOKEN
+authorization: Bearer CLERK_SESSION_TOKEN
 ```
 
-If `DEMO_MODE=1`, the service also accepts `x-user-id: user_dev` as a local-only fallback.
+Same-origin event streams may authenticate with the Clerk session cookie instead of placing a token in the URL. The gateway synchronizes the verified Clerk user ID, name, and primary email before serving user-owned data.
 
-The development token route is enabled by default only when `AUTH_PROVIDER=dev` or `DEMO_MODE=1`. In production, set `AUTH_PROVIDER=clerk` and send a Clerk session/JWT bearer token instead of a platform development token. The gateway verifies the bearer token with Clerk and uses the Clerk `userId` as the platform user ID. If you need local Clerk testing with development tokens, set `ENABLE_DEV_TOKENS=1` deliberately; do not set this in production.
+The legacy development-token route is enabled only when `AUTH_PROVIDER=dev` or `DEMO_MODE=1`. It is disabled in Clerk mode and is not part of the React UI.
 
 Read public browser auth settings:
 
@@ -45,6 +37,50 @@ curl http://127.0.0.1:8877/v1/auth/config
 ```
 
 This endpoint exposes the auth provider and Clerk publishable key only. It never returns `CLERK_SECRET_KEY`.
+
+## Initial Onboarding
+
+Authenticated React users are guided through T3 host configuration, environment pairing,
+workspace/model selection, a first thread, and a controller or browser-only choice.
+
+Read durable progress and server-derived readiness:
+
+```http
+GET /v1/onboarding
+authorization: Bearer CLERK_SESSION_TOKEN
+```
+
+Persist a partial step update:
+
+```http
+PUT /v1/onboarding
+authorization: Bearer CLERK_SESSION_TOKEN
+content-type: application/json
+
+{
+  "status": "in_progress",
+  "currentStep": "connect",
+  "networkMode": "tailscale",
+  "networkUrl": "https://machine.tailnet.ts.net",
+  "provider": {
+    "harness": "openai",
+    "instanceId": "codex",
+    "model": "gpt-5.4"
+  },
+  "workspace": {
+    "path": "/work/agent-controller",
+    "title": "Agent Controller"
+  }
+}
+```
+
+Nested provider, workspace, and device values merge with prior progress. Completion returns
+HTTP 409 until the server can prove every requirement: reachable owned environment, selected
+project/provider/model, a matching accepted `thread.launch` command for those exact selections, and either browser-only
+operation or a non-revoked controller configured to that environment and thread. Registered
+development controllers also require `device.credentialConfirmed: true`.
+
+See [onboarding-flow.md](onboarding-flow.md) for the activation definition and recovery behavior.
 
 ## Rate Limits
 
@@ -168,8 +204,6 @@ content-type: application/json
   "labelPrefix": "Agent Controller",
   "profile": "agent-controller",
   "gatewayBaseUrl": "https://gateway.example.com",
-  "wifiSsid": "factory-wifi",
-  "wifiPassword": "factory-password",
   "hardwareModel": "e213-esp32-s3r8",
   "firmwareVersion": "0.1.0",
   "enableOtaApply": false,
@@ -178,7 +212,26 @@ content-type: application/json
 }
 ```
 
-The response includes one-time `secret`, customer `claimCode`, and generated `controller_config.h` content per device. Save those artifacts immediately; secrets are not recoverable later.
+There are no `wifiSsid`/`wifiPassword` fields: the factory cannot know the customer's network, so
+Wi-Fi is entered by the owner through the on-device SoftAP portal.
+
+The response includes, per device, a one-time `secret`, the customer `claimCode`, an `nvsSeed` CSV,
+and generated `controller_config.h` content. Save those artifacts immediately; secrets are not
+recoverable later.
+
+`nvsSeed` is the production artefact — feed it to `nvs_partition_gen.py` and write the resulting
+image at the NVS partition offset, so a line flashes one signed application image per batch and
+varies only a small data partition:
+
+```bash
+python nvs_partition_gen.py generate dev_x.nvs.csv dev_x.nvs.bin 0x5000
+esptool.py write_flash 0x9000 dev_x.nvs.bin
+```
+
+It carries `dev_id`, `dev_secret`, `gw_url`, `claim_code`, and `claim_exp`. The claim code is
+included deliberately: the gateway will not reissue a still-live code's plaintext, so a unit that
+did not leave the line holding its own code could never display one — the screen would read "no
+code" while the printed label carried the real thing.
 `enableOtaApply` controls whether generated firmware configs only report available updates or automatically download and apply them. The current signature prototype uses HMAC; do not ship one shared HMAC key broadly in production hardware.
 
 Claim a pre-provisioned device:
@@ -276,9 +329,12 @@ x-device-id: dev_...
 x-device-secret: ...
 ```
 
-Unclaimed devices can heartbeat and rotate a setup code, but cannot access display, media, events, or T3 control endpoints until claimed.
+Unclaimed devices can heartbeat and request a setup code, but cannot access display, media, events, or T3 control endpoints until claimed.
 
-Rotate and display a fresh setup code from an authenticated unclaimed device:
+Fetch the setup code for an authenticated unclaimed device. The code is **stable**: while the
+existing one is unexpired this returns `200` with `setup.rotated: false` and `setup.claimCode: null`,
+so a device polling after its first `403` cannot invalidate the code printed at manufacture. Pass
+`{"rotate": true}` to deliberately replace it, which answers `201` with the new plaintext.
 
 ```http
 POST /v1/device/setup-code
@@ -288,7 +344,7 @@ content-type: application/json
 ```
 
 ```json
-{}
+{ "rotate": false }
 ```
 
 Response:
@@ -301,14 +357,23 @@ Response:
   },
   "setup": {
     "claimed": false,
+    "rotated": true,
     "claimCode": "ABCDE-23456",
+    "claimCodeExpiresAt": "2026-09-06T09:48:18.923Z",
     "instructions": "Sign in to the Agent Controller dashboard and claim this device with the displayed code."
   },
-  "claimCode": "ABCDE-23456"
+  "claimCode": "ABCDE-23456",
+  "claimCodeExpiresAt": "2026-09-06T09:48:18.923Z"
 }
 ```
 
-This route is intended for the physical controller's setup screen. Calling it rotates the claim code, so older printed or displayed codes stop working.
+This route is intended for the physical controller's setup screen. Codes expire 30 days from issue,
+and an expired code is refused at claim time (`404`) rather than treated as unknown. Only a rotation
+retires a previously printed or displayed code.
+
+`POST /v1/devices/claim` answers `404` with "Claim code is invalid, expired, or already used." for
+all three cases; the `/claim?device=…&code=…` deep link surfaces that as an explicit dead end with a
+route to manual entry.
 
 Heartbeat can include lightweight diagnostics. The gateway stores the latest values on the device record and exposes them in `/v1/devices` and `/v1/device/display`:
 
@@ -502,6 +567,29 @@ content-type: application/json
 ```
 
 ## Register T3 Environment
+
+The guided host setup is available through `npm run setup:t3`. Adding an initial project is optional; users can instead manage projects directly in T3 Code or with `t3 project`.
+
+Launch the first thread for a project that is already registered in T3:
+
+```http
+POST /v1/t3/environments/:environmentId/threads
+Authorization: Bearer PLATFORM_TOKEN
+Content-Type: application/json
+
+{
+  "projectId": "project_id",
+  "text": "Inspect this project and report that the session is ready.",
+  "modelSelection": {
+    "instanceId": "codex",
+    "model": "gpt-5.4"
+  },
+  "runtimeMode": "approval-required",
+  "interactionMode": "default"
+}
+```
+
+`modelSelection` is optional when the T3 project has a default. Provider instance IDs are not restricted to built-ins, so user-defined T3 provider instances are supported. The gateway dispatches `thread.create` followed by `thread.turn.start` because T3's HTTP orchestration endpoint requires the thread to exist before accepting the first turn.
 
 ```http
 POST /v1/t3/environments
@@ -921,15 +1009,15 @@ content-type: application/json
 }
 ```
 
-## Dashboard
+## Application
 
-The platform serves a local dashboard:
+The React/Vite application is the primary UI and is served from:
 
 ```text
 http://127.0.0.1:3996/
 ```
 
-It can create a development platform token, register or claim devices, rotate device secrets, revoke devices, pair T3 environments, upload media, send prompts, approve or reject high-risk commands, request status, stop sessions, and review audit activity.
+The React application can register or claim devices, rotate device secrets, revoke devices, pair T3 environments, upload media, send prompts, approve or reject high-risk commands, request status, stop sessions, and review audit activity.
 
 ## Display State And Events
 

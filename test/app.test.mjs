@@ -521,6 +521,77 @@ test("T3 environment snapshot exposes projects and threads for session selection
   assert.equal(snapshots[0].authorization, "Bearer snapshot-token");
 });
 
+test("web users can launch the first T3 thread with any provider instance", async (t) => {
+  const originalFetch = globalThis.fetch;
+  const dispatches = [];
+  globalThis.fetch = async (url, init = {}) => {
+    const parsed = new URL(String(url));
+    if (parsed.pathname === "/api/orchestration/snapshot") {
+      return jsonResponse({
+        projects: [{
+          id: "project_tacs",
+          title: "Tacs",
+          workspaceRoot: "/projects/Tacs",
+          defaultModelSelection: { instanceId: "codex", model: "gpt-5.4" },
+        }],
+        threads: [],
+      }, 200);
+    }
+    if (parsed.pathname === "/api/orchestration/dispatch") {
+      dispatches.push(JSON.parse(init.body));
+      return jsonResponse({ accepted: true }, 200);
+    }
+    return jsonResponse({ error: "not found" }, 404);
+  };
+  t.after(() => {
+    globalThis.fetch = originalFetch;
+  });
+
+  const { server } = createApp({ config: { demoMode: false } });
+  await listen(server);
+  t.after(() => server.close());
+  const baseUrl = `http://127.0.0.1:${server.address().port}`;
+  const authHeaders = await createAuthHeaders(originalFetch, baseUrl);
+  const environment = await requestJson(originalFetch, baseUrl, "/v1/t3/environments", {
+    method: "POST",
+    headers: authHeaders,
+    body: {
+      label: "Launch T3",
+      baseUrl: "https://launch-t3.example",
+      accessToken: "launch-token",
+    },
+  });
+
+  const launched = await requestJson(
+    originalFetch,
+    baseUrl,
+    `/v1/t3/environments/${environment.environment.id}/threads`,
+    {
+      method: "POST",
+      headers: authHeaders,
+      body: {
+        projectId: "project_tacs",
+        text: "Inspect the Tacs project and report that this remote session works.",
+        modelSelection: { instanceId: "claudeAgent", model: "claude-sonnet-5" },
+      },
+    },
+  );
+
+  assert.match(launched.threadId, /^thread_/u);
+  assert.equal(launched.command.status, "dispatched");
+  assert.deepEqual(launched.modelSelection, {
+    instanceId: "claudeAgent",
+    model: "claude-sonnet-5",
+  });
+  assert.equal(dispatches.length, 2);
+  assert.equal(dispatches[0].type, "thread.create");
+  assert.equal(dispatches[0].threadId, launched.threadId);
+  assert.equal(dispatches[0].projectId, "project_tacs");
+  assert.equal(dispatches[0].modelSelection.instanceId, "claudeAgent");
+  assert.equal(dispatches[1].type, "thread.turn.start");
+  assert.equal(dispatches[1].threadId, launched.threadId);
+});
+
 test("expired T3 access tokens are blocked before snapshot or dispatch", async (t) => {
   const originalFetch = globalThis.fetch;
   let t3Calls = 0;
@@ -1154,7 +1225,7 @@ test("support diagnostics bundle redacts prompts, shell commands, and secrets", 
   assert.equal(serialized.includes(mediaDir), false);
 });
 
-test("serves the web dashboard", async (t) => {
+test("serves the React dashboard and its built assets", async (t) => {
   const { server } = createApp();
   await listen(server);
   t.after(() => server.close());
@@ -1164,8 +1235,29 @@ test("serves the web dashboard", async (t) => {
   const html = await response.text();
   assert.equal(response.status, 200);
   assert.match(response.headers.get("content-type"), /text\/html/u);
-  assert.match(html, /Remote agent control plane/u);
-  assert.match(html, /Clerk account/u);
+  assert.match(html, /Agent Controller/u);
+  assert.match(html, /id="root"/u);
+  assert.doesNotMatch(html, /Remote agent control plane/u);
+
+  const assetPath = html.match(/(?:src|href)="(\/assets\/[^"]+)"/u)?.[1];
+  assert.ok(assetPath);
+  const assetResponse = await fetch(new URL(assetPath, baseUrl));
+  assert.equal(assetResponse.status, 200);
+  assert.match(assetResponse.headers.get("cache-control"), /immutable/u);
+});
+
+test("the pre-React dashboard assets are gone from every route", async (t) => {
+  const { server } = createApp();
+  await listen(server);
+  t.after(() => server.close());
+  const baseUrl = `http://127.0.0.1:${server.address().port}`;
+
+  // The legacy dashboard was removed; the React build is the only client. These paths must 404
+  // rather than fall through to the SPA and hand back index.html for a .js request.
+  for (const path of ["/legacy/", "/legacy/app.js", "/app.js", "/styles.css"]) {
+    const response = await fetch(new URL(path, baseUrl));
+    assert.equal(response.status, 404, `${path} should be gone`);
+  }
 });
 
 test("auth config exposes only public Clerk browser settings", async (t) => {
@@ -1759,6 +1851,9 @@ test("factory preprovisioned devices must be claimed before control and support 
   });
   assert.equal(unclaimedDisplay.status, 403);
 
+  // Firmware asks for a setup code on its first 403, seconds after boot. That must not invalidate
+  // the code printed on the box at manufacture, so the request reports the existing code as still
+  // valid and mints nothing.
   const setupCode = await requestJson(fetch, baseUrl, "/v1/device/setup-code", {
     method: "POST",
     headers: {
@@ -1770,23 +1865,24 @@ test("factory preprovisioned devices must be claimed before control and support 
   assert.equal(setupCode.device.id, preprovisioned.device.id);
   assert.equal(setupCode.device.claimed, false);
   assert.equal(setupCode.setup.claimed, false);
-  assert.match(setupCode.setup.claimCode, /^[A-Z0-9]{5}-[A-Z0-9]{5}$/u);
-  assert.notEqual(setupCode.setup.claimCode, preprovisioned.claimCode);
+  assert.equal(setupCode.setup.rotated, false);
+  assert.equal(setupCode.setup.claimCode, null);
+  assert.ok(Date.parse(setupCode.setup.claimCodeExpiresAt) > Date.now());
 
-  const staleClaim = await fetch(new URL("/v1/devices/claim", baseUrl), {
+  // Repeating it — the device polls — still does not move the code.
+  await requestJson(fetch, baseUrl, "/v1/device/setup-code", {
     method: "POST",
     headers: {
-      ...authHeaders,
-      "content-type": "application/json",
+      "x-device-id": preprovisioned.device.id,
+      "x-device-secret": preprovisioned.secret,
     },
-    body: JSON.stringify({ claimCode: preprovisioned.claimCode, label: "Stale claim" }),
+    body: {},
   });
-  assert.equal(staleClaim.status, 404);
 
   const claimed = await requestJson(fetch, baseUrl, "/v1/devices/claim", {
     method: "POST",
     headers: authHeaders,
-    body: { claimCode: setupCode.setup.claimCode, label: "Claimed controller" },
+    body: { claimCode: preprovisioned.claimCode, label: "Claimed controller" },
   });
   assert.equal(claimed.device.claimed, true);
   assert.equal(claimed.device.label, "Claimed controller");
@@ -1975,8 +2071,6 @@ test("factory batch provisioning returns flash configs and firmware manifests ar
       count: 2,
       labelPrefix: "Batch controller",
       gatewayBaseUrl: "https://gateway.example.com",
-      wifiSsid: "factory-wifi",
-      wifiPassword: "factory-pass",
       firmwareVersion: "0.1.0",
       shellCommand: "npm test -- --runInBand",
       enableOtaApply: true,
@@ -1990,7 +2084,26 @@ test("factory batch provisioning returns flash configs and firmware manifests ar
   assert.match(batch.devices[0].claimCode, /^[A-Z0-9]{5}-[A-Z0-9]{5}$/u);
   assert.match(batch.devices[0].flashConfig, /#define GATEWAY_BASE_URL "https:\/\/gateway\.example\.com"/u);
   assert.match(batch.devices[0].flashConfig, new RegExp(`#define DEVICE_ID "${batch.devices[0].device.id}"`, "u"));
-  assert.match(batch.devices[0].flashConfig, /#define WIFI_SSID "factory-wifi"/u);
+  // Break 1: the factory cannot know the customer's network, so a baked-in SSID guaranteed that
+  // no shipped unit could connect. Wi-Fi now comes from the owner via the on-device portal.
+  // The generated header still names them in a comment explaining where they went, so this
+  // asserts on the definition rather than the substring.
+  assert.doesNotMatch(batch.devices[0].flashConfig, /#define\s+WIFI_SSID/u);
+  assert.doesNotMatch(batch.devices[0].flashConfig, /#define\s+WIFI_PASSWORD/u);
+
+  // The NVS seed is what lets one signed image serve a whole batch.
+  assert.equal(batch.devices[0].nvsSeedFilename, `${batch.devices[0].device.id}.nvs.csv`);
+  assert.match(batch.devices[0].nvsSeed, /^key,type,encoding,value$/mu);
+  assert.match(batch.devices[0].nvsSeed, /^agentctl,namespace,,$/mu);
+  assert.match(batch.devices[0].nvsSeed, new RegExp(`^dev_id,data,string,${batch.devices[0].device.id}$`, "mu"));
+  assert.match(batch.devices[0].nvsSeed, /^gw_url,data,string,https:\/\/gateway\.example\.com$/mu);
+  assert.ok(batch.devices[0].nvsSeed.includes(batch.devices[0].secret));
+  // The claim code ships in the seed so the on-screen code matches the printed label from first
+  // boot; the gateway will not reissue a still-live code's plaintext later.
+  assert.ok(batch.devices[0].nvsSeed.includes(`claim_code,data,string,${batch.devices[0].claimCode}`));
+  assert.ok(batch.devices[0].nvsSeed.includes("claim_exp,data,string,"));
+  // Wi-Fi stays absent: the factory cannot know the customer's network.
+  assert.ok(!batch.devices[0].nvsSeed.includes("wifi_ssid"));
   assert.match(batch.devices[0].flashConfig, /#define DEFAULT_SHELL_COMMAND "npm test -- --runInBand"/u);
   assert.match(batch.devices[0].flashConfig, /#define ENABLE_OTA_APPLY 1/u);
   assert.match(batch.devices[0].flashConfig, /#define REQUIRE_OTA_SIGNATURE 1/u);
@@ -2142,6 +2255,42 @@ test("Clerk auth mode maps bearer sessions to platform users", async (t) => {
   assert.equal(devices.devices[0].id, created.device.id);
 });
 
+test("Clerk cookie sessions synchronize the real user profile", async (t) => {
+  const { server, store } = createApp({
+    config: {
+      authProvider: "clerk",
+      demoMode: false,
+    },
+    clerkAuth: async (req) => {
+      assert.equal(req.headers.cookie, "__session=clerk-cookie-session");
+      return {
+        id: "user_clerk_cookie",
+        email: "operator@example.com",
+        name: "Gateway Operator",
+      };
+    },
+  });
+  await listen(server);
+  t.after(() => server.close());
+  const baseUrl = `http://127.0.0.1:${server.address().port}`;
+
+  const devices = await requestJson(fetch, baseUrl, "/v1/devices", {
+    method: "GET",
+    headers: { cookie: "__session=clerk-cookie-session" },
+    body: undefined,
+  });
+
+  assert.deepEqual(devices.devices, []);
+  assert.deepEqual(
+    store.exportState().users.map(({ id, email, name }) => ({ id, email, name })),
+    [{
+      id: "user_clerk_cookie",
+      email: "operator@example.com",
+      name: "Gateway Operator",
+    }],
+  );
+});
+
 test("gateway routes support async Store API implementations", async (t) => {
   const store = createAsyncStore(createMemoryStore());
   const { server } = createApp({ store });
@@ -2256,7 +2405,7 @@ async function readStreamUntil(body, pattern) {
     const { done, value } = await reader.read();
     if (done) break;
     output += decoder.decode(value, { stream: true });
-    if (output.includes(pattern)) {
+    if (includesCompletedEvent(output, pattern)) {
       await reader.cancel();
       return output;
     }
@@ -2264,3 +2413,347 @@ async function readStreamUntil(body, pattern) {
   await reader.cancel();
   throw new Error(`Timed out waiting for ${pattern}. Received: ${output}`);
 }
+
+// SSE events are terminated by a blank line. Only treat the pattern as found once
+// its whole event has arrived; matching mid-event returns while the `event:` line
+// has been read but the `data:` payload is still in flight.
+function includesCompletedEvent(output, pattern) {
+  const boundary = output.lastIndexOf("\n\n");
+  return boundary !== -1 && output.slice(0, boundary).includes(pattern);
+}
+
+// --- device-scoped thread selection ---------------------------------------
+//
+// A device may change which thread it drives, but only within the environment its
+// owner bound. The owner keeps the boundary that matters; the hardware gets the
+// autonomy that is actually useful at a five-key bezel.
+
+async function threadSelectionFixture(t, { threads } = {}) {
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = async (url) => {
+    const parsed = new URL(String(url));
+    if (parsed.pathname === "/api/orchestration/snapshot") {
+      return jsonResponse({
+        projects: [{ id: "p1" }],
+        threads: threads ?? [
+          { id: "thread_a", title: "Alpha" },
+          { id: "thread_b", title: "Beta" },
+        ],
+      }, 200);
+    }
+    return jsonResponse({ error: "not found" }, 404);
+  };
+  t.after(() => {
+    globalThis.fetch = originalFetch;
+  });
+
+  const { server } = createApp();
+  await listen(server);
+  t.after(() => server.close());
+  const baseUrl = `http://127.0.0.1:${server.address().port}`;
+  const authHeaders = await createAuthHeaders(originalFetch, baseUrl);
+
+  const created = await requestJson(originalFetch, baseUrl, "/v1/devices", {
+    method: "POST",
+    headers: authHeaders,
+    body: { label: "Bezel controller", profile: "agent-controller" },
+  });
+  const deviceHeaders = {
+    "x-device-id": created.device.id,
+    "x-device-secret": created.secret,
+  };
+
+  const environment = await requestJson(originalFetch, baseUrl, "/v1/t3/environments", {
+    method: "POST",
+    headers: authHeaders,
+    body: { label: "Bound T3", baseUrl: "https://bound-t3.example", accessToken: "tok" },
+  });
+
+  return { originalFetch, baseUrl, authHeaders, created, deviceHeaders, environment };
+}
+
+test("a device lists selectable threads from the environment its owner bound", async (t) => {
+  const f = await threadSelectionFixture(t);
+  await requestJson(f.originalFetch, f.baseUrl, `/v1/devices/${f.created.device.id}/config`, {
+    method: "PUT",
+    headers: f.authHeaders,
+    body: { environmentId: f.environment.environment.id },
+  });
+
+  const listed = await requestJson(f.originalFetch, f.baseUrl, "/v1/device/threads", {
+    headers: f.deviceHeaders,
+  });
+  assert.equal(listed.environmentId, f.environment.environment.id);
+  assert.deepEqual(listed.threads, [
+    { id: "thread_a", title: "Alpha" },
+    { id: "thread_b", title: "Beta" },
+  ]);
+  assert.equal(listed.threadId, null, "no thread is selected yet");
+});
+
+test("a device can select a thread inside its bound environment", async (t) => {
+  const f = await threadSelectionFixture(t);
+  await requestJson(f.originalFetch, f.baseUrl, `/v1/devices/${f.created.device.id}/config`, {
+    method: "PUT",
+    headers: f.authHeaders,
+    body: { environmentId: f.environment.environment.id },
+  });
+
+  const updated = await requestJson(f.originalFetch, f.baseUrl, "/v1/device/config/thread", {
+    method: "POST",
+    headers: f.deviceHeaders,
+    body: { threadId: "thread_b" },
+  });
+  assert.equal(updated.config.threadId, "thread_b");
+  // The bound environment must survive a thread change.
+  assert.equal(updated.config.environmentId, f.environment.environment.id);
+
+  const reread = await requestJson(f.originalFetch, f.baseUrl, "/v1/device/config", {
+    headers: f.deviceHeaders,
+  });
+  assert.equal(reread.config.threadId, "thread_b", "the choice is durable");
+});
+
+test("a device cannot select a thread that is not in its bound environment", async (t) => {
+  const f = await threadSelectionFixture(t);
+  await requestJson(f.originalFetch, f.baseUrl, `/v1/devices/${f.created.device.id}/config`, {
+    method: "PUT",
+    headers: f.authHeaders,
+    body: { environmentId: f.environment.environment.id, threadId: "thread_a" },
+  });
+
+  const response = await f.originalFetch(new URL("/v1/device/config/thread", f.baseUrl), {
+    method: "POST",
+    headers: { ...f.deviceHeaders, "content-type": "application/json" },
+    body: JSON.stringify({ threadId: "thread_from_another_environment" }),
+  });
+  assert.equal(response.status, 404);
+
+  const reread = await requestJson(f.originalFetch, f.baseUrl, "/v1/device/config", {
+    headers: f.deviceHeaders,
+  });
+  assert.equal(reread.config.threadId, "thread_a", "the rejected write changed nothing");
+});
+
+test("thread selection is refused when the owner bound no environment", async (t) => {
+  const f = await threadSelectionFixture(t);
+
+  const listed = await f.originalFetch(new URL("/v1/device/threads", f.baseUrl), {
+    headers: f.deviceHeaders,
+  });
+  assert.equal(listed.status, 409);
+
+  const wrote = await f.originalFetch(new URL("/v1/device/config/thread", f.baseUrl), {
+    method: "POST",
+    headers: { ...f.deviceHeaders, "content-type": "application/json" },
+    body: JSON.stringify({ threadId: "thread_a" }),
+  });
+  assert.equal(wrote.status, 409);
+});
+
+test("a device may only write threadId, never widen its own scope", async (t) => {
+  const f = await threadSelectionFixture(t);
+  await requestJson(f.originalFetch, f.baseUrl, `/v1/devices/${f.created.device.id}/config`, {
+    method: "PUT",
+    headers: f.authHeaders,
+    body: { environmentId: f.environment.environment.id, shellCommand: "npm test" },
+  });
+
+  // Everything except threadId must be ignored, including an attempt to repoint the
+  // device at another environment or hand itself a more permissive shell command.
+  await requestJson(f.originalFetch, f.baseUrl, "/v1/device/config/thread", {
+    method: "POST",
+    headers: f.deviceHeaders,
+    body: {
+      threadId: "thread_a",
+      environmentId: "env_somewhere_else",
+      shellCommand: "sudo rm -rf /",
+      menu: ["status", "prompt", "shell", "macro", "media", "stop", "approve"],
+    },
+  });
+
+  const reread = await requestJson(f.originalFetch, f.baseUrl, "/v1/device/config", {
+    headers: f.deviceHeaders,
+  });
+  assert.equal(reread.config.threadId, "thread_a");
+  assert.equal(reread.config.environmentId, f.environment.environment.id, "environment is owner-only");
+  assert.equal(reread.config.shellCommand, "npm test", "shell command is owner-only");
+});
+
+test("an unclaimed device cannot list or select threads", async (t) => {
+  const originalFetch = globalThis.fetch;
+  const { server } = createApp({ config: { factoryToken: "factory-secret", demoMode: false } });
+  await listen(server);
+  t.after(() => server.close());
+  const baseUrl = `http://127.0.0.1:${server.address().port}`;
+
+  const provisioned = await requestJson(originalFetch, baseUrl, "/v1/factory/devices", {
+    method: "POST",
+    headers: { authorization: "Bearer factory-secret" },
+    body: { label: "Unclaimed", profile: "agent-controller" },
+  });
+  const headers = {
+    "x-device-id": provisioned.device.id,
+    "x-device-secret": provisioned.secret,
+  };
+
+  const listed = await originalFetch(new URL("/v1/device/threads", baseUrl), { headers });
+  assert.equal(listed.status, 403);
+  const wrote = await originalFetch(new URL("/v1/device/config/thread", baseUrl), {
+    method: "POST",
+    headers: { ...headers, "content-type": "application/json" },
+    body: JSON.stringify({ threadId: "thread_a" }),
+  });
+  assert.equal(wrote.status, 403);
+});
+
+test("the device display payload carries the owner's configured menu, not a generic one", async (t) => {
+  const originalFetch = globalThis.fetch;
+  const { server } = createApp();
+  await listen(server);
+  t.after(() => server.close());
+  const baseUrl = `http://127.0.0.1:${server.address().port}`;
+  const authHeaders = await createAuthHeaders(originalFetch, baseUrl);
+
+  const created = await requestJson(originalFetch, baseUrl, "/v1/devices", {
+    method: "POST",
+    headers: authHeaders,
+    body: { label: "Menu controller", profile: "agent-controller" },
+  });
+  const deviceHeaders = {
+    "x-device-id": created.device.id,
+    "x-device-secret": created.secret,
+  };
+
+  await requestJson(originalFetch, baseUrl, `/v1/devices/${created.device.id}/config`, {
+    method: "PUT",
+    headers: authHeaders,
+    body: { menu: ["status", "thread", "stop"] },
+  });
+
+  // Firmware applies the display menu every few seconds and the config menu once a
+  // minute, so a generic menu here would quietly undo the owner's choice.
+  const display = await requestJson(originalFetch, baseUrl, "/v1/device/display", {
+    headers: deviceHeaders,
+  });
+  assert.deepEqual(display.display.menu, ["status", "thread", "stop"]);
+});
+
+test("a full device menu round-trips without silently dropping entries", async (t) => {
+  const originalFetch = globalThis.fetch;
+  const { server } = createApp();
+  await listen(server);
+  t.after(() => server.close());
+  const baseUrl = `http://127.0.0.1:${server.address().port}`;
+  const authHeaders = await createAuthHeaders(originalFetch, baseUrl);
+
+  const created = await requestJson(originalFetch, baseUrl, "/v1/devices", {
+    method: "POST",
+    headers: authHeaders,
+    body: { label: "Full menu controller", profile: "agent-controller" },
+  });
+
+  // Seven entries: previously capped at six, which dropped "stop" off the end with
+  // no error, quietly removing the ability to halt a session from the hardware.
+  const menu = ["status", "prompt", "shell", "macro", "thread", "media", "stop"];
+  const updated = await requestJson(originalFetch, baseUrl, `/v1/devices/${created.device.id}/config`, {
+    method: "PUT",
+    headers: authHeaders,
+    body: { menu },
+  });
+  assert.deepEqual(updated.config.menu, menu);
+
+  // And the device must be served the same list it was configured with.
+  const display = await requestJson(originalFetch, baseUrl, "/v1/device/display", {
+    headers: { "x-device-id": created.device.id, "x-device-secret": created.secret },
+  });
+  assert.deepEqual(display.display.menu, menu);
+});
+
+test("the destructive reset entry is assignable to a device menu", async (t) => {
+  const originalFetch = globalThis.fetch;
+  const { server } = createApp();
+  await listen(server);
+  t.after(() => server.close());
+  const baseUrl = `http://127.0.0.1:${server.address().port}`;
+  const authHeaders = await createAuthHeaders(originalFetch, baseUrl);
+
+  const created = await requestJson(originalFetch, baseUrl, "/v1/devices", {
+    method: "POST",
+    headers: authHeaders,
+    body: { label: "Resettable controller", profile: "agent-controller" },
+  });
+
+  // "reset" opens an on-device confirmation screen that wipes Wi-Fi, the config cache, the cached
+  // claim code and any gateway override. It is owner-assigned rather than always present, so an
+  // accidental dial press cannot reach a factory wipe on a device that was never given the entry.
+  const menu = ["status", "prompt", "thread", "reset"];
+  const updated = await requestJson(originalFetch, baseUrl, `/v1/devices/${created.device.id}/config`, {
+    method: "PUT",
+    headers: authHeaders,
+    body: { menu },
+  });
+  assert.deepEqual(updated.config.menu, menu);
+
+  const display = await requestJson(originalFetch, baseUrl, "/v1/device/display", {
+    headers: { "x-device-id": created.device.id, "x-device-secret": created.secret },
+  });
+  assert.deepEqual(display.display.menu, menu);
+});
+
+test("devices declare which owner operations the gateway will accept", async (t) => {
+  const originalFetch = globalThis.fetch;
+  const { server } = createApp();
+  await listen(server);
+  t.after(() => server.close());
+  const baseUrl = `http://127.0.0.1:${server.address().port}`;
+  const authHeaders = await createAuthHeaders(originalFetch, baseUrl);
+
+  const created = await requestJson(originalFetch, baseUrl, "/v1/devices", {
+    method: "POST",
+    headers: authHeaders,
+    body: { label: "Actionable controller", profile: "agent-controller" },
+  });
+  assert.deepEqual(created.device.actions, {
+    rotateSecret: true,
+    transferReset: true,
+    updateConfig: true,
+    updateProfile: true,
+    revoke: true,
+  });
+
+  const revoked = await requestJson(originalFetch, baseUrl, `/v1/devices/${created.device.id}/revoke`, {
+    method: "POST",
+    headers: authHeaders,
+    body: {},
+  });
+  // Every one of these is refused once revoked, so a client that trusts this field cannot render a
+  // control that returns 404 — which is the whole point of the server declaring it.
+  assert.deepEqual(revoked.device.actions, {
+    rotateSecret: false,
+    transferReset: false,
+    updateConfig: false,
+    updateProfile: false,
+    revoke: false,
+  });
+
+  // The declaration has to match what the routes actually do, or it is just a second thing to
+  // keep in sync. These are the guards it stands in for.
+  for (const [path, body] of [
+    [`/v1/devices/${created.device.id}/rotate-secret`, {}],
+    [`/v1/devices/${created.device.id}/transfer-reset`, {}],
+  ]) {
+    const response = await originalFetch(new URL(path, baseUrl), {
+      method: "POST",
+      headers: { ...authHeaders, "content-type": "application/json" },
+      body: JSON.stringify(body),
+    });
+    assert.equal(response.status, 404, `${path} must refuse a revoked device`);
+  }
+  const config = await originalFetch(new URL(`/v1/devices/${created.device.id}/config`, baseUrl), {
+    method: "PUT",
+    headers: { ...authHeaders, "content-type": "application/json" },
+    body: JSON.stringify({ threadId: "thread_x" }),
+  });
+  assert.equal(config.status, 404, "config updates must refuse a revoked device");
+});
