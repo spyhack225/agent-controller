@@ -2974,26 +2974,69 @@ html:not(.dark)[data-theme="light"] {
 
 @layer components {
   /* The signed-out front door. Deliberately outside .app-shell: there is no workspace to frame
-     yet, and the nav chrome would be empty for someone who has not signed in. */
+     yet, and the nav chrome would be empty for someone who has not signed in.
+
+     Unlike the console, this page is full-bleed: every band spans the viewport and re-centres its
+     own `.landing__inner`, so alternating section backgrounds reach the window edge. */
   .landing {
     display: grid;
-    min-height: 100vh;
-    grid-template-rows: auto 1fr;
+    grid-template-rows: auto 1fr auto;
     background: var(--ac-canvas);
     color: var(--ac-ink);
+
+    /* `body` is `overflow: hidden` because `.app-shell` is a fixed 100dvh grid that scrolls its
+       workspace internally — so the document itself never scrolls. The old landing was one screen
+       tall and did not care; this one is several, so it has to own its scrolling. Sticky positioning
+       on the header resolves against this box. */
+    height: 100dvh;
+    overflow-y: auto;
+
+    /* Darker than the canvas so alternating bands read as recessed. The console token is already
+       near-black in dark mode; in light mode it is not, hence the override below. */
+    --landing-sunken: var(--ac-console);
+    --landing-hatch-a: #151615;
+    --landing-hatch-b: #1b1c1b;
+  }
+
+  html:not(.dark)[data-theme="light"] .landing {
+    --landing-sunken: var(--ac-surface-inset);
+    --landing-hatch-a: var(--ac-surface);
+    --landing-hatch-b: var(--ac-surface-inset);
   }
 
   .landing--resolving {
     grid-template-rows: 1fr;
   }
 
+  /* Section labels stay faint (the global `.eyebrow` tone); the two that head a full narrative
+     block — the hero and the hardware pitch — take the accent so they read as titles, not captions. */
+  .landing .eyebrow--accent {
+    color: var(--ac-accent);
+  }
+
+  .landing__inner {
+    width: min(75rem, 100%);
+    margin-inline: auto;
+    padding-inline: clamp(1.25rem, 4vw, 2.5rem);
+  }
+
   .landing__bar {
+    position: sticky;
+    top: 0;
+    z-index: 5;
+    border-bottom: 1px solid var(--ac-border);
+    background: color-mix(in srgb, var(--ac-canvas) 92%, transparent);
+    backdrop-filter: blur(12px);
+  }
+
+  .landing__bar-inner {
     display: flex;
     align-items: center;
     justify-content: space-between;
     gap: 1rem;
-    padding: 1rem 1.5rem;
-    border-bottom: 1px solid var(--ac-border);
+    width: min(75rem, 100%);
+    margin-inline: auto;
+    padding: 1rem clamp(1.25rem, 4vw, 2.5rem);
   }
 
   .landing__brand {
@@ -3002,33 +3045,122 @@ html:not(.dark)[data-theme="light"] {
     gap: 0.6rem;
   }
 
-  .landing__main {
-    display: grid;
-    gap: 3.5rem;
-    width: min(64rem, 100%);
-    margin-inline: auto;
-    padding: clamp(2.5rem, 7vw, 5rem) 1.5rem 4rem;
-    align-content: start;
+  .landing__nav {
+    display: flex;
+    align-items: center;
+    gap: 1.75rem;
+    font-size: 0.8rem;
   }
+
+  .landing__nav a {
+    color: var(--ac-ink-muted);
+    text-decoration: none;
+    transition: color 150ms;
+  }
+
+  .landing__nav a:hover,
+  .landing__nav a:focus-visible {
+    color: var(--ac-ink);
+  }
+
+  .landing__bar-actions {
+    display: flex;
+    align-items: center;
+    gap: 0.5rem;
+  }
+
+  .landing__main {
+    display: block;
+  }
+
+  .landing__section {
+    border-bottom: 1px solid var(--ac-border);
+    padding-block: clamp(2.5rem, 6vw, 3.5rem);
+    /* Clears the sticky header, which would otherwise sit on top of the section's own eyebrow
+       when a nav link jumps here. */
+    scroll-margin-top: 4rem;
+  }
+
+  .landing__section--hero {
+    padding-block: clamp(3rem, 8vw, 5rem) clamp(2.5rem, 6vw, 4rem);
+  }
+
+  .landing__section--sunken {
+    background: var(--landing-sunken);
+    padding-block: clamp(2.75rem, 7vw, 4rem);
+  }
+
+  .landing__section-title {
+    max-width: 38rem;
+    font-size: clamp(1.25rem, 3vw, 1.5rem);
+    font-weight: 600;
+    letter-spacing: -0.022em;
+  }
+
+  /* Hero */
 
   .landing__hero {
     display: grid;
-    gap: 1.1rem;
-    max-width: 42rem;
+    grid-template-columns: minmax(0, 1.05fr) minmax(0, 0.95fr);
+    align-items: center;
+    gap: clamp(2rem, 5vw, 3.5rem);
   }
 
-  .landing__hero h1 {
+  .landing__hero-copy {
+    display: grid;
+    gap: 1.1rem;
+    align-content: start;
+  }
+
+  .landing__hero-copy h1 {
     font-family: var(--font-display, inherit);
-    font-size: clamp(1.9rem, 5vw, 3rem);
+    font-size: clamp(1.9rem, 5vw, 3.4rem);
     font-weight: 650;
-    line-height: 1.08;
-    letter-spacing: -0.02em;
+    line-height: 1.06;
+    letter-spacing: -0.028em;
     text-wrap: balance;
+  }
+
+  .landing__hero-shots {
+    display: grid;
+    gap: 0.65rem;
+  }
+
+  .landing__hero-shots-row {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 0.65rem;
+  }
+
+  .landing__shot {
+    display: grid;
+    place-items: center;
+    align-content: center;
+    gap: 0.4rem;
+    padding: 1rem;
+    border: 1px solid var(--ac-border-strong);
+    border-radius: 0.75rem;
+    background: repeating-linear-gradient(
+      135deg,
+      var(--landing-hatch-a),
+      var(--landing-hatch-a) 9px,
+      var(--landing-hatch-b) 9px,
+      var(--landing-hatch-b) 18px
+    );
+    color: var(--ac-ink-faint);
+  }
+
+  .landing__shot p {
+    font-family: var(--font-mono);
+    font-size: 0.7rem;
+    text-align: center;
+    text-wrap: balance;
+    color: var(--ac-sidebar-muted);
   }
 
   .landing__lede {
     max-width: 38rem;
-    font-size: 1rem;
+    font-size: 1.0625rem;
     line-height: 1.65;
     color: var(--ac-ink-muted);
   }
@@ -3064,10 +3196,12 @@ html:not(.dark)[data-theme="light"] {
     color: var(--ac-ink-faint);
   }
 
+  /* Three steps */
+
   .landing__steps ol {
     display: grid;
     gap: 1rem;
-    margin-top: 1.25rem;
+    margin-top: 2rem;
     grid-template-columns: repeat(auto-fit, minmax(15rem, 1fr));
     list-style: none;
     padding: 0;
@@ -3077,7 +3211,7 @@ html:not(.dark)[data-theme="light"] {
     display: grid;
     gap: 0.15rem;
     align-content: start;
-    padding: 1.15rem;
+    padding: 1.35rem;
     border-radius: 0.75rem;
     border: 1px solid var(--ac-border);
     background: var(--ac-surface);
@@ -3087,7 +3221,7 @@ html:not(.dark)[data-theme="light"] {
     display: flex;
     align-items: center;
     gap: 0.6rem;
-    margin-bottom: 0.65rem;
+    margin-bottom: 0.75rem;
   }
 
   .landing__step-index {
@@ -3109,20 +3243,363 @@ html:not(.dark)[data-theme="light"] {
   }
 
   .landing__steps h3 {
-    font-size: 0.9375rem;
+    font-size: 1rem;
     font-weight: 600;
   }
 
   .landing__steps p {
-    margin-top: 0.3rem;
+    margin-top: 0.4rem;
     font-size: 0.8125rem;
     line-height: 1.6;
     color: var(--ac-ink-muted);
   }
 
+  /* Hardware */
+
+  .landing__hardware {
+    display: grid;
+    grid-template-columns: minmax(0, 0.9fr) minmax(0, 1.1fr);
+    align-items: center;
+    gap: clamp(2rem, 5vw, 3.5rem);
+  }
+
+  .landing__hardware-title {
+    font-family: var(--font-display, inherit);
+    font-size: clamp(1.5rem, 4vw, 2.25rem);
+    font-weight: 650;
+    line-height: 1.1;
+    letter-spacing: -0.025em;
+  }
+
+  .landing__hardware .landing__lede {
+    margin-top: 1.1rem;
+    font-size: 1rem;
+  }
+
+  .landing__specs {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(11rem, 1fr));
+    gap: 1.25rem 2rem;
+    margin-top: 2rem;
+  }
+
+  .landing__specs dt {
+    font-size: 0.6875rem;
+    font-weight: 600;
+    letter-spacing: 0.12em;
+    text-transform: uppercase;
+    color: var(--ac-ink-faint);
+  }
+
+  .landing__specs dd {
+    margin-top: 0.3rem;
+    font-family: var(--font-mono);
+    font-size: 0.8rem;
+  }
+
+  .landing__claim-callout {
+    display: grid;
+    grid-template-columns: minmax(0, 1fr) auto;
+    align-items: center;
+    gap: 1rem;
+    margin-top: 2rem;
+    padding: 1rem;
+    border: 1px solid var(--ac-border-strong);
+    border-radius: 0.65rem;
+    background: var(--ac-canvas);
+  }
+
+  .landing__claim-callout p {
+    font-family: var(--font-mono);
+    font-size: 0.72rem;
+    line-height: 1.6;
+    color: var(--ac-console-ink);
+  }
+
+  /* An anchor that has to sit next to real buttons, so it borrows the secondary button's shape. */
+  .landing__link-button {
+    display: inline-flex;
+    align-items: center;
+    gap: 0.5rem;
+    min-height: 2.25rem;
+    padding-inline: 0.75rem;
+    border: 1px solid var(--ac-border-strong);
+    border-radius: var(--radius-sm);
+    background: var(--ac-surface-raised);
+    color: var(--ac-ink);
+    font-size: 0.8rem;
+    font-weight: 600;
+    white-space: nowrap;
+    text-decoration: none;
+    transition: background 150ms;
+  }
+
+  .landing__link-button:hover,
+  .landing__link-button:focus-visible {
+    background: var(--ac-surface-inset);
+    color: var(--ac-ink);
+  }
+
+  /* Features */
+
+  /* 19rem, not 16rem: at the 75rem container width a 16rem minimum fits four columns and the
+     six cards break 4 + 2 instead of the intended two rows of three. */
+  .landing__features {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(19rem, 1fr));
+    gap: 1rem;
+    margin-top: 2rem;
+  }
+
+  .landing__features article {
+    display: grid;
+    gap: 0.15rem;
+    align-content: start;
+    padding: 1.35rem;
+    border: 1px solid var(--ac-border);
+    border-radius: 0.75rem;
+    background: var(--ac-surface);
+  }
+
+  .landing__feature-icon {
+    display: grid;
+    place-items: center;
+    width: 1.9rem;
+    height: 1.9rem;
+    margin-bottom: 0.85rem;
+    border-radius: 0.5rem;
+    background: color-mix(in srgb, var(--ac-accent) 12%, transparent);
+    color: var(--ac-accent);
+  }
+
+  .landing__features h3 {
+    font-size: 0.9375rem;
+    font-weight: 600;
+  }
+
+  .landing__features p {
+    margin-top: 0.4rem;
+    font-size: 0.8125rem;
+    line-height: 1.6;
+    color: var(--ac-ink-muted);
+  }
+
+  /* Pricing */
+
+  .landing__tiers {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(17rem, 1fr));
+    gap: 1rem;
+    align-items: stretch;
+    margin-top: 2rem;
+  }
+
+  .landing__tier {
+    display: flex;
+    flex-direction: column;
+    padding: 1.6rem;
+    border: 1px solid var(--ac-border);
+    border-radius: 0.75rem;
+    background: var(--ac-surface);
+  }
+
+  .landing__tier[data-featured] {
+    border-color: color-mix(in srgb, var(--ac-primary) 40%, transparent);
+    background:
+      linear-gradient(180deg, color-mix(in srgb, var(--ac-primary) 7%, transparent), transparent 55%),
+      var(--ac-surface);
+  }
+
+  .landing__tier-head {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 0.75rem;
+  }
+
+  .landing__tier-head h3 {
+    font-size: 1rem;
+    font-weight: 600;
+  }
+
+  .landing__tier-badge {
+    display: inline-flex;
+    align-items: center;
+    min-height: 1.5rem;
+    padding-inline: 0.5rem;
+    border: 1px solid var(--ac-border);
+    border-radius: var(--radius-sm);
+    background: var(--ac-surface-inset);
+    color: var(--ac-ink-muted);
+    font-family: var(--font-mono);
+    font-size: 0.625rem;
+    letter-spacing: 0.06em;
+    white-space: nowrap;
+  }
+
+  .landing__tier[data-featured] .landing__tier-badge {
+    border-color: color-mix(in srgb, var(--ac-primary) 25%, transparent);
+    background: color-mix(in srgb, var(--ac-primary) 10%, transparent);
+    color: var(--ac-primary);
+  }
+
+  .landing__tier-price {
+    margin-top: 1rem;
+    font-size: 2.25rem;
+    font-weight: 650;
+    letter-spacing: -0.03em;
+  }
+
+  .landing__tier-price span {
+    font-size: 0.875rem;
+    font-weight: 500;
+    color: var(--ac-ink-muted);
+  }
+
+  .landing__tier-blurb {
+    margin-top: 0.5rem;
+    font-size: 0.8125rem;
+    line-height: 1.6;
+    color: var(--ac-ink-muted);
+  }
+
+  .landing__tier ul {
+    display: grid;
+    gap: 0.6rem;
+    margin: 1.5rem 0 1.75rem;
+    padding: 0;
+    list-style: none;
+  }
+
+  .landing__tier li {
+    display: grid;
+    grid-template-columns: auto minmax(0, 1fr);
+    gap: 0.55rem;
+    align-items: start;
+    font-size: 0.8125rem;
+    line-height: 1.5;
+    color: var(--ac-ink-muted);
+  }
+
+  .landing__tier li svg {
+    margin-top: 0.2rem;
+    color: var(--ac-primary);
+  }
+
+  .landing__tier-cta {
+    margin-top: auto;
+    width: 100%;
+  }
+
+  .landing__tier-cta--link {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    min-height: 2.5rem;
+    padding-inline: 1rem;
+    border: 1px solid var(--ac-border-strong);
+    border-radius: var(--radius-sm);
+    background: var(--ac-surface-raised);
+    color: var(--ac-ink);
+    font-size: 0.875rem;
+    font-weight: 600;
+    text-decoration: none;
+    transition: background 150ms;
+  }
+
+  .landing__tier-cta--link:hover,
+  .landing__tier-cta--link:focus-visible {
+    background: var(--ac-surface-inset);
+    color: var(--ac-ink);
+  }
+
+  /* FAQ */
+
+  .landing__faq {
+    display: grid;
+    grid-template-columns: minmax(0, 0.7fr) minmax(0, 1.3fr);
+    gap: clamp(1.5rem, 4vw, 3rem);
+  }
+
+  .landing__faq-list > div {
+    padding-block: 1.35rem;
+    border-top: 1px solid var(--ac-border);
+    scroll-margin-top: 5rem;
+  }
+
+  .landing__faq-list > div:first-child {
+    padding-top: 0;
+    border-top: 0;
+  }
+
+  .landing__faq-list h3 {
+    font-size: 0.9375rem;
+    font-weight: 600;
+  }
+
+  .landing__faq-list p {
+    margin-top: 0.5rem;
+    max-width: 46rem;
+    font-size: 0.8125rem;
+    line-height: 1.65;
+    color: var(--ac-ink-muted);
+  }
+
+  /* Footer */
+
+  .landing__footer {
+    color: var(--ac-ink-faint);
+    font-size: 0.75rem;
+  }
+
+  .landing__footer-inner {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    flex-wrap: wrap;
+    gap: 1rem 2rem;
+    padding-block: 2.25rem;
+  }
+
+  .landing__footer-brand {
+    display: flex;
+    align-items: center;
+    gap: 0.6rem;
+  }
+
+  .brand-mark--muted {
+    width: 1.6rem;
+    height: 1.6rem;
+    border-radius: 0.35rem;
+    color: var(--ac-ink-faint);
+  }
+
+  @media (max-width: 900px) {
+    .landing__hero,
+    .landing__hardware,
+    .landing__faq {
+      grid-template-columns: minmax(0, 1fr);
+    }
+
+    .landing__hero-shots,
+    .landing__hardware > .landing__shot {
+      order: 2;
+    }
+  }
+
+  @media (max-width: 760px) {
+    .landing__nav {
+      display: none;
+    }
+  }
+
   @media (max-width: 640px) {
     .landing__actions button {
       width: 100%;
+    }
+
+    .landing__claim-callout {
+      grid-template-columns: minmax(0, 1fr);
     }
   }
 }

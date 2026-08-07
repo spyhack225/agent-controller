@@ -24,8 +24,17 @@ test("offers sign-up and sign-in as separate doors", () => {
   const clerk = clerkBridge();
   render(<LandingPage authConfig={clerkEnabled} clerk={clerk} />);
 
-  fireEvent.click(screen.getByRole("button", { name: /Create your account/u }));
-  expect(clerk.openSignUp).toHaveBeenCalled();
+  // The page repeats the account CTA (header, hero, and the Hosted pricing tier), so this asserts
+  // the invariant rather than a single button: every create-account affordance opens sign-up, and
+  // none of them silently falls through to sign-in.
+  const signUpButtons = screen.getAllByRole("button", { name: /Create (your )?account/u });
+  expect(signUpButtons.length).toBeGreaterThan(1);
+  for (const button of signUpButtons) {
+    (clerk.openSignUp as ReturnType<typeof vi.fn>).mockClear();
+    fireEvent.click(button);
+    expect(clerk.openSignUp).toHaveBeenCalledTimes(1);
+  }
+  expect(clerk.openSignIn).not.toHaveBeenCalled();
 
   fireEvent.click(screen.getByRole("button", { name: /I already have one/u }));
   expect(clerk.openSignIn).toHaveBeenCalled();
@@ -48,6 +57,39 @@ test("explains a gateway with no sign-in configured instead of showing a dead bu
   expect(screen.getByText(/Sign-in is not configured/u)).toBeInTheDocument();
   expect(screen.getByText("CLERK_SECRET_KEY")).toBeInTheDocument();
   expect(screen.queryByRole("button", { name: /Create your account/u })).not.toBeInTheDocument();
+});
+
+test("covers hardware, capabilities, pricing and FAQ below the hero", () => {
+  render(<LandingPage authConfig={clerkEnabled} clerk={clerkBridge()} />);
+
+  expect(screen.getByRole("heading", { name: /One knob, one e-ink face/u })).toBeInTheDocument();
+  expect(screen.getByText("EC11 rotary encoder + press")).toBeInTheDocument();
+  expect(screen.getByRole("heading", { name: /Policy gate with real approvals/u })).toBeInTheDocument();
+  expect(screen.getByRole("heading", { name: "Self-hosted" })).toBeInTheDocument();
+  expect(screen.getByRole("heading", { name: "Hosted" })).toBeInTheDocument();
+  expect(screen.getByRole("heading", { name: "Team" })).toBeInTheDocument();
+  expect(screen.getByRole("heading", { name: /Does Agent Controller run the model\?/u })).toBeInTheDocument();
+});
+
+// Every in-page link has to resolve to something that exists. A marketing header whose nav
+// scrolls nowhere is worse than a header with no nav at all.
+test("only links to sections that are actually rendered", () => {
+  const { container } = render(<LandingPage authConfig={clerkEnabled} clerk={clerkBridge()} />);
+
+  const hrefs = Array.from(container.querySelectorAll("a[href^='#']")).map(
+    (anchor) => anchor.getAttribute("href") ?? "",
+  );
+  expect(hrefs.length).toBeGreaterThan(0);
+  for (const href of hrefs) {
+    expect(container.querySelector(href), `${href} has no target on the page`).not.toBeNull();
+  }
+});
+
+// The team waitlist has no signup path behind it yet, so its CTA must not imply one.
+test("does not present the team waitlist as something you can join today", () => {
+  render(<LandingPage authConfig={clerkEnabled} clerk={clerkBridge()} />);
+
+  expect(screen.getByRole("button", { name: /Join the waitlist/u })).toBeDisabled();
 });
 
 test("holds the CTAs disabled while Clerk is still resolving the session", () => {
