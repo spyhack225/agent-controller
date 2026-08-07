@@ -6,6 +6,14 @@ firmware/esp32-controller/include/controller_config.h
 .env
 .DS_Store
 coverage/
+dist/
 *.log
 
 .env.local
+
+# Elecrow's CrowPanel vendor download: 246 MB of .zip archives, a PDF manual, and CH34x macOS
+# driver installers. Reference material, not source — the parts we actually build against are
+# vendored into firmware/esp32-controller/lib/ElecrowEPD/ and committed.
+# Re-downloadable from:
+#   https://www.elecrow.com/wiki/CrowPanel_ESP32_E-Paper_HMI_2.13-inch_Display.html
+firmware/esp32-controller/docs/
