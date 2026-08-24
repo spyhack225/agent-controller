@@ -17,6 +17,7 @@
 #include <WiFi.h>
 
 #include "display.h"
+#include "touch.h"
 
 #include <ThinkingOrb.h>
 
@@ -29,8 +30,9 @@
 #include "controller_config.example.h"
 #endif
 
-#if ENABLE_AUDIO_CAPTURE
 #include <Wire.h>
+
+#if ENABLE_AUDIO_CAPTURE
 #include "driver/i2s_std.h"
 #include "es8311.h"
 #endif
@@ -62,6 +64,12 @@ DeviceStore store;
 Provisioning provisioning;
 
 ProvisioningState lastState = ProvisioningState::Unprovisioned;
+
+// Mode browser. The setup screen doubles as the place to see every animation, because that is the
+// one screen a device sits on for minutes at a time with nothing else to say. Declared up here
+// because reportState() consults it long before the screen code is defined.
+bool orbBrowsing = false;
+uint8_t browseIndex = 0;
 uint32_t bootHeldSince = 0;
 bool bootWasDown = false;
 
@@ -80,14 +88,6 @@ size_t clipCapacity = 0;            // in samples, not bytes
 bool audioReady = false;
 
 constexpr size_t kFrameSamples = 512;   // per i2s_channel_read, per channel
-
-bool i2cInit() {
-  // Wire, not i2c_driver_install. The board shares one I2C bus between the ES8311 codec, the
-  // FT6336G touch controller and the external header, so they must all speak through the same
-  // driver generation — and linking ESP-IDF's legacy I2C driver alongside the new one aborts from
-  // a constructor at boot, before Serial exists. See lib/ES8311/README.md.
-  return Wire.begin(I2C_SDA_PIN, I2C_SCL_PIN, I2C_SPEED_HZ);
-}
 
 bool i2sInit() {
   i2s_chan_config_t chanCfg =
@@ -136,10 +136,6 @@ bool audioInit() {
   pinMode(AUDIO_PA_ENABLE_PIN, OUTPUT);
   speakerEnable(false);
 
-  if (!i2cInit()) {
-    Serial.println("[audio] I2C init failed.");
-    return false;
-  }
   if (!i2sInit()) {
     Serial.println("[audio] I2S init failed.");
     return false;
@@ -392,6 +388,8 @@ void setOrbState(OrbMode mode, const String& label, const String& context);
 
 void reportState(ProvisioningState state) {
   const ProvisioningStatus& status = provisioning.status();
+  // A state change while the user is flipping through animations would yank the screen away
+  // mid-gesture. The serial line still reports it.
   Serial.printf("[provisioning] %s", provisioningStateName(state));
   if (status.detail.length()) Serial.printf(" — %s", status.detail.c_str());
   Serial.println();
@@ -403,6 +401,8 @@ void reportState(ProvisioningState state) {
   if (state == ProvisioningState::Online) {
     Serial.printf("  IP %s, RSSI %d dBm\n", WiFi.localIP().toString().c_str(), WiFi.RSSI());
   }
+
+  if (orbBrowsing) return;
 
   switch (state) {
     case ProvisioningState::Provisioning:
@@ -539,6 +539,35 @@ void setOrbState(OrbMode mode, const String& label, const String& context) {
 
 // Called from loop(). The orb owns the frame budget: at ~30 ms a frame the sphere reads as smooth
 // without starving Wi-Fi or the provisioning portal, both of which share this core.
+// Swipe through the nine states; tap returns to whatever the device is actually doing.
+void pollOrbBrowser() {
+  const TouchGesture g = touchPoll();
+  if (g == TouchGesture::None) return;
+
+  if (g == TouchGesture::Tap && orbBrowsing) {
+    orbBrowsing = false;
+    Serial.println("[orb] browser off; following device state again");
+    reportState(provisioning.status().state);
+    return;
+  }
+
+  if (g == TouchGesture::SwipeLeft || g == TouchGesture::SwipeRight) {
+    const uint8_t count = (uint8_t)OrbMode::ModeCount;
+    if (!orbBrowsing) {
+      orbBrowsing = true;
+      browseIndex = (uint8_t)currentMode;
+    }
+    browseIndex = (uint8_t)((g == TouchGesture::SwipeLeft)
+                            ? (browseIndex + 1) % count
+                            : (browseIndex + count - 1) % count);
+    const OrbMode m = orbModeAt(browseIndex);
+    Serial.printf("[orb] %u/%u %s\n", (unsigned)(browseIndex + 1), (unsigned)count,
+                  orbStateName(m));
+    setOrbState(m, orbLabelForMode(m),
+                String(browseIndex + 1) + "/" + String(count) + "  " + orbStateName(m));
+  }
+}
+
 void tickScreen() {
   if (!displayReady()) return;
 
@@ -590,8 +619,16 @@ void setup() {
 
   pinMode(BOOT_BUTTON_PIN, INPUT_PULLUP);
 
+  // One I2C bus, shared by the FT6336G touch controller, the ES8311 codec and the external header.
+  // It is started here rather than inside audio init because touch needs it in builds that have no
+  // audio at all — which is exactly how the display build failed to see the touch controller.
+  if (!Wire.begin(I2C_SDA_PIN, I2C_SCL_PIN, I2C_SPEED_HZ)) {
+    Serial.println("[i2c] Wire.begin failed; touch and codec will not respond.");
+  }
+
   if (displayBegin()) {
     Serial.println("[display] ILI9341V up, 240x320, backlight on.");
+    touchBegin();
     // 132 px across, comfortably inside the 240 px panel, and a dot budget that keeps a frame
     // under the 30 ms tick.
     if (displayBeginCanvases(148) && orb.begin(140, 900)) {
@@ -670,6 +707,7 @@ void loop() {
   }
 #endif
 
+  pollOrbBrowser();
   tickScreen();
 
   pollBootButton();

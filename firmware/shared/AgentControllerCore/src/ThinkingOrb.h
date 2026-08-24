@@ -21,11 +21,20 @@
 // library's; the mapping from an Agent Controller thread state is in orbModeForAgentState().
 enum class OrbMode : uint8_t {
   Orbits,   // working    — particles on inclined orbits
-  Globe,    // searching  — lat/lon dot sphere with a scanning band
-  Wave,     // listening  — sphere whose rings breathe with amplitude
-  Ring,     // breathing  — face-on concentric lanes, the calm/idle state
-  Web,      // connecting — sparse nodes with linking chords
+  Globe,    // searching  — a scan meridian sweeps a dotted globe
+  Rubik,    // solving    — bands scramble, then click back solved
+  Wave,     // listening  — a waveform rolls through the rings
+  Web,      // connecting — a constellation wires itself
+  Braid,    // weaving    — three strands plait around the sphere
+  Ribbon,   // composing  — an undulating multi-band sash
+  Ring,     // breathing  — a ring slowly morphing
+  Morph,    // shaping    — dotted outline: circle -> triangle -> square
+  ModeCount
 };
+
+// Cycle order for the on-device mode picker, matching the order the library documents.
+OrbMode orbModeAt(uint8_t index);
+const char* orbStateName(OrbMode mode);
 
 struct OrbDot {
   // Position and radius in SIXTEENTHS of a pixel, relative to the centre passed to render().
@@ -93,6 +102,11 @@ class ThinkingOrb {
   uint16_t emitWave(float t);
   uint16_t emitRing(float t);
   uint16_t emitWeb(float t);
+  uint16_t emitRubik(float t);
+  uint16_t emitBraid(float t);
+  uint16_t emitRibbon(float t, bool faceOn);
+  uint16_t emitMorph(float t);
+  uint16_t emitGhostSphere(float t, float R, uint16_t& n);
 
   // Shared spin + tilt + orthographic projection, matching the reference engine's makeProj.
   void setProjection(float yaw, float tilt, float scale);

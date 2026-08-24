@@ -49,17 +49,17 @@ constexpr float kRMin = 0.3f;
 constexpr float kCullAlpha = 0.02f;
 constexpr float kPi = 3.14159265358979f;
 
+// Order must match OrbMode exactly.
 const Profile kProfiles[] = {
-  // Orbits — working
-  { 0,  0,   1.20f, 1.60f, 0.55f, 0.45f, 1.885f, 1.00f, 0.6f, 1.00f },
-  // Globe — searching/thinking
-  { 17, 44,  0.60f, 1.70f, 0.62f, 0.54f, 2.015f, 1.00f, 0.6f, 0.45f },
-  // Wave — listening
-  { 15, 40,  0.60f, 1.70f, 0.62f, 0.54f, 4.388f, 0.90f, 0.6f, 1.00f },
-  // Ring — breathing/idle
-  { 5,  88,  1.10f, 1.70f, 0.60f, 0.50f, 1.200f, 0.85f, 0.6f, 1.00f },
-  // Web — connecting
-  { 0,  0,   1.40f, 1.80f, 0.55f, 0.45f, 2.400f, 1.00f, 0.6f, 1.00f },
+  /* Orbits  */ { 0,  0,   1.20f, 1.60f, 0.55f, 0.45f, 1.885f, 1.00f, 0.6f, 1.00f },
+  /* Globe   */ { 17, 44,  0.60f, 1.70f, 0.62f, 0.54f, 2.015f, 1.00f, 0.6f, 0.45f },
+  /* Rubik   */ { 15, 40,  0.60f, 1.70f, 0.62f, 0.54f, 1.820f, 0.85f, 0.6f, 1.00f },
+  /* Wave    */ { 15, 40,  0.60f, 1.70f, 0.62f, 0.54f, 4.388f, 0.90f, 0.6f, 1.00f },
+  /* Web     */ { 0,  0,   1.40f, 1.80f, 0.55f, 0.45f, 2.400f, 1.00f, 0.6f, 1.00f },
+  /* Braid   */ { 0,  0,   1.20f, 1.80f, 0.55f, 0.45f, 1.600f, 1.00f, 0.6f, 1.00f },
+  /* Ribbon  */ { 5,  88,  1.10f, 1.70f, 0.52f, 0.44f, 1.500f, 0.85f, 0.6f, 1.00f },
+  /* Ring    */ { 5,  88,  1.10f, 1.70f, 0.52f, 0.44f, 1.200f, 0.85f, 0.6f, 1.00f },
+  /* Morph   */ { 0,  0,   1.10f, 0.00f, 0.20f, 0.00f, 1.000f, 1.00f, 0.6f, 1.00f },
 };
 
 const Profile& profileFor(OrbMode m) { return kProfiles[static_cast<uint8_t>(m)]; }
@@ -428,6 +428,256 @@ uint16_t ThinkingOrb::emitWeb(float t) {
   return n;
 }
 
+// --- Ghost sphere: the faint dotted shell braid and ribbon sit inside --------------------------
+uint16_t ThinkingOrb::emitGhostSphere(float t, float R, uint16_t& n) {
+  const float rs = radiusScale();
+  constexpr int kGhost = 110;
+  for (int i = 0; i < kGhost; ++i) {
+    float dx, dy, dz;
+    fibDir(i, kGhost, dx, dy, dz);
+    float px, py, depth;
+    projectPoint(dx, dy, dz, px, py, depth);
+    // Very faint and very small: this is a hint of the surface the strands wrap, not a globe.
+    pushDot(px, py, depth, 0.8f * rs, 0.78f, 0.10f + 0.22f * depth, n);
+  }
+  return n;
+}
+
+// --- Rubik: bands twist in quarter turns, scramble then solve --------------------------------
+uint16_t ThinkingOrb::emitRubik(float t) {
+  const Profile& p = profileFor(mode_);
+  setProjection(t * 0.55f, 0.35f + 0.1f * sinf(t * 0.9f), radiusPx_ * 0.82f);
+  const float rs = radiusScale();
+
+  // The palindrome: moves apply in order, then unwind in reverse, so the sphere always clicks back
+  // to solved and rests before scrambling again. That resolution is the whole character of the
+  // state — an agent that finishes, not one that churns.
+  constexpr int kMoves = 14;
+  constexpr float kSlot = 0.42f, kRest = 1.2f;
+  const float cyc = 2 * kMoves * kSlot + kRest;
+  const float tc = fmodf(t, cyc);
+
+  float amount[kMoves] = {0};
+  int active = -1;
+  if (tc < 2 * kMoves * kSlot) {
+    const int slot = (int)(tc / kSlot);
+    const float prog = (tc - slot * kSlot) / kSlot;
+    const float cl = fminf(1.0f, prog / 0.7f);
+    const float ep = 1.0f - powf(1.0f - cl, 3.0f);   // machine ease-out
+    if (slot < kMoves) {
+      for (int i = 0; i < slot; ++i) amount[i] = 1.0f;
+      amount[slot] = ep;
+      active = slot;
+    } else {
+      const int u = 2 * kMoves - 1 - slot;
+      for (int i = 0; i < u; ++i) amount[i] = 1.0f;
+      if (u >= 0 && u < kMoves) amount[u] = 1.0f - ep;
+      active = u;
+    }
+  }
+
+  uint16_t n = 0;
+  for (uint8_t li = 0; li <= latRings_; ++li) {
+    const float lat = -kPi / 2.0f + ((float)li / latRings_) * kPi;
+    const float cosLat = cosf(lat), sinLat = sinf(lat);
+    const uint16_t lonCount = (uint16_t)fmaxf(1.0f, roundf(fabsf(cosLat) * lonDensity_));
+    for (uint16_t lj = 0; lj < lonCount; ++lj) {
+      const float lon = ((float)lj / lonCount) * 2.0f * kPi;
+      float x = cosLat * cosf(lon), y = sinLat, z = cosLat * sinf(lon);
+      bool inActive = false;
+
+      for (int i = 0; i < kMoves; ++i) {
+        if (amount[i] <= 0.0f) continue;
+        const int axis = (int)fminf(2.0f, floorf(hashD(i, 2.3f) * 3.0f));
+        const float lo = -1.0f + 0.5f * fminf(3.0f, floorf(hashD(i, 5.9f) * 4.0f));
+        const float dir = hashD(i, 7.7f) < 0.5f ? 1.0f : -1.0f;
+        const float coord = axis == 0 ? x : (axis == 1 ? y : z);
+        if (coord < lo || coord >= lo + 0.5f) continue;
+        if (i == active) inActive = true;
+
+        const float a = dir * (kPi / 2.0f) * amount[i];
+        const float ca = cosf(a), sa = sinf(a);
+        if (axis == 0)      { const float y2 = y * ca - z * sa; z = y * sa + z * ca; y = y2; }
+        else if (axis == 1) { const float x2 = x * ca + z * sa; z = -x * sa + z * ca; x = x2; }
+        else                { const float x2 = x * ca - y * sa; y = x * sa + y * ca; x = x2; }
+      }
+
+      float px, py, depth;
+      projectPoint(x, y, z, px, py, depth);
+      pushDot(px, py, depth,
+              (p.rBase + p.rDepth * depth) * rs,
+              p.inkFar - p.inkSpan * depth,
+              inActive ? 1.0f : 0.72f, n);   // the turning band reads brighter
+    }
+  }
+  return n;
+}
+
+// --- Braid: three strands plait around the sphere ---------------------------------------------
+uint16_t ThinkingOrb::emitBraid(float t) {
+  const Profile& p = profileFor(mode_);
+  setProjection(t * 0.4f, 0.3f, radiusPx_ * 0.76f);
+  const float rs = radiusScale();
+
+  uint16_t n = 0;
+  emitGhostSphere(t, 1.0f, n);
+
+  constexpr int kStrand = 46;
+  constexpr float kTurns = 3.0f;
+  for (int s = 0; s < 3; ++s) {
+    const float phase = ((float)s / 3.0f) * 2.0f * kPi;
+    for (int i = 0; i < kStrand; ++i) {
+      // u walks pole to pole; the wrap slides the whole strand along its own helix.
+      float f = (float)i / kStrand + t * 0.045f;
+      f -= floorf(f);
+      const float u = (f * 2.0f - 1.0f) * 0.96f;
+      const float surf = sqrtf(fmaxf(0.0f, 1.0f - u * u));
+      const float endFade = fminf(1.0f, (1.0f - fabsf(u)) / 0.1f);
+      const float a = u * kPi * kTurns + phase;
+      // Radial breathing is what reads as over/under: the strands trade places rather than merely
+      // running parallel.
+      const float weave = 1.0f + 0.075f * sinf(u * kPi * kTurns * 2.0f + phase * 2.0f + t * 0.8f);
+      const float rr = surf * weave;
+
+      float px, py, depth;
+      projectPoint(cosf(a) * rr, u * weave, sinf(a) * rr, px, py, depth);
+      pushDot(px, py, depth,
+              (p.rBase + p.rDepth * depth) * rs,
+              0.55f - 0.45f * depth,
+              endFade * (0.45f + 0.55f * depth), n);
+    }
+  }
+  return n;
+}
+
+// --- Ribbon / Ring: an undulating multi-band sash ---------------------------------------------
+uint16_t ThinkingOrb::emitRibbon(float t, bool faceOn) {
+  const Profile& p = profileFor(mode_);
+  const float camTilt = 0.3f;
+  setProjection(t * 0.1f, camTilt, radiusPx_ * 0.78f);
+  const float rs = radiusScale();
+
+  uint16_t n = 0;
+  emitGhostSphere(t, 1.0f, n);
+
+  // The band's own frame: u and v span its plane, nrm is its normal. Advancing ya and ta rotates
+  // the sash independently of the camera, which is what stops it looking like a painted stripe.
+  const float ya = t * 0.24f;
+  const float ta = faceOn ? -camTilt : 0.55f + 0.3f * sinf(t * 0.18f);
+  const float ux = cosf(ya), uy = 0.0f, uz = sinf(ya);
+  const float vx = -uz * sinf(ta), vy = cosf(ta), vz = ux * sinf(ta);
+  const float nx = uy * vz - uz * vy, ny = uz * vx - ux * vz, nz = ux * vy - uy * vx;
+
+  const float wobAmp = 0.23f;
+  const float baseR = faceOn ? 1.0f / (1.0f + 0.85f * wobAmp) : 1.0f;
+  const int lanes = latRings_ > 0 ? latRings_ : 5;
+  const int segs = lonDensity_ > 0 ? lonDensity_ : 88;
+
+  for (int w = 0; w < lanes; ++w) {
+    const float laneOff = (w - (lanes - 1) / 2.0f) * 0.075f;
+    const float edge = fabsf(w - (lanes - 1) / 2.0f) / fmaxf(1.0f, (lanes - 1) / 2.0f);
+    for (int k = 0; k < segs; ++k) {
+      const float a = ((float)k / segs) * 2.0f * kPi;
+      const float wob = 0.16f * sinf(a * 3.0f - t * 1.7f + w * 0.22f)
+                      + 0.07f * sinf(a * 5.0f + t * 1.1f);
+
+      // Face-on modulates the in-plane radius so lobes genuinely swell outward; the sash instead
+      // wobbles out of plane, where re-normalisation pins the silhouette at R.
+      const float radial = faceOn ? 1.0f + wob : 1.0f;
+      const float off = faceOn ? laneOff : laneOff + wob;
+
+      float x = ux * cosf(a) + vx * sinf(a) + nx * off;
+      float y = uy * cosf(a) + vy * sinf(a) + ny * off;
+      float z = uz * cosf(a) + vz * sinf(a) + nz * off;
+      const float l = fmaxf(1e-6f, sqrtf(x * x + y * y + z * z));
+      const float rr = baseR * radial;
+
+      float px, py, depth;
+      projectPoint((x / l) * rr, (y / l) * rr, (z / l) * rr, px, py, depth);
+      pushDot(px, py, depth,
+              (p.rBase + p.rDepth * depth) * (1.0f - 0.25f * edge) * rs,
+              p.inkFar - p.inkSpan * depth + 0.18f * edge,
+              0.40f + 0.60f * depth, n);
+    }
+  }
+  return n;
+}
+
+// --- Morph: a dotted outline cycling circle -> triangle -> square ------------------------------
+namespace {
+
+// Each shape is sampled by arc-length fraction so dots stay evenly spaced whatever the outline,
+// and so two shapes can be blended by interpolating corresponding points.
+void shapePoint(int shape, float f, float& x, float& y) {
+  if (shape == 0) {                       // circle
+    const float a = -kPi / 2.0f + f * 2.0f * kPi;
+    x = cosf(a) * 0.24f; y = sinf(a) * 0.24f;
+    return;
+  }
+  static const float tri[3][2]  = {{0.0f, -0.26f}, {0.24f, 0.16f}, {-0.24f, 0.16f}};
+  // Five vertices so the square's path starts at top-centre like the others; a mismatch there
+  // makes the morph rotate as it transitions.
+  static const float sq[5][2]   = {{0.0f, -0.2f}, {0.2f, -0.2f}, {0.2f, 0.2f},
+                                   {-0.2f, 0.2f}, {-0.2f, -0.2f}};
+  const int V = shape == 1 ? 3 : 5;
+  const float (*verts)[2] = shape == 1 ? tri : sq;
+
+  float len[5], total = 0.0f;
+  for (int i = 0; i < V; ++i) {
+    const float dx = verts[(i + 1) % V][0] - verts[i][0];
+    const float dy = verts[(i + 1) % V][1] - verts[i][1];
+    len[i] = sqrtf(dx * dx + dy * dy);
+    total += len[i];
+  }
+  float target = f * total;
+  int i = 0;
+  while (i < V - 1 && target > len[i]) { target -= len[i]; ++i; }
+  const float ff = len[i] > 0.0f ? fminf(1.0f, target / len[i]) : 0.0f;
+  x = verts[i][0] + (verts[(i + 1) % V][0] - verts[i][0]) * ff;
+  y = verts[i][1] + (verts[(i + 1) % V][1] - verts[i][1]) * ff;
+}
+
+}  // namespace
+
+uint16_t ThinkingOrb::emitMorph(float t) {
+  const Profile& p = profileFor(mode_);
+  setProjection(0.0f, 0.0f, radiusPx_ * 2.0f);   // shapes are authored in ±0.26 units
+  const float rs = radiusScale();
+
+  constexpr float kHold = 1.4f, kMorph = 0.9f;
+  constexpr float kSeg = kHold + kMorph;
+  const int K = 3;
+  const float tc = fmodf(t, kSeg * K);
+  const int k = (int)(tc / kSeg);
+  const float local = tc - k * kSeg;
+
+  // Smoothstep, so the shapes ease into each other instead of sliding linearly.
+  float m = 0.0f;
+  if (local > kHold) {
+    const float u = (local - kHold) / kMorph;
+    m = u * u * (3.0f - 2.0f * u);
+  }
+
+  constexpr int kDots = 108;
+  const float pulse = 1.0f + 0.02f * sinf(local * 3.1f);
+
+  uint16_t n = 0;
+  for (int i = 0; i < kDots; ++i) {
+    const float f = (float)i / kDots;
+    float ax, ay, bx, by;
+    shapePoint(k, f, ax, ay);
+    shapePoint((k + 1) % K, f, bx, by);
+    const float x = (ax + (bx - ax) * m) * pulse;
+    const float y = (ay + (by - ay) * m) * pulse;
+
+    float px, py, depth;
+    projectPoint(x, y, 0.0f, px, py, depth);
+    // Flat by nature, so every dot is the same size and weight; the outline is the whole message.
+    pushDot(px, py, 0.5f, p.rBase * rs, p.inkFar, 1.0f, n);
+  }
+  return n;
+}
+
 OrbFrame ThinkingOrb::render(uint32_t elapsedMs) {
   if (!dots_ || !scratch) return {nullptr, 0, nullptr, 0};
 
@@ -437,11 +687,16 @@ OrbFrame ThinkingOrb::render(uint32_t elapsedMs) {
   lineCount_ = 0;
   uint16_t n = 0;
   switch (mode_) {
-    case OrbMode::Globe:  n = emitGlobe(t);  break;
-    case OrbMode::Wave:   n = emitWave(t);   break;
-    case OrbMode::Ring:   n = emitRing(t);   break;
-    case OrbMode::Orbits: n = emitOrbits(t); break;
-    case OrbMode::Web:    n = emitWeb(t);    break;
+    case OrbMode::Orbits: n = emitOrbits(t);       break;
+    case OrbMode::Globe:  n = emitGlobe(t);        break;
+    case OrbMode::Rubik:  n = emitRubik(t);        break;
+    case OrbMode::Wave:   n = emitWave(t);         break;
+    case OrbMode::Web:    n = emitWeb(t);          break;
+    case OrbMode::Braid:  n = emitBraid(t);        break;
+    case OrbMode::Ribbon: n = emitRibbon(t, false); break;
+    case OrbMode::Ring:   n = emitRibbon(t, true);  break;
+    case OrbMode::Morph:  n = emitMorph(t);        break;
+    default: break;
   }
 
   // Painter's order: far to near, so a near dot overwrites the one behind it.
@@ -453,19 +708,47 @@ OrbFrame ThinkingOrb::render(uint32_t elapsedMs) {
 
 OrbMode orbModeForAgentState(const String& state) {
   if (state == "running" || state == "working" || state == "dispatched") return OrbMode::Orbits;
-  if (state == "searching" || state == "thinking") return OrbMode::Globe;
+  if (state == "searching") return OrbMode::Globe;
+  if (state == "solving" || state == "planning") return OrbMode::Rubik;
   if (state == "listening" || state == "recording") return OrbMode::Wave;
   if (state == "connecting" || state == "pairing") return OrbMode::Web;
+  if (state == "weaving") return OrbMode::Braid;
+  if (state == "composing" || state == "writing") return OrbMode::Ribbon;
+  if (state == "shaping") return OrbMode::Morph;
   return OrbMode::Ring;
+}
+
+OrbMode orbModeAt(uint8_t index) {
+  const uint8_t count = (uint8_t)OrbMode::ModeCount;
+  return (OrbMode)(index % count);
+}
+
+const char* orbStateName(OrbMode mode) {
+  switch (mode) {
+    case OrbMode::Orbits: return "working";
+    case OrbMode::Globe:  return "searching";
+    case OrbMode::Rubik:  return "solving";
+    case OrbMode::Wave:   return "listening";
+    case OrbMode::Web:    return "connecting";
+    case OrbMode::Braid:  return "weaving";
+    case OrbMode::Ribbon: return "composing";
+    case OrbMode::Ring:   return "breathing";
+    case OrbMode::Morph:  return "shaping";
+    default: return "idle";
+  }
 }
 
 const char* orbLabelForMode(OrbMode mode) {
   switch (mode) {
     case OrbMode::Orbits: return "Working";
-    case OrbMode::Globe:  return "Thinking";
+    case OrbMode::Globe:  return "Searching";
+    case OrbMode::Rubik:  return "Solving";
     case OrbMode::Wave:   return "Listening";
     case OrbMode::Web:    return "Connecting";
-    case OrbMode::Ring:   return "Ready";
+    case OrbMode::Braid:  return "Weaving";
+    case OrbMode::Ribbon: return "Composing";
+    case OrbMode::Ring:   return "Thinking";
+    case OrbMode::Morph:  return "Shaping";
+    default: return "Ready";
   }
-  return "Ready";
 }
