@@ -1,5 +1,7 @@
 #include "Provisioning.h"
 
+#include "GatewayDiscovery.h"
+
 namespace {
 constexpr uint32_t kJoinTimeoutMs = 20000;
 // After this many consecutive failures the stored network is presumed wrong and the portal comes
@@ -60,18 +62,24 @@ void Provisioning::begin(DeviceStore& store, const String& apNameSeed) {
   else enterProvisioning();
 }
 
-void Provisioning::enterProvisioning() {
-  const bool keepStation = store_ != nullptr && store_->hasWifiCredentials();
+void Provisioning::enterProvisioning(bool keepStation) {
   status_.state = ProvisioningState::Provisioning;
   status_.detail = keepStation ? "Reconfigure at " + apName_ : "Join " + apName_;
-  // Only tear down a station that exists. On a first boot with no stored credentials the Wi-Fi
-  // driver has never been started, and disconnect() logs ESP_ERR_WIFI_NOT_INIT at error level --
-  // alarming, and the very first thing an owner sees on the serial console of a new unit.
-  if (WiFi.getMode() != WIFI_OFF) WiFi.disconnect(true);
-  startPortal();
+
+  // Reconfiguration keeps the station associated. That is what lets "Find gateway" in the portal
+  // actually search: a device in pure SoftAP mode is not on the network it is being asked to
+  // search, so the button could only ever time out.
+  if (!keepStation && WiFi.getMode() != WIFI_OFF) {
+    // Only tear down a station that exists. On a first boot with no stored credentials the Wi-Fi
+    // driver has never been started, and disconnect() logs ESP_ERR_WIFI_NOT_INIT at error level --
+    // alarming, and the very first thing an owner sees on the serial console of a new unit.
+    WiFi.disconnect(true);
+  }
+  startPortal(keepStation);
 }
 
 void Provisioning::enterConnecting() {
+  configPortal_ = false;
   stopPortal();
   status_.state = ProvisioningState::Connecting;
   status_.detail = store_->wifiSsid();
@@ -91,7 +99,8 @@ void Provisioning::resetToProvisioning() {
 void Provisioning::openConfigPortal() {
   status_.joinFailures = 0;
   portalError_ = "Update the gateway URL, then Save.";
-  enterProvisioning();
+  configPortal_ = store_ != nullptr && store_->hasWifiCredentials();
+  enterProvisioning(configPortal_);
 }
 
 bool Provisioning::consumeJustConnected() {
@@ -173,11 +182,13 @@ ProvisioningState Provisioning::poll() {
   return status_.state;
 }
 
-void Provisioning::startPortal() {
+void Provisioning::startPortal(bool keepStation) {
   if (portalUp_) return;
   // Every step is checked and logged. A portal that reports itself up while the radio silently
   // refused to start is indistinguishable, from the owner's side, from a dead device.
-  const bool modeOk = WiFi.mode(WIFI_AP);
+  // AP_STA when reconfiguring, so the owner reaches the portal over the device's own AP while the
+  // device stays on their network and can still see the gateway.
+  const bool modeOk = WiFi.mode(keepStation ? WIFI_AP_STA : WIFI_AP);
   const bool apOk = WiFi.softAP(apName_.c_str());
   delay(100);
   const IPAddress ip = WiFi.softAPIP();
@@ -267,8 +278,15 @@ void Provisioning::handlePortalRoot() {
     "<input id=\"password\" name=\"password\" type=\"password\" autocomplete=\"off\">"
     "<label for=\"gateway\">Gateway URL</label>"
     "<input id=\"gateway\" name=\"gateway\" type=\"url\" value=\""
-    + htmlEscape(store_->gatewayUrl()) + "\">"
-    "<button type=\"submit\">Save</button></form>"
+    + htmlEscape(discovered_.length() ? discovered_ : store_->gatewayUrl()) + "\">"
+    // Only offered when the device is still on the owner's network. In first-time setup it is in
+    // pure SoftAP mode, is not on that network, and the search could only time out — a button that
+    // cannot work is worse than no button.
+    + String(configPortal_
+        ? "<button type=\"submit\" name=\"action\" value=\"discover\" class=\"secondary\">"
+          "Find gateway on this network</button>"
+        : "")
+    + "<button type=\"submit\">Save</button></form>"
     "<p class=\"hint\">To correct only the gateway, leave the network blank and press Save; "
     "the controller keeps the Wi-Fi it already has.</p>"
     "<p class=\"hint\">The controller tries the network before saving it, so a wrong password "
@@ -280,6 +298,21 @@ void Provisioning::handlePortalRoot() {
 
 void Provisioning::handlePortalSubmit() {
   portalLastClientAt_ = millis();
+
+  if (server_.arg("action") == "discover") {
+    const GatewayCandidate found = discoverGateway();
+    if (found.found) {
+      discovered_ = found.baseUrl;
+      portalError_ = "Found " + (found.name.length() ? found.name : String("a gateway"))
+                   + ". Press Save to use it.";
+    } else {
+      discovered_ = "";
+      portalError_ = "No gateway answered on this network.";
+    }
+    handlePortalRoot();
+    return;
+  }
+
   const String ssid = server_.arg("ssid");
   const String password = server_.arg("password");
   const String gateway = server_.arg("gateway");

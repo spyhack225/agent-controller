@@ -1,6 +1,7 @@
 #include "gatewayProbe.h"
 
 #include <DeviceStore.h>
+#include <GatewayDiscovery.h>
 #include <HTTPClient.h>
 #include <WiFi.h>
 #include <WiFiClientSecure.h>
@@ -71,7 +72,29 @@ void probeTask(void*) {
       if (WiFi.status() != WL_CONNECTED) {
         status = GatewayStatus::Unknown;
       } else {
-        const GatewayStatus s = probeOnce(deviceStore().gatewayUrl());
+        GatewayStatus s = probeOnce(deviceStore().gatewayUrl());
+
+        // If the configured gateway does not answer, look for one. An address that cannot be
+        // reached is worth nothing, so replacing it with one that can is never a downgrade — and
+        // this is the whole reason a device on the same network should not need to be told an
+        // address in the first place.
+        //
+        // Only on failure, never on success: a working gateway is not second-guessed because some
+        // other machine on the network also answered.
+        if (s != GatewayStatus::Reachable) {
+          const GatewayCandidate found = discoverGateway();
+          if (found.found && found.baseUrl != deviceStore().gatewayUrl()) {
+            const GatewayStatus probed = probeOnce(found.baseUrl);
+            if (probed == GatewayStatus::Reachable) {
+              Serial.printf("[gateway] adopting discovered %s (%s); previous %s was %s\n",
+                            found.baseUrl.c_str(), found.name.c_str(),
+                            deviceStore().gatewayUrl().c_str(), gatewayStatusText(s));
+              deviceStore().setGatewayUrl(found.baseUrl);
+              s = probed;
+            }
+          }
+        }
+
         if (s != status) {
           Serial.printf("[gateway] %s -> %s\n", deviceStore().gatewayUrl().c_str(),
                         gatewayStatusText(s));

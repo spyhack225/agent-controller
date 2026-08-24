@@ -60,13 +60,17 @@ class Provisioning {
   // which also destroys working Wi-Fi credentials the owner had no reason to lose.
   void openConfigPortal();
 
+  // True while the portal was opened for reconfiguration rather than first-time setup, which is
+  // when the station stays up and LAN discovery can work.
+  bool configPortalActive() const { return configPortal_; }
+
   // True exactly once after a successful join, so the caller can re-run its gateway handshake.
   bool consumeJustConnected();
 
  private:
-  void enterProvisioning();
+  void enterProvisioning(bool keepStation = false);
   void enterConnecting();
-  void startPortal();
+  void startPortal(bool keepStation = false);
   void stopPortal();
   void handlePortalRoot();
   void handlePortalSubmit();
@@ -75,6 +79,8 @@ class Provisioning {
   String scanOptionsHtml();
 
   DeviceStore* store_ = nullptr;
+  bool configPortal_ = false;
+  String discovered_;   // result of the last portal search, prefilled into the form
   ProvisioningStatus status_;
   String apName_;
   DNSServer dns_;
