@@ -1,0 +1,109 @@
+#pragma once
+
+// The drawing vocabulary the screens are built from, with no screen state in it.
+//
+// Split out of ui.cpp when the UI stopped being rectangles. The reason for the split is not line
+// count: these are the only functions in the firmware that decide what the product LOOKS like, and
+// having them in one file with no `screen` variable in sight is what stops a shape being tuned for
+// one screen and diverging on the next.
+//
+// Everything here resolves through display.cpp's soft-shape primitives, which composite an
+// anti-aliased distance field rather than filling a rectangle. There is deliberately no wrapper for
+// fillRect or drawFastHLine: clearing a band is still a rectangle because it is invisible, but
+// nothing a person can see is drawn with a hard corner or a one-pixel rule.
+
+#include <Arduino.h>
+
+namespace uip {
+
+constexpr int16_t kW = 240;
+constexpr int16_t kH = 320;
+
+// Greys, before panelGrey(). The two surface tones are new: a card that is a slightly lifted
+// ground rather than an outlined box is what lets a list stop needing separators between every
+// row.
+constexpr uint8_t kBg = 0;          // #000, the ground the orb sits on
+constexpr uint8_t kSurface = 20;    // a card, barely lifted off the ground
+constexpr uint8_t kSurfaceHi = 38;  // the lifted card: the drawer, the action tray
+constexpr uint8_t kHair = 54;       // curved separators, disabled ink
+constexpr uint8_t kMuted = 132;     // secondary text
+constexpr uint8_t kText = 205;      // primary text
+constexpr uint8_t kBright = 255;    // the one thing on the screen that matters
+
+// 6 px per character at text size 1, 12 px at size 2. Everything that truncates counts characters,
+// not pixels, because the font is fixed-width and counting pixels twice invites them to disagree.
+constexpr size_t kCols1 = 38;
+constexpr size_t kCols2 = 19;
+
+struct Rect {
+  int16_t x, y, w, h;
+};
+
+bool hit(const Rect& r, int16_t x, int16_t y);
+
+// ---------------------------------------------------------------------------------------------
+// Motion
+// ---------------------------------------------------------------------------------------------
+//
+// Nothing in this UI moves linearly. A panel that arrives at constant speed and stops dead reads
+// as a redraw; the same distance over the same time with a decelerating tail reads as a thing that
+// came to rest.
+
+float easeOutCubic(float t);
+float easeInOutCubic(float t);
+
+// Advances `value` towards `target` at a rate of one full traversal per `durationMs`, given a frame
+// of `frameMs`. Returns the new value; compare it with the old one to know whether to keep
+// painting.
+float approach(float value, float target, uint32_t frameMs, uint32_t durationMs);
+
+// ---------------------------------------------------------------------------------------------
+// Text
+// ---------------------------------------------------------------------------------------------
+
+String fit(const String& value, size_t cols);
+void text(int16_t x, int16_t y, uint8_t size, uint8_t grey, const String& value);
+void textCentered(int16_t y, uint8_t size, uint8_t grey, const String& value);
+void textCenteredIn(const Rect& r, int16_t y, uint8_t size, uint8_t grey, const String& value);
+void textRight(int16_t right, int16_t y, uint8_t size, uint8_t grey, const String& value);
+
+// Word wrap into a caller-owned array. Returns the number of lines written. A word longer than the
+// column count is broken rather than allowed to run off the edge — a URL or a file path is exactly
+// the kind of unbroken token an assistant reply is full of.
+size_t wrapText(const String& value, size_t cols, String* out, size_t maxLines);
+
+// ---------------------------------------------------------------------------------------------
+// Shapes
+// ---------------------------------------------------------------------------------------------
+
+// A rounded surface. `fill` and `stroke` take -1 for "none".
+// `bg` is the ground the shape is composited against. It is a parameter and not a constant
+// because these nest: a marker inside a card, a chevron inside the drawer, a button inside the
+// action tray. Compositing an anti-aliased edge against the wrong ground draws a dark halo around
+// it, which is the one artefact that makes soft edges look worse than hard ones.
+void card(const Rect& r, float radius, int16_t fill, int16_t stroke, float strokeWidth = 1.3f,
+          float feather = 1.2f, uint8_t bg = kBg);
+
+// A card whose corners are its own half-height: the shape every button, pill and badge in this UI
+// is, so that nothing on the glass has a corner tighter than the orb's own curvature.
+void capsule(const Rect& r, int16_t fill, int16_t stroke, float strokeWidth = 1.3f,
+             float feather = 1.2f, uint8_t bg = kBg);
+
+// A button. Primary is filled and reads as the thing to press; secondary is an outline. Disabled is
+// neither — it is drawn, because a control that vanishes when it cannot be used is a control nobody
+// learns exists.
+void button(const Rect& r, const String& label, bool primary, bool enabled, uint8_t bg = kBg);
+
+// The separator between two list rows. Curved, faded at both ends, and never touching the bezel.
+void divider(int16_t x, int16_t y, int16_t w, uint8_t grey = kHair, uint8_t bg = kBg);
+
+void dot(int16_t cx, int16_t cy, float radius, uint8_t grey, uint8_t bg = kBg);
+
+// A chevron built from two soft segments. `dir` is -1 left, 1 right, 2 down, -2 up.
+void chevron(int16_t cx, int16_t cy, float size, int8_t dir, uint8_t grey, float thickness = 2.0f,
+             uint8_t bg = kBg);
+
+// The marker beside the selected row of a list: a short vertical capsule, not a filled rectangle.
+void marker(int16_t x, int16_t y, int16_t h, uint8_t grey, uint8_t bg = kBg);
+
+}  // namespace uip

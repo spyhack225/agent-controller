@@ -47,11 +47,22 @@ bool displayBegin();
 
 // Allocates the off-screen canvases the orb and label composite into. Must be called after
 // displayBegin() and before either draw function.
-bool displayBeginCanvases(uint16_t orbSize);
+//
+// `miniSize` allocates a second, smaller coverage buffer. It exists because the list screens have
+// no room for the 148 px orb but still have to show that the agent is doing something: a screen
+// where the only moving thing stops moving reads as a hang, and the hang it looks like is the one
+// the device is most likely to actually have. Pass 0 to skip it.
+bool displayBeginCanvases(uint16_t orbSize, uint16_t miniSize = 0);
 
 // Paints one orb frame centred at (cx, cy). Dots are drawn far-to-near as the renderer ordered
 // them, so overlap reads as depth.
+//
+// The orb's own diameter() decides the box; it must not exceed the size the matching canvas was
+// allocated with, so the two calls take separate ThinkingOrb instances rather than one resized
+// between screens (resizing reallocates and rebuilds the geometry, which is not a per-frame cost
+// anyone should pay).
 void displayDrawOrb(ThinkingOrb& orb, int16_t cx, int16_t cy, uint32_t elapsedMs);
+void displayDrawMiniOrb(ThinkingOrb& orb, int16_t cx, int16_t cy, uint32_t elapsedMs);
 
 // The status line under the orb, with the shimmer sweep the web component uses. `phase` advances
 // the highlight; pass the same elapsedMs as the orb.
@@ -66,3 +77,37 @@ Adafruit_ILI9341& displayPanel();
 // True once displayBegin() has run successfully. Everything that draws checks this, so a board
 // with ENABLE_LCD 0 or a failed init degrades to serial-only rather than crashing.
 bool displayReady();
+
+// ---------------------------------------------------------------------------------------------
+// Soft shapes
+// ---------------------------------------------------------------------------------------------
+//
+// The orb is an anti-aliased point cloud. Everything that used to be drawn beside it was
+// fillRect corners and 1 px hairlines, which is a different product sharing one piece of glass.
+// These composite a signed-distance field straight onto the panel through the same DMA staging
+// row the orb blit uses: no second buffer, coverage blended against a known flat ground, and a
+// `feather` that can be wider than one pixel where an edge should read as soft rather than merely
+// un-jagged.
+//
+// Greys are 0..255 BEFORE panelGrey(), matching the rest of this adapter. `fillGrey` and
+// `strokeGrey` accept -1 for "none", which is how a stroke-only capsule or a plain fill is asked
+// for without two functions.
+//
+// Everything here clips to the panel. The staging row holds exactly one panel width, so a shape
+// that starts left of the origin or runs past the right edge is trimmed against THAT row's
+// capacity rather than the shape's own.
+
+// A rounded rectangle. `radius >= min(w, h) / 2` is a capsule; `radius == 0` is a rectangle with
+// anti-aliased edges, which is still not the same thing as fillRect and is not what this is for.
+void displaySoftRoundRect(int16_t x, int16_t y, int16_t w, int16_t h, float radius,
+                          uint8_t bgGrey, int16_t fillGrey, int16_t strokeGrey,
+                          float strokeWidth = 1.4f, float feather = 1.0f);
+
+// A capsule-ended line at any angle: chevrons, back arrows, the marker beside a selected row.
+void displaySoftSegment(float x0, float y0, float x1, float y1, float thickness,
+                        uint8_t bgGrey, uint8_t inkGrey, float feather = 1.0f);
+
+// The replacement for drawFastHLine. A shallow parabolic sag with both ends faded out, so a list
+// separator is a curve that stops rather than a rule that hits the bezel.
+void displaySoftArcDivider(int16_t x, int16_t y, int16_t w, float sag, float thickness,
+                           uint8_t bgGrey, uint8_t inkGrey);

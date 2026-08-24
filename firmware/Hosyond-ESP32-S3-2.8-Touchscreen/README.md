@@ -242,26 +242,60 @@ real board lights up with red and green swapped, `LED_COLOR_ORDER_GRB` is the sw
 
 ## The screens
 
-`src/ui.cpp` owns five screens over the shared `GatewayClient`. The tab bar along the bottom is the
-only screen navigation; a vertical drag scrolls a list, and a horizontal swipe pages the response —
-one gesture, one meaning, because a gesture that does two things depending on where the finger
-happens to be is how a device with no labels becomes unusable.
+`src/ui.cpp` owns the screens; `src/ui_paint.cpp` owns the shapes they are drawn from.
+
+**There is no tab bar.** Navigation is a status drawer pulled down out of the header, and the bottom
+of the screen carries a contextual action bar that is drawn only while there is something to press.
+A permanent five-tab strip spent 42 px advertising four destinations that were usually inert; the
+drawer says what is actually true of the device and doubles as the way to the screen that fixes it.
+
+- **Pull down, or tap the header**, for DEVICE / GATEWAY / THREAD / ACTIVITY — each a one-line
+  status and each a route to where that thing is changed. Only the rows the device's state justifies
+  are drawn: an unclaimed unit has no thread and no activity, because every route behind both
+  answers 403.
+- **The action bar** carries at most three things, all of them doable on the screen in front of you:
+  APPROVE/REJECT on a held command, SEND/DISCARD on a recorded clip, PREV/NEXT on a paged reply,
+  RETRY on a failed turn, RELOAD on an empty list. When it has nothing, it is not drawn and those
+  58 px belong to the content.
+- **A vertical drag** scrolls a list, **a horizontal swipe** pages the response, and **a drag that
+  started in the header** pulls the drawer. One gesture, one meaning, decided by where the finger
+  landed rather than by where it ended up.
 
 | Screen | What it is for |
 |---|---|
 | **HOME** | The orb, the selected thread, and the last thing that happened. The orb's mode comes from `orbModeForAgentState()`, fed by the best signal the device protocol carries: a live recording, then a response still arriving, then the selected thread's status |
-| **THREADS** | The thread list, scrolled with a finger; tapping a row selects it. The bound environment id is shown and never chosen — see below |
+| **THREADS** | The thread list, scrolled with a finger; tapping a row selects it. The breadcrumb capsule at the top shows the bound environment and folder, and opens the browser |
+| **ENVIRONMENTS** | Which paired T3 host this controller drives. Tapping a row `POST`s it and clears the folder and thread, because those ids only meant something inside the environment being left |
+| **FOLDERS** | The projects inside the bound environment, each with its thread count. There is no "all folders" row: `POST /v1/device/config/project` reads `projectId` as a required string, so widening the scope again is a console operation |
 | **SEND** | Hold-to-talk at the top, saved actions below. There is no keyboard and there will not be one: on this device a request is voice or a choice the owner saved earlier |
 | **REPLY** | The assistant's answer, paged. The gateway wraps to 31 characters for a 122x250 e-ink panel; this screen re-joins and re-wraps to 19 so the text can be size 2 and read at arm's length |
 | **APPROVALS** | One held command at a time with REJECT and APPROVE. Approve goes through a second confirm, because it runs on the owner's own machine |
+| **DEVICE** / **GATEWAY** | Identity, Wi-Fi, model, URL, link and probe state, with the config portal and the provisioning reset behind them. Both stay reachable on an unclaimed unit, because they are what somebody opens when the claim screen is not working |
 
-An unclaimed device gets none of that. It shows the claim code and the three steps to use it, with
-no tab bar at all — every tab it could offer answers 403 until somebody owns it.
+An unclaimed device gets none of the thread-shaped screens. It shows the claim code and the three
+steps to use it, with no action bar at all — rotating the code invalidates the number the owner may
+be part-way through typing, so it stays behind a deliberate tap on the code itself.
 
-**There is no environments -> projects -> threads picker, and cannot be one.** The device protocol
-exposes no list of either: the owner binds one environment in the console and the hardware works
-inside it (`docs/hardware-protocol.md`, "Thread API"). `GET /v1/device/threads` is the whole picker
-the protocol offers, and a project appears only as a number in the display payload's counts.
+### Environment -> project -> thread
+
+The gateway grew device-facing endpoints for the two levels above a thread
+(`docs/hardware-protocol.md`, "Environment, project, and thread API"), and
+`firmware/shared/AgentControllerCore/src/GatewayBrowse.cpp` is the client for them:
+`GET/POST /v1/device/environments` and `/v1/device/projects`, in their own translation unit with
+their own state rather than as new members on `GatewayClient`.
+
+Older comments in this tree still say a picker is impossible because `GET /v1/device/threads` is
+the only list the protocol offers. That was true and is not any more.
+
+### The shapes
+
+The orb is an anti-aliased point cloud with no straight edge in it, and everything drawn beside it
+used to be a hard-cornered `fillRect` and a one-pixel rule. `displaySoftRoundRect`,
+`displaySoftSegment` and `displaySoftArcDivider` in `src/display.cpp` composite a signed distance
+field through the same DMA staging row the orb blit already uses — no second buffer, and a
+`feather` that can be wider than a pixel where an edge should read as soft rather than merely
+un-jagged. Separators are shallow arcs that fade out before either bezel; every button is a
+capsule; the drawer and the action tray are surfaces that slide, eased, rather than appearing.
 
 ### Push-to-talk
 
@@ -312,9 +346,12 @@ In dependency order:
 
 ## What is unverified
 
-1. **Everything on the glass.** The five screens, the tab bar, every tap target, the list scrolling,
-   push-to-talk, media upload, and every gateway call behind them were written without a board
-   attached. They compile; nothing has been executed.
+1. **Everything on the glass.** Every screen, the status drawer, the action bar, all the soft
+   shapes, every tap target, the list scrolling, push-to-talk, media upload, and every gateway call
+   behind them were written without a board attached. They compile; nothing has been executed. The
+   frame cost of the drawer's largest slide frame — a 240x240 distance-field fill plus its band
+   clear — is estimated, not measured: read `draw<=` off the `[fps]` line on real hardware before
+   believing it.
 2. **The touch coordinate mapping.** `src/touch.cpp` maps the FT6336G's frame onto the panel's as
    the identity, which is what the vendor's own examples do at rotation 0 — but it has never been
    checked against a finger. If the tap targets are mirrored or transposed, the fix is one of the

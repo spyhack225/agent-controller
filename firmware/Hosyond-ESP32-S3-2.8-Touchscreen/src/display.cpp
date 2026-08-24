@@ -143,6 +143,12 @@ class InternalCanvas16 : public GFXcanvas16 {
 uint8_t* orbGrey = nullptr;
 int16_t orbDim = 0;
 
+// The list screens' activity indicator. A 44 px orb is 1.9 KB against the main orb's 22 KB, and
+// its dot budget is small enough that the whole frame is dominated by the blit rather than the
+// maths.
+uint8_t* miniGrey = nullptr;
+int16_t miniDim = 0;
+
 InternalCanvas16* labelCanvas = nullptr;
 
 constexpr int16_t kLabelH = 22;
@@ -169,13 +175,18 @@ void pushRow(Adafruit_ILI9341& g, const uint16_t* src, int16_t len) {
 
 }  // namespace
 
-bool displayBeginCanvases(uint16_t orbSize) {
+bool displayBeginCanvases(uint16_t orbSize, uint16_t miniSize) {
   const uint32_t heapBefore = ESP.getFreeHeap();
 
   if (!orbGrey) {
     orbDim = (int16_t)orbSize;
     orbGrey = (uint8_t*)heap_caps_malloc((size_t)orbSize * orbSize,
                                          MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+  }
+  if (!miniGrey && miniSize > 0) {
+    miniDim = (int16_t)miniSize;
+    miniGrey = (uint8_t*)heap_caps_malloc((size_t)miniSize * miniSize,
+                                          MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
   }
   if (!labelCanvas) labelCanvas = new InternalCanvas16(240, kLabelH);
 
@@ -200,35 +211,48 @@ bool displayBeginCanvases(uint16_t orbSize) {
     Serial.println("[display] BUFFER ALLOCATION FAILED — the orb cannot be composited.");
     return false;
   }
+  if (miniSize > 0 && !miniGrey) {
+    Serial.println("[display] Mini-orb buffer failed; list screens will be static.");
+  }
   return true;
 }
 
-void displayDrawOrb(ThinkingOrb& orb, int16_t cx, int16_t cy, uint32_t elapsedMs) {
-  if (!displayReady() || !orbGrey || !dmaRow) return;
+namespace {
+
+void blitOrb(ThinkingOrb& orb, int16_t cx, int16_t cy, uint32_t elapsedMs, uint8_t* grey,
+             int16_t dim) {
+  if (!displayReady() || !grey || !dmaRow) return;
 
   const OrbFrame frame = orb.render(elapsedMs);
-
-  const int16_t w = orbDim;
-  const int16_t h = orbDim;
-  const int16_t mid = w / 2;
+  const int16_t mid = dim / 2;
 
   // Rasterised by the shared painter, so this board and every other draw the identical orb. An
   // e-paper controller and an AMOLED one should be recognisably the same product, which they will
   // not be if each grows its own rasteriser.
-  paintOrbCoverage(frame, orbGrey, w);
+  paintOrbCoverage(frame, grey, dim);
 
   // Convert a row at a time straight into the DMA staging buffer. The 8-bit coverage buffer is half
   // the RAM of the RGB565 canvas it replaces, and the colour conversion has to happen on the way
   // out regardless.
   Adafruit_ILI9341& g = displayPanel();
   g.startWrite();
-  g.setAddrWindow(cx - mid, cy - mid, w, h);
-  for (int16_t row = 0; row < h; ++row) {
-    const uint8_t* src = orbGrey + (size_t)row * w;
-    for (int16_t col = 0; col < w; ++col) dmaRow[col] = panelGrey(src[col]);
-    g.writePixels(dmaRow, w);
+  g.setAddrWindow(cx - mid, cy - mid, dim, dim);
+  for (int16_t row = 0; row < dim; ++row) {
+    const uint8_t* src = grey + (size_t)row * dim;
+    for (int16_t col = 0; col < dim; ++col) dmaRow[col] = panelGrey(src[col]);
+    g.writePixels(dmaRow, dim);
   }
   g.endWrite();
+}
+
+}  // namespace
+
+void displayDrawOrb(ThinkingOrb& orb, int16_t cx, int16_t cy, uint32_t elapsedMs) {
+  blitOrb(orb, cx, cy, elapsedMs, orbGrey, orbDim);
+}
+
+void displayDrawMiniOrb(ThinkingOrb& orb, int16_t cx, int16_t cy, uint32_t elapsedMs) {
+  blitOrb(orb, cx, cy, elapsedMs, miniGrey, miniDim);
 }
 
 void displayClearStatus(int16_t cy) {
@@ -282,6 +306,175 @@ void displayDrawStatus(const char* label, int16_t cy, uint32_t elapsedMs) {
   g.setAddrWindow(stripX, cy - 4, stripW, kLabelH);
   for (int16_t row = 0; row < kLabelH; ++row) {
     pushRow(g, buf + (size_t)row * 240, stripW);
+  }
+  g.endWrite();
+}
+
+// ---------------------------------------------------------------------------------------------
+// Soft shapes
+// ---------------------------------------------------------------------------------------------
+
+namespace {
+
+// The panel's own frame at rotation 0, and — not incidentally — the capacity of `dmaRow`. Every
+// clip below is taken against THIS, the buffer actually being written, rather than against the
+// dimensions of the shape being asked for.
+constexpr int16_t kPanelW = 240;
+constexpr int16_t kPanelH = 320;
+
+inline float clamp01(float v) { return v < 0.0f ? 0.0f : (v > 1.0f ? 1.0f : v); }
+
+// One coverage step. The ground under everything this draws is flat, so a blend is a lerp and
+// there is nothing to read back off the panel.
+inline float over(float base, float ink, float cov) { return base + (ink - base) * cov; }
+
+// Signed distance to a rounded box centred on the origin. Negative inside. The square-root is only
+// reached in the four corner quadrants; the straight bands resolve without one, which is what keeps
+// a 240 px wide tray affordable once a frame.
+inline float roundBoxSdf(float px, float py, float halfW, float halfH, float r) {
+  const float qx = fabsf(px) - (halfW - r);
+  const float qy = fabsf(py) - (halfH - r);
+  if (qx > 0.0f && qy > 0.0f) return sqrtf(qx * qx + qy * qy) - r;
+  const float outer = qx > qy ? qx : qy;
+  return (outer < 0.0f ? outer : 0.0f) + (qx > 0.0f ? qx : (qy > 0.0f ? qy : 0.0f)) - r;
+}
+
+}  // namespace
+
+void displaySoftRoundRect(int16_t x, int16_t y, int16_t w, int16_t h, float radius,
+                          uint8_t bgGrey, int16_t fillGrey, int16_t strokeGrey,
+                          float strokeWidth, float feather) {
+  if (!displayReady() || !dmaRow || w <= 0 || h <= 0) return;
+
+  int16_t x0 = x, y0 = y;
+  int16_t x1 = (int16_t)(x + w), y1 = (int16_t)(y + h);
+  if (x0 < 0) x0 = 0;
+  if (y0 < 0) y0 = 0;
+  if (x1 > kPanelW) x1 = kPanelW;
+  if (y1 > kPanelH) y1 = kPanelH;
+  if (x1 <= x0 || y1 <= y0) return;
+  const int16_t vw = (int16_t)(x1 - x0);
+
+  const float cx = x + w * 0.5f;
+  const float cy = y + h * 0.5f;
+  const float halfW = w * 0.5f;
+  const float halfH = h * 0.5f;
+  float r = radius;
+  const float rMax = halfW < halfH ? halfW : halfH;
+  if (r > rMax) r = rMax;
+  if (r < 0.0f) r = 0.0f;
+
+  const float f = feather < 0.35f ? 0.35f : feather;
+  const float halfStroke = strokeWidth * 0.5f;
+  const float base = (float)bgGrey;
+  const float fill = fillGrey >= 0 ? (float)fillGrey : base;
+  const bool wantFill = fillGrey >= 0;
+  const bool wantStroke = strokeGrey >= 0 && strokeWidth > 0.0f;
+  const float stroke = wantStroke ? (float)strokeGrey : base;
+
+  Adafruit_ILI9341& g = displayPanel();
+  g.startWrite();
+  g.setAddrWindow(x0, y0, vw, (int16_t)(y1 - y0));
+  for (int16_t py = y0; py < y1; ++py) {
+    const float fy = (py + 0.5f) - cy;
+    for (int16_t col = 0; col < vw; ++col) {
+      const float fx = (x0 + col + 0.5f) - cx;
+      const float d = roundBoxSdf(fx, fy, halfW, halfH, r);
+      float v = base;
+      if (wantFill) v = over(v, fill, clamp01(0.5f - d / f));
+      if (wantStroke) v = over(v, stroke, clamp01((halfStroke - fabsf(d)) / f + 0.5f));
+      dmaRow[col] = panelGrey((uint8_t)(v + 0.5f));
+    }
+    g.writePixels(dmaRow, vw);
+  }
+  g.endWrite();
+}
+
+void displaySoftSegment(float x0f, float y0f, float x1f, float y1f, float thickness,
+                        uint8_t bgGrey, uint8_t inkGrey, float feather) {
+  if (!displayReady() || !dmaRow || thickness <= 0.0f) return;
+
+  const float pad = thickness * 0.5f + feather + 1.0f;
+  int16_t x0 = (int16_t)floorf((x0f < x1f ? x0f : x1f) - pad);
+  int16_t x1 = (int16_t)ceilf((x0f > x1f ? x0f : x1f) + pad);
+  int16_t y0 = (int16_t)floorf((y0f < y1f ? y0f : y1f) - pad);
+  int16_t y1 = (int16_t)ceilf((y0f > y1f ? y0f : y1f) + pad);
+  if (x0 < 0) x0 = 0;
+  if (y0 < 0) y0 = 0;
+  if (x1 > kPanelW) x1 = kPanelW;
+  if (y1 > kPanelH) y1 = kPanelH;
+  if (x1 <= x0 || y1 <= y0) return;
+  const int16_t vw = (int16_t)(x1 - x0);
+
+  const float ex = x1f - x0f, ey = y1f - y0f;
+  const float lenSq = ex * ex + ey * ey;
+  const float invLenSq = lenSq > 0.0001f ? 1.0f / lenSq : 0.0f;
+  const float f = feather < 0.35f ? 0.35f : feather;
+  const float half = thickness * 0.5f;
+  const float base = (float)bgGrey;
+  const float ink = (float)inkGrey;
+
+  Adafruit_ILI9341& g = displayPanel();
+  g.startWrite();
+  g.setAddrWindow(x0, y0, vw, (int16_t)(y1 - y0));
+  for (int16_t py = y0; py < y1; ++py) {
+    const float fy = py + 0.5f;
+    for (int16_t col = 0; col < vw; ++col) {
+      const float fx = x0 + col + 0.5f;
+      float t = ((fx - x0f) * ex + (fy - y0f) * ey) * invLenSq;
+      t = clamp01(t);
+      const float dx = fx - (x0f + ex * t);
+      const float dy = fy - (y0f + ey * t);
+      const float d = sqrtf(dx * dx + dy * dy) - half;
+      dmaRow[col] = panelGrey((uint8_t)(over(base, ink, clamp01(0.5f - d / f)) + 0.5f));
+    }
+    g.writePixels(dmaRow, vw);
+  }
+  g.endWrite();
+}
+
+void displaySoftArcDivider(int16_t x, int16_t y, int16_t w, float sag, float thickness,
+                           uint8_t bgGrey, uint8_t inkGrey) {
+  if (!displayReady() || !dmaRow || w <= 1) return;
+
+  // A parabola, not a sine. At this sag the two are indistinguishable and this one costs two
+  // multiplies per column instead of a transcendental per pixel — which matters because the
+  // separator between two list rows is drawn once per visible row, per repaint.
+  const float bandTop = y - thickness;
+  const float bandBottom = y + sag + thickness + 1.0f;
+  int16_t x0 = x, x1 = (int16_t)(x + w);
+  int16_t y0 = (int16_t)floorf(bandTop), y1 = (int16_t)ceilf(bandBottom);
+  if (x0 < 0) x0 = 0;
+  if (y0 < 0) y0 = 0;
+  if (x1 > kPanelW) x1 = kPanelW;
+  if (y1 > kPanelH) y1 = kPanelH;
+  if (x1 <= x0 || y1 <= y0) return;
+  const int16_t vw = (int16_t)(x1 - x0);
+
+  const float invSpan = 1.0f / (float)(w - 1);
+  const float half = thickness * 0.5f;
+  const float base = (float)bgGrey;
+  const float ink = (float)inkGrey;
+  // Both ends fade out over a fifth of the width. A separator that runs into the bezel is a rule;
+  // one that dissolves before it gets there is a curve that knows where it stops.
+  constexpr float kFade = 0.22f;
+
+  Adafruit_ILI9341& g = displayPanel();
+  g.startWrite();
+  g.setAddrWindow(x0, y0, vw, (int16_t)(y1 - y0));
+  for (int16_t py = y0; py < y1; ++py) {
+    const float fy = py + 0.5f;
+    for (int16_t col = 0; col < vw; ++col) {
+      const float t = clamp01((float)(x0 + col - x) * invSpan);
+      const float curve = y + sag * 4.0f * t * (1.0f - t);
+      float edge = 1.0f;
+      if (t < kFade) edge = t / kFade;
+      else if (t > 1.0f - kFade) edge = (1.0f - t) / kFade;
+      edge = edge * edge * (3.0f - 2.0f * edge);
+      const float cov = clamp01(half - fabsf(fy - curve) + 0.5f) * edge;
+      dmaRow[col] = panelGrey((uint8_t)(over(base, ink, cov) + 0.5f));
+    }
+    g.writePixels(dmaRow, vw);
   }
   g.endWrite();
 }

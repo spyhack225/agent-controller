@@ -8,6 +8,27 @@
 #include "controller_config.example.h"
 #endif
 
+// Controller-to-panel mapping.
+//
+// The vendor's own examples map the FT6336G's raw range straight onto the display at rotation 0:
+// x over 0..240, y over 0..320, no swap and no inversion (docs/.../Example_29_touch_pen/touch.h).
+// This adapter runs the panel at rotation 0, so the mapping is the identity — but it is expressed
+// as three flags in one place because a touch panel bonded the other way up is a one-line fix here
+// and an unfindable bug everywhere else. TOUCH_TRACE prints raw and mapped coordinates so a bench
+// session can tell which of the three is wrong rather than guessing.
+#ifndef TOUCH_SWAP_XY
+#define TOUCH_SWAP_XY 0
+#endif
+#ifndef TOUCH_INVERT_X
+#define TOUCH_INVERT_X 0
+#endif
+#ifndef TOUCH_INVERT_Y
+#define TOUCH_INVERT_Y 0
+#endif
+#ifndef TOUCH_TRACE
+#define TOUCH_TRACE 0
+#endif
+
 namespace {
 
 bool present = false;
@@ -15,7 +36,9 @@ bool present = false;
 bool down = false;
 int16_t startX = 0, startY = 0;
 int16_t lastX = 0, lastY = 0;
+int16_t prevX = 0, prevY = 0;     // the previous poll's point, for the per-poll delta
 uint32_t startMs = 0;
+bool moved = false;               // travelled beyond the tap slop at any point in this press
 
 // A swipe has to travel this far to count, and a tap has to stay within it. Below this the two are
 // indistinguishable from a finger rolling slightly on release.
@@ -24,6 +47,10 @@ constexpr uint32_t kTapMaxMs = 500;
 constexpr uint32_t kLongPressMs = 1200;
 // A long press is a press, not a slow drag: the finger has to stay put.
 constexpr int16_t kLongPressSlopPx = 24;
+// Movement beyond this in either axis means the press was a drag, and a drag is never also a tap.
+// Larger than the long-press slop because a list scroll starts as a deliberate pull, while an
+// accidental tap wobble is a few pixels.
+constexpr int16_t kDragSlopPx = 8;
 bool longFired = false;
 
 bool readPoint(int16_t& x, int16_t& y) {
@@ -39,14 +66,37 @@ bool readPoint(int16_t& x, int16_t& y) {
   const uint8_t yl = Wire.read();
   if (count == 0 || count > 2) return false;
 
-  x = (int16_t)(((xh & 0x0F) << 8) | xl);
-  y = (int16_t)(((yh & 0x0F) << 8) | yl);
+  int16_t rawX = (int16_t)(((xh & 0x0F) << 8) | xl);
+  int16_t rawY = (int16_t)(((yh & 0x0F) << 8) | yl);
+
+#if TOUCH_SWAP_XY
+  const int16_t swap = rawX;
+  rawX = rawY;
+  rawY = swap;
+#endif
+#if TOUCH_INVERT_X
+  rawX = (int16_t)(LCD_WIDTH - 1 - rawX);
+#endif
+#if TOUCH_INVERT_Y
+  rawY = (int16_t)(LCD_HEIGHT - 1 - rawY);
+#endif
+
+  // Clamped rather than rejected: a point one pixel off the edge is a real touch on the bezel, and
+  // dropping it makes a button at the screen edge feel dead.
+  if (rawX < 0) rawX = 0;
+  if (rawY < 0) rawY = 0;
+  if (rawX > LCD_WIDTH - 1) rawX = LCD_WIDTH - 1;
+  if (rawY > LCD_HEIGHT - 1) rawY = LCD_HEIGHT - 1;
+
+  x = rawX;
+  y = rawY;
   return true;
 }
 
 }  // namespace
 
 bool touchPresent() { return present; }
+bool touchDown() { return down; }
 
 bool touchBegin() {
   pinMode(TOUCH_RST_PIN, OUTPUT);
@@ -64,47 +114,82 @@ bool touchBegin() {
   return present;
 }
 
-TouchGesture touchPoll() {
-  if (!present) return TouchGesture::None;
+TouchEvent touchPoll() {
+  TouchEvent event;
+  if (!present) return event;
 
   int16_t x = 0, y = 0;
   const bool hasPoint = readPoint(x, y);
 
   if (hasPoint) {
+#if TOUCH_TRACE
+    Serial.printf("[touch] point %d,%d\n", (int)x, (int)y);
+#endif
     if (!down) {
       down = true;
       longFired = false;
-      startX = x;
-      startY = y;
+      moved = false;
+      startX = prevX = lastX = x;
+      startY = prevY = lastY = y;
       startMs = millis();
+      event.gesture = TouchGesture::Press;
+      event.x = x;
+      event.y = y;
+      return event;
     }
     // The release read returns nothing at all, so the travel has to be measured from the last
     // point seen while the finger was still down.
     lastX = x;
     lastY = y;
+    if (abs(x - startX) > kDragSlopPx || abs(y - startY) > kDragSlopPx) moved = true;
 
     if (!longFired && millis() - startMs >= kLongPressMs) {
       const int16_t mx = x - startX, my = y - startY;
       if (abs(mx) <= kLongPressSlopPx && abs(my) <= kLongPressSlopPx) {
         longFired = true;
-        return TouchGesture::LongPress;
+        event.gesture = TouchGesture::LongPress;
+        event.x = x;
+        event.y = y;
+        return event;
       }
     }
-    return TouchGesture::None;
+
+    if (x != prevX || y != prevY) {
+      event.gesture = TouchGesture::Drag;
+      event.x = x;
+      event.y = y;
+      event.dx = (int16_t)(x - prevX);
+      event.dy = (int16_t)(y - prevY);
+      prevX = x;
+      prevY = y;
+      return event;
+    }
+    return event;
   }
 
-  if (!down) return TouchGesture::None;
+  if (!down) return event;
   down = false;
-  // A long press already fired; the release that follows it is not also a tap.
-  if (longFired) { longFired = false; return TouchGesture::None; }
+  event.x = lastX;
+  event.y = lastY;
+  // A long press already fired; the lift that follows it is not also a tap or a swipe — but it is
+  // still a lift, and it has to be reported as one.
+  //
+  // Returning None here silently swallowed the end of every push-to-talk hold: a voice note is by
+  // definition held past kLongPressMs, so LongPress fired, the UI ignored it (holding the
+  // microphone is the whole point of the gesture), and then the finger coming off produced no
+  // event at all. The recording only ended when it hit the buffer or duration ceiling, which made
+  // every clip the maximum length regardless of when the speaker stopped talking.
+  if (longFired) { longFired = false; event.gesture = TouchGesture::Release; return event; }
 
   const int16_t dx = lastX - startX;
   const uint32_t heldMs = millis() - startMs;
 
   // Horizontal intent wins over a tap; a slow drag still counts, because a deliberate swipe on a
   // 2.8" panel is often slower than a phone gesture.
-  if (dx <= -kSwipeMinPx) return TouchGesture::SwipeLeft;
-  if (dx >= kSwipeMinPx) return TouchGesture::SwipeRight;
-  if (heldMs <= kTapMaxMs) return TouchGesture::Tap;
-  return TouchGesture::None;
+  if (dx <= -kSwipeMinPx) { event.gesture = TouchGesture::SwipeLeft; return event; }
+  if (dx >= kSwipeMinPx) { event.gesture = TouchGesture::SwipeRight; return event; }
+  // A press that scrolled a list is never also a tap on whatever ended up under the finger.
+  if (!moved && heldMs <= kTapMaxMs) { event.gesture = TouchGesture::Tap; return event; }
+  event.gesture = TouchGesture::Release;
+  return event;
 }
