@@ -134,6 +134,10 @@ int GatewayClient::request(const char* method, const char* path, const String& b
     }
   }
 
+  // HTTPClient logs "error(-11): read Timeout" with no indication of which call died, which makes a
+  // recurring failure impossible to attribute. Name the path and the code.
+  if (code <= 0) Serial.printf("[gateway] %s failed code=%d\n", path, code);
+
   // 401 means the credential itself was rejected — the owner revoked this device, or it was
   // transfer-reset. No amount of retrying fixes that, so it is recorded here, once, rather than
   // being re-derived at every call site.

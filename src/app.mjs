@@ -2196,20 +2196,43 @@ export function createApp({
         await enforceDeviceRead(req, res, rateLimiter, config, device);
         requireClaimedDevice(device);
         const environment = await boundDeviceEnvironment(store, device);
-        let snapshot;
-        try {
-          snapshot = await fetchT3Snapshot(environment);
-        } catch (error) {
-          throw new HttpError(502, "T3 environment is unavailable.", {
-            code: "t3_unreachable",
-            environmentId: environment.id,
-            cause: errorMessage(error),
-          });
-        }
+        const snapshot = await fetchDeviceSnapshot(environment);
         return sendJson(res, 200, {
           environmentId: environment.id,
+          projectId: device.config?.projectId ?? null,
           threadId: device.config?.threadId ?? null,
-          threads: deviceSelectableThreads(snapshot, device.config?.threadId),
+          threads: deviceSelectableThreads(snapshot, device.config?.threadId, device.config?.projectId),
+        });
+      }
+
+      // The environments the owner holds. Unlike every other device route that reaches T3
+      // this one answers with no environment bound — a device that has none is exactly the
+      // device that needs the list, so a 409 here would be a locked door with the key inside.
+      if (req.method === "GET" && url.pathname === "/v1/device/environments") {
+        const device = await authenticateDevice(req, store, url, config);
+        await enforceDeviceRead(req, res, rateLimiter, config, device);
+        requireClaimedDevice(device);
+        // Scoped to the owner, not to the platform: listEnvironments() is a per-user read,
+        // so a device can only ever see what the account that claimed it owns.
+        const environments = await store.listEnvironments(device.userId);
+        return sendJson(res, 200, {
+          environmentId: device.config?.environmentId ?? null,
+          environments: deviceSelectableEnvironments(environments, device.config?.environmentId),
+        });
+      }
+
+      // Projects ("folders") inside the bound environment. 409 with no environment bound,
+      // matching the thread routes: there is nothing to enumerate until the boundary exists.
+      if (req.method === "GET" && url.pathname === "/v1/device/projects") {
+        const device = await authenticateDevice(req, store, url, config);
+        await enforceDeviceRead(req, res, rateLimiter, config, device);
+        requireClaimedDevice(device);
+        const environment = await boundDeviceEnvironment(store, device);
+        const snapshot = await fetchDeviceSnapshot(environment);
+        return sendJson(res, 200, {
+          environmentId: environment.id,
+          projectId: device.config?.projectId ?? null,
+          projects: deviceSelectableProjects(snapshot, device.config?.projectId),
         });
       }
 
@@ -2227,16 +2250,7 @@ export function createApp({
         const after = optionalString(url.searchParams.get("after"));
         if (after && !Number.isFinite(Date.parse(after))) throw new HttpError(400, "after must be an ISO timestamp.");
         const environment = await boundDeviceEnvironment(store, device);
-        let snapshot;
-        try {
-          snapshot = await fetchT3Snapshot(environment);
-        } catch (error) {
-          throw new HttpError(502, "T3 environment is unavailable.", {
-            code: "t3_unreachable",
-            environmentId: environment.id,
-            cause: errorMessage(error),
-          });
-        }
+        const snapshot = await fetchDeviceSnapshot(environment);
         const thread = (Array.isArray(snapshot?.threads) ? snapshot.threads : [])
           .find((candidate) => optionalString(candidate?.id) === threadId);
         if (!thread) throw new HttpError(404, "Selected thread was not found in the bound environment.");
@@ -2262,19 +2276,11 @@ export function createApp({
         const body = await readJson(req);
         const threadId = requireString(body.threadId, "threadId");
         const environment = await boundDeviceEnvironment(store, device);
-        let snapshot;
-        try {
-          snapshot = await fetchT3Snapshot(environment);
-        } catch (error) {
-          throw new HttpError(502, "T3 environment is unavailable.", {
-            code: "t3_unreachable",
-            environmentId: environment.id,
-            cause: errorMessage(error),
-          });
-        }
-        const threads = deviceSelectableThreads(snapshot, device.config?.threadId);
+        const snapshot = await fetchDeviceSnapshot(environment);
+        const threads = deviceSelectableThreads(snapshot, device.config?.threadId, device.config?.projectId);
         // Validated against the live snapshot, so a device cannot invent a thread id
-        // or reach one belonging to a different environment.
+        // or reach one belonging to a different environment — or, once a project is
+        // selected, to a different folder.
         if (!threads.some((thread) => thread.id === threadId)) {
           throw new HttpError(404, "Thread not found in the bound environment.");
         }
@@ -2282,6 +2288,68 @@ export function createApp({
           userId: device.userId,
           deviceId: device.id,
           config: { threadId },
+          actorType: "device",
+          actorId: device.id,
+        });
+        if (!updated) throw new HttpError(404, "Device not found.");
+        return sendJson(res, 200, { deviceId: updated.id, config: updated.config });
+      }
+
+      // Binding an environment is the one place the hardware may move its own boundary.
+      // It is still fenced by ownership: the id has to resolve through the claiming
+      // user's own scope, so another account's environment is simply not found.
+      if (req.method === "POST" && url.pathname === "/v1/device/config/environment") {
+        const device = await authenticateDevice(req, store, url, config);
+        await enforceDeviceWrite(req, res, rateLimiter, config, device);
+        requireClaimedDevice(device);
+        const body = await readJson(req);
+        const environmentId = requireString(body.environmentId, "environmentId");
+        const environment = await store.getEnvironmentForUser(device.userId, environmentId);
+        if (!environment) throw new HttpError(404, "Environment not found.");
+        // An expired token is not a reason to refuse the binding: the device can see the
+        // expiry in the listing, and the routes that actually reach T3 already 409 on it.
+        // Refusing here would leave a re-paired environment unselectable from the bezel.
+        const changed = optionalString(device.config?.environmentId) !== environment.id;
+        const updated = await store.updateDeviceConfig({
+          userId: device.userId,
+          deviceId: device.id,
+          // A project and a thread only mean something inside the environment that held
+          // them. Carrying them across would point the device at ids the new environment
+          // has never heard of, so a real change clears both.
+          config: changed
+            ? { environmentId: environment.id, projectId: null, threadId: null }
+            : { environmentId: environment.id },
+          actorType: "device",
+          actorId: device.id,
+        });
+        if (!updated) throw new HttpError(404, "Device not found.");
+        return sendJson(res, 200, { deviceId: updated.id, config: updated.config });
+      }
+
+      // Selecting the folder the device works inside. Same shape as thread selection:
+      // validated against the live snapshot of the bound environment, never against an
+      // id the hardware supplies on its own authority.
+      if (req.method === "POST" && url.pathname === "/v1/device/config/project") {
+        const device = await authenticateDevice(req, store, url, config);
+        await enforceDeviceWrite(req, res, rateLimiter, config, device);
+        requireClaimedDevice(device);
+        const body = await readJson(req);
+        const projectId = requireString(body.projectId, "projectId");
+        const environment = await boundDeviceEnvironment(store, device);
+        const snapshot = await fetchDeviceSnapshot(environment);
+        const projects = deviceSelectableProjects(snapshot, device.config?.projectId);
+        if (!projects.some((project) => project.id === projectId)) {
+          throw new HttpError(404, "Project not found in the bound environment.");
+        }
+        // A thread outside the newly chosen folder would survive as a selection the
+        // thread list no longer offers — visible nowhere, still driving every dispatch.
+        const currentThreadId = optionalString(device.config?.threadId);
+        const keepsThread = currentThreadId !== null
+          && snapshotThreadProjectId(snapshot, currentThreadId) === projectId;
+        const updated = await store.updateDeviceConfig({
+          userId: device.userId,
+          deviceId: device.id,
+          config: keepsThread ? { projectId } : { projectId, threadId: null },
           actorType: "device",
           actorId: device.id,
         });
@@ -4608,9 +4676,17 @@ async function boundDeviceEnvironment(store, device) {
 // current row without duplicating selection logic, while the top-level threadId is
 // retained for older clients. `status` follows the same precedence as the selected
 // thread display: active work wins over a stale stopped session.
-function deviceSelectableThreads(snapshot, selectedThreadId = null) {
+//
+// `projectId` narrows the list to one folder. Null — the default, and what firmware
+// that predates project selection sends — keeps the whole bound environment visible,
+// so adding project selection cannot shrink an existing controller's thread list.
+function deviceSelectableThreads(snapshot, selectedThreadId = null, projectId = null) {
   const threads = Array.isArray(snapshot?.threads) ? snapshot.threads : [];
+  const scope = optionalString(projectId);
   return threads
+    // A thread with no project cannot be proven to live in the selected folder, so a
+    // bound project excludes it rather than guessing.
+    .filter((thread) => !scope || optionalString(thread?.projectId) === scope)
     .map((thread) => ({
       id: optionalString(thread?.id) ?? null,
       title: optionalString(thread?.title) ?? optionalString(thread?.name) ?? "Untitled thread",
@@ -4618,6 +4694,68 @@ function deviceSelectableThreads(snapshot, selectedThreadId = null) {
       selected: optionalString(thread?.id) === optionalString(selectedThreadId),
     }))
     .filter((thread) => thread.id !== null);
+}
+
+// The owner's environments, as much of one as a bezel can render. Deliberately not
+// publicEnvironment(): baseUrl, scopes, health timestamps and pairing state are console
+// material, and the token-bearing fields must never reach the hardware realm at all.
+// `tokenExpired` is carried because selecting such an environment is a dead end the
+// device should be able to show *before* the owner walks to it.
+function deviceSelectableEnvironments(environments, selectedEnvironmentId = null) {
+  return (Array.isArray(environments) ? environments : [])
+    .map((environment) => ({
+      id: optionalString(environment?.id) ?? null,
+      label: optionalString(environment?.label) ?? "Untitled environment",
+      status: optionalString(environment?.status) ?? "unknown",
+      tokenExpired: isEnvironmentTokenExpired(environment),
+      selected: optionalString(environment?.id) === optionalString(selectedEnvironmentId),
+    }))
+    .filter((environment) => environment.id !== null);
+}
+
+// Projects ("folders") in the bound environment, straight from the T3 snapshot — the
+// orchestration API publishes them alongside threads, so this costs no extra call.
+// `threadCount` is what makes the list usable at five keys: it says which folder has
+// anything in it before the owner pages into an empty one.
+function deviceSelectableProjects(snapshot, selectedProjectId = null) {
+  const threads = Array.isArray(snapshot?.threads) ? snapshot.threads : [];
+  const projects = Array.isArray(snapshot?.projects) ? snapshot.projects : [];
+  return projects
+    .map((project) => {
+      const id = optionalString(project?.id) ?? null;
+      return {
+        id,
+        title: optionalString(project?.title) ?? optionalString(project?.name) ?? "Untitled project",
+        threadCount: id === null
+          ? 0
+          : threads.filter((thread) => optionalString(thread?.projectId) === id).length,
+        selected: id !== null && id === optionalString(selectedProjectId),
+      };
+    })
+    .filter((project) => project.id !== null);
+}
+
+// The T3 project a thread belongs to, or null when the snapshot does not say.
+function snapshotThreadProjectId(snapshot, threadId) {
+  const wanted = optionalString(threadId);
+  if (!wanted) return null;
+  const threads = Array.isArray(snapshot?.threads) ? snapshot.threads : [];
+  const thread = threads.find((candidate) => optionalString(candidate?.id) === wanted);
+  return thread ? optionalString(thread?.projectId) : null;
+}
+
+// Every device route that reads T3 reports an unreachable host the same way, so the
+// firmware has one error contract to branch on instead of four.
+async function fetchDeviceSnapshot(environment) {
+  try {
+    return await fetchT3Snapshot(environment);
+  } catch (error) {
+    throw new HttpError(502, "T3 environment is unavailable.", {
+      code: "t3_unreachable",
+      environmentId: environment.id,
+      cause: errorMessage(error),
+    });
+  }
 }
 
 function deviceThreadStatus(thread) {

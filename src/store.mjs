@@ -579,6 +579,7 @@ export function createStore(seed = {}, options = {}) {
         label: device.label,
         previousLabel,
         environmentId: device.config.environmentId,
+        projectId: device.config.projectId,
         threadId: device.config.threadId,
         gatewayAccessMode: device.config.gatewayAccessMode,
         gatewayUrl: device.config.gatewayUrl,
@@ -1050,7 +1051,13 @@ export function createStore(seed = {}, options = {}) {
     const removed = emptyEnvironmentRemoval();
     for (const device of devices.values()) {
       if (device.userId !== userId || device.config?.environmentId !== environmentId) continue;
-      device.config = normalizeDeviceConfig({ ...device.config, environmentId: null }, device.config);
+      // The project lived inside the environment that just went away; leaving the id
+      // behind would silently filter the next environment's threads to a folder that
+      // does not exist there.
+      device.config = normalizeDeviceConfig(
+        { ...device.config, environmentId: null, projectId: null },
+        device.config,
+      );
       removed.devices.push(device.id);
     }
     for (const action of actions.values()) {
@@ -2005,6 +2012,10 @@ function normalizeClaimCode(claimCode) {
 function createDefaultDeviceConfig() {
   return {
     environmentId: null,
+    // The T3 project ("folder") the device is working inside. Null means the whole
+    // environment: every thread the owner's environment holds stays selectable, which
+    // is what firmware that predates project selection expects.
+    projectId: null,
     threadId: null,
     gatewayAccessMode: "local",
     gatewayUrl: null,
@@ -2143,6 +2154,9 @@ function normalizeDeviceConfig(input = {}, existing = null) {
 
   if (Object.hasOwn(input, "environmentId")) {
     next.environmentId = normalizeNullableString(input.environmentId);
+  }
+  if (Object.hasOwn(input, "projectId")) {
+    next.projectId = normalizeNullableString(input.projectId);
   }
   if (Object.hasOwn(input, "threadId")) {
     next.threadId = normalizeNullableString(input.threadId);

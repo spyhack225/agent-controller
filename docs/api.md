@@ -1516,6 +1516,7 @@ x-device-secret: ...
   "deviceId": "dev_...",
   "config": {
     "environmentId": "env_...",
+    "projectId": null,
     "threadId": "thread_...",
     "defaultPrompt": "Continue the current task, inspect progress, and run relevant tests.",
     "shellCommand": "npm test",
@@ -1525,6 +1526,97 @@ x-device-secret: ...
 ```
 
 Once `environmentId` and `threadId` are configured, device intent requests can omit those fields and the gateway will apply the saved defaults. Status intents only require `environmentId`.
+
+### Device environment, project and thread selection
+
+A controller browses three levels, each scoped by the one above it. The full wire format
+and the firmware-side flow live in [hardware-protocol.md](hardware-protocol.md#environment-project-and-thread-api);
+this is the endpoint summary.
+
+| Method | Path | Purpose |
+|---|---|---|
+| GET | `/v1/device/environments` | The claiming owner's environments, with the bound one flagged |
+| POST | `/v1/device/config/environment` | Bind the device to one of them |
+| GET | `/v1/device/projects` | Projects in the bound environment, from the T3 snapshot |
+| POST | `/v1/device/config/project` | Set the active project |
+| GET | `/v1/device/threads` | Threads in the bound environment, narrowed to the active project |
+| POST | `/v1/device/config/thread` | Set the active thread |
+
+All six are device realm (`x-device-id` + `x-device-secret`) and require a claimed device.
+
+```http
+GET /v1/device/environments
+x-device-id: dev_...
+x-device-secret: ...
+```
+
+```json
+{
+  "environmentId": "env_bound",
+  "environments": [
+    { "id": "env_bound", "label": "Workshop mac", "status": "ready", "tokenExpired": false, "selected": true },
+    { "id": "env_spare", "label": "Spare T3", "status": "ready", "tokenExpired": false, "selected": false }
+  ]
+}
+```
+
+Only the claiming owner's environments are listed, and only these five fields — `baseUrl`, scopes
+and anything token-bearing never cross into the device realm. This route answers `200` with no
+environment bound, because a device that has none is exactly the one that needs the list.
+
+```http
+POST /v1/device/config/environment
+x-device-id: dev_...
+x-device-secret: ...
+content-type: application/json
+
+{ "environmentId": "env_spare" }
+```
+
+`environmentId` is resolved through the owner's own scope, so another account's id is a `404`;
+a blank or missing one is a `400`. Changing to a different environment clears `projectId` and
+`threadId`, which only meant anything inside the environment being left. Re-binding the same
+environment keeps both.
+
+```http
+GET /v1/device/projects
+x-device-id: dev_...
+x-device-secret: ...
+```
+
+```json
+{
+  "environmentId": "env_bound",
+  "projectId": "proj_beta",
+  "projects": [
+    { "id": "proj_alpha", "title": "Alpha folder", "threadCount": 2, "selected": false },
+    { "id": "proj_beta", "title": "Beta folder", "threadCount": 1, "selected": true }
+  ]
+}
+```
+
+```http
+POST /v1/device/config/project
+x-device-id: dev_...
+x-device-secret: ...
+content-type: application/json
+
+{ "projectId": "proj_alpha" }
+```
+
+The id is validated against the live snapshot of the bound environment, so an unknown or foreign
+project is a `404`. Selecting a project that does not contain the current thread clears
+`threadId`; a thread already inside it is untouched. Both project endpoints return `409` when no
+environment is bound and `502` with `details.code: "t3_unreachable"` when the bound T3 host cannot
+be reached — the same contract the thread endpoints use.
+
+`projectId` is `null` by default and means "the whole environment", so `GET /v1/device/threads`
+keeps returning every thread for firmware that predates project selection. Once a project is set,
+both the thread listing and `POST /v1/device/config/thread` are narrowed to it, and a thread with
+no `projectId` in the snapshot is excluded rather than guessed at.
+
+The owner-facing `PUT /v1/devices/:id/config` accepts `projectId` alongside `environmentId` and
+`threadId`. Deleting an environment clears the `projectId` of every device bound to it.
 
 Devices can list and run saved macros for the claimed account:
 

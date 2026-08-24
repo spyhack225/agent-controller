@@ -677,6 +677,7 @@ export const updateDeviceConfig = gatewayMutation({
         label,
         previousLabel: device.label,
         environmentId: config.environmentId ?? null,
+        projectId: config.projectId ?? null,
         threadId: config.threadId ?? null,
         gatewayAccessMode: config.gatewayAccessMode ?? "local",
         gatewayUrl: config.gatewayUrl ?? null,
@@ -940,7 +941,11 @@ export const deleteEnvironment = gatewayMutation({
     for (const device of devices) {
       if (device.config?.environmentId !== environmentId) continue;
       await ctx.db.patch(device._id, {
-        config: normalizeDeviceConfig({ ...device.config, environmentId: null }, device.config),
+        // The project lived inside the environment that just went away.
+        config: normalizeDeviceConfig(
+          { ...device.config, environmentId: null, projectId: null },
+          device.config,
+        ),
         updatedAt: timestamp,
       });
       removed.devices.push(String(device._id));
@@ -2656,6 +2661,9 @@ function normalizeDeviceConfig(input: any = {}, existing: any = null) {
   if (Object.hasOwn(input, "environmentId")) {
     next.environmentId = normalizeNullableString(input.environmentId) ?? undefined;
   }
+  if (Object.hasOwn(input, "projectId")) {
+    next.projectId = normalizeNullableString(input.projectId) ?? undefined;
+  }
   if (Object.hasOwn(input, "threadId")) {
     next.threadId = normalizeNullableString(input.threadId) ?? undefined;
   }
@@ -3088,6 +3096,7 @@ function latestIso(...values: any[]) {
 function publicDeviceConfig(config: any = {}) {
   return {
     environmentId: config.environmentId ?? null,
+    projectId: config.projectId ?? null,
     threadId: config.threadId ?? null,
     gatewayAccessMode: config.gatewayAccessMode ?? "local",
     gatewayUrl: config.gatewayUrl ?? null,

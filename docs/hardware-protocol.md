@@ -366,7 +366,10 @@ not imply rollback of steps already dispatched.
 ## Thread list, selection, and switching
 
 Thread browsing is a first-class product flow, not a “cycle to next” shortcut. It is constrained to
-the environment bound by the owner.
+the environment bound by the owner, and to the project selected inside it when there is one.
+Environment and project browsing follow the same shape one level up: list, move a cursor, confirm
+on a row, POST the exact id, update the active marker only after success. See
+[Environment, project, and thread API](#environment-project-and-thread-api) for the wire format.
 
 1. Open `MENU -> THREADS`. The device renders `LOADING THREADS` and calls
    `GET /v1/device/threads`.
@@ -853,12 +856,110 @@ requires HTTPS. Before persisting a changed URL, firmware authenticates against
 `GET /v1/device/config` on the candidate endpoint. A failed probe leaves the last known-good URL in
 NVS, preventing a bad remote setting from stranding the unit.
 
-## Thread API
+## Environment, project, and thread API
+
+A controller browses three levels: the environment (which paired T3 host), the project
+(the folder inside it), and the thread. Each level is scoped by the one above it, and
+every id is checked server-side — through the claiming owner's own scope for
+environments, and against the bound environment's live snapshot for projects and
+threads. A device still cannot change its profile or widen its menu.
+
+`device.config` carries `environmentId`, `projectId`, and `threadId`. `projectId` is
+`null` by default and means "the whole environment": firmware that predates project
+selection keeps seeing every thread the bound environment holds.
+
+### Environments
+
+```http
+GET /v1/device/environments
+x-device-id: dev_...
+x-device-secret: ...
+```
+
+```json
+{
+  "environmentId": "env_bound",
+  "environments": [
+    { "id": "env_bound", "label": "Workshop mac", "status": "ready", "tokenExpired": false, "selected": true },
+    { "id": "env_spare", "label": "Spare T3", "status": "ready", "tokenExpired": false, "selected": false }
+  ]
+}
+```
+
+Only the environments owned by the account that claimed the device are listed, and only
+these five fields: `baseUrl`, scopes, pairing state and anything token-bearing stay in
+the console realm. `tokenExpired` is carried so the device can show a dead end before the
+owner walks over to it. Unlike every other environment-scoped route this one answers
+`200` with no environment bound — a controller with none is exactly the one that needs
+the list.
+
+```http
+POST /v1/device/config/environment
+x-device-id: dev_...
+x-device-secret: ...
+content-type: application/json
+```
+
+```json
+{ "environmentId": "env_spare" }
+```
+
+`environmentId` is the only field read. It is resolved through the owner's scope, so an
+id belonging to another account — or to nothing — is a `404` and nothing changes. A
+blank or missing id is a `400`. Changing to a *different* environment clears
+`projectId` and `threadId`, because those ids only meant something inside the
+environment being left; re-binding the environment already in place keeps both. An
+expired access token does not block the binding: the listing already reports it and the
+routes that actually reach T3 return `409 token_expired` on their own. The audit entry
+is recorded with `actorType: "device"`.
+
+### Projects
+
+```http
+GET /v1/device/projects
+x-device-id: dev_...
+x-device-secret: ...
+```
+
+```json
+{
+  "environmentId": "env_bound",
+  "projectId": "proj_beta",
+  "projects": [
+    { "id": "proj_alpha", "title": "Alpha folder", "threadCount": 2, "selected": false },
+    { "id": "proj_beta", "title": "Beta folder", "threadCount": 1, "selected": true }
+  ]
+}
+```
+
+Projects come from the same `GET /api/orchestration/snapshot` as threads, so listing them
+costs no extra call. `threadCount` is what makes the list usable at five keys: it says
+which folder has anything in it before the owner pages into an empty one.
+
+```http
+POST /v1/device/config/project
+x-device-id: dev_...
+x-device-secret: ...
+content-type: application/json
+```
+
+```json
+{ "projectId": "proj_alpha" }
+```
+
+`projectId` is the only field read and is validated against the live snapshot, so an
+unknown or foreign project is a `404`. Selecting a project whose folder does not contain
+the currently selected thread clears `threadId` — a thread the list no longer offers must
+not keep driving every dispatch. A thread already inside the chosen folder is untouched.
+Both project endpoints return `409` when the owner bound no environment, and `502` with
+`details.code: "t3_unreachable"` when the bound host cannot be reached.
+
+### Threads
 
 A device may change which thread it drives, but only within the environment its owner
-bound in `device.config.environmentId`. The owner keeps the boundary that matters; the
-hardware gets the autonomy that is useful at a five-key bezel. A device cannot repoint
-itself at another environment, change its profile, or widen its menu.
+bound in `device.config.environmentId` — and, once a project is selected, only within
+that folder. The owner keeps the boundary that matters; the hardware gets the autonomy
+that is useful at a five-key bezel.
 
 ```http
 GET /v1/device/threads
@@ -869,6 +970,7 @@ x-device-secret: ...
 ```json
 {
   "environmentId": "env_...",
+  "projectId": null,
   "threadId": "thread_current",
   "threads": [
     { "id": "thread_a", "title": "Alpha", "status": "stopped", "selected": true },
@@ -894,9 +996,10 @@ content-type: application/json
 { "threadId": "thread_b" }
 ```
 
-`threadId` is the only field read; anything else in the body is ignored. The id is validated
-against the live snapshot of the bound environment, so an unknown or foreign thread is a
-`404` and nothing changes. A device with no bound environment gets `409` from both endpoints.
+`threadId` is the only field read; anything else in the body is ignored — including
+`environmentId`, which has its own endpoint above. The id is validated against the live
+snapshot of the bound environment, and against `device.config.projectId` when one is set,
+so an unknown, foreign, or out-of-folder thread is a `404` and nothing changes. A device with no bound environment gets `409` from both endpoints.
 If the environment is bound but its T3 orchestration endpoint cannot be reached, the gateway
 returns `502` with `details.code: "t3_unreachable"`. CrowPanel renders `Start T3 Code` and changes
 the empty-list OK action to Retry; it never erases the last configured thread merely because the

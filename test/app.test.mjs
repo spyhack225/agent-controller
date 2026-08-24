@@ -3119,6 +3119,423 @@ test("invalid device credentials cannot read or change thread selection", async 
   assert.equal(wrote.status, 401);
 });
 
+// --- Device environment and project selection -------------------------------
+//
+// Threads were the whole picker a controller could offer, and the environment was a
+// choice only the console could make. These give the hardware the two levels above a
+// thread — which machine, which folder — without loosening the boundary that matters:
+// every id is resolved through the claiming owner's own scope, or validated against
+// the live snapshot of the environment already bound.
+
+const ENVIRONMENT_FIXTURE_SNAPSHOTS = {
+  "bound-t3.example": {
+    projects: [
+      { id: "proj_alpha", title: "Alpha folder" },
+      { id: "proj_beta", name: "Beta folder" },
+      { id: "proj_empty", title: "Empty folder" },
+    ],
+    threads: [
+      { id: "thread_a", title: "Alpha one", projectId: "proj_alpha", session: { status: "stopped" } },
+      {
+        id: "thread_b",
+        title: "Alpha two",
+        projectId: "proj_alpha",
+        session: { status: "stopped" },
+        latestTurn: { state: "running" },
+      },
+      { id: "thread_c", title: "Beta one", projectId: "proj_beta", session: { status: "stopped" } },
+      { id: "thread_orphan", title: "No folder", session: { status: "stopped" } },
+    ],
+  },
+  "spare-t3.example": {
+    projects: [{ id: "proj_spare", title: "Spare folder" }],
+    threads: [{ id: "thread_spare", title: "Spare one", projectId: "proj_spare", session: { status: "stopped" } }],
+  },
+  "intruder-t3.example": {
+    projects: [{ id: "proj_intruder", title: "Not yours" }],
+    threads: [{ id: "thread_intruder", title: "Not yours either", projectId: "proj_intruder" }],
+  },
+};
+
+async function environmentSelectionFixture(t, { snapshotError = null } = {}) {
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = async (url) => {
+    const parsed = new URL(String(url));
+    if (parsed.pathname === "/api/orchestration/snapshot") {
+      if (snapshotError) throw snapshotError;
+      const snapshot = ENVIRONMENT_FIXTURE_SNAPSHOTS[parsed.hostname];
+      if (!snapshot) return jsonResponse({ error: "unknown host" }, 404);
+      return jsonResponse(snapshot, 200);
+    }
+    return jsonResponse({ error: "not found" }, 404);
+  };
+  t.after(() => {
+    globalThis.fetch = originalFetch;
+  });
+
+  const { server } = createApp();
+  await listen(server);
+  t.after(() => server.close());
+  const baseUrl = `http://127.0.0.1:${server.address().port}`;
+  const authHeaders = await createAuthHeaders(originalFetch, baseUrl);
+
+  const created = await requestJson(originalFetch, baseUrl, "/v1/devices", {
+    method: "POST",
+    headers: authHeaders,
+    body: { label: "Bezel controller", profile: "agent-controller" },
+  });
+  const deviceHeaders = {
+    "x-device-id": created.device.id,
+    "x-device-secret": created.secret,
+  };
+
+  const bound = await requestJson(originalFetch, baseUrl, "/v1/t3/environments", {
+    method: "POST",
+    headers: authHeaders,
+    body: { label: "Bound T3", baseUrl: "https://bound-t3.example", accessToken: "tok" },
+  });
+  const spare = await requestJson(originalFetch, baseUrl, "/v1/t3/environments", {
+    method: "POST",
+    headers: authHeaders,
+    body: { label: "Spare T3", baseUrl: "https://spare-t3.example", accessToken: "tok" },
+  });
+
+  // A second account, so "not yours" can be tested against a real environment rather
+  // than an invented id that any lookup would miss anyway.
+  const intruderToken = await requestJson(originalFetch, baseUrl, "/v1/users/dev", {
+    method: "POST",
+    headers: {},
+    body: { userId: "user_intruder", email: "intruder@example.local" },
+  });
+  const intruderHeaders = { authorization: `Bearer ${intruderToken.apiToken.secret}` };
+  const foreign = await requestJson(originalFetch, baseUrl, "/v1/t3/environments", {
+    method: "POST",
+    headers: intruderHeaders,
+    body: { label: "Intruder T3", baseUrl: "https://intruder-t3.example", accessToken: "tok" },
+  });
+
+  const bind = async (body) => requestJson(originalFetch, baseUrl, `/v1/devices/${created.device.id}/config`, {
+    method: "PUT",
+    headers: authHeaders,
+    body,
+  });
+  const deviceConfig = async () => (await requestJson(originalFetch, baseUrl, "/v1/device/config", {
+    headers: deviceHeaders,
+  })).config;
+
+  return {
+    originalFetch,
+    baseUrl,
+    authHeaders,
+    created,
+    deviceHeaders,
+    bound: bound.environment,
+    spare: spare.environment,
+    foreign: foreign.environment,
+    bind,
+    deviceConfig,
+  };
+}
+
+test("a device lists its owner's environments and flags the bound one", async (t) => {
+  const f = await environmentSelectionFixture(t);
+
+  // Answered before anything is bound: a controller with no environment is exactly the
+  // one that needs the list.
+  const unbound = await requestJson(f.originalFetch, f.baseUrl, "/v1/device/environments", {
+    headers: f.deviceHeaders,
+  });
+  assert.equal(unbound.environmentId, null);
+  assert.deepEqual(unbound.environments.map((environment) => environment.id), [f.bound.id, f.spare.id]);
+  assert.equal(unbound.environments.every((environment) => environment.selected === false), true);
+
+  await f.bind({ environmentId: f.bound.id });
+  const listed = await requestJson(f.originalFetch, f.baseUrl, "/v1/device/environments", {
+    headers: f.deviceHeaders,
+  });
+  assert.equal(listed.environmentId, f.bound.id);
+  assert.deepEqual(
+    listed.environments.map((environment) => ({
+      id: environment.id,
+      label: environment.label,
+      selected: environment.selected,
+      tokenExpired: environment.tokenExpired,
+    })),
+    [
+      { id: f.bound.id, label: "Bound T3", selected: true, tokenExpired: false },
+      { id: f.spare.id, label: "Spare T3", selected: false, tokenExpired: false },
+    ],
+  );
+
+  // Another account's environment is not in the listing, and nothing token-bearing is.
+  assert.equal(listed.environments.some((environment) => environment.id === f.foreign.id), false);
+  assert.equal(JSON.stringify(listed).includes("accessToken"), false);
+  assert.equal(JSON.stringify(listed).includes("intruder-t3.example"), false);
+});
+
+test("a device can bind itself to one of its owner's environments", async (t) => {
+  const f = await environmentSelectionFixture(t);
+  await f.bind({ environmentId: f.bound.id, threadId: "thread_a" });
+
+  const updated = await requestJson(f.originalFetch, f.baseUrl, "/v1/device/config/environment", {
+    method: "POST",
+    headers: f.deviceHeaders,
+    body: { environmentId: f.spare.id },
+  });
+  assert.equal(updated.config.environmentId, f.spare.id);
+  // A thread id from the environment that was just left behind means nothing here.
+  assert.equal(updated.config.threadId, null);
+  assert.equal(updated.config.projectId, null);
+
+  assert.equal((await f.deviceConfig()).environmentId, f.spare.id, "the choice is durable");
+
+  const audit = await requestJson(f.originalFetch, f.baseUrl, "/v1/audit", { headers: f.authHeaders });
+  const event = audit.events.findLast((entry) => (
+    entry.action === "device.config_updated" && entry.metadata?.environmentId === f.spare.id
+  ));
+  assert.equal(event?.actorType, "device", "the hardware is credited, not the owner");
+  assert.equal(event?.actorId, f.created.device.id);
+});
+
+test("re-binding the environment a device already has keeps its project and thread", async (t) => {
+  const f = await environmentSelectionFixture(t);
+  await f.bind({ environmentId: f.bound.id, projectId: "proj_alpha", threadId: "thread_a" });
+
+  const updated = await requestJson(f.originalFetch, f.baseUrl, "/v1/device/config/environment", {
+    method: "POST",
+    headers: f.deviceHeaders,
+    body: { environmentId: f.bound.id },
+  });
+  assert.equal(updated.config.environmentId, f.bound.id);
+  assert.equal(updated.config.projectId, "proj_alpha");
+  assert.equal(updated.config.threadId, "thread_a");
+});
+
+test("a device cannot bind an environment belonging to another owner", async (t) => {
+  const f = await environmentSelectionFixture(t);
+  await f.bind({ environmentId: f.bound.id });
+
+  const response = await f.originalFetch(new URL("/v1/device/config/environment", f.baseUrl), {
+    method: "POST",
+    headers: { ...f.deviceHeaders, "content-type": "application/json" },
+    body: JSON.stringify({ environmentId: f.foreign.id }),
+  });
+  assert.equal(response.status, 404);
+  assert.equal((await f.deviceConfig()).environmentId, f.bound.id, "the rejected write changed nothing");
+});
+
+test("environment selection rejects unknown, missing or blank ids", async (t) => {
+  const f = await environmentSelectionFixture(t);
+  await f.bind({ environmentId: f.bound.id });
+
+  const unknown = await f.originalFetch(new URL("/v1/device/config/environment", f.baseUrl), {
+    method: "POST",
+    headers: { ...f.deviceHeaders, "content-type": "application/json" },
+    body: JSON.stringify({ environmentId: "env_does_not_exist" }),
+  });
+  assert.equal(unknown.status, 404);
+
+  for (const body of [{}, { environmentId: "   " }]) {
+    const response = await f.originalFetch(new URL("/v1/device/config/environment", f.baseUrl), {
+      method: "POST",
+      headers: { ...f.deviceHeaders, "content-type": "application/json" },
+      body: JSON.stringify(body),
+    });
+    assert.equal(response.status, 400);
+  }
+  assert.equal((await f.deviceConfig()).environmentId, f.bound.id);
+});
+
+test("a device lists the projects in its bound environment with thread counts", async (t) => {
+  const f = await environmentSelectionFixture(t);
+  await f.bind({ environmentId: f.bound.id, projectId: "proj_beta" });
+
+  const listed = await requestJson(f.originalFetch, f.baseUrl, "/v1/device/projects", {
+    headers: f.deviceHeaders,
+  });
+  assert.equal(listed.environmentId, f.bound.id);
+  assert.equal(listed.projectId, "proj_beta");
+  assert.deepEqual(listed.projects, [
+    { id: "proj_alpha", title: "Alpha folder", threadCount: 2, selected: false },
+    { id: "proj_beta", title: "Beta folder", threadCount: 1, selected: true },
+    { id: "proj_empty", title: "Empty folder", threadCount: 0, selected: false },
+  ]);
+});
+
+test("a device can select a project and its thread list narrows to that folder", async (t) => {
+  const f = await environmentSelectionFixture(t);
+  await f.bind({ environmentId: f.bound.id });
+
+  // With no project bound the whole environment stays visible, orphan thread included.
+  const everything = await requestJson(f.originalFetch, f.baseUrl, "/v1/device/threads", {
+    headers: f.deviceHeaders,
+  });
+  assert.deepEqual(everything.threads.map((thread) => thread.id), [
+    "thread_a",
+    "thread_b",
+    "thread_c",
+    "thread_orphan",
+  ]);
+  assert.equal(everything.projectId, null);
+
+  const updated = await requestJson(f.originalFetch, f.baseUrl, "/v1/device/config/project", {
+    method: "POST",
+    headers: f.deviceHeaders,
+    body: { projectId: "proj_alpha" },
+  });
+  assert.equal(updated.config.projectId, "proj_alpha");
+  assert.equal(updated.config.environmentId, f.bound.id, "the bound environment survives a project change");
+
+  const narrowed = await requestJson(f.originalFetch, f.baseUrl, "/v1/device/threads", {
+    headers: f.deviceHeaders,
+  });
+  assert.equal(narrowed.projectId, "proj_alpha");
+  assert.deepEqual(narrowed.threads, [
+    { id: "thread_a", title: "Alpha one", status: "stopped", selected: false },
+    { id: "thread_b", title: "Alpha two", status: "running", selected: false },
+  ]);
+
+  // A thread outside the folder is no longer selectable, and one inside it is.
+  const outside = await f.originalFetch(new URL("/v1/device/config/thread", f.baseUrl), {
+    method: "POST",
+    headers: { ...f.deviceHeaders, "content-type": "application/json" },
+    body: JSON.stringify({ threadId: "thread_c" }),
+  });
+  assert.equal(outside.status, 404);
+  const inside = await requestJson(f.originalFetch, f.baseUrl, "/v1/device/config/thread", {
+    method: "POST",
+    headers: f.deviceHeaders,
+    body: { threadId: "thread_b" },
+  });
+  assert.equal(inside.config.threadId, "thread_b");
+});
+
+test("selecting a project drops a thread from outside it but keeps one inside", async (t) => {
+  const f = await environmentSelectionFixture(t);
+  await f.bind({ environmentId: f.bound.id, threadId: "thread_c" });
+
+  const moved = await requestJson(f.originalFetch, f.baseUrl, "/v1/device/config/project", {
+    method: "POST",
+    headers: f.deviceHeaders,
+    body: { projectId: "proj_alpha" },
+  });
+  assert.equal(moved.config.threadId, null, "a thread the list no longer offers must not keep driving dispatch");
+
+  await requestJson(f.originalFetch, f.baseUrl, "/v1/device/config/thread", {
+    method: "POST",
+    headers: f.deviceHeaders,
+    body: { threadId: "thread_a" },
+  });
+  const stayed = await requestJson(f.originalFetch, f.baseUrl, "/v1/device/config/project", {
+    method: "POST",
+    headers: f.deviceHeaders,
+    body: { projectId: "proj_alpha" },
+  });
+  assert.equal(stayed.config.threadId, "thread_a", "a thread inside the chosen folder is untouched");
+});
+
+test("a device cannot select a project that is not in its bound environment", async (t) => {
+  const f = await environmentSelectionFixture(t);
+  await f.bind({ environmentId: f.bound.id, projectId: "proj_alpha" });
+
+  for (const projectId of ["proj_spare", "proj_intruder", "proj_invented"]) {
+    const response = await f.originalFetch(new URL("/v1/device/config/project", f.baseUrl), {
+      method: "POST",
+      headers: { ...f.deviceHeaders, "content-type": "application/json" },
+      body: JSON.stringify({ projectId }),
+    });
+    assert.equal(response.status, 404, `${projectId} must not be reachable`);
+  }
+  assert.equal((await f.deviceConfig()).projectId, "proj_alpha", "the rejected writes changed nothing");
+
+  for (const body of [{}, { projectId: "  " }]) {
+    const response = await f.originalFetch(new URL("/v1/device/config/project", f.baseUrl), {
+      method: "POST",
+      headers: { ...f.deviceHeaders, "content-type": "application/json" },
+      body: JSON.stringify(body),
+    });
+    assert.equal(response.status, 400);
+  }
+});
+
+test("project listing and selection are refused when the owner bound no environment", async (t) => {
+  const f = await environmentSelectionFixture(t);
+
+  const listed = await f.originalFetch(new URL("/v1/device/projects", f.baseUrl), {
+    headers: f.deviceHeaders,
+  });
+  assert.equal(listed.status, 409);
+
+  const wrote = await f.originalFetch(new URL("/v1/device/config/project", f.baseUrl), {
+    method: "POST",
+    headers: { ...f.deviceHeaders, "content-type": "application/json" },
+    body: JSON.stringify({ projectId: "proj_alpha" }),
+  });
+  assert.equal(wrote.status, 409);
+});
+
+test("project listing reports a bound T3 host outage as an actionable gateway error", async (t) => {
+  const f = await environmentSelectionFixture(t, { snapshotError: new Error("connect ECONNREFUSED") });
+  await f.bind({ environmentId: f.bound.id });
+
+  const response = await f.originalFetch(new URL("/v1/device/projects", f.baseUrl), {
+    headers: f.deviceHeaders,
+  });
+  assert.equal(response.status, 502);
+  const body = await response.json();
+  assert.equal(body.error.details.code, "t3_unreachable");
+  assert.equal(body.error.details.environmentId, f.bound.id);
+});
+
+test("invalid credentials and unclaimed devices cannot browse environments or projects", async (t) => {
+  const f = await environmentSelectionFixture(t);
+  await f.bind({ environmentId: f.bound.id });
+  const badHeaders = {
+    "x-device-id": f.created.device.id,
+    "x-device-secret": "wrong-secret",
+  };
+
+  for (const path of ["/v1/device/environments", "/v1/device/projects"]) {
+    const response = await f.originalFetch(new URL(path, f.baseUrl), { headers: badHeaders });
+    assert.equal(response.status, 401, path);
+  }
+  for (const [path, body] of [
+    ["/v1/device/config/environment", { environmentId: f.bound.id }],
+    ["/v1/device/config/project", { projectId: "proj_alpha" }],
+  ]) {
+    const response = await f.originalFetch(new URL(path, f.baseUrl), {
+      method: "POST",
+      headers: { ...badHeaders, "content-type": "application/json" },
+      body: JSON.stringify(body),
+    });
+    assert.equal(response.status, 401, path);
+  }
+
+  const { server } = createApp({ config: { factoryToken: "factory-secret", demoMode: false } });
+  await listen(server);
+  t.after(() => server.close());
+  const factoryBaseUrl = `http://127.0.0.1:${server.address().port}`;
+  const provisioned = await requestJson(f.originalFetch, factoryBaseUrl, "/v1/factory/devices", {
+    method: "POST",
+    headers: { authorization: "Bearer factory-secret" },
+    body: { label: "Unclaimed", profile: "agent-controller" },
+  });
+  const unclaimedHeaders = {
+    "x-device-id": provisioned.device.id,
+    "x-device-secret": provisioned.secret,
+  };
+  for (const path of ["/v1/device/environments", "/v1/device/projects"]) {
+    const response = await f.originalFetch(new URL(path, factoryBaseUrl), { headers: unclaimedHeaders });
+    assert.equal(response.status, 403, path);
+  }
+  const wrote = await f.originalFetch(new URL("/v1/device/config/environment", factoryBaseUrl), {
+    method: "POST",
+    headers: { ...unclaimedHeaders, "content-type": "application/json" },
+    body: JSON.stringify({ environmentId: f.bound.id }),
+  });
+  assert.equal(wrote.status, 403);
+});
+
 test("the device display payload carries the owner's configured menu, not a generic one", async (t) => {
   const originalFetch = globalThis.fetch;
   const { server } = createApp();
