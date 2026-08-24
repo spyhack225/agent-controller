@@ -1,0 +1,8 @@
+{
+  "name": "ES8311",
+  "version": "1.0.0",
+  "description": "ES8311 mono audio codec driver (ADC + DAC). Espressif's Apache-2.0 driver, vendored unmodified from the Hosyond ES3C28P example pack so the build has no external dependency.",
+  "license": "Apache-2.0",
+  "frameworks": "arduino",
+  "platforms": "espressif32"
+}

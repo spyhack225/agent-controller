@@ -1,0 +1,16 @@
+# Dual-app OTA layout for the 16 MB Hosyond ES3C28P (2.8" IPS ESP32-S3).
+#
+# Identical to the Waveshare AMOLED table: both boards are 16 MB, and keeping the layout the same
+# across boards means one firmware manifest shape and one rollback procedure rather than two.
+#
+# Two app slots plus otadata is what makes rollback possible: the bootloader flashes the inactive
+# slot, boots it PENDING_VERIFY, and returns to the previous slot on the next reset unless the
+# firmware confirms itself. A single-app layout cannot roll back at all.
+#
+# Name,     Type, SubType,  Offset,   Size
+nvs,        data, nvs,      0x9000,   0x5000
+otadata,    data, ota,      0xe000,   0x2000
+app0,       app,  ota_0,    0x10000,  0x500000
+app1,       app,  ota_1,    0x510000, 0x500000
+spiffs,     data, spiffs,   0xA10000, 0x5E0000
+coredump,   data, coredump, 0xFF0000, 0x10000

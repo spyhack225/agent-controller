@@ -324,8 +324,23 @@ deliberately not scripted.
 deployment validation), [docs/hardware-protocol.md](docs/hardware-protocol.md) (device provisioning/display/intent wire
 format), [roadmap/](roadmap/).
 
-Firmware is PlatformIO C++ under `firmware/esp32-controller` (2.13" e-ink, five active-low keys) and
-`firmware/vision-master-t190`; copy `include/controller_config.example.h` to `controller_config.h`, then `pio run`.
+Firmware is PlatformIO C++ under four board folders; copy `include/controller_config.example.h` to
+`controller_config.h`, then `pio run`.
+
+| Folder | Board | State |
+|---|---|---|
+| `CrowPanel-ESP32-2.13-E-paper` | 2.13" e-ink, five active-low keys | The only complete implementation |
+| `vision-master-t190` | 1.9" TFT | Bring-up sketch |
+| `Waveshare-ESP32-S3-Touch-AMOLED-1.75C` | 466x466 round AMOLED touch, dual-mic array | Scaffold; pin map unverified |
+| `Hosyond-ESP32-S3-2.8-Touchscreen` | 2.8" IPS 240x320 touch, on-board mic + speaker (ES8311) | Scaffold with a working capture path; pin map vendor-verified |
+
+Every board is pinned to **ESP-IDF 5.5 / Arduino core 3.3** via the pioarduino platform fork. The official
+`platformio/platform-espressif32` is unmaintained at Arduino 2.0.17 / ESP-IDF 4.4, which lacks `driver/i2s_std.h`
+and cannot build the audio boards. Changing the pin means re-verifying all nine environments.
+
+**Every ESP32-S3 board is BLE-only** — no Bluetooth Classic, so no HFP headset microphone, and no LE Audio.
+Bluetooth earbuds cannot be a microphone source on any current or planned board. On-board mics or a phone
+companion are the two real paths.
 
 `firmware/shared/AgentControllerCore` (via `lib_extra_dirs`) owns the writable device state both boards need:
 `DeviceStore` wraps NVS (namespace `agentctl`) for identity, gateway URL, Wi-Fi credentials, the cached claim code, and

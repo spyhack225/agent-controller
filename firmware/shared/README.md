@@ -2,8 +2,25 @@
 
 PlatformIO libraries shared by every Agent Controller board, pulled in with `lib_extra_dirs = ../shared`.
 
-Both boards run the same client logic and differ only in their panel. Keeping that logic here is what
-stops `esp32-controller` and `vision-master-t190` from drifting into two unrelated firmwares.
+Every board runs the same client logic and differs only in its panel and input surface. Keeping that
+logic here is what stops `CrowPanel-ESP32-2.13-E-paper`, `vision-master-t190`,
+`Waveshare-ESP32-S3-Touch-AMOLED-1.75C`, and `Hosyond-ESP32-S3-2.8-Touchscreen` from drifting into
+four unrelated firmwares.
+
+All four are pinned to one toolchain — ESP-IDF 5.5 / Arduino core 3.3 via the
+[pioarduino](https://github.com/pioarduino/platform-espressif32) platform fork. The official
+`platformio/platform-espressif32` is unmaintained and frozen at Arduino 2.0.17 / ESP-IDF 4.4, which
+has no `driver/i2s_std.h` and therefore cannot build the on-board audio boards.
+
+**This library does not yet hold enough.** Only `DeviceStore` and `Provisioning` are shared today;
+the gateway client — heartbeat, display-state fetch, intent submission, OTA, media upload — still
+lives inside the CrowPanel's 3652-line `src/main.cpp`. That was tolerable with one real board and
+one bring-up sketch. Two audio boards later it is the single thing standing between a recorded
+clip and a dispatched intent — the Hosyond board already captures audio and can do nothing with it.
+Extracting the client here is now the prerequisite for a second working firmware, not a cleanup
+task. Port plans:
+[`Waveshare`](../Waveshare-ESP32-S3-Touch-AMOLED-1.75C/README.md),
+[`Hosyond`](../Hosyond-ESP32-S3-2.8-Touchscreen/README.md).
 
 ## AgentControllerCore
 
@@ -66,5 +83,5 @@ returns the owner to the form instead of writing a value that bricks the next bo
 
 ## Status
 
-Compiles on all three `esp32-controller` environments. **Not yet validated on hardware** — the
+Compiles on all nine environments across all four boards. **Not yet validated on hardware** — the
 portal, the join-timeout path, and the long-press reset have never run on real silicon.
