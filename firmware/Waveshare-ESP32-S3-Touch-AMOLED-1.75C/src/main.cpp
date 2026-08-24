@@ -106,6 +106,16 @@ void pollResetButton() {
 
 void setup() {
   Serial.begin(115200);
+
+  // Never block on a serial write.
+  //
+  // Serial here is the ESP32-S3's native USB CDC, and by default a write waits for the host to
+  // drain the TX buffer. With a monitor attached that is invisible; with nothing reading, the
+  // buffer fills and every Serial.printf stalls the loop for the timeout — so the bug is masked by
+  // the very tool used to look for it. 0 means "write what fits, drop the rest", which is the right
+  // trade: diagnostics are worth nothing if printing them is what stops the device working.
+  Serial.setTxTimeoutMs(0);
+
   // Native USB CDC needs a moment before the host enumerates it, and anything printed before that
   // is lost. This board programs over native USB, unlike the CrowPanel.
   delay(2000);

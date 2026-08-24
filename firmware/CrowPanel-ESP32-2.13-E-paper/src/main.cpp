@@ -396,9 +396,19 @@ int requestJsonAtBase(
     return 429;
   }
 
-  HTTPClient http;
+  // Declaration order is load-bearing, not style.
+  //
+  // C++ destroys locals in reverse declaration order, and HTTPClient keeps a reference to the
+  // client beginHttp() handed it. With HTTPClient declared first it is destroyed LAST — after the
+  // client it points at — so ~HTTPClient() calls stop() on freed memory. That crashed as
+  // InstrFetchProhibited at PC 0xfffffffd (a call through a dead vtable) and corrupted the lwIP
+  // TCP heap on the way out, surfacing later as pbuf_free/tcp_seg_free panics in the tcpip thread.
+  // The device was rebooting roughly twice a minute.
+  //
+  // Clients first, HTTPClient last: it dies first, while what it points at is still alive.
   WiFiClient plainClient;
   WiFiClientSecure secureClient;
+  HTTPClient http;
   const String url = urlForBase(gatewayBase, path);
 
   if (!beginHttp(http, plainClient, secureClient, url)) {
@@ -1903,9 +1913,10 @@ bool applyFirmwareUpdate(JsonObject manifest) {
 
   reportFirmwareStatus("downloading", targetVersion, "download started", 0);
 
-  HTTPClient http;
+  // Clients first, HTTPClient last; see the note in requestJsonAtBase().
   WiFiClient plainClient;
   WiFiClientSecure secureClient;
+  HTTPClient http;
   String downloadUrl = String(firmwareUrl);
   if (downloadUrl.startsWith("/")) downloadUrl = activeGatewayBase() + downloadUrl;
   if (!beginHttp(http, plainClient, secureClient, downloadUrl)) {
@@ -2086,9 +2097,10 @@ String uploadMedia(
   );
   const size_t contentLength = bodyStream.contentLength();
 
-  HTTPClient http;
+  // Clients first, HTTPClient last; see the note in requestJsonAtBase().
   WiFiClient plainClient;
   WiFiClientSecure secureClient;
+  HTTPClient http;
   const String url = urlFor("/v1/device/media");
   if (!beginHttp(http, plainClient, secureClient, url)) {
     Serial.println("[media] http begin failed");

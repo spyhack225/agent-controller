@@ -92,6 +92,13 @@ bool publishHeartbeat() {
 
 void setup() {
   Serial.begin(115200);
+
+  // Never block on a serial write. Serial here is the ESP32-S3's native USB CDC, and by default a
+  // write waits for the host to drain the TX buffer — so with nothing reading, every Serial.printf
+  // stalls the loop for the timeout. Attaching a monitor hides it, which is what makes it hard to
+  // find. 0 means "write what fits, drop the rest".
+  Serial.setTxTimeoutMs(0);
+
   delay(1000);
 
   Serial.println("\n=== Vision Master T190 boot ===");
