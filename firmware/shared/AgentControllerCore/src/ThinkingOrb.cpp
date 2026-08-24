@@ -727,7 +727,15 @@ OrbFrame ThinkingOrb::render(uint32_t elapsedMs) {
   return {dots_, n, lines_, lineCount_};
 }
 
-OrbMode orbModeForAgentState(const String& state) {
+OrbMode orbModeForAgentState(const String& stateIn) {
+  // Case-folded, because this function's whole job is absorbing whatever word the gateway sends
+  // and the gateway does not promise a case. GatewayOperate.cpp upper-cases every thread status
+  // before it is stored, so every literal below — all lower case — silently failed to match and
+  // the mapper returned Ring. That is not a cosmetic miss: Ring is the calm orb labelled "Ready",
+  // so a device whose agent was mid-search would have looked idle. Comparing against a word this
+  // function was handed is exactly where the normalisation belongs.
+  String state = stateIn;
+  state.toLowerCase();
   if (state == "running" || state == "working" || state == "dispatched") return OrbMode::Orbits;
   if (state == "searching") return OrbMode::Globe;
   if (state == "solving" || state == "planning") return OrbMode::Rubik;

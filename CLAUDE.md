@@ -152,6 +152,43 @@ re-decided, and a streaming assistant message does not yet count as a reply.
 Real captured data lives in `test/fixtures/` (a live snapshot and the five provider caches); tests
 run against it rather than invented shapes.
 
+### Agent verbs (what the orb animates)
+
+The controller renders nine orb animations. Five were driven by the words this gateway already
+speaks; `searching` / `solving` / `weaving` / `shaping` are now derived in `src/agentVerb.mjs` and
+published on the **selected** row's `status` in `GET /v1/device/threads` — the one field the orb
+reads (`presentationForState()` in the Hosyond `ui.cpp`). The other six words are never replaced;
+a verb only ever refines `running`.
+
+**The snapshot cannot answer this and never could.** T3's own handler comment
+(`src/orchestration/http.ts` in the 0.0.32 source map) says `GET /api/orchestration/snapshot`
+serves "the lightweight command read model (thread bodies empty)" because hydrating every message
+and activity "has OOM-killed servers" — which is why `test/fixtures/t3-snapshot.json` carries no
+`messages` and no `activities` on any thread. The work log lives on
+`GET /api/orchestration/threads/:threadId`, contract endpoint `threadSnapshot`, with an optional
+`?turnLimit=` window. `fetchT3ThreadDetail()` calls it with `turnLimit: 1`, for the selected thread
+only, and only while that thread is running.
+
+The evidence is `thread.activities[]` (`OrchestrationThreadActivity`), whose tool rows
+`ProviderRuntimeIngestion.ts` emits as `kind: tool.started|tool.updated|tool.completed` with
+`payload.itemType` from `TOOL_LIFECYCLE_ITEM_TYPES` and a `payload.data` that
+`ActivityPayloadProjection.ts` slims to `{item, command, files[].path, toolCallId, kind, rawOutput}`
+— so `data.rawInput` is **not** on the wire and nothing may read it.
+`classifyToolActivity()` is a port of T3's own `classifyToolAction`
+(`packages/shared/src/toolActivity.ts`), so the gateway and the T3 UI cannot disagree about what a
+tool call was.
+
+Three refusals are the point: a settled turn yields no verb, an activity stamped with a different
+`turnId` never speaks for the live one, and an unclassifiable tool (`mcp_tool_call`,
+`dynamic_tool_call` with no `data.kind`) stays at `running`. A single-file edit is likewise not
+`weaving`, which means "coordinated edits across multiple files" and needs two distinct paths.
+T3 publishes no "the model is generating" activity, so a finished `tool.completed` with nothing
+after it still reports that tool — a known, uncloseable gap.
+
+**Known firmware gap:** `orbModeForAgentState()` compares against lowercase literals
+(`ThinkingOrb.cpp`), but `GatewayOperate.cpp` upper-cases `ThreadOption.status` before the orb table
+reads it, so the fallback mapper cannot match a verb until that compare is made case-insensitive.
+
 ### Media storage and processing
 
 `storagePath` on a media record is a **local path or an S3 object key** depending on

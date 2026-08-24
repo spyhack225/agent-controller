@@ -410,7 +410,8 @@ Thread-state outcomes:
 | Long title | Truncate list label with `~`; preserve full bounded title across detail pages |
 
 The endpoint returns a compact thread `status` plus `selected`. Status is derived from the latest
-turn/session with active work taking precedence over a stale stopped session. Firmware may display
+turn/session with active work taking precedence over a stale stopped session; on the selected row
+`running` may be refined into an agent verb (see "Agent verbs on `status`" below). Firmware may display
 that bounded value, but must still treat the top-level `threadId` as the compatibility source of
 truth when talking to an older gateway. Renaming, creating, deleting, or editing a thread remains a
 dashboard operation.
@@ -984,6 +985,25 @@ device-facing source of real thread identity. `status` is a compact latest-turn/
 active `running` work takes precedence over a stale stopped session. `selected` duplicates the
 top-level `threadId` on each row for simple renderers. Older firmware may ignore both optional
 fields.
+
+### Agent verbs on `status`
+
+The **selected** row's `running` may be refined into one of four agent verbs describing what the
+agent is actually doing. The other six words (`starting`, `streaming`, `completed`, `error`,
+`stopped`, `idle`) are never replaced, and unselected rows always keep `running`.
+
+| Verb | Emitted when, in the live turn's work log |
+|---|---|
+| `searching` | the newest tool row is a read or a search (`web_search` itemType, `data.kind` `read`/`search`, or a `Grep`/`Find`/`Read file` title) |
+| `solving` | the newest row is a `turn.plan.updated`, or a command execution (`command_execution` itemType / `data.kind: "execute"` / `Terminal`) |
+| `weaving` | the newest row is a file edit **and** the turn has touched two or more distinct paths |
+| `shaping` | the newest row is a file change with `data.kind` of `write`, `move`, or `delete` |
+
+The evidence is `thread.activities[]` from T3's hydrated
+`GET /api/orchestration/threads/:threadId?turnLimit=1`; the bodiless
+`GET /api/orchestration/snapshot` cannot answer this. Every step is best-effort: a T3 without that
+route, a slow host, a settled turn, an unattributable activity, or a tool the gateway cannot name
+all leave the row at plain `running`. A verb is never emitted on a guess — see `src/agentVerb.mjs`.
 
 ```http
 POST /v1/device/config/thread

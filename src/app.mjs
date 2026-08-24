@@ -106,8 +106,10 @@ import {
   dispatchT3Command,
   exchangePairingToken,
   fetchT3Snapshot,
+  fetchT3ThreadDetail,
   isEnvironmentTokenExpired,
 } from "./t3Client.mjs";
+import { refineThreadStatus } from "./agentVerb.mjs";
 import {
   buildT3ReleaseStatus,
   fetchLatestT3Release,
@@ -2203,11 +2205,12 @@ export function createApp({
         requireClaimedDevice(device);
         const environment = await boundDeviceEnvironment(store, device);
         const snapshot = await fetchDeviceSnapshot(environment);
+        const threads = deviceSelectableThreads(snapshot, device.config?.threadId, device.config?.projectId);
         return sendJson(res, 200, {
           environmentId: environment.id,
           projectId: device.config?.projectId ?? null,
           threadId: device.config?.threadId ?? null,
-          threads: deviceSelectableThreads(snapshot, device.config?.threadId, device.config?.projectId),
+          threads: await refineSelectedThreadVerb(environment, threads),
         });
       }
 
@@ -4696,6 +4699,10 @@ async function boundDeviceEnvironment(store, device) {
 // retained for older clients. `status` follows the same precedence as the selected
 // thread display: active work wins over a stale stopped session.
 //
+// `status` is the field the orb reads, and the selected row's `running` is refined
+// afterwards into an agent verb by refineSelectedThreadVerb() when — and only when — T3's
+// work log proves one. The words produced here are unchanged.
+//
 // `projectId` narrows the list to one folder. Null — the default, and what firmware
 // that predates project selection sends — keeps the whole bound environment visible,
 // so adding project selection cannot shrink an existing controller's thread list.
@@ -4713,6 +4720,32 @@ function deviceSelectableThreads(snapshot, selectedThreadId = null, projectId = 
       selected: optionalString(thread?.id) === optionalString(selectedThreadId),
     }))
     .filter((thread) => thread.id !== null);
+}
+
+// Refines the selected thread's `running` into what the agent is actually doing.
+//
+// Only the selected thread, and only while it is running. The orb reads exactly one row —
+// the selected one (presentationForState() in the Hosyond ui.cpp) — so hydrating the rest
+// would buy a screen nothing and cost one HTTP round trip per thread per poll. `turnLimit: 1`
+// bounds the response to the live turn.
+//
+// Best-effort by construction. A T3 that predates GET /api/orchestration/threads/:threadId,
+// a slow host, or a thread that settled between the two reads all leave the row at plain
+// `running`, which is exactly what this route answered before. The thread list must not fail
+// because a decoration could not be computed.
+async function refineSelectedThreadVerb(environment, threads) {
+  const selected = threads.find((thread) => thread.selected && thread.status === "running");
+  if (!selected) return threads;
+  let detail = null;
+  try {
+    detail = await fetchT3ThreadDetail(environment, selected.id, { turnLimit: 1 });
+  } catch {
+    return threads;
+  }
+  const refined = refineThreadStatus(selected.status, detail);
+  if (refined === selected.status) return threads;
+  selected.status = refined;
+  return threads;
 }
 
 // The owner's environments, as much of one as a bezel can render. Deliberately not
@@ -4777,6 +4810,9 @@ async function fetchDeviceSnapshot(environment) {
   }
 }
 
+// The five words this list has always spoken. Refinement into an agent verb happens in
+// refineSelectedThreadVerb(), never here: this function sees only the bodiless snapshot
+// thread, which carries no evidence about what the agent is doing.
 function deviceThreadStatus(thread) {
   const sessionStatus = optionalString(thread?.session?.status);
   const turnStatus = optionalString(thread?.latestTurn?.state);

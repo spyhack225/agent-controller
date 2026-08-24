@@ -80,6 +80,49 @@ export async function fetchT3Snapshot(environment, options = {}) {
   return response.json();
 }
 
+/**
+ * One thread, hydrated — messages, activities, checkpoints.
+ *
+ * `GET /api/orchestration/snapshot` is deliberately bodiless on the T3 side ("thread bodies
+ * empty", src/orchestration/http.ts), which is why test/fixtures/t3-snapshot.json has no
+ * `messages` and no `activities` on any thread. The work log lives here instead:
+ * `GET /api/orchestration/threads/:threadId` (contract endpoint "threadSnapshot", success
+ * `OrchestrationThreadDetailSnapshot` = {snapshotSequence, thread, page?}).
+ *
+ * `turnLimit` is the contract's own query-string window. Passing 1 bounds the response to the
+ * most recent turn, which is all a "what is the agent doing right now" read ever needs, and
+ * keeps a thread with thousands of activity rows from being pulled across the wire on a poll.
+ */
+export async function fetchT3ThreadDetail(environment, threadId, options = {}) {
+  const timeoutMs = Number.isFinite(options.timeoutMs)
+    ? options.timeoutMs
+    : Number.isFinite(environment?.timeoutMs) ? environment.timeoutMs : 8000;
+  const fetchImpl = options.fetchImpl ?? globalThis.fetch;
+  const url = new URL(`/api/orchestration/threads/${encodeURIComponent(threadId)}`, environment.baseUrl);
+  if (Number.isFinite(options.turnLimit)) url.searchParams.set("turnLimit", String(options.turnLimit));
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), timeoutMs);
+  let response;
+  try {
+    response = await fetchImpl(url, {
+      headers: authorizationHeaders(environment.accessToken),
+      signal: controller.signal,
+    });
+  } catch (error) {
+    if (error?.name === "AbortError") {
+      throw taggedError(`T3 thread snapshot timed out after ${timeoutMs}ms.`, { code: "ETIMEDOUT" });
+    }
+    throw error;
+  } finally {
+    clearTimeout(timeout);
+  }
+  if (!response.ok) {
+    throw taggedError(`T3 thread snapshot failed with HTTP ${response.status}.`, { status: response.status });
+  }
+  const payload = await response.json();
+  return payload?.thread ?? null;
+}
+
 export async function dispatchT3Command(environment, command) {
   const response = await fetch(new URL("/api/orchestration/dispatch", environment.baseUrl), {
     method: "POST",
