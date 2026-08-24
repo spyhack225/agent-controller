@@ -9,12 +9,23 @@
 #include <SPI.h>
 
 namespace {
-Adafruit_ILI9341 panel(LCD_CS, LCD_DC, LCD_RST);
+
+// Constructed lazily, NOT as a global.
+//
+// Adafruit_ILI9341's constructor captures a reference to the global `SPI` object. As a file-scope
+// global this is the static initialization order fiasco: nothing orders `panel` after `SPI` across
+// translation units, so it can capture an SPIClass that has not been constructed yet. The symptom
+// is a board that dies before Serial.begin() and therefore explains nothing about itself — which
+// is exactly what happened, and it happened even in builds with ENABLE_LCD=0, because the global
+// is constructed regardless of whether the display is ever used.
+Adafruit_ILI9341* panel = nullptr;
 bool ready = false;
+
 }  // namespace
 
-bool displayReady() { return ready; }
-Adafruit_ILI9341& displayPanel() { return panel; }
+bool displayReady() { return ready && panel != nullptr; }
+
+Adafruit_ILI9341& displayPanel() { return *panel; }
 
 void displayBacklight(bool on) {
   // Ramped, not switched. The vendor spec rates this board at 140 mA with the display alone and
@@ -45,9 +56,13 @@ bool displayBegin() {
   // shares the bus, though this driver never reads from it.
   SPI.begin(LCD_SCLK, LCD_MISO, LCD_MOSI, LCD_CS);
 
-  panel.begin();
-  panel.setRotation(0);            // portrait, 240x320, ribbon at the bottom
-  panel.fillScreen(ILI9341_BLACK);
+  // Built here, after Arduino's init and after SPI is known to exist.
+  if (!panel) panel = new Adafruit_ILI9341(LCD_CS, LCD_DC, LCD_RST);
+  if (!panel) return false;
+
+  panel->begin();
+  panel->setRotation(0);           // portrait, 240x320, ribbon at the bottom
+  panel->fillScreen(ILI9341_BLACK);
 
   // Let the panel's own rails settle before adding the backlight load on top of them.
   delay(20);
@@ -79,7 +94,7 @@ uint16_t paintedCount = 0;
 }  // namespace
 
 void displayDrawOrb(ThinkingOrb& orb, int16_t cx, int16_t cy, uint32_t elapsedMs) {
-  if (!ready) return;
+  if (!displayReady()) return;
   Adafruit_ILI9341& g = displayPanel();
 
   const OrbFrame frame = orb.render(elapsedMs);
@@ -105,7 +120,7 @@ void displayDrawOrb(ThinkingOrb& orb, int16_t cx, int16_t cy, uint32_t elapsedMs
 }
 
 void displayDrawStatus(const char* label, int16_t cy, uint32_t elapsedMs) {
-  if (!ready || !label) return;
+  if (!displayReady() || !label) return;
   Adafruit_ILI9341& g = displayPanel();
 
   const size_t len = strlen(label);
