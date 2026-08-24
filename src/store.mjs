@@ -2,6 +2,7 @@ import { createHash, timingSafeEqual } from "node:crypto";
 
 import { ENVIRONMENT_REMOVED_REASON } from "./actions.mjs";
 import { defaultSubscription, normalizeSubscription } from "./billing.mjs";
+import { ENVIRONMENT_FAILURE_REASONS } from "./environmentFailure.mjs";
 import { createId, createSecret, nowIso } from "./ids.mjs";
 import { normalizeOnboarding, normalizeStoredOnboarding } from "./onboarding.mjs";
 import { createSecretBox } from "./secretBox.mjs";
@@ -1854,6 +1855,7 @@ function normalizeEnvironmentHealth(input = {}, existing = null) {
     lastCheckedAt: null,
     lastReachableAt: null,
     lastError: null,
+    failureReason: null,
     snapshot: null,
     compatibility: null,
     ...(existing ?? {}),
@@ -1863,9 +1865,14 @@ function normalizeEnvironmentHealth(input = {}, existing = null) {
     ...(Object.hasOwn(input, "lastCheckedAt") ? { lastCheckedAt: normalizeNullableString(input.lastCheckedAt) } : {}),
     ...(Object.hasOwn(input, "lastReachableAt") ? { lastReachableAt: normalizeNullableString(input.lastReachableAt) } : {}),
     ...(Object.hasOwn(input, "lastError") ? { lastError: normalizeNullableString(input.lastError) } : {}),
+    ...(Object.hasOwn(input, "failureReason") ? { failureReason: normalizeEnvironmentFailureReason(input.failureReason) } : {}),
     ...(Object.hasOwn(input, "snapshot") ? { snapshot: input.snapshot ?? null } : {}),
     ...(Object.hasOwn(input, "compatibility") ? { compatibility: input.compatibility ?? null } : {}),
   };
+}
+
+function normalizeEnvironmentFailureReason(value) {
+  return ENVIRONMENT_FAILURE_REASONS.includes(value) ? value : null;
 }
 
 function normalizeCommandMetrics(input = {}) {

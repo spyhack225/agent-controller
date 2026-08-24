@@ -116,7 +116,7 @@ test("an unreachable environment is marked unreachable and reported once", async
     store,
     events,
     fetchSnapshot: async () => {
-      throw new Error("T3 snapshot timed out after 8000ms.");
+      throw Object.assign(new Error("T3 snapshot timed out after 8000ms."), { code: "ETIMEDOUT" });
     },
   });
   poller.trackUser("user_1");
@@ -128,6 +128,7 @@ test("an unreachable environment is marked unreachable and reported once", async
   const stored = await store.getEnvironmentForUser("user_1", environment.id);
   assert.equal(stored.status, "unreachable");
   assert.match(stored.health.lastError, /timed out/u);
+  assert.equal(stored.health.failureReason, "timeout");
 
   assert.equal(events.broadcasts.length, 1);
   assert.equal(events.broadcasts[0].payload.screen.state, "unreachable");
@@ -156,6 +157,9 @@ test("expired tokens are surfaced without attempting a snapshot", async () => {
   assert.equal(result.polled[0].status, "token_expired");
   assert.equal(snapshotCalls, 0, "an expired token must not be sent to T3");
   assert.equal(events.broadcasts[0].payload.screen.state, "token_expired");
+
+  const stored = await store.getEnvironmentForUser("user_1", (await store.listEnvironments("user_1"))[0].id);
+  assert.equal(stored.health.failureReason, "token_expired");
 });
 
 test("a slow tick does not overlap with the next one", async () => {

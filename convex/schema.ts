@@ -126,6 +126,7 @@ export default defineSchema({
       lastCheckedAt: v.union(v.string(), v.null()),
       lastReachableAt: v.union(v.string(), v.null()),
       lastError: v.union(v.string(), v.null()),
+      failureReason: v.optional(v.union(v.string(), v.null())),
       snapshot: v.any(),
       compatibility: v.optional(v.any()),
     })),

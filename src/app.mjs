@@ -107,7 +107,13 @@ import {
   fetchLatestT3Release,
   runT3CompatibilityCheck,
   summarizeT3Compatibility,
+  T3_COMPATIBILITY_POLICY,
 } from "./t3Compatibility.mjs";
+import {
+  classifyEnvironmentFailure,
+  describeEnvironmentFailure,
+  isRetryableEnvironmentFailure,
+} from "./environmentFailure.mjs";
 
 const STANDARD_T3_SCOPES = ["orchestration:read", "orchestration:operate"];
 const BILLING_WEBHOOK_TOLERANCE_MS = 5 * 60 * 1000;
@@ -938,6 +944,7 @@ export function createApp({
         } catch (error) {
           if (error instanceof HttpError) throw error;
           const message = error?.message || "T3 snapshot is unavailable.";
+          const reason = classifyEnvironmentFailure(error);
           const checkedAt = new Date().toISOString();
           const updated = await store.updateEnvironmentHealth({
             userId: user.id,
@@ -946,9 +953,15 @@ export function createApp({
             health: {
               lastCheckedAt: checkedAt,
               lastError: message,
+              failureReason: reason,
             },
           });
-          throw new HttpError(502, "T3 snapshot is unavailable.", { environment: updated, cause: message });
+          throw new HttpError(502, "T3 snapshot is unavailable.", {
+            environment: updated,
+            cause: message,
+            reason,
+            failure: buildEnvironmentFailure({ environment: updated ?? environment, reason, message }),
+          });
         }
       }
 
@@ -3252,44 +3265,88 @@ function storableT3Command(command) {
 async function checkEnvironmentHealth({ store, userId, environment }) {
   const checkedAt = new Date().toISOString();
   if (isEnvironmentTokenExpired(environment)) {
-    const updated = await store.updateEnvironmentHealth({
+    return recordEnvironmentFailure({
+      store,
       userId,
-      environmentId: environment.id,
-      status: "token_expired",
-      health: {
-        lastCheckedAt: checkedAt,
-        lastError: "T3 access token has expired. Re-pair this environment.",
-      },
+      environment,
+      checkedAt,
+      reason: "token_expired",
+      message: describeEnvironmentFailure("token_expired"),
     });
-    return { environment: updated, error: updated?.health?.lastError };
   }
+  let snapshot;
   try {
-    const snapshot = await fetchT3Snapshot({ ...environment, timeoutMs: 5000 });
-    const screen = compressSnapshot(snapshot);
-    const updated = await store.updateEnvironmentHealth({
-      userId,
-      environmentId: environment.id,
-      status: "reachable",
-      health: {
-        lastCheckedAt: checkedAt,
-        lastReachableAt: checkedAt,
-        lastError: null,
-        snapshot: screen,
-      },
-    });
-    return { environment: updated, screen };
+    snapshot = await fetchT3Snapshot({ ...environment, timeoutMs: 5000 });
   } catch (error) {
-    const updated = await store.updateEnvironmentHealth({
+    const reason = classifyEnvironmentFailure(error);
+    return recordEnvironmentFailure({
+      store,
       userId,
-      environmentId: environment.id,
-      status: "unreachable",
-      health: {
-        lastCheckedAt: checkedAt,
-        lastError: error?.message || "T3 environment is unreachable.",
-      },
+      environment,
+      checkedAt,
+      reason,
+      message: error?.message || describeEnvironmentFailure(reason),
     });
-    return { environment: updated, error: updated?.health?.lastError ?? "T3 environment is unreachable." };
   }
+  // A 200 that carries neither projects nor threads is a host speaking a contract this gateway
+  // cannot drive, which is a different failure from an unreachable one.
+  if (!Array.isArray(snapshot?.projects) || !Array.isArray(snapshot?.threads)) {
+    return recordEnvironmentFailure({
+      store,
+      userId,
+      environment,
+      checkedAt,
+      reason: "contract_incompatible",
+      message: "The T3 snapshot did not expose the projects and threads arrays this gateway requires.",
+    });
+  }
+  const screen = compressSnapshot(snapshot);
+  const updated = await store.updateEnvironmentHealth({
+    userId,
+    environmentId: environment.id,
+    status: "reachable",
+    health: {
+      lastCheckedAt: checkedAt,
+      lastReachableAt: checkedAt,
+      lastError: null,
+      failureReason: null,
+      snapshot: screen,
+    },
+  });
+  return { environment: updated, screen, reason: null, failure: null };
+}
+
+async function recordEnvironmentFailure({ store, userId, environment, checkedAt, reason, message }) {
+  const updated = await store.updateEnvironmentHealth({
+    userId,
+    environmentId: environment.id,
+    status: reason === "token_expired" ? "token_expired" : "unreachable",
+    health: { lastCheckedAt: checkedAt, lastError: message, failureReason: reason },
+  });
+  const error = updated?.health?.lastError ?? message;
+  return {
+    environment: updated,
+    error,
+    reason,
+    failure: buildEnvironmentFailure({ environment: updated ?? environment, reason, message: error }),
+  };
+}
+
+// The recovery dialog renders from this; it must never carry a credential.
+function buildEnvironmentFailure({ environment, reason, message }) {
+  return {
+    reason,
+    message,
+    retryable: isRetryableEnvironmentFailure(reason),
+    baseUrl: environment?.baseUrl ?? null,
+    ...(reason === "contract_incompatible"
+      ? {
+        installedVersion: environment?.health?.compatibility?.installedVersion ?? null,
+        minimumVersion: T3_COMPATIBILITY_POLICY.minimumVersion,
+        maximumTestedVersion: T3_COMPATIBILITY_POLICY.maximumTestedVersion,
+      }
+      : {}),
+  };
 }
 
 async function purgeExpiredMedia({ store, userId, config = null, now = new Date().toISOString() }) {
@@ -3944,9 +4001,16 @@ function tokenExpiresAt(tokenResponse) {
 
 function assertEnvironmentTokenActive(environment) {
   if (isEnvironmentTokenExpired(environment)) {
+    // `reason` is the discriminator the console branches on; the message stays human copy.
     throw new HttpError(409, "T3 access token has expired. Re-pair this environment.", {
       environmentId: environment.id,
       accessTokenExpiresAt: environment.accessTokenExpiresAt,
+      reason: "token_expired",
+      failure: buildEnvironmentFailure({
+        environment,
+        reason: "token_expired",
+        message: describeEnvironmentFailure("token_expired"),
+      }),
     });
   }
 }

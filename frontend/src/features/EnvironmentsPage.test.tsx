@@ -219,3 +219,47 @@ test("lists controller gateways, marks the active endpoint, and names its device
   expect(within(dialog).getByText("Desk Controller")).toBeVisible();
   expect(within(dialog).getByText("online")).toBeVisible();
 });
+
+test("removes an environment only after showing what still points at it", async () => {
+  const environment: Environment = {
+    id: "env_42",
+    label: "Studio Mac",
+    baseUrl: "https://studio.tailnet.ts.net",
+    status: "reachable",
+  };
+  const c = controller([environment]);
+  Object.assign(c, {
+    api: vi.fn(async (path: string) => {
+      if (path.endsWith("/dependencies")) {
+        return {
+          environmentId: "env_42",
+          dependencies: {
+            devices: [{ id: "dev_desk", label: "Desk Controller" }],
+            actions: [{ id: "action_ship", label: "Ship it" }],
+            macros: [],
+            onboarding: true,
+          },
+          counts: { devices: 1, actions: 1, macros: 0, onboarding: 1 },
+        };
+      }
+      return { environment };
+    }),
+  });
+  renderPage(c);
+
+  fireEvent.click(screen.getByRole("button", { name: "Edit Studio Mac" }));
+  const dialog = screen.getByRole("dialog", { name: "Studio Mac" });
+  fireEvent.click(within(dialog).getByRole("button", { name: "health" }));
+  expect(within(dialog).queryByRole("button", { name: /Unpair/u })).toBeNull();
+  fireEvent.click(within(dialog).getByRole("button", { name: "Remove environment" }));
+
+  const confirmation = await screen.findByRole("alertdialog");
+  expect(within(confirmation).getByText("Remove Studio Mac?")).toBeVisible();
+  expect(within(confirmation).getByText(/1 device default, 1 saved action and your onboarding selection/u)).toBeVisible();
+  expect(within(confirmation).getByText(/disabled until you re-save them/u)).toBeVisible();
+
+  fireEvent.click(within(confirmation).getByRole("button", { name: "Remove environment" }));
+
+  await waitFor(() => expect(c.api).toHaveBeenCalledWith("/v1/t3/environments/env_42", { method: "DELETE" }));
+  expect(c.run).toHaveBeenCalledWith("remove-environment", "Environment removed.", expect.any(Function));
+});

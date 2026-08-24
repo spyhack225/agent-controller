@@ -452,6 +452,9 @@ test("T3 environment health checks record reachable and unreachable status", asy
   assert.match(unreachable.error, /HTTP 503/u);
   assert.match(unreachable.environment.health.lastError, /HTTP 503/u);
   assert.equal(unreachable.environment.health.lastReachableAt, null);
+  // A 503 is the host answering while it cannot serve; nothing about it names a cause.
+  assert.equal(unreachable.reason, "unknown");
+  assert.equal(unreachable.failure.retryable, true);
 
   const environments = await requestJson(originalFetch, baseUrl, "/v1/t3/environments", {
     method: "GET",
@@ -708,6 +711,8 @@ test("expired T3 access tokens are blocked before snapshot or dispatch", async (
   });
   assert.equal(health.environment.status, "token_expired");
   assert.match(health.error, /expired/u);
+  assert.equal(health.reason, "token_expired");
+  assert.equal(health.failure.retryable, false);
 
   const snapshot = await originalFetch(new URL(`/v1/t3/environments/${environment.environment.id}/snapshot`, baseUrl), {
     method: "GET",

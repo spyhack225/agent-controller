@@ -1,6 +1,7 @@
 import { createHash } from "node:crypto";
 
 import { compressSnapshot, fetchT3Snapshot, isEnvironmentTokenExpired } from "./t3Client.mjs";
+import { classifyEnvironmentFailure } from "./environmentFailure.mjs";
 import { extractThreadOutcomes, reconcileCommandStatus } from "./t3Harness.mjs";
 
 const DEFAULT_INTERVAL_MS = 5000;
@@ -90,6 +91,7 @@ export function createSnapshotPoller({
       await updateHealth(userId, environment, "token_expired", {
         checkedAt,
         lastError: "T3 access token has expired. Re-pair this environment.",
+        failureReason: "token_expired",
       });
       publishScreen(userId, environment, {
         title: "T3 Code",
@@ -102,13 +104,14 @@ export function createSnapshotPoller({
 
     try {
       const snapshot = await fetchSnapshot(environment);
-      await updateHealth(userId, environment, "reachable", { checkedAt, lastError: null });
+      await updateHealth(userId, environment, "reachable", { checkedAt, lastError: null, failureReason: null });
       const changed = publishScreen(userId, environment, compressSnapshot(snapshot));
       const reconciled = await reconcileCommands(userId, environmentId, snapshot);
       return { environmentId, status: "reachable", changed, reconciled };
     } catch (error) {
       const lastError = message(error);
-      await updateHealth(userId, environment, "unreachable", { checkedAt, lastError });
+      const failureReason = classifyEnvironmentFailure(error);
+      await updateHealth(userId, environment, "unreachable", { checkedAt, lastError, failureReason });
       publishScreen(userId, environment, {
         title: "T3 Code",
         state: "unreachable",

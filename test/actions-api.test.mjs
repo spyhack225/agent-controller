@@ -457,6 +457,70 @@ test("macro continuation checkpoints survive a file-store restart and are claime
   await second.flush();
 });
 
+test("a fixed action survives its environment being removed as a disabled control", async (t) => {
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = async (url) => {
+    const pathname = new URL(String(url)).pathname;
+    if (pathname === "/api/orchestration/dispatch") return jsonResponse({ accepted: true }, 200);
+    if (pathname === "/api/orchestration/snapshot") return jsonResponse({ projects: [], threads: [] }, 200);
+    return jsonResponse({ error: "not found" }, 404);
+  };
+  t.after(() => { globalThis.fetch = originalFetch; });
+
+  const { server } = createApp();
+  await listen(server);
+  t.after(() => server.close());
+  const baseUrl = `http://127.0.0.1:${server.address().port}`;
+  const auth = await createAuthHeaders(originalFetch, baseUrl);
+  const created = await requestJson(originalFetch, baseUrl, "/v1/devices", {
+    method: "POST", headers: auth, body: { label: "Orphan controller", profile: "agent-controller" },
+  });
+  const deviceAuth = { "x-device-id": created.device.id, "x-device-secret": created.secret };
+  const environment = await requestJson(originalFetch, baseUrl, "/v1/t3/environments", {
+    method: "POST",
+    headers: auth,
+    body: { label: "Mock T3", baseUrl: "https://mock-t3.example", accessToken: "mock-token" },
+  });
+  await requestJson(originalFetch, baseUrl, `/v1/devices/${created.device.id}/config`, {
+    method: "PUT",
+    headers: auth,
+    body: { environmentId: environment.environment.id, threadId: "thread_actions" },
+  });
+  const fixed = await createAction(originalFetch, baseUrl, auth, {
+    type: "prompt",
+    label: "Fixed prompt",
+    payload: { text: "Continue and run tests." },
+    targetMode: "fixed",
+    environmentId: environment.environment.id,
+    threadId: "thread_actions",
+  });
+  await requestJson(originalFetch, baseUrl, `/v1/devices/${created.device.id}/controls`, {
+    method: "PUT", headers: auth, body: { controls: [{ actionId: fixed.id }] },
+  });
+  const before = await requestJson(originalFetch, baseUrl, "/v1/device/controls", {
+    method: "GET", headers: deviceAuth,
+  });
+  assert.equal(before.controls[0].enabled, true);
+
+  await requestJson(originalFetch, baseUrl, `/v1/t3/environments/${environment.environment.id}`, {
+    method: "DELETE", headers: auth,
+  });
+
+  const after = await requestJson(originalFetch, baseUrl, "/v1/device/controls", {
+    method: "GET", headers: deviceAuth,
+  });
+  assert.equal(after.controls[0].enabled, false);
+  assert.match(after.controls[0].reason, /environment was removed/u);
+
+  // The record is still editable: normalizeActionInput would reject a fixed action with no
+  // environmentId, so the repair had to drop the fixed target as well as disable it.
+  const rescued = await requestJson(originalFetch, baseUrl, `/v1/actions/${fixed.id}`, {
+    method: "PUT", headers: auth, body: { label: "Repaired prompt" },
+  });
+  assert.equal(rescued.action.label, "Repaired prompt");
+  assert.equal(rescued.action.disabled, false);
+});
+
 async function createAction(fetchImpl, baseUrl, auth, body) {
   const response = await requestJson(fetchImpl, baseUrl, "/v1/actions", {
     method: "POST", headers: auth, body,

@@ -730,14 +730,49 @@ content-type: application/json
 
 You can also send a new `pairingToken` instead of `accessToken`. Omitted fields keep their current values, including `accessTokenExpiresAt`.
 
-Unpair an environment:
+Preview what still points at an environment before removing it:
+
+```http
+GET /v1/t3/environments/env_.../dependencies
+authorization: Bearer PLATFORM_TOKEN
+```
+
+```json
+{
+  "environmentId": "env_...",
+  "dependencies": {
+    "devices": [{ "id": "dev_...", "label": "Desk Controller" }],
+    "actions": [{ "id": "action_...", "label": "Ship it" }],
+    "macros": [],
+    "onboarding": true
+  },
+  "counts": { "devices": 1, "actions": 1, "macros": 0, "onboarding": 1 }
+}
+```
+
+Remove an environment:
 
 ```http
 DELETE /v1/t3/environments/env_...
 authorization: Bearer PLATFORM_TOKEN
 ```
 
-Unpairing deletes the stored T3 credential and clears this environment from any device runtime config that used it as the default.
+```json
+{
+  "environment": { "id": "env_...", "label": "MacBook Pro T3 Code" },
+  "removed": {
+    "devices": ["dev_..."],
+    "actions": ["action_..."],
+    "macros": ["macro_..."],
+    "onboarding": true
+  },
+  "alreadyRemoved": false
+}
+```
+
+Removal deletes the stored T3 credential and repairs everything that referenced the environment: device runtime configs lose it as their default, the onboarding selection (and its first thread) is cleared, and saved actions and macros that targeted it are **disabled** with `disabledReason: "environment_removed"` rather than left dangling — a fixed-target action without an `environmentId` is a record the API would refuse to create. Saving such an action or macro again re-enables it.
+
+The call is idempotent: repeating it answers `200` with `environment: null`, an empty `removed`, and `alreadyRemoved: true`.
 
 Check whether a paired environment is currently reachable:
 

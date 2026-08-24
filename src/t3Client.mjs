@@ -24,6 +24,10 @@ export async function exchangePairingToken({ baseUrl, pairingToken, scopes }) {
   return response.json();
 }
 
+function taggedError(message, tags) {
+  return Object.assign(new Error(message), tags);
+}
+
 export async function fetchT3EnvironmentInfo(environment, options = {}) {
   const timeoutMs = Number.isFinite(options.timeoutMs) ? options.timeoutMs : 5000;
   const fetchImpl = options.fetchImpl ?? globalThis.fetch;
@@ -36,14 +40,14 @@ export async function fetchT3EnvironmentInfo(environment, options = {}) {
     });
   } catch (error) {
     if (error?.name === "AbortError") {
-      throw new Error(`T3 environment metadata timed out after ${timeoutMs}ms.`);
+      throw taggedError(`T3 environment metadata timed out after ${timeoutMs}ms.`, { code: "ETIMEDOUT" });
     }
     throw error;
   } finally {
     clearTimeout(timeout);
   }
   if (!response.ok) {
-    throw new Error(`T3 environment metadata failed with HTTP ${response.status}.`);
+    throw taggedError(`T3 environment metadata failed with HTTP ${response.status}.`, { status: response.status });
   }
   return response.json();
 }
@@ -63,14 +67,15 @@ export async function fetchT3Snapshot(environment, options = {}) {
     });
   } catch (error) {
     if (error?.name === "AbortError") {
-      throw new Error(`T3 snapshot timed out after ${timeoutMs}ms.`);
+      // The abort erases the original code, so re-stamp one; failure classification reads it.
+      throw taggedError(`T3 snapshot timed out after ${timeoutMs}ms.`, { code: "ETIMEDOUT" });
     }
     throw error;
   } finally {
     clearTimeout(timeout);
   }
   if (!response.ok) {
-    throw new Error(`T3 snapshot failed with HTTP ${response.status}.`);
+    throw taggedError(`T3 snapshot failed with HTTP ${response.status}.`, { status: response.status });
   }
   return response.json();
 }

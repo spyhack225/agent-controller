@@ -96,10 +96,34 @@ export interface DeviceProfile {
   capabilities?: string[];
 }
 
+/** Why an environment is not answering, as returned by the gateway. Never inferred from copy. */
+export type EnvironmentFailureReason =
+  | "process_not_running"
+  | "network_unreachable"
+  | "timeout"
+  | "tls_error"
+  | "token_expired"
+  | "authentication_failed"
+  | "contract_incompatible"
+  | "unknown";
+
+/** The failure envelope on a /check response and on a snapshot error's details. */
+export interface EnvironmentFailure {
+  reason: EnvironmentFailureReason;
+  message: string;
+  /** False when retrying cannot help until the owner replaces a credential or upgrades T3. */
+  retryable: boolean;
+  baseUrl?: string | null;
+  installedVersion?: string | null;
+  minimumVersion?: string | null;
+  maximumTestedVersion?: string | null;
+}
+
 export interface EnvironmentHealth {
   lastCheckedAt?: string | null;
   lastReachableAt?: string | null;
   lastError?: string | null;
+  failureReason?: EnvironmentFailureReason | null;
   snapshot?: {
     title?: string;
     state?: string;

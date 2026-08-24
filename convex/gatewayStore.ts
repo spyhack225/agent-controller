@@ -43,9 +43,22 @@ const defaultEnvironmentHealth = {
   lastCheckedAt: null,
   lastReachableAt: null,
   lastError: null,
+  failureReason: null,
   snapshot: null,
   compatibility: null,
 };
+
+// Mirrors ENVIRONMENT_FAILURE_REASONS in src/environmentFailure.mjs.
+const environmentFailureReasons = new Set([
+  "process_not_running",
+  "network_unreachable",
+  "timeout",
+  "tls_error",
+  "token_expired",
+  "authentication_failed",
+  "contract_incompatible",
+  "unknown",
+]);
 
 const defaultPrivacySettings = {
   mediaRetentionDays: 30,
@@ -2317,6 +2330,9 @@ function normalizeEnvironmentHealth(input: any = {}, existing: any = null) {
     ...(Object.hasOwn(input, "lastCheckedAt") ? { lastCheckedAt: normalizeNullableString(input.lastCheckedAt) } : {}),
     ...(Object.hasOwn(input, "lastReachableAt") ? { lastReachableAt: normalizeNullableString(input.lastReachableAt) } : {}),
     ...(Object.hasOwn(input, "lastError") ? { lastError: normalizeNullableString(input.lastError) } : {}),
+    ...(Object.hasOwn(input, "failureReason")
+      ? { failureReason: environmentFailureReasons.has(input.failureReason) ? input.failureReason : null }
+      : {}),
     ...(Object.hasOwn(input, "snapshot") ? { snapshot: input.snapshot ?? null } : {}),
     ...(Object.hasOwn(input, "compatibility") ? { compatibility: input.compatibility ?? null } : {}),
   };
