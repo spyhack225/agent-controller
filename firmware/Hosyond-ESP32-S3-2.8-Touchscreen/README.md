@@ -3,10 +3,13 @@
 Vendor materials live in [`docs/`](docs/) — schematic, specification, datasheets, and a 30-example
 Arduino pack. This board's pin map and audio driver both come from there, not from guesswork.
 
-**Status: hardware-proven prototype; four environments compile.** The board has been flashed and
-used to verify 8 MB PSRAM, 16 MB flash, battery telemetry, SoftAP provisioning, the ES8311 codec and
-on-board microphone, the ILI9341 display, panel polarity, and the animated orb UI. It still has no
-shared gateway client, media upload/dispatch, touch input, or live agent-state feed. See the
+**Status: hardware-proven prototype with a full touch UI; five environments compile.** The board has
+been flashed and used to verify 8 MB PSRAM, 16 MB flash, battery telemetry, SoftAP provisioning, the
+ES8311 codec and on-board microphone, the ILI9341 display, panel polarity, and the animated orb.
+
+The five screens, the touch routing, media upload, and every gateway call behind them **have not run
+on silicon** — they compile and no board has been attached since they were written. What is proven is
+the layer underneath: the orb, the panel, the codec, NVS, and provisioning. See the
 [canonical implementation ledger](../../roadmap/IMPLEMENTATION-STATUS.md).
 
 ## Why this board runs the full workflow
@@ -24,11 +27,11 @@ handle upload and transcription.
 | Capability | This board |
 |---|---|
 | Voice input | On-board MEMS microphone via ES8311 ADC, 16 kHz mono — exactly what the gateway's transcription pipeline expects, so no on-device resampling |
-| Audio output | Speaker connector via ES8311 DAC, 1.5 W (8 Ω) or 2 W (4 Ω) |
+| Audio output | Speaker connector via ES8311 DAC through an FM8002E amplifier, 1.5 W (8 Ω) or 2 W (4 Ω). Driven by `src/speaker.cpp` — seven UI cues and a PCM path |
 | Typing / rich input | FT6336G capacitive touch, 240x320 — an on-screen keyboard fits a rectangular panel far better than the Waveshare's round one |
 | Showing an agent reply | 2.8" IPS, 240x320, 262K colours |
 | Clip memory | 8 MB OPI PSRAM; a 30 s 16 kHz mono clip is ~960 KB |
-| Recording indicator | Single-wire RGB LED on GPIO42 |
+| Recording indicator | Single-wire WS2812B RGB LED on GPIO42, driven by `src/led.cpp` — seven breathing states |
 | Portability | 3.7 V lithium connector with on-board charging; battery sense on GPIO9 |
 | Storage | microSD over 4-bit SDIO |
 
@@ -105,7 +108,7 @@ Arduino 2.0.17 on ESP-IDF 4.4 — where `driver/i2s_std.h` does not exist and on
 driver is available. This board's vendored ES8311 driver and its capture path are both written
 against the IDF 5.x I2S API, so the old platform could not build them.
 
-All four boards and all 11 environments were rebuilt and pass on the new platform, so the tree
+All four boards and all 12 environments were rebuilt and pass on the new platform, so the tree
 runs one toolchain rather than two.
 
 ## Display configuration
@@ -116,7 +119,7 @@ does not:
 
 | Setting | Value | Why |
 |---|---|---|
-| **Display inversion** | **ON (`0x21`)** | **The one thing Adafruit's stock init omits.** Its sequence targets TN glass; this panel is IPS and the vendor sends INVON. Without it every colour is inverted — `fillScreen(BLACK)` renders white — which reads as a broken driver rather than a single wrong bit. Applied as `invertDisplay(true)`. |
+| **Display inversion** | **corrected in software, not by `0x21`** | The vendor's sequence sends INVON, but on real glass this panel's polarity does not respond to INVON or INVOFF at all — both were flashed and photographed and the screen was identical. Sending it on top of Adafruit's own init simply cancelled out. So every colour goes through `panelGrey()` / `panelRgb()` in `src/display.h` instead, where the bytes are ours and the result is deterministic. Do not "restore" `invertDisplay(true)` from the vendor file without looking at the panel. |
 | Pixel format `0x3A` | `0x55` | 16-bit RGB565. Matches the library default. |
 | MADCTL `0x36` | BGR bit set | The vendor sets bit 3 (BGR) in every rotation. Adafruit also sets `MADCTL_BGR`, so rotations agree. |
 | Reset | software only | The panel's reset is tied to CHIP_PU, so there is no GPIO for it. The constructor takes `-1` and the library issues a software reset instead. |
@@ -135,25 +138,152 @@ config, which the driver never reads and which would drag their display setup in
 Vendored rather than fetched, for the same reason the CrowPanel vendors `ElecrowEPD`: the audio
 path must not depend on a network fetch or a third-party package that can move.
 
+## Speaker output
+
+`src/speaker.h` is the whole surface: `speakerBegin()`, `speakerSetVolume(pct)`,
+`speakerPlayCue(cue)`, `speakerPlayPcm(samples, count, rateHz)`, `speakerBusy()`, `speakerStop()`.
+Seven cues — tap, confirm, error, turn-complete, approval-needed, recording-start, recording-stop —
+synthesised as sine segments under a raised-cosine envelope, because a tone that starts on a step
+is a click and on a 45 ms cue the click is most of what you hear.
+
+**Nothing here waits for a sound to finish.** A cue is handed to a FreeRTOS task pinned to core 0
+and the caller returns in microseconds; the render loop in `src/ui.cpp` has a 33 ms budget and the
+shortest cue is 45 ms, so a synchronous API could not be called from the place that knows a button
+was tapped. Core 0 rather than core 1 because core 1 runs the panel, touch, and the blocking
+gateway calls — a beep that stutters because an HTTP POST is waiting on a socket is worse than no
+beep. The one call that touches I2C, `speakerSetVolume()`, deliberately runs on the *caller's*
+thread so the shared `Wire` bus is only ever driven from the core that already polls touch.
+
+The ES8311 needs no separate bring-up for output: `es8311_codec_init()` already configures the DAC
+and sets a volume, so `ENABLE_SPEAKER` requires `ENABLE_AUDIO_CAPTURE` and `#error`s without it
+rather than half-building.
+
+### Capture and playback share one codec — the arbitration rule
+
+Both directions run on one ES8311, one I2S port, one MCLK, one amplifier enable line. The rule,
+written out in full in [`src/audio_bus.h`](src/audio_bus.h), is:
+
+> **Recording wins, always, and a cue is dropped rather than deferred.**
+
+- While a capture is live the speaker task starts nothing and aborts anything already sounding, at
+  the next DMA chunk boundary (16 ms).
+- A cue requested during a capture is **discarded, not queued**. A cue is feedback about something
+  the person just did; playing it eleven seconds later when the clip finally ends is not late
+  feedback, it is a mystery noise — and deferral would make the queue longest exactly when the user
+  is mid-sentence, so every beep would arrive in a burst at the release.
+- Capture never waits for playback. `startRecording()` is on the finger-lift path of the render
+  loop and may not block on a task on the other core, so it signals and proceeds.
+- The amplifier is forced off by capture regardless of what the speaker task believed. An idle
+  class-D amp hisses, and it hisses into the microphone.
+
+**It is worth being precise about why**, because the obvious explanation is wrong. This is *not* a
+half-duplex codec taking turns. The ES8311 has an independent ADC and DAC, `i2s_new_channel()`
+hands back a tx and an rx handle on the same port precisely so both can run at once, and the
+vendor's own `Example_17_echo` streams capture straight back out to the speaker in real time.
+Simultaneous playback and capture **works** on this silicon.
+
+It is refused anyway, for an acoustic reason that is worse than a driver limitation because no
+amount of correct code fixes it: the speaker connector and the downward-facing MEMS microphone are
+centimetres apart, and unlike the Waveshare AMOLED board there is no ES7210 and no echo canceller
+anywhere in the chain. A confirmation beep played while recording is a confirmation beep
+transcribed by Parakeet and dispatched to somebody's shell as part of their instruction. The rule
+is a product rule, deliberately stricter than the hardware requires.
+
+Two generation counters rather than two flags make it correct rather than nearly correct.
+`captureGeneration()` distinguishes "no capture happened" from "a whole capture started and
+finished while the speaker task was not looking" — a plain boolean misses the second, and the tail
+of the cue plays into the tail of the clip. `stopGeneration` does the same for `speakerStop()`: a
+flag that the task cleared as it picked up each request cancelled the sound that was playing and
+then let the very next queued cue straight through.
+
+## Notification LED
+
+One WS2812B-class addressable RGB LED on **GPIO42**, driven from `src/led.h`: `ledBegin()`,
+`ledSetState(state)`, `ledTick()`, plus `ledSetBrightness(pct)`.
+
+Seven states — Idle, Connecting, Listening, Thinking, NeedsApproval, Error, Offline — and **not one
+hard blink in the file**. Every effect is a continuous function of time, a raised cosine or a sum
+of them, crossfaded over 300 ms when the state changes, gamma-corrected so the ramp looks linear to
+the eye. The board's visual language is already the Thinking Orb, which morphs rather than cuts;
+a blinking LED reads as a fault indicator on consumer hardware, which is precisely the wrong thing
+to say about an agent that is merely thinking.
+
+Listening is red with the brightest floor of any state, because a live microphone is red on every
+device anybody owns and this is the one state where being understood across a room beats being
+pretty. Error is told apart from it by **rhythm** rather than hue — three grouped pulses against a
+continuous breath — because "is that reddish or that other reddish" is not a distinction people
+make at a glance, and colour-blind users make it never.
+
+`ledTick()` paces itself to 40 Hz and returns after one `millis()` comparison when an update is not
+due. When one is due it costs a few floating-point operations and one **asynchronous** 24-bit RMT
+transmission it does not wait for. It uses the Arduino core's RMT peripheral driver directly rather
+than `Adafruit_NeoPixel`, whose `show()` disables interrupts and busy-waits for the whole frame —
+that is what lets `ledTick()` be honest about being non-blocking.
+
+### The pin is vendor-documented, not guessed
+
+Four independent sources in `docs/` agree, which is why this is not behind an "unverified default"
+caveat the way an inferred pin would be:
+
+| Source | What it says |
+|---|---|
+| `5-原理图_Schematic/ESP32-S3芯片IO资源分配表.xlsx`, row **48 \| IO42** | 单线RGB三色LED灯控制引脚 — "single-wire RGB tri-colour LED control pin". The same sheet the rest of this board's pin map came from |
+| `2.8inch_ESP32-S3_Display_Schematic.pdf` | names the part **XL-5050RGBC-WS2812B**, one instance, net `RGB_LED` |
+| `4-数据手册_DataSheet/RGB+LED(IC)_WS2812B-V5-W.PDF` | the LED's own datasheet ships in the pack |
+| `Example_06_RGB_LED`, `Example_15_RGB_LED_TOUCH` | both `#define LED_PIN 42`, Adafruit_NeoPixel at 800 kHz |
+
+GPIO42 is MTMS (JTAG TMS) and is **not** a strapping pin, so unlike the backlight on GPIO45 there
+is no boot hazard here — the board uses the internal USB-Serial-JTAG, leaving the pin free.
+
+One detail is *not* confirmed: both vendor examples declare `LED_COUNT 60`, and `Example_06`
+declares `NEO_GRBW`. Both are unedited Adafruit strip-demo boilerplate — the schematic shows a
+single RGB (not RGBW) part and `Example_15` uses `NEO_GRB`. We drive one LED in GRB order. If a
+real board lights up with red and green swapped, `LED_COLOR_ORDER_GRB` is the switch.
+
+## The screens
+
+`src/ui.cpp` owns five screens over the shared `GatewayClient`. The tab bar along the bottom is the
+only screen navigation; a vertical drag scrolls a list, and a horizontal swipe pages the response —
+one gesture, one meaning, because a gesture that does two things depending on where the finger
+happens to be is how a device with no labels becomes unusable.
+
+| Screen | What it is for |
+|---|---|
+| **HOME** | The orb, the selected thread, and the last thing that happened. The orb's mode comes from `orbModeForAgentState()`, fed by the best signal the device protocol carries: a live recording, then a response still arriving, then the selected thread's status |
+| **THREADS** | The thread list, scrolled with a finger; tapping a row selects it. The bound environment id is shown and never chosen — see below |
+| **SEND** | Hold-to-talk at the top, saved actions below. There is no keyboard and there will not be one: on this device a request is voice or a choice the owner saved earlier |
+| **REPLY** | The assistant's answer, paged. The gateway wraps to 31 characters for a 122x250 e-ink panel; this screen re-joins and re-wraps to 19 so the text can be size 2 and read at arm's length |
+| **APPROVALS** | One held command at a time with REJECT and APPROVE. Approve goes through a second confirm, because it runs on the owner's own machine |
+
+An unclaimed device gets none of that. It shows the claim code and the three steps to use it, with
+no tab bar at all — every tab it could offer answers 403 until somebody owns it.
+
+**There is no environments -> projects -> threads picker, and cannot be one.** The device protocol
+exposes no list of either: the owner binds one environment in the console and the hardware works
+inside it (`docs/hardware-protocol.md`, "Thread API"). `GET /v1/device/threads` is the whole picker
+the protocol offers, and a project appears only as a number in the display payload's counts.
+
+### Push-to-talk
+
+Holding the microphone button records into PSRAM, releasing uploads and dispatches. The recording
+runs as a state the frame loop pumps rather than a blocking `while (key down)` loop — the old
+version could not see the finger lift, and the orb stopped for the duration of the clip.
+
+On release the clip goes to `POST /v1/device/media` as base64 streamed straight into the TCP buffer,
+then to the owner's saved capture action if there is one, or to a plain `audio_prompt` on the
+selected thread if there is not.
+
 ## What `src/main.cpp` does today
 
-Boots, reports memory and battery, opens NVS, runs the shared provisioning state machine, and — in
-the capture build — brings up I2C, I2S, and the ES8311, then implements push-to-talk:
+Boots, reports memory and battery, opens NVS, brings up the panel, touch, the codec, and the shared
+provisioning state machine, then runs the loop that drives the gateway client and the UI. It is the
+board — pins, radios, the one physical button — and nothing in it knows what a thread is.
 
-- **Hold BOOT** to record from the on-board microphone into a PSRAM buffer.
-- **Release** to stop. The clip is measured and reported: duration, sample count, peak, and RMS.
-- Peak and RMS are what prove the microphone is alive without needing a speaker. A dead codec reads
-  a flat zero, and the firmware says `SILENT` rather than leaving you to guess; a hot one pins at
-  32767 and says `CLIPPING`.
-- With `AUDIO_SELFTEST_PLAYBACK` (default on) the clip plays back through the speaker, verifying
-  capture, the codec, and output in one press, entirely offline.
+- **Tap BOOT** to reopen the configuration portal without erasing otherwise-valid Wi-Fi credentials.
+  This is the escape hatch for a mistyped gateway URL.
 - **Hold BOOT for 10 s** to wipe Wi-Fi and re-enter provisioning, matching the CrowPanel's EXIT
-  long-press recovery.
-- **Tap BOOT** in the non-capture/recovery flow to reopen the configuration portal without erasing
-  otherwise-valid Wi-Fi credentials.
-- The 240x320 display renders a near-black orb, one state verb, and a context line. The active
-  renderer keeps critical buffers in internal RAM and stages panel rows through DMA-capable memory
-  before SPI transfer; buffer and anti-alias tuning is still in progress.
+  long-press recovery. This is the way back from a revoked device, a house move, or a resale.
+- BOOT no longer records. It was overloaded three ways and the screen is the interface now.
 
 ### Hardware evidence recorded on 2026-08-24
 
@@ -170,43 +300,75 @@ the capture build — brings up I2C, I2S, and the ES8311, then implements push-t
 
 In dependency order:
 
-1. **The gateway client.** This is the blocker, and it is not board-specific. Heartbeat, display
-   state, intent submission, OTA, and media upload all still live inside the CrowPanel's 3652-line
-   `src/main.cpp`; `DeviceStore`, `Provisioning`, and `ThinkingOrb` are shared. Extract the client once
-   into `AgentControllerCore` and both new boards can talk to the gateway. Until then the capture
-   path stops at "clip recorded and measured".
-2. **Upload wiring.** `POST /v1/device/media` then an `audio_prompt` intent — the sequence the
-   CrowPanel capture build already exercises. Note the gateway does not currently auto-transcribe
-   device audio; that gap is Category 3 of the
+1. **OTA.** `partitions_ota.csv` is in place, but the manifest poll, the download, and the
+   `confirmFirmwareIfPendingVerify()` rollback confirm still live only in the CrowPanel's
+   `src/main.cpp`. A board that cannot be updated in the field is a board that has to come back.
+2. **Gateway profiles.** The two-phase LAN/tailnet switch protocol is likewise unported, so
+   `config.gatewayUrl` is read and ignored rather than persisted unprobed.
+3. **On-screen keyboard**, for correcting a transcript rather than for composing a request.
+4. **Automatic transcription of device audio.** The gateway does not currently transcribe an upload
+   that arrives from a device; that gap is Category 3 of the
    [open-input roadmap](../../roadmap/open-input-media-voice-environments-roadmap.md).
-3. **FT6336G touch** over I2C.
-4. **Agent-state and interaction UI:** drive the orb from gateway/T3 state, then add result text,
-   approve/reject or structured-answer controls, and a push-to-talk target better than BOOT.
-5. **RGB LED** as a recording indicator.
-6. **On-screen keyboard**, once voice works. Voice first — the keyboard is for correcting a
-   transcript.
 
 ## What is unverified
 
-1. **FT6336G touch and RGB LED.** Neither path is implemented or proven on this unit.
-2. **Speaker/PA polarity.** The vendor echo example drives GPIO1 LOW before streaming, so
-   the config assumes LOW means enabled. That is an inference from one example, not a datasheet
-   statement; speaker playback has not been recorded as a product-level hardware pass.
-3. **OTA rollback.** The 16 MB flash/partition configuration boots, but the dual-slot failure and
+1. **Everything on the glass.** The five screens, the tab bar, every tap target, the list scrolling,
+   push-to-talk, media upload, and every gateway call behind them were written without a board
+   attached. They compile; nothing has been executed.
+2. **The touch coordinate mapping.** `src/touch.cpp` maps the FT6336G's frame onto the panel's as
+   the identity, which is what the vendor's own examples do at rotation 0 — but it has never been
+   checked against a finger. If the tap targets are mirrored or transposed, the fix is one of the
+   three flags at the top of that file; `-DTOUCH_TRACE=1` prints the raw and mapped points.
+3. **Every sound the speaker makes.** `src/speaker.cpp` compiles and its arbitration is reasoned
+   through, but nobody has heard it. Specifically unproven: that the amplifier produces audible
+   output at all; that `SPEAKER_PA_SETTLE_MS`/`SPEAKER_PA_TAIL_MS` are long enough to suppress the
+   switch-on and switch-off pop, which are guesses biased towards "no pop" rather than measurements
+   against the FM8002E datasheet; that the cue volumes are sensible in a room rather than merely
+   sensible on paper; and that a cue aborted mid-tone by a recording sounds like a cut rather than
+   a bang. The PA polarity itself is no longer a guess — see below.
+4. **Every colour the LED shows.** `src/led.cpp` compiles and the pin is vendor-documented four
+   ways, but no LED on this board has been lit by this firmware. Unproven: the GRB channel order
+   (the vendor examples contradict each other, hence `LED_COLOR_ORDER_GRB`); that one LED is the
+   right count; that the WS2812B-V5 part latches on our 100 ns-tick bit timings; and every
+   brightness and hue judgement, all of which were made without seeing the diffuser.
+5. **OTA rollback.** The 16 MB flash/partition configuration boots, but the dual-slot failure and
    rollback ceremony has not been tested.
-4. **Touch/display bus coexistence.** Display and codec work, but adding FT6336G on the shared I2C
+6. **Touch/display bus coexistence.** Display and codec work, but adding FT6336G on the shared I2C
    bus still needs a real-board test.
-5. **Sustained capture/upload power and thermals.** Local clips work; Wi-Fi upload under battery
-   load cannot be measured until the gateway client is present.
+7. **Sustained capture/upload power and thermals.** Local clips work; Wi-Fi upload under battery
+   load cannot be measured until the gateway client is present. The LED and the amplifier both add
+   to that budget — a WS2812B at full white is roughly 60 mA, which is why
+   `LED_DEFAULT_BRIGHTNESS_PCT` is 55 and not 100.
+
+**Promoted out of this list:** the PA enable polarity on GPIO1 used to be recorded here as an
+inference from one vendor example. It is not an inference any more — the manufacturer's IO
+allocation table states 音频功放IC使能引脚，低电平使能 ("audio power amplifier IC enable pin, LOW
+enables") for GPIO1, and three vendor examples agree. What remains unverified is whether the
+amplifier makes a noise, not which way round its enable line goes.
 
 ## Build
 
 ```
-pio run -e hosyond-es3c28p              # bring-up, audio off
-pio run -e hosyond-es3c28p-capture      # microphone + speaker enabled
+pio run -e hosyond-es3c28p-controller   # display + microphone: the actual product
+pio run -e hosyond-es3c28p              # bring-up, display and audio off
+pio run -e hosyond-es3c28p-capture      # microphone + speaker, no panel
+pio run -e hosyond-es3c28p-display      # panel + touch UI, no microphone
 pio run -e hosyond-es3c28p-recovery     # provisioning/recovery image
-pio run -e hosyond-es3c28p-display      # display/orb image
+pio run -e hosyond-es3c28p-orbbench     # cycles every orb mode and reports frame cost
 ```
+
+Two flags gate the hardware added most recently. `ENABLE_SPEAKER=1` is set in `-capture` and
+`-controller`; it requires `ENABLE_AUDIO_CAPTURE=1` and refuses to build without it, because the
+I2S channels and the ES8311 are brought up by `src/audio.cpp` and the DAC borrows them.
+`ENABLE_NOTIFICATION_LED=1` is set in `-capture`, `-display`, `-orbbench` and `-controller` — the
+LED needs no codec, so a display bisect can still have its status light while everything touching
+I2S stays out of a build whose whole purpose is to have no audio in it. Both are off in the base
+and `-recovery` environments, following the convention `ENABLE_LCD` set for unproven hardware.
+
+`-display` and `-capture` each disable half the product, which was right while both were bring-up
+harnesses and is not right now that the screen is the interface and the microphone is how a request
+is made. They are kept because bisecting a display fault still wants a build with no audio in it,
+and vice versa. Flash `-controller`.
 
 Copy `include/controller_config.example.h` to `include/controller_config.h` first. Wi-Fi
 credentials are deliberately not in it — the owner enters them through the SoftAP portal and they

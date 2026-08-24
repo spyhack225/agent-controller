@@ -145,8 +145,18 @@
 #define AUDIO_I2S_DIN_PIN  6   // microphone in, from the ES8311 ADC
 #define AUDIO_I2S_DOUT_PIN 8   // speaker out, to the ES8311 DAC
 
-// Speaker amplifier enable. The vendor echo example drives this LOW before
-// streaming, so treat LOW as enabled until a board says otherwise.
+// Speaker amplifier enable (an FM8002E — its datasheet is in docs/…/4-数据手册_DataSheet/).
+//
+// This used to be recorded here as an inference from one vendor example driving it LOW. It is not
+// an inference any more: the manufacturer's IO allocation table
+// (docs/…/5-原理图_Schematic/ESP32-S3芯片IO资源分配表.xlsx, row "6 | GPIO1") states
+// 音频功放IC使能引脚，低电平使能 — "audio power amplifier IC enable pin, LOW enables". Three
+// vendor examples agree (Example_16_music, Example_17_echo, Example_30_ai_chat all
+// digitalWrite(AP_ENABLE, LOW) before streaming).
+//
+// Only src/audio.cpp writes this pin, through audio::bus::setPaEnabled() — see src/audio_bus.h.
+// The microphone path can force it off at any moment and the speaker task has to accept that,
+// because an idle class-D amplifier hisses and the microphone is centimetres away.
 #define AUDIO_PA_ENABLE_PIN 1
 #define AUDIO_PA_ENABLE_ACTIVE_LOW 1
 
@@ -220,6 +230,77 @@
 #endif
 
 // ---------------------------------------------------------------------------
+// Speaker output — the ES8311's DAC half, driving the 1.25 mm speaker
+// connector through the FM8002E amplifier on GPIO1.
+//
+// The codec needs no separate bring-up for this: es8311_codec_init() in
+// lib/ES8311 already configures the DAC and sets a volume, so enabling output
+// is a matter of powering the amplifier and writing to the I2S TX channel that
+// src/audio.cpp created alongside the RX one. That is why ENABLE_SPEAKER
+// requires ENABLE_AUDIO_CAPTURE and refuses to build without it.
+//
+// CAPTURE AND PLAYBACK SHARE ONE CODEC AND ONE I2S PORT. They can physically
+// run at once — the ES8311 is full duplex and the vendor's Example_17_echo
+// does exactly that — but this firmware refuses to, because there is no echo
+// canceller anywhere on this board and anything the speaker plays during a
+// recording is transcribed as part of the user's instruction. Recording wins;
+// a cue asked for during a capture is dropped rather than queued. The rule and
+// its edge cases are written out in src/audio_bus.h.
+// ---------------------------------------------------------------------------
+#ifndef ENABLE_SPEAKER
+#define ENABLE_SPEAKER 0
+#endif
+
+// Outstanding cue requests. Deliberately tiny: this smooths two taps landing
+// in one frame, it is not a playlist. A deep queue turns a flurry of taps into
+// ten seconds of beeping after the flurry is over.
+#ifndef SPEAKER_QUEUE_DEPTH
+#define SPEAKER_QUEUE_DEPTH 3
+#endif
+
+#ifndef SPEAKER_TASK_STACK
+#define SPEAKER_TASK_STACK 4096
+#endif
+
+// Above the Arduino loop task (priority 1) so a cue is not starved by the UI;
+// far below the Wi-Fi tasks (~22) so it can never delay the radio. The task is
+// pinned to core 0 because core 1 runs the render loop and the blocking
+// gateway calls, and a beep that stutters because an HTTP POST is waiting on a
+// socket is worse than no beep.
+#ifndef SPEAKER_TASK_PRIORITY
+#define SPEAKER_TASK_PRIORITY 4
+#endif
+
+// Silence clocked out after the amplifier is enabled and before the first tone,
+// and again after the last tone before it is cut. Both are pop suppression:
+// switching a class-D amplifier while the DAC sits at a non-zero level is an
+// audible click, and on a 45 ms cue the click is most of what you hear. These
+// are biased towards "no pop" rather than measured — the FM8002E datasheet in
+// docs/ is where to tighten them once a board has been listened to.
+#ifndef SPEAKER_PA_SETTLE_MS
+#define SPEAKER_PA_SETTLE_MS 12
+#endif
+#ifndef SPEAKER_PA_TAIL_MS
+#define SPEAKER_PA_TAIL_MS 8
+#endif
+
+// Ceiling on one i2s_channel_write. Blocks the playback task only, never a
+// caller. If the DMA ring has not drained in this long the clock is wrong, and
+// giving up beats hanging with the amplifier powered.
+#ifndef SPEAKER_WRITE_TIMEOUT_MS
+#define SPEAKER_WRITE_TIMEOUT_MS 250
+#endif
+
+// The private copy speakerPlayPcm() takes of a caller's clip, in mono samples.
+// 16000 = 1 s at 16 kHz = 32 KB from PSRAM. Cues are synthesised and need none
+// of this; the staging buffer exists so a future gateway-supplied TTS reply has
+// somewhere to land, and so the bench can play a recording back. Allocation
+// failure is not fatal — cues still work.
+#ifndef SPEAKER_PCM_STAGE_SAMPLES
+#define SPEAKER_PCM_STAGE_SAMPLES 16000
+#endif
+
+// ---------------------------------------------------------------------------
 // No camera on this board, so camera capture stays off and no pin map exists.
 // ---------------------------------------------------------------------------
 #ifndef ENABLE_CAMERA_CAPTURE
@@ -240,9 +321,62 @@
 #define PROVISIONING_RESET_HOLD_MS 10000
 #endif
 
-// Single-wire RGB LED with a built-in controller (WS2812-style). Useful as a
-// recording indicator, which an e-ink board cannot do.
+// ---------------------------------------------------------------------------
+// Notification LED — one WS2812B-class addressable RGB LED on GPIO42.
+//
+// THE PIN IS VENDOR-DOCUMENTED, NOT GUESSED. Four sources agree:
+//   1. docs/…/5-原理图_Schematic/ESP32-S3芯片IO资源分配表.xlsx, the maker's own
+//      IO allocation table, row "48 | IO42":
+//      单线RGB三色LED灯控制引脚 — "single-wire RGB tri-colour LED control pin".
+//   2. The schematic PDF names the part XL-5050RGBC-WS2812B, one instance,
+//      net RGB_LED.
+//   3. docs/…/4-数据手册_DataSheet/ ships the LED's own datasheet,
+//      RGB+LED(IC)_WS2812B-V5-W.PDF.
+//   4. Example_06_RGB_LED and Example_15_RGB_LED_TOUCH both #define LED_PIN 42.
+//
+// GPIO42 is MTMS (JTAG TMS) and is NOT a strapping pin, so unlike LCD_BL on
+// GPIO45 there is no boot hazard here — the board uses the internal
+// USB-Serial-JTAG, leaving the pin free.
+//
+// WHAT IS STILL UNVERIFIED: no LED on this board has been lit by this firmware.
+// Both vendor examples say LED_COUNT 60 and one says NEO_GRBW, which is
+// unedited Adafruit strip-demo boilerplate — the schematic shows a single RGB
+// (not RGBW) part. We drive one LED in GRB. Hence the feature ships OFF by
+// default, the same convention ENABLE_LCD follows for unproven hardware.
+// ---------------------------------------------------------------------------
 #define RGB_LED_PIN 42
+
+#ifndef ENABLE_NOTIFICATION_LED
+#define ENABLE_NOTIFICATION_LED 0
+#endif
+
+// 40 Hz. Fast enough that a 300 ms crossfade has a dozen steps and no visible
+// staircase; slow enough that the RMT frame cost disappears into a 33 ms
+// render budget. ledTick() returns after one millis() comparison when the next
+// update is not yet due, so calling it every loop pass is free.
+#ifndef LED_TICK_INTERVAL_MS
+#define LED_TICK_INTERVAL_MS 25
+#endif
+
+// Crossfade between two states. Long enough to read as a fade rather than a
+// cut, short enough that "the microphone just opened" is unambiguous by the
+// time a finger has finished pressing.
+#ifndef LED_TRANSITION_MS
+#define LED_TRANSITION_MS 300
+#endif
+
+// A WS2812B at full white draws roughly 60 mA, which is real money on a 3.7 V
+// cell for a light nobody asked to be a torch. Every effect is scaled by this.
+#ifndef LED_DEFAULT_BRIGHTNESS_PCT
+#define LED_DEFAULT_BRIGHTNESS_PCT 55
+#endif
+
+// WS2812B wire order is green, red, blue. Set to 0 if a real board shows red
+// and green swapped — this is the one property of the part the vendor examples
+// contradict each other on, so it is a switch rather than a constant.
+#ifndef LED_COLOR_ORDER_GRB
+#define LED_COLOR_ORDER_GRB 1
+#endif
 
 // microSD over 4-bit SDIO.
 #define SD_CLK_PIN 38

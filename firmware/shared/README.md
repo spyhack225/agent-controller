@@ -12,13 +12,10 @@ All four are pinned to one toolchain — ESP-IDF 5.5 / Arduino core 3.3 via the
 `platformio/platform-espressif32` is unmaintained and frozen at Arduino 2.0.17 / ESP-IDF 4.4, which
 has no `driver/i2s_std.h` and therefore cannot build the on-board audio boards.
 
-**This library does not yet hold enough.** `DeviceStore`, `Provisioning`, and `ThinkingOrb` are shared today;
-the gateway client — heartbeat, display-state fetch, intent submission, OTA, media upload — still
-lives inside the CrowPanel's 3652-line `src/main.cpp`. That was tolerable with one real board and
-one bring-up sketch. Two audio boards later it is the single thing standing between a recorded
-clip and a dispatched intent — the Hosyond board already captures audio and can do nothing with it.
-Extracting the client here is now the prerequisite for a second working firmware, not a cleanup
-task. Port plans:
+**Still to lift out of the CrowPanel's `src/main.cpp`:** media upload, OTA (manifest poll, signed
+download, rollback confirm), and the two-phase gateway-profile switch. `GatewayClient` now covers
+claiming and the whole operate flow, so a board can drive a thread — but until media upload moves
+here, a board that records a clip still has nowhere to put it. Port plans:
 [`Waveshare`](../Waveshare-ESP32-S3-Touch-AMOLED-1.75C/README.md),
 [`Hosyond`](../Hosyond-ESP32-S3-2.8-Touchscreen/README.md).
 
@@ -29,6 +26,8 @@ task. Port plans:
 | `DeviceStore` | Writable device state in NVS (namespace `agentctl`): identity, gateway profiles and switch journal, Wi-Fi credentials, the cached claim code, and the last-known runtime config. |
 | `Provisioning` | The boot state machine and its first transport, a SoftAP captive portal. |
 | `ThinkingOrb` | Provider-neutral visual state model and point-cloud renderer used by display-capable boards. |
+| `GatewayClient` | The device's whole conversation with the gateway: claim, heartbeat, runtime config, saved actions, threads, dispatch, response paging, and the approval queue. No drawing — see [the operate surface](#the-operate-surface). |
+| `OperateModel.h` | The board-agnostic shapes a UI renders from, and the fixed cap on every one of them. |
 
 ### Why this exists
 
@@ -82,10 +81,62 @@ read off a 122x250 panel doubles the failure surface for no real gain.
 Credentials are validated by attempting the join **before** they are persisted, so a wrong password
 returns the owner to the form instead of writing a value that bricks the next boot.
 
+## The operate surface
+
+`GatewayClient` splits its calls two ways, and the difference decides how a board uses them.
+
+**Polled.** `runCycle()` refreshes the display, the controls layout, the approval queue, and an open
+response page on their own timers — heartbeat 30 s, config 60 s, controls 30 s, approvals 30 s,
+display 5 s. It makes **at most one HTTP request per call** on every path, including the
+just-connected edge, which marks the operate resources due rather than firing them in a burst. A UI
+never asks for these: it renders whatever the accessors hold, and repaints when `revision()` changes.
+
+**Gesture.** `refreshThreads()`, `selectThread()`, the `send*` / `run*` calls, `fetchResponsePage()`,
+and `answerApproval()` are driven by a person. Each performs one request and **blocks for up to the
+5 s timeout** — `HTTPClient` has no async mode, and a worker task would put a lock in front of every
+accessor. The contract inherited from the CrowPanel firmware is therefore: paint a pending frame
+first, then call. On a board running a continuous renderer, expect the animation to stall.
+
+Two things in here are easy to break by simplifying:
+
+- **`responseAfter`.** A dispatch returns an ISO timestamp; `openResponse()` takes it and carries it
+  into every page fetch. Without it the gateway answers with the *previous* turn's completed reply
+  the instant an action is fired, and the poll that waits for the real one never starts.
+- **Local confirmation is not gateway approval.** `runControl()` deliberately does not enforce
+  `requiresConfirmation` — that gate belongs to the UI, which is what lets a confirmed action be
+  re-dispatched without looping back into its own prompt.
+
+Every collection is a fixed array, because this runs beside a renderer and an unbounded `String`
+vector fragmenting the heap over days of uptime does not show up on the bench. Caps: 8 controls (the
+gateway's `limits.menuItems`), 12 threads, 3 response lines per page (the gateway's page size, not
+screen geometry — a taller screen walks pages), 2 follow-ups, 4 pending approvals, 6 macros, and an
+8 KB ceiling on any response body. `setLimits()` declares the first two to the gateway in the
+heartbeat; wrong numbers there come back as clipped text rather than as an error.
+
+There is no device-facing list of environments or projects, by design: the owner binds one
+environment and the hardware works inside it. Projects surface only as a count in the display
+payload, and `context().environmentId` is read-only from here. A board that wants an
+"environments -> projects -> threads" picker cannot have one: the thread list is the whole picker
+the protocol offers.
+
+### Media upload
+
+`uploadMedia()` is the one call that does not go through `request()`. Its body is base64 inside JSON
+and a 30 s voice note is over a megabyte encoded, so `MediaUpload.h` streams
+`prefix + base64(header ++ body) + suffix` four characters at a time straight into the TCP buffer —
+the capture buffer in PSRAM stays the only full copy. `buildWavHeader()` fills the 44-byte header as
+its own segment so the PCM is never memmoved to make room in front of it.
+
+It repeats the local backoff gate, the device credentials and the retry-after handling rather than
+skipping them, takes a 30 s timeout against everyone else's 5 s, and answers 413 locally — without
+opening a socket — when the decoded size exceeds the `mediaUploadBytes` declared in `setLimits()`,
+which is the same number the gateway checks.
+
 ## Status
 
-Compiles on all 11 environments across all four board folders: CrowPanel 4, Hosyond 4, Waveshare 2,
+Compiles on all 12 environments across all four board folders: CrowPanel 4, Hosyond 5, Waveshare 2,
 and Vision Master T190 1. Hosyond has exercised NVS-backed provisioning, the SoftAP portal, BOOT
-recovery, and `ThinkingOrb` on silicon. That does not validate CrowPanel, Waveshare, or T190, and the
-shared gateway client remains absent. Current evidence and blockers are maintained in
+recovery, and `ThinkingOrb` on silicon. **The operate surface has run on no board at all** — it is a
+port of a flow verified end to end on the CrowPanel, compiled here but never executed against a live
+gateway. Current evidence and blockers are maintained in
 [roadmap/IMPLEMENTATION-STATUS.md](../../roadmap/IMPLEMENTATION-STATUS.md).
