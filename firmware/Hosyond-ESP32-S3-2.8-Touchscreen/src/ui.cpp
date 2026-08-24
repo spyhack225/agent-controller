@@ -1,6 +1,7 @@
 #include "ui.h"
 
 #include <GatewayBrowse.h>
+#include <GatewayVoice.h>
 #include <MediaUpload.h>
 #include <ThinkingOrb.h>
 
@@ -90,10 +91,49 @@ constexpr uint16_t kOrbPx = 148;
 constexpr uint16_t kMiniOrbPx = 44;
 
 constexpr int16_t kOrbCx = kW / 2;
-constexpr int16_t kOrbCy = 132;
-constexpr int16_t kLabelY = 210;
-constexpr int16_t kHomeThreadY = 234;
-constexpr int16_t kHomeDetailY = 252;
+
+// The home composition is MEASURED, not positioned.
+//
+// The orb, the shimmer label and the lines under them used to sit at four fixed y-coordinates,
+// which is only right for the one case they were tuned against. Both of the lines are conditional —
+// a thread whose name is not known yet, an empty gateway line — and the action bar comes and goes
+// underneath, so a fixed layout is top-anchored by construction and the slack collects at the
+// bottom. That is exactly what the photograph showed: a small gap above the orb and a wide one
+// between the last line and the TALK button.
+//
+// So the block's height is computed from what is actually about to be drawn, and the whole thing is
+// centred in whatever space is left above the action bar — or in the full content area when there
+// is no bar.
+
+// What displayDrawOrb() actually writes: a 148 px disc.
+constexpr int16_t kOrbBlitR = (int16_t)(kOrbPx / 2);
+
+// What the orb LOOKS like, which is not the same number. The geometry projects to radiusPx_ * 0.82
+// with a little breathing on top of that — about 64 px of the 74 px box. Centring on the box makes
+// the composition sit visibly low, because the 10 px of empty margin above the dots counts as orb
+// while the 10 below counts as gap. Centring on the ink is what makes it look deliberate.
+constexpr int16_t kOrbInkR = 64;
+
+// The label strip is a 240 px wide blit, 22 px tall, drawn from labelY - 4. It therefore must start
+// at or below the bottom of the orb's blit box or it would erase a band of the orb on every frame
+// and flicker. This offset is that constraint, written down once.
+constexpr int16_t kLabelDrop = kOrbBlitR + 4;
+constexpr int16_t kLabelInkH = 16;    // size-2 glyphs inside the strip
+constexpr int16_t kLineH = 8;         // size-1 glyphs
+constexpr int16_t kGapLabelLine = 12;
+constexpr int16_t kGapLine = 8;
+
+// Where the orb and each line of the stack ended up. Computed by the screen that is about to paint
+// and read by the frame loop, so the orb and the text it belongs with can never disagree about
+// where the composition is.
+struct Stack {
+  int16_t orbCy = 130;
+  int16_t labelY = 208;
+  int16_t line1Y = 236;
+  int16_t line2Y = 252;
+  bool line1 = false;
+  bool line2 = false;
+};
 
 // Deliberately not tighter to the right edge: the blit is 44 px wide and centred, so a smaller cx
 // would push setAddrWindow past the panel, and a smaller cy would push it negative.
@@ -142,6 +182,11 @@ DeviceStore* store = nullptr;
 // and is not the place to grow a browser while it is being worked on elsewhere.
 GatewayBrowse browse;
 
+// The voice note's journey after it leaves the board. Its own TU for the same reason, and because
+// GatewayClient::uploadMedia() discards the job id the status poll needs.
+GatewayVoice voice;
+uint32_t lastVoiceRevision = 0;
+
 ThinkingOrb orb;
 ThinkingOrb miniOrb;
 bool orbReady = false;
@@ -172,6 +217,17 @@ String message;
 
 String statusLabel = "Starting";
 String shownLabel;
+// Where the current screen put its composition. Written by whichever paint function laid it out,
+// read by the frame loop when it draws the orb and the label, so the two can never disagree about
+// where the block is.
+Stack stack;
+// The name last drawn into the header, so a display poll that finally learns the device's label can
+// dirty the chrome. Nothing else does: revision() drives the CONTENT, and the header was painted
+// once at boot with whatever was known then — which is why it sat on the id-tail fallback.
+String shownDeviceName;
+// And once a real name has been seen it is kept. A later poll that fails, or a gateway that answers
+// with its own "Controller" placeholder, must not demote the header back to an id.
+String resolvedDeviceName;
 bool chromeDirty = true;
 bool contentDirty = true;
 
@@ -225,7 +281,31 @@ bool barDirty = false;
 // A finger that came down in the header is pulling the drawer, wherever it ends up. Decided on the
 // press rather than on each drag, because a drag that starts in a list and wanders into the header
 // is a scroll, not a pull.
-bool dragFromHeader = false;
+// ---------------------------------------------------------------------------------------------
+// Gesture ownership
+// ---------------------------------------------------------------------------------------------
+//
+// One finger, three things it could mean. The rule is decided by WHERE THE FINGER LANDED, once, on
+// the press — never by whichever handler happens to see the event first, which is how the drawer
+// came to eat the page's scrolls:
+//
+//   Drawer      the finger landed in the header or on the grabber. It owns the drawer in both
+//               directions: downward opens, upward closes. Nothing else here does.
+//   DrawerList  the finger landed inside the open drawer. It scrolls the drawer's own row list
+//               when that list can scroll, and closes the drawer only on OVERSCROLL — the list is
+//               already at its top and the finger is still travelling in the closing direction.
+//   Content     the finger landed on the page. It scrolls the page and NEVER closes the drawer.
+//
+// And nothing commits from the first few pixels. `dragTravel` accumulates movement since the finger
+// landed and the drawer acts only once it passes kDragCommitPx; a two-pixel wobble at the start of
+// a scroll used to be read as a dismissal, which is the whole of "the slider closes back when the
+// user tries to scroll content up".
+enum class DragOwner : uint8_t { Content, Drawer, DrawerList };
+DragOwner dragOwner = DragOwner::Content;
+int16_t dragTravel = 0;
+
+// Far enough that it is a gesture and not a tremor, short enough that it still feels immediate.
+constexpr int16_t kDragCommitPx = 18;
 
 // Frame statistics. Draw time alone was not enough to explain a visible hitch — it stayed at 27 ms
 // while the animation still stumbled — so the interval BETWEEN frames is measured as well as the
@@ -295,13 +375,39 @@ String deviceName() {
     const String& title = gw->display().title;
     // Both of these are the fallback the gateway or the parser substituted, not a name anybody
     // chose, so neither is worth showing over the device's own id.
-    if (title.length() > 0 && title != "Controller" && title != "Agent Controller") return title;
+    if (title.length() > 0 && title != "Controller" && title != "Agent Controller") {
+      resolvedDeviceName = title;
+      return title;
+    }
   }
+  if (resolvedDeviceName.length() > 0) return resolvedDeviceName;
   if (store) {
     const String& id = store->deviceId();
     if (id.length() >= 4) return String("Controller ") + id.substring(id.length() - 4);
   }
   return String("Controller");
+}
+
+// The selected thread's human title, or an empty string.
+//
+// GatewayClient::selectedThreadLabel() falls back to a shortened id when the thread list has not
+// been fetched this boot, which is what put `~85f4dc4dd4a` under the orb and in the drawer. It is
+// the same defect the environment breadcrumb had, and it has the same answer: an id names the
+// thread to the gateway and to nobody standing in front of the device. Return nothing, and let each
+// caller say something a person can act on.
+//
+// The list is fetched on the way into THREADS, so the gap lasts until the owner looks at the list
+// once. It is deliberately not fetched from here: this is called from paint functions, and a
+// blocking socket has no business on the render loop.
+String threadTitle() {
+  if (!gw || !gw->hasThread()) return String();
+  const String& id = gw->context().threadId;
+  for (size_t i = 0; i < gw->threadCount(); ++i) {
+    const ThreadOption* row = gw->thread(i);
+    if (!row) continue;
+    if ((row->selected || row->id == id) && row->title.length() > 0) return row->title;
+  }
+  return String();
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -350,7 +456,10 @@ String rowValue(Row row) {
     case Row::Thread: {
       if (!gw) return String("None");
       if (!gw->hasThread()) return String("None selected");
-      return gw->selectedThreadLabel();
+      const String title = threadTitle();
+      // Bound, but the list has not been fetched, so the title is not known here. Saying so is
+      // better than showing the id — and the row is a link to the screen that will resolve it.
+      return title.length() > 0 ? title : String("Open to see which");
     }
     default: {
       if (!gw) return String("Nothing yet");
@@ -419,7 +528,23 @@ void rebuildDrawerRows() {
 // screen underneath showing below it and read as a popup rather than as a surface being pulled
 // down over the device.
 constexpr int16_t kDrawerFullH = kH - kContentTop;
+constexpr int16_t kDrawerPadTop = 12;
 int16_t drawerHeight() { return kDrawerFullH; }
+
+// Every row the device can justify fits, whole, with no scrolling.
+//
+// A row sliced in half at the bottom edge looks like a bug because it is one, so this is a build
+// error rather than a runtime clip: add a fifth category or make the rows taller and the compiler
+// stops you, at which point either the row height comes down or the drawer grows a scroll — and
+// the overscroll branch in handleDrag() is already written for that day.
+static_assert(kDrawerPadTop + kMaxDrawerRows * kDrawerRowH <= kDrawerFullH,
+              "The drawer's rows must fit its height without clipping the last one.");
+
+// True when the drawer's own list is taller than the panel. Constant today, by the assert above,
+// and consulted rather than assumed so the gesture rule stays honest if that ever changes.
+bool drawerListScrolls() {
+  return kDrawerPadTop + (int16_t)drawerRowCount * kDrawerRowH > kDrawerFullH;
+}
 
 // ---------------------------------------------------------------------------------------------
 // Header
@@ -456,15 +581,20 @@ void drawHeader() {
   uip::capsule({(int16_t)(kW / 2 - 17), 38, 34, 4}, (int16_t)kHair, -1);
 }
 
-// The header's right-hand affordance. When the big orb is not on screen the mini orb lives here and
-// IS the handle; when it is, a dot stands in so the tap target never disappears.
+// The header's right-hand affordance: one dot, whose tone is the worst thing any drawer row has to
+// say. When the big orb is not on screen the mini orb lives here instead.
+//
+// There was a small chevron under the dot pointing at the pull-down. It has been removed. The
+// grabber under the title stays: with the arrow gone it is the only remaining hint that the header
+// opens, and it is not a second copy of the same idea — the arrow sat beside the STATUS dot, where
+// it read as a property of the status rather than of the header, while the grabber is the ordinary
+// sheet handle sitting centred on the edge the panel comes out of.
 void drawHeaderStatusDot() {
   uint8_t tone = kMuted;
   for (uint8_t i = 0; i < drawerRowCount; ++i) {
     if (rowTone(drawerRows[i]) == kBright) { tone = kBright; break; }
   }
-  uip::dot(kMiniOrbCx, kMiniOrbCy - 4, 5.0f, tone);
-  uip::chevron(kMiniOrbCx, kMiniOrbCy + 9, 4.0f, 2, kHair, 1.8f);
+  uip::dot(kMiniOrbCx, kMiniOrbCy, 5.0f, tone);
 }
 
 void drawChrome() {
@@ -552,6 +682,36 @@ OrbPresentation presentationForState() {
   //    the same moment for the same reason.
   if (gw->approvalCount() > 0) return {OrbMode::Ring, "Needs you"};
 
+  // 4. The voice note, while one is in flight.
+  //
+  //    Everything after the POST happens on the gateway and used to be completely invisible here:
+  //    the board uploaded a clip and then showed whatever the thread happened to be doing, which
+  //    for the twenty seconds of a CPU transcription is nothing at all.
+  //
+  //    Ready and Sent are deliberately absent. At that point the journey is over and the ordinary
+  //    table below is more truthful than anything this block could say — it will show Working if
+  //    the turn really is in flight, and the actual state if the dispatch was refused. Forcing
+  //    "Working" here would claim an agent was busy on a send that policy had already blocked.
+  switch (voice.stage()) {
+    case VoiceStage::Uploading:
+      // Bytes moving. The orb cannot animate through this one — uploadMedia blocks the render loop
+      // for the whole transfer — but the screen showing "Sending" is painted before the call and is
+      // therefore true for the entire stall.
+      return {OrbMode::Ribbon, "Sending"};
+    case VoiceStage::Transcribing:
+      // The scan meridian sweeping a dotted globe is a genuinely good read for ASR working through
+      // a clip, and this is the first real trigger `searching` has ever had on this device.
+      return {OrbMode::Globe, "Transcribing"};
+    case VoiceStage::Review:
+      // A STOP. The normaliser changed something a person has to look at before it is dispatched,
+      // so this must not animate as work in progress.
+      return {OrbMode::Ring, "Needs review"};
+    case VoiceStage::Failed:
+      return {OrbMode::Ring, "Voice failed"};
+    default:
+      break;
+  }
+
   // 4. The turn in front of us. `waiting` and `streaming` were previously both "working"; they are
   //    different facts. Waiting is the agent thinking with nothing to show. Streaming is text
   //    arriving right now, which is what "composing" means.
@@ -622,12 +782,54 @@ String gatewayLine() {
   }
 }
 
+// Lays the orb, the label and up to two lines out as one block, centred in the space available.
+//
+// `bottom` is contentBottom() everywhere except the claim screen, where the claim block owns the
+// lower half and the orb centres in what is left above it.
+Stack layOutStack(bool showLabel, bool line1, bool line2, int16_t bottom) {
+  Stack out;
+  out.line1 = line1;
+  out.line2 = line2;
+
+  // How far the ink reaches BELOW the orb's centre. Everything else follows from the centre, so the
+  // block's height is this plus the ink radius above it.
+  int16_t below = showLabel ? (int16_t)(kLabelDrop + kLabelInkH) : kOrbInkR;
+  if (line1) below = (int16_t)(below + kGapLabelLine + kLineH);
+  if (line2) below = (int16_t)(below + kGapLine + kLineH);
+
+  const int16_t height = (int16_t)(kOrbInkR + below);
+  const int16_t space = (int16_t)(bottom - kContentTop);
+  int16_t cy = (int16_t)(kContentTop + (space - height) / 2 + kOrbInkR);
+
+  // The ink is narrower than the blit, so centring the ink can push the 148 px disc up into the
+  // header. The disc is what actually gets written, so it is the thing that has to be clamped.
+  if (cy < kContentTop + kOrbBlitR) cy = (int16_t)(kContentTop + kOrbBlitR);
+
+  out.orbCy = cy;
+  out.labelY = (int16_t)(cy + kLabelDrop);
+  int16_t cursor = showLabel ? (int16_t)(out.labelY + kLabelInkH) : (int16_t)(cy + kOrbInkR);
+  if (line1) {
+    out.line1Y = (int16_t)(cursor + kGapLabelLine);
+    cursor = (int16_t)(out.line1Y + kLineH);
+  }
+  if (line2) {
+    out.line2Y = (int16_t)(cursor + kGapLine);
+  }
+  return out;
+}
+
 void paintHome() {
-  clearContent();
-  const String thread = gw ? gw->selectedThreadLabel() : String("No gateway");
-  uip::textCentered(kHomeThreadY, 1, kText, uip::fitWords(thread, kCols1));
+  // The thread's own name, or an honest stand-in. Never an id.
+  String thread;
+  if (!gw) thread = "No gateway";
+  else if (!gw->hasThread()) thread = "Select a thread";
+  else thread = threadTitle();
   const String detail = message.length() > 0 ? message : gatewayLine();
-  uip::textCentered(kHomeDetailY, 1, kMuted, uip::fitWords(detail, kCols1));
+
+  stack = layOutStack(true, thread.length() > 0, detail.length() > 0, contentBottom());
+  clearContent();
+  if (stack.line1) uip::textCentered(stack.line1Y, 1, kText, uip::fitWords(thread, kCols1));
+  if (stack.line2) uip::textCentered(stack.line2Y, 1, kMuted, uip::fitWords(detail, kCols1));
 }
 
 // The claim screen. A brand-new controller has one job: tell its owner how to take possession of
@@ -641,9 +843,11 @@ void paintHome() {
 constexpr int16_t kClaimTop = 210;
 
 void paintStatus() {
-  clearContent();
-
   if (unclaimed()) {
+    // No label and no lines here — the claim block owns everything from kClaimTop down, and the orb
+    // centres in the band above it.
+    stack = layOutStack(false, false, false, (int16_t)(kClaimTop - 6));
+    clearContent();
     const String code = gw->claimCode();
     uip::textCentered(kClaimTop, 1, kMuted, "CLAIM THIS CONTROLLER");
     if (code.length() > 0) {
@@ -669,13 +873,18 @@ void paintStatus() {
     return;
   }
 
-  uip::textCentered(kHomeThreadY, 1, kMuted, uip::fit(gatewayLine(), kCols1));
+  const String line1 = gatewayLine();
+  String line2;
   if (prov && prov->status().state == ProvisioningState::Provisioning) {
-    uip::textCentered(kHomeDetailY, 1, kHair,
-                      uip::fit(String("Join ") + prov->status().apName, kCols1));
-  } else if (message.length() > 0) {
-    uip::textCentered(kHomeDetailY, 1, kHair, uip::fit(message, kCols1));
+    line2 = String("Join ") + prov->status().apName;
+  } else {
+    line2 = message;
   }
+
+  stack = layOutStack(true, line1.length() > 0, line2.length() > 0, contentBottom());
+  clearContent();
+  if (stack.line1) uip::textCentered(stack.line1Y, 1, kMuted, uip::fitWords(line1, kCols1));
+  if (stack.line2) uip::textCentered(stack.line2Y, 1, kHair, uip::fitWords(line2, kCols1));
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -1116,7 +1325,7 @@ void paintModal() {
   uip::textCentered((int16_t)(box.y + box.h - 26), 1, kHair,
                     approval ? "Runs on your machine"
                              : (reprovision ? "Identity is kept"
-                                            : uip::fit(gw->selectedThreadLabel(), 30)));
+                                            : uip::fitWords(threadTitle(), 30)));
 }
 
 void paintContent() {
@@ -1148,7 +1357,8 @@ void paintContent() {
 // repaint clears, so putting it away never leaves a sliver of its surface stranded under the
 // header's curved divider.
 Rect drawerRowRect(uint8_t index) {
-  return {0, (int16_t)(kContentTop + 12 + (int16_t)index * kDrawerRowH), kW, kDrawerRowH};
+  return {0, (int16_t)(kContentTop + kDrawerPadTop + (int16_t)index * kDrawerRowH), kW,
+          kDrawerRowH};
 }
 
 // Paints one row of the drawer onto the surface, clearing its band first.
@@ -1246,6 +1456,23 @@ void openDrawer() {
   drawerDirty = true;
   // Every row has to be painted afresh: the surface it sits on is about to be laid down again.
   for (uint8_t i = 0; i < kMaxDrawerRows; ++i) drawerRowOnGlass[i] = false;
+
+  // The tray does NOT animate away. The drawer slides over it.
+  //
+  // Letting the two animate at once left a black band across the bottom of an open drawer, and it
+  // is worth writing down why, because it is not obvious: the bar clears its whole 58 px band
+  // before it paints, while the drawer only ever paints the strip that moved. The bar's animation
+  // is shorter than the drawer's, so its final clear landed AFTER the drawer had already swept
+  // past that region — and the drawer, having no reason to revisit ground it had already covered,
+  // never painted it again. What the photograph showed as "the ACTIVITY row cut off, a dark band,
+  // then a light strip at the very bottom" was exactly that: surface, the bar's black, and the one
+  // strip the drawer painted after the bar had finished.
+  //
+  // So it is retired here, in one step, before the drawer's first frame.
+  barT = 0.0f;
+  barReserved = false;
+  barDirty = false;
+  if (displayReady()) g().fillRect(0, (int16_t)(kH - kBarH), kW, kBarH, panelGrey(kBg));
 }
 
 void closeDrawer() {
@@ -1404,15 +1631,19 @@ void paintActionBar() {
   barDirty = false;
   if (offset >= kBarH || actionCount == 0) return;
 
-  // The tray is drawn wider and taller than the screen so only its top corners are ever visible:
-  // the bar reads as a surface rising out of the bottom edge, not as a card floating on it. Only
-  // those corners go through the distance field — the other 24 000 pixels are a flat fill, and
-  // paying field arithmetic for them was a measurable slice of every frame the bar animated.
-  displaySoftPanel(-10, top, (int16_t)(kW + 20), (int16_t)(kBarH + 40), 26.0f, kBg, kSurfaceHi,
-                   true, false);
+  // No tray. The buttons sit on the page.
+  //
+  // There used to be a filled surface behind them, drawn ten pixels wider than the screen on each
+  // side so that "only its top corners are ever visible". That was the mistake: pushing the shape
+  // past the bezel put its curves off-glass and left a full-width band with HARD SQUARE CORNERS —
+  // the most rectangular thing on a screen whose entire brief was to stop being rectangular. It
+  // was also a second surface stacked on the page for no reason, when the button already has the
+  // strongest shape and the strongest contrast on it.
+  //
+  // The reserved band stays: contentBottom() still stops short of these 58 px, so the buttons keep
+  // their clear space and nothing scrolls underneath them. Only the fill is gone.
   for (uint8_t i = 0; i < actionCount; ++i) {
-    uip::button(actionRect(i, top), actions[i].label, actions[i].primary, actions[i].enabled,
-                kSurfaceHi);
+    uip::button(actionRect(i, top), actions[i].label, actions[i].primary, actions[i].enabled, kBg);
   }
 }
 
@@ -1535,6 +1766,7 @@ void discardClip() {
   clipHeld = false;
   clipHeldMs = 0;
   audio::discard();
+  voice.reset();
   message = "Clip discarded";
   contentDirty = true;
 }
@@ -1550,20 +1782,27 @@ void sendHeldClip() {
     return;
   }
 
-  showBusy("Uploading", String(ms / 1000) + "s voice note");
+  // Paint the stage, THEN block in it. The upload holds the render loop for its whole duration, so
+  // the only honest thing to do is put the right words on the glass before the stall starts.
+  voice.setLocalStage(VoiceStage::Uploading);
+  showBusy("Sending", String(ms / 1000) + "s voice note");
 
   // The WAV header is passed as its own segment so the PCM is never memmoved to make room in front
   // of it — on a megabyte clip that copy is the difference between working and not.
   uint8_t header[media::kWavHeaderBytes];
   media::buildWavHeader(header, (uint32_t)bytes, audio::sampleRateHz());
 
+  // Through GatewayVoice, not GatewayClient: the POST answers with both a media id and a job id and
+  // only this one keeps the second, which is what the whole status poll hangs off.
   int httpStatus = 0;
-  const String mediaId = gw->uploadMedia("audio", "audio/wav", "controller.wav", header,
-                                         sizeof(header), audio::pcm(), bytes, httpStatus);
+  const String mediaId = voice.upload("audio", "audio/wav", "controller.wav", header,
+                                      sizeof(header), audio::pcm(), bytes,
+                                      MEDIA_UPLOAD_MAX_BYTES, httpStatus);
   clipHeld = false;
   clipHeldMs = 0;
   audio::discard();
   if (mediaId.length() == 0) {
+    voice.reset();
     message = httpStatus == 413 ? String("Clip too large") : String("Upload failed ") + httpStatus;
     contentDirty = true;
     return;
@@ -1606,6 +1845,7 @@ void finishRecording() {
 
   clipHeld = true;
   clipHeldMs = ms;
+  voice.setLocalStage(VoiceStage::Recorded);
   message = "";
   contentDirty = true;
 }
@@ -1625,6 +1865,8 @@ void startRecording() {
   // to send a clip that no longer exists.
   clipHeld = false;
   clipHeldMs = 0;
+  // A new capture retires whatever the previous one was still reporting.
+  voice.reset();
   recordArmed = true;
   audio::startRecording();
   applyPresentation();
@@ -2015,14 +2257,29 @@ void handleDrag(int16_t y, int16_t dy) {
   // what anybody meant by that.
   if (recordArmed) return;
 
-  // The pull-down. Only a finger that STARTED in the header drives the drawer, so a list that
-  // scrolls past the top edge never turns into one.
-  if (dragFromHeader || drawerT > 0.05f) {
-    if (dragFromHeader && dy > 0 && !drawerOpen) { openDrawer(); return; }
-    if (drawerOpen && dy < 0) { closeDrawer(); return; }
+  dragTravel = (int16_t)(dragTravel + dy);
+  (void)y;
+
+  if (dragOwner == DragOwner::Drawer) {
+    if (!drawerOpen && dragTravel > kDragCommitPx) openDrawer();
+    else if (drawerOpen && dragTravel < -kDragCommitPx) closeDrawer();
     return;
   }
-  (void)y;
+
+  if (dragOwner == DragOwner::DrawerList) {
+    // Scroll first, dismiss only on overscroll. The list does not scroll today — the static_assert
+    // beside drawerHeight() guarantees every row the device can justify fits without one — so this
+    // branch is unreachable and the dismissal below is what actually runs. It is written out anyway
+    // because the day a fifth category is added is the day this would otherwise start silently
+    // eating scrolls again, and the assert is what will make that impossible to miss.
+    if (drawerListScrolls()) return;
+    if (drawerOpen && dragTravel < -kDragCommitPx) closeDrawer();
+    return;
+  }
+
+  // Content. With the drawer out it covers the whole page, so there is nothing underneath to
+  // scroll; with it shut there is nothing to close. Either way this never touches the drawer.
+  if (drawerT > 0.05f) return;
 
   if (screen == Screen::Threads) {
     const int16_t limit = maxScroll(gw->threadCount(), kThreadRowH, kThreadListTop);
@@ -2068,6 +2325,7 @@ bool uiBegin(GatewayClient& gateway, Provisioning& provisioning, DeviceStore& de
   prov = &provisioning;
   store = &deviceStore;
   browse.begin(deviceStore);
+  voice.begin(deviceStore);
 
   orbReady = orb.begin(kOrbPx - 8, 900);
   // A fifth of the home orb's dot budget. It is 44 px across; a denser cloud at that size reads as
@@ -2086,7 +2344,11 @@ void uiHandleTouch(const TouchEvent& event) {
 
   switch (event.gesture) {
     case TouchGesture::Press:
-      dragFromHeader = event.y < kContentTop;
+      // Ownership is decided here and nowhere else, from where the finger landed.
+      dragTravel = 0;
+      if (event.y < kContentTop) dragOwner = DragOwner::Drawer;
+      else if (drawerT > 0.05f) dragOwner = DragOwner::DrawerList;
+      else dragOwner = DragOwner::Content;
       // Push-to-talk starts on contact, not on release: waiting for the lift would record nothing.
       if (operable() && modal == Modal::None && screen == Screen::Send && !clipHeld
           && drawerT <= 0.05f && uip::hit(kMicButton, event.x, event.y)) {
@@ -2099,19 +2361,19 @@ void uiHandleTouch(const TouchEvent& event) {
       return;
 
     case TouchGesture::Release:
-      dragFromHeader = false;
+      dragTravel = 0;
       if (recordArmed) finishRecording();
       return;
 
     case TouchGesture::Tap:
-      dragFromHeader = false;
+      dragTravel = 0;
       if (recordArmed) { finishRecording(); return; }
       handleTap(event.x, event.y);
       return;
 
     case TouchGesture::SwipeLeft:
     case TouchGesture::SwipeRight: {
-      dragFromHeader = false;
+      dragTravel = 0;
       if (recordArmed) { finishRecording(); return; }
       if (drawerT > 0.05f) { closeDrawer(); return; }
       // Paging, and only paging. A swipe that changed screens would fight the list scroll and the
@@ -2244,6 +2506,15 @@ void uiTick() {
     contentDirty = true;
     drawerDirty = true;
     modeDirty = true;
+    // The header is painted on chromeDirty, which revision() does not set — so the device's own
+    // label, which only arrives with the first successful display fetch, was computed once at boot
+    // and never looked at again. That is why the header sat on "Controller 3bq7" while the gateway
+    // had been sending "Hosyond Touch screen" for minutes.
+    const String name = deviceName();
+    if (name != shownDeviceName) {
+      shownDeviceName = name;
+      chromeDirty = true;
+    }
   }
   if (browse.revision() != lastBrowseRevision) {
     lastBrowseRevision = browse.revision();
@@ -2310,7 +2581,11 @@ void uiTick() {
   const float nextBarT = uip::approach(barT, barTarget, kFrameMs, kBarSlideMs);
   const bool barMoved = nextBarT != barT;
   barT = nextBarT;
-  const bool reserve = barT > 0.001f;
+  // The content stops short of the tray whenever the tray BELONGS on screen, not merely once it has
+  // finished arriving. Deciding this from barT meant that on the frame the drawer finished closing
+  // the content was laid out at full height, and then laid out again as the tray rose — which on
+  // HOME is the entire composition jumping.
+  const bool reserve = actionCount > 0 && !drawerOpen;
   if (reserve != barReserved) {
     barReserved = reserve;
     contentDirty = true;
@@ -2330,7 +2605,8 @@ void uiTick() {
   //
   // The CONTENT goes last and only when the drawer is fully away, because the drawer covers the
   // whole page and repainting underneath it is work nobody can see.
-  if (barMoved || barDirty) paintActionBar();
+  // Never while the drawer owns the screen — see openDrawer() for what interleaving the two did.
+  if ((barMoved || barDirty) && !drawerOpen && drawerT <= 0.001f) paintActionBar();
 
   const bool drawerActive = drawerMoved || drawerT > 0.0f || drawerShownPx > 0;
   if (drawerActive && (drawerMoved || drawerDirty)) {
@@ -2363,16 +2639,16 @@ void uiTick() {
   if (repaintedContent) {
     // Nothing: the orb resumes on the next frame, 33 ms later.
   } else if (bigOrb && orbReady) {
-    displayDrawOrb(orb, kOrbCx, kOrbCy, elapsed);
+    displayDrawOrb(orb, kOrbCx, stack.orbCy, elapsed);
     // The claim block starts where the label would be, and the label's strip is full width: drawing
     // both means the code is repainted over four times a second by a word.
     if (unclaimed()) {
       shownLabel = "";
     } else if (statusLabel != shownLabel) {
-      displayClearStatus(kLabelY);
+      displayClearStatus(stack.labelY);
       shownLabel = statusLabel;
     }
-    if (!unclaimed()) displayDrawStatus(statusLabel.c_str(), kLabelY, elapsed);
+    if (!unclaimed()) displayDrawStatus(statusLabel.c_str(), stack.labelY, elapsed);
   } else if (miniReady) {
     displayDrawMiniOrb(miniOrb, kMiniOrbCx, kMiniOrbCy, elapsed);
     shownLabel = "";
@@ -2404,6 +2680,25 @@ void uiTick() {
     stats.worstGapMs = 0;
     stats.hitches = 0;
     lastReport = now;
+  }
+
+  // The voice job status, polled LAST — after everything this frame drew is already on the glass.
+  //
+  // This is the one recurring blocking call on the render loop and the placement is the whole of
+  // why it is acceptable: paint, then stall. It costs one dropped frame roughly once a second
+  // while a capture is in flight, it stops the moment the job reaches a terminal milestone, and it
+  // backs off and gives up rather than freezing the board once a second against a gateway that has
+  // gone away.
+  if (voice.pollDue(millis()) && operable()) {
+    voice.poll();
+    if (voice.revision() != lastVoiceRevision) {
+      lastVoiceRevision = voice.revision();
+      // The stage moved: the orb, its word and the line under it all follow from it.
+      applyPresentation();
+      statusLabel = currentLabel;
+      message = voice.detail();
+      contentDirty = true;
+    }
   }
 }
 
