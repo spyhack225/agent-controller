@@ -29,15 +29,27 @@ GatewayStatus probeOnce(const String& base) {
   if (base.length() == 0) return GatewayStatus::Unknown;
 
   const String url = base + "/health";
+
+  // Declaration order is load-bearing, not style.
+  //
+  // C++ destroys locals in reverse declaration order, and HTTPClient keeps a reference to the
+  // client it was handed. With HTTPClient declared first it is destroyed LAST — after the client it
+  // points at — so ~HTTPClient() calls stop() on freed memory. That crashed as
+  // InstrFetchProhibited at PC 0xfffffffd (a call through a dead vtable), and corrupted the lwIP
+  // TCP heap on the way out, which surfaced later as pbuf_free/tcp_seg_free panics in the tcpip
+  // thread. The device was rebooting roughly twice a minute.
+  //
+  // Clients first, HTTPClient last: it dies first, while what it points at is still alive.
+  WiFiClientSecure secure;
+  WiFiClient plain;
   HTTPClient http;
+
   http.setTimeout(kTimeoutMs);
   http.setConnectTimeout(kTimeoutMs);
   // A gateway that redirects is a gateway that is up; following the redirect only slows the answer.
   http.setFollowRedirects(HTTPC_DISABLE_FOLLOW_REDIRECTS);
 
   bool began = false;
-  WiFiClientSecure secure;
-  WiFiClient plain;
   if (url.startsWith("https://")) {
 #if INSECURE_SKIP_TLS_VERIFY
     secure.setInsecure();
