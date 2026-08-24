@@ -139,7 +139,21 @@ void displayDrawOrb(ThinkingOrb& orb, int16_t cx, int16_t cy, uint32_t elapsedMs
     else orbCanvas->fillCircle(x, y, d.radius, colour);
   }
 
-  displayPanel().drawRGBBitmap(cx - mid, cy - mid, orbCanvas->getBuffer(), w, h);
+  // Pushed with setAddrWindow + writePixels rather than drawRGBBitmap.
+  //
+  // The two are not equivalent here: with an identical canvas fill, drawRGBBitmap rendered the orb
+  // box as a white rectangle while the label strip — same buffer type, same fill value, pushed this
+  // way — came out correctly black. Whatever drawRGBBitmap does to the pixel data on this
+  // core/library combination, it does not round-trip. This path is the one with evidence behind it,
+  // and it is also the one the label already uses, so there is a single blit idiom in the file.
+  Adafruit_ILI9341& g = displayPanel();
+  const uint16_t* buf = orbCanvas->getBuffer();
+  g.startWrite();
+  g.setAddrWindow(cx - mid, cy - mid, w, h);
+  for (int16_t row = 0; row < h; ++row) {
+    g.writePixels(const_cast<uint16_t*>(buf + (size_t)row * w), w);
+  }
+  g.endWrite();
 }
 
 void displayDrawStatus(const char* label, int16_t cy, uint32_t elapsedMs) {
