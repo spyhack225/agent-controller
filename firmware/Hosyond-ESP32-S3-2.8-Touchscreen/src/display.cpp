@@ -1,5 +1,7 @@
 #include "display.h"
 
+#include <esp_heap_caps.h>
+
 #if __has_include("controller_config.h")
 #include "controller_config.h"
 #else
@@ -110,18 +112,74 @@ GFXcanvas16* labelCanvas = nullptr;
 
 constexpr int16_t kLabelH = 22;
 
+// One row of pixels in internal, DMA-capable RAM.
+//
+// GFXcanvas16 allocates with plain malloc, and on this board that lands in PSRAM (confirmed at
+// runtime: the buffers came back at 0x3c0f_xxxx while the internal heap moved by 120 bytes for
+// 54 KB of canvas). SPI DMA cannot reliably source from PSRAM — the controller reads stale or
+// unmapped data — which is exactly what a rectangle that flickers between the drawn frame and
+// white looks like.
+//
+// Rather than fight GFXcanvas16's allocator, each row is copied into this internal staging buffer
+// on its way out. 480 bytes of DMA-safe RAM, one memcpy of ~300 bytes per row, and the canvas keeps
+// all of Adafruit_GFX's drawing primitives.
+uint16_t* dmaRow = nullptr;
+
+// Copies `len` pixels from a possibly-PSRAM source into the staging row and pushes them.
+void pushRow(Adafruit_ILI9341& g, const uint16_t* src, int16_t len) {
+  if (!dmaRow) return;
+  memcpy(dmaRow, src, (size_t)len * sizeof(uint16_t));
+  g.writePixels(dmaRow, len);
+}
+
 }  // namespace
 
 bool displayBeginCanvases(uint16_t orbSize) {
+  const uint32_t heapBefore = ESP.getFreeHeap();
+
   if (!orbCanvas) orbCanvas = new GFXcanvas16(orbSize, orbSize);
   if (!labelCanvas) labelCanvas = new GFXcanvas16(240, kLabelH);
-  return orbCanvas && labelCanvas && orbCanvas->getBuffer() && labelCanvas->getBuffer();
+
+  const uint16_t* orbBuf = orbCanvas ? orbCanvas->getBuffer() : nullptr;
+  const uint16_t* labelBuf = labelCanvas ? labelCanvas->getBuffer() : nullptr;
+
+  Serial.printf(
+    "[display] canvases: orb %ux%u buf=%p (%u B), label 240x%d buf=%p (%u B), heap %u -> %u\n",
+    (unsigned)orbSize, (unsigned)orbSize, (const void*)orbBuf,
+    (unsigned)(orbSize * orbSize * 2), (int)kLabelH, (const void*)labelBuf,
+    (unsigned)(240 * kLabelH * 2), (unsigned)heapBefore, (unsigned)ESP.getFreeHeap()
+  );
+
+  if (!dmaRow) {
+    dmaRow = (uint16_t*)heap_caps_malloc(240 * sizeof(uint16_t), MALLOC_CAP_DMA | MALLOC_CAP_INTERNAL);
+  }
+
+  Serial.printf("[display] dma row buf=%p (%s)\n", (const void*)dmaRow,
+                dmaRow ? "internal/DMA" : "FAILED");
+
+  if (!orbBuf || !labelBuf || !dmaRow) {
+    Serial.println("[display] CANVAS ALLOCATION FAILED — the orb cannot be composited.");
+    return false;
+  }
+  return true;
 }
 
 void displayDrawOrb(ThinkingOrb& orb, int16_t cx, int16_t cy, uint32_t elapsedMs) {
-  if (!displayReady() || !orbCanvas) return;
+  // The buffer, not just the object: a GFXcanvas16 whose malloc failed is a live object wrapping a
+  // null pointer, and pushing from it sends whatever happens to be in RAM — which is exactly what a
+  // flickering white rectangle looks like.
+  if (!displayReady() || !orbCanvas || !orbCanvas->getBuffer()) return;
 
   const OrbFrame frame = orb.render(elapsedMs);
+
+  // One line, once, so a frame that draws nothing is distinguishable from a frame that draws and
+  // fails to reach the glass.
+  static bool reported = false;
+  if (!reported) {
+    reported = true;
+    Serial.printf("[display] first orb frame: %u dots, canvas %dx%d\n",
+                  (unsigned)frame.count, orbCanvas->width(), orbCanvas->height());
+  }
 
   const int16_t w = orbCanvas->width();
   const int16_t h = orbCanvas->height();
@@ -151,13 +209,13 @@ void displayDrawOrb(ThinkingOrb& orb, int16_t cx, int16_t cy, uint32_t elapsedMs
   g.startWrite();
   g.setAddrWindow(cx - mid, cy - mid, w, h);
   for (int16_t row = 0; row < h; ++row) {
-    g.writePixels(const_cast<uint16_t*>(buf + (size_t)row * w), w);
+    pushRow(g, buf + (size_t)row * w, w);
   }
   g.endWrite();
 }
 
 void displayDrawStatus(const char* label, int16_t cy, uint32_t elapsedMs) {
-  if (!displayReady() || !labelCanvas || !label) return;
+  if (!displayReady() || !labelCanvas || !labelCanvas->getBuffer() || !label) return;
 
   const size_t len = strlen(label);
   if (len == 0) return;
@@ -199,7 +257,7 @@ void displayDrawStatus(const char* label, int16_t cy, uint32_t elapsedMs) {
   g.startWrite();
   g.setAddrWindow(stripX, cy - 4, stripW, kLabelH);
   for (int16_t row = 0; row < kLabelH; ++row) {
-    g.writePixels(const_cast<uint16_t*>(buf + (size_t)row * 240), stripW);
+    pushRow(g, buf + (size_t)row * 240, stripW);
   }
   g.endWrite();
 }
