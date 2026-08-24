@@ -170,6 +170,15 @@
 #define AUDIO_GAIN_SHIFT 0
 #endif
 
+// Analogue microphone gain in the ES8311 itself, which is the right place to get level: raising it
+// here uses the ADC's range, where AUDIO_GAIN_SHIFT only scales samples that were already
+// quantised. The vendor's es8311_codec_init leaves this unset, and a bench measurement of a quiet
+// room at default gain read peak 264 / rms 91 out of 32767 — far too quiet for speech.
+// One of ES8311_MIC_GAIN_0DB, _6DB, _12DB, _18DB, _24DB, _30DB, _36DB, _42DB.
+#ifndef AUDIO_MIC_GAIN
+#define AUDIO_MIC_GAIN ES8311_MIC_GAIN_30DB
+#endif
+
 // Playback volume, 0..100, passed to es8311_voice_volume_set.
 #ifndef AUDIO_PLAYBACK_VOLUME
 #define AUDIO_PLAYBACK_VOLUME 85

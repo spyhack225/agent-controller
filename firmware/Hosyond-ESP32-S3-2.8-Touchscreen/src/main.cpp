@@ -45,6 +45,13 @@
 #define AUDIO_SELFTEST_PLAYBACK 1
 #endif
 
+// Record a short clip at boot and report what the microphone actually produced. This is the
+// first-run microphone diagnostic the roadmap asks for, and it is the only way to answer "is the
+// mic alive" on a unit whose only button is also the provisioning reset.
+#ifndef AUDIO_BOOT_SELFTEST_MS
+#define AUDIO_BOOT_SELFTEST_MS 2000
+#endif
+
 namespace {
 
 DeviceStore store;
@@ -143,6 +150,18 @@ bool audioInit() {
     return false;
   }
 
+  // Microphone gain, which es8311_codec_init deliberately leaves at its default (the vendor left
+  // the call commented out). A second handle is cheap — it is a struct holding the port and
+  // address, and the register write is idempotent — and it keeps lib/ES8311 byte-identical to the
+  // vendor drop rather than forking it for one line.
+  es8311_handle_t gainHandle = es8311_create((i2c_port_t)I2C_PORT_NUM, ES8311_I2C_ADDR);
+  if (gainHandle) {
+    if (es8311_microphone_gain_set(gainHandle, AUDIO_MIC_GAIN) != ESP_OK) {
+      Serial.println("[audio] Could not set microphone gain; continuing at the default.");
+    }
+    es8311_delete(gainHandle);
+  }
+
   clipCapacity = AUDIO_CAPTURE_MAX_BYTES / sizeof(int16_t);
   clipBuffer = (int16_t*)ps_malloc(clipCapacity * sizeof(int16_t));
   if (!clipBuffer) {
@@ -159,7 +178,6 @@ bool audioInit() {
   audioReady = true;
   return true;
 }
-
 // Reads one I2S frame and appends the left channel to the clip. Returns false when the clip is
 // full, which is one of the three ways recording ends.
 bool captureFrame() {
@@ -184,32 +202,57 @@ bool captureFrame() {
 
 // Peak and RMS are what tell you the microphone is alive without needing a speaker. A dead mic
 // reads a flat zero; a clipping one pins peak at 32767.
+struct ClipStats {
+  int32_t peak;
+  double rms;
+  uint32_t ms;
+  uint32_t dcOffset;   // a stuck codec often reads a constant non-zero value rather than zero
+};
+
+ClipStats measureClip() {
+  ClipStats st = {0, 0.0, 0, 0};
+  if (clipSamples == 0) return st;
+
+  int64_t sum = 0;
+  uint64_t sumSquares = 0;
+  for (size_t i = 0; i < clipSamples; ++i) {
+    const int32_t v = clipBuffer[i];
+    const int32_t a = v < 0 ? -v : v;
+    if (a > st.peak) st.peak = a;
+    sum += v;
+    sumSquares += (uint64_t)((int64_t)v * v);
+  }
+  st.rms = sqrt((double)sumSquares / (double)clipSamples);
+  st.ms = (uint32_t)((uint64_t)clipSamples * 1000ULL / AUDIO_SAMPLE_RATE_HZ);
+  const int64_t mean = sum / (int64_t)clipSamples;
+  st.dcOffset = (uint32_t)(mean < 0 ? -mean : mean);
+  return st;
+}
+
+void printClipVerdict(const ClipStats& st) {
+  Serial.printf("[audio] %u ms, %u samples, %u bytes. peak %d, rms %.0f, dc %u",
+                (unsigned)st.ms, (unsigned)clipSamples,
+                (unsigned)(clipSamples * sizeof(int16_t)), (int)st.peak, st.rms,
+                (unsigned)st.dcOffset);
+  if (st.peak == 0) {
+    Serial.print("  <- SILENT: the codec is not delivering samples");
+  } else if (st.peak >= 32700) {
+    Serial.print("  <- CLIPPING: lower the mic gain");
+  } else if (st.rms < 8.0) {
+    Serial.print("  <- VERY QUIET: check mic gain, or the room really is silent");
+  }
+  Serial.println();
+}
+
 void reportClip() {
   if (clipSamples == 0) {
     Serial.println("[audio] Nothing captured.");
     return;
   }
 
-  int32_t peak = 0;
-  uint64_t sumSquares = 0;
-  for (size_t i = 0; i < clipSamples; ++i) {
-    const int32_t s = clipBuffer[i];
-    const int32_t a = s < 0 ? -s : s;
-    if (a > peak) peak = a;
-    sumSquares += (uint64_t)((int64_t)s * s);
-  }
-  const double rms = sqrt((double)sumSquares / (double)clipSamples);
-  const uint32_t ms = (uint32_t)((uint64_t)clipSamples * 1000ULL / AUDIO_SAMPLE_RATE_HZ);
-
-  Serial.printf("[audio] %u ms, %u samples, %u bytes. peak %d, rms %.0f",
-                (unsigned)ms, (unsigned)clipSamples,
-                (unsigned)(clipSamples * sizeof(int16_t)), (int)peak, rms);
-  if (peak == 0) {
-    Serial.print("  <- SILENT: the codec is not delivering samples");
-  } else if (peak >= 32700) {
-    Serial.print("  <- CLIPPING: lower the mic gain");
-  }
-  Serial.println();
+  const ClipStats st = measureClip();
+  printClipVerdict(st);
+  const uint32_t ms = st.ms;
 
   if (ms < AUDIO_CAPTURE_MIN_MS) {
     Serial.printf("[audio] Shorter than %u ms — discarded as a mis-tap.\n",
@@ -249,6 +292,36 @@ void playClip() {
   speakerEnable(false);
 }
 #endif  // AUDIO_SELFTEST_PLAYBACK
+
+#if AUDIO_BOOT_SELFTEST_MS > 0
+// Records for a fixed window with no button involved, so a unit whose only key is also the
+// provisioning reset can still prove its microphone works.
+void audioBootSelfTest() {
+  if (!audioReady) return;
+
+  Serial.printf("[audio] Self-test: recording %u ms from the on-board microphone...\n",
+                (unsigned)AUDIO_BOOT_SELFTEST_MS);
+  clipSamples = 0;
+  const uint32_t startedAt = millis();
+  // The first frames after the codec starts are unreliable while its ADC settles, so discard a
+  // few before measuring rather than reporting a false SILENT.
+  for (int i = 0; i < 4; ++i) captureFrame();
+  clipSamples = 0;
+
+  while (millis() - startedAt < AUDIO_BOOT_SELFTEST_MS) {
+    if (!captureFrame()) break;
+  }
+
+  const ClipStats st = measureClip();
+  printClipVerdict(st);
+  if (st.peak > 0 && st.peak < 32700) {
+    Serial.println("[audio] Self-test PASSED — the microphone is delivering samples.");
+  } else {
+    Serial.println("[audio] Self-test FAILED — see the verdict above.");
+  }
+  clipSamples = 0;
+}
+#endif
 
 void recordWhileHeld() {
   if (!audioReady) return;
@@ -389,7 +462,11 @@ void setup() {
   reportIdentity();
 
 #if ENABLE_AUDIO_CAPTURE
-  audioInit();
+  if (audioInit()) {
+#if AUDIO_BOOT_SELFTEST_MS > 0
+    audioBootSelfTest();
+#endif
+  }
 #else
   Serial.println("[audio] Disabled. Build -e hosyond-es3c28p-capture to enable the microphone.");
 #endif

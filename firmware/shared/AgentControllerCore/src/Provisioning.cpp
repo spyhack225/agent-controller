@@ -44,7 +44,14 @@ void Provisioning::begin(DeviceStore& store, const String& apNameSeed) {
   String suffix = apNameSeed;
   if (suffix.length() > 4) suffix = suffix.substring(suffix.length() - 4);
   suffix.toLowerCase();
-  if (suffix.length() == 0) suffix = "0000";
+  // An unprovisioned unit has no device id, so every one of them would advertise the same
+  // "agent-ctl-0000". Fall back to the MAC, which is unique and available before any identity is.
+  if (suffix.length() == 0) {
+    const uint64_t mac = ESP.getEfuseMac();
+    char macSuffix[5];
+    snprintf(macSuffix, sizeof(macSuffix), "%04x", (unsigned)(mac & 0xFFFF));
+    suffix = macSuffix;
+  }
   apName_ = "agent-ctl-" + suffix;
   status_.apName = apName_;
   status_.portalUrl = "http://192.168.4.1";
@@ -56,7 +63,10 @@ void Provisioning::begin(DeviceStore& store, const String& apNameSeed) {
 void Provisioning::enterProvisioning() {
   status_.state = ProvisioningState::Provisioning;
   status_.detail = "Join " + apName_;
-  WiFi.disconnect(true);
+  // Only tear down a station that exists. On a first boot with no stored credentials the Wi-Fi
+  // driver has never been started, and disconnect() logs ESP_ERR_WIFI_NOT_INIT at error level --
+  // alarming, and the very first thing an owner sees on the serial console of a new unit.
+  if (WiFi.getMode() != WIFI_OFF) WiFi.disconnect(true);
   startPortal();
 }
 
