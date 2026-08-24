@@ -1,10 +1,17 @@
 export async function buildUserDisplayState(store, userId) {
-  const environments = await store.listEnvironments(userId);
-  const devices = await store.listDevices(userId);
-  const media = await store.listMediaUploads(userId);
-  const macros = await store.listMacros(userId);
-  const commands = await store.listCommands(userId);
-  const audit = await store.listAuditLogs(userId);
+  // Awaited together, not in sequence. None of these six depends on another, and under the Convex
+  // store each one is its own network round trip — so serialising them made the device's five-second
+  // display poll six round trips deep and it began timing out on the firmware side
+  // (HTTPClient error -11) once the account had enough history. Batching turns that back into one
+  // slowest-call wait.
+  const [environments, devices, media, macros, commands, audit] = await Promise.all([
+    store.listEnvironments(userId),
+    store.listDevices(userId),
+    store.listMediaUploads(userId),
+    store.listMacros(userId),
+    store.listCommands(userId),
+    store.listAuditLogs(userId),
+  ]);
   const lastCommand = commands.at(-1) ?? null;
   const lastAudit = audit.at(-1) ?? null;
   const onlineDevices = devices.filter((device) => device.presence?.online).length;
