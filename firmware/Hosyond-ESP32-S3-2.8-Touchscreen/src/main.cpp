@@ -482,28 +482,27 @@ constexpr int16_t kOrbCy = 118;
 constexpr int16_t kLabelY = 208;
 constexpr int16_t kContextY = 244;
 
-// #070707, the background the web component sits on. Not pure black: the panel's black is deep
-// enough that a hairline of lift keeps the orb from looking like it is floating in a void.
-constexpr uint16_t kBg = 0x0000;
-constexpr uint16_t kDim = 0x39E7;
-constexpr uint16_t kMuted = 0x8410;
+// Greys, resolved through panelGrey() so the panel's polarity is applied in one place.
+constexpr uint8_t kBgGrey = 0;      // #000, the ground the web component sits on
+constexpr uint8_t kDimGrey = 56;    // hairlines
+constexpr uint8_t kMutedGrey = 132; // secondary text
 
 // Static chrome, drawn once. Redrawing it every frame would triple the SPI traffic for pixels that
 // never change.
 void drawChrome() {
   if (!displayReady()) return;
   Adafruit_ILI9341& g = displayPanel();
-  g.fillScreen(kBg);
+  g.fillScreen(panelGrey(kBgGrey));
 
   g.setTextSize(1);
-  g.setTextColor(kMuted);
+  g.setTextColor(panelGrey(kMutedGrey));
   g.setCursor(12, 14);
   g.print("AGENT CONTROLLER");
 
-  g.drawFastHLine(12, 30, kScreenW - 24, kDim);
-  g.drawFastHLine(12, kScreenH - 34, kScreenW - 24, kDim);
+  g.drawFastHLine(12, 30, kScreenW - 24, panelGrey(kDimGrey));
+  g.drawFastHLine(12, kScreenH - 34, kScreenW - 24, panelGrey(kDimGrey));
 
-  g.setTextColor(kDim);
+  g.setTextColor(panelGrey(kDimGrey));
   g.setCursor(12, kScreenH - 24);
   g.print(HARDWARE_MODEL);
 
@@ -513,11 +512,11 @@ void drawChrome() {
 void drawContext(const String& text) {
   if (!displayReady()) return;
   Adafruit_ILI9341& g = displayPanel();
-  g.fillRect(0, kContextY - 2, kScreenW, 16, kBg);
+  g.fillRect(0, kContextY - 2, kScreenW, 16, panelGrey(kBgGrey));
   if (text.length() == 0) return;
 
   g.setTextSize(1);
-  g.setTextColor(kMuted);
+  g.setTextColor(panelGrey(kMutedGrey));
   const int16_t w = (int16_t)(text.length() * 6);
   g.setCursor((kScreenW - w) / 2, kContextY);
   g.print(text);

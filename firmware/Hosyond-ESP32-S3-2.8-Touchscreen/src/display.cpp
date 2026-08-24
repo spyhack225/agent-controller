@@ -76,10 +76,11 @@ bool displayBegin() {
   // way round. Sending it on top produced a white screen with dark dots on real glass (photo
   // evidence, 2026-08-24), so the two inversions were cancelling. Verified visually: do not
   // "restore" this from the vendor file without looking at the panel.
-  panel->invertDisplay(false);
+  // Left at the library default. It provably does nothing on this glass (see PANEL_OUTPUT_INVERTED
+  // in display.h); polarity is corrected in software instead.
 
   panel->setRotation(0);           // portrait, 240x320, ribbon at the bottom
-  panel->fillScreen(ILI9341_BLACK);
+  panel->fillScreen(panelGrey(0));
 
   // Let the panel's own rails settle before adding the backlight load on top of them.
   delay(20);
@@ -94,11 +95,6 @@ bool displayBegin() {
 }
 
 namespace {
-
-// The panel is 16-bit RGB565 and the orb is greyscale, so ink collapses to one channel triple.
-inline uint16_t greyToRgb565(uint8_t g) {
-  return (uint16_t)(((g & 0xF8) << 8) | ((g & 0xFC) << 3) | (g >> 3));
-}
 
 // Off-screen canvases, blitted in one transaction each.
 //
@@ -131,10 +127,10 @@ void displayDrawOrb(ThinkingOrb& orb, int16_t cx, int16_t cy, uint32_t elapsedMs
   const int16_t h = orbCanvas->height();
   const int16_t mid = w / 2;
 
-  orbCanvas->fillScreen(0x0000);
+  orbCanvas->fillScreen(panelGrey(0));
   for (uint16_t i = 0; i < frame.count; ++i) {
     const OrbDot& d = frame.dots[i];
-    const uint16_t colour = greyToRgb565(d.ink);
+    const uint16_t colour = panelGrey(d.ink);
     const int16_t x = mid + d.x;
     const int16_t y = mid + d.y;
     // A 1 px dot as a filled circle costs a bounding-box walk for one pixel, and most of the
@@ -152,25 +148,44 @@ void displayDrawStatus(const char* label, int16_t cy, uint32_t elapsedMs) {
   const size_t len = strlen(label);
   if (len == 0) return;
 
-  labelCanvas->fillScreen(0x0000);
-  labelCanvas->setTextSize(2);
-
   const int16_t charW = 12;                       // 6 px base glyph at size 2
   const int16_t textW = (int16_t)(len * charW);
   const int16_t x0 = (int16_t)((240 - textW) / 2);
 
   // The web component sweeps a bright band across the label with a CSS gradient. There is no
   // gradient here, so the same read is produced per-glyph: a moving window of brighter characters.
-  const float head = fmodf(elapsedMs / 1100.0f, 1.6f) * (len + 3.0f) - 1.5f;
+  //
+  // The sweep is slow and the brightness range is narrow on purpose. The first version swung each
+  // glyph between 96 and 255 every 1.1 s, which at a glance is not a shimmer, it is a flicker —
+  // eight characters strobing out of phase. 150..235 over 2.6 s reads as a highlight travelling
+  // across a word.
+  const float head = fmodf(elapsedMs / 2600.0f, 1.5f) * (len + 4.0f) - 2.0f;
 
+  // Only the glyphs, and only the width they occupy, are repainted. Clearing and pushing the full
+  // 240 px strip every frame made the whole line pulse against the background.
+  const int16_t stripX = (int16_t)(x0 - 4 < 0 ? 0 : x0 - 4);
+  const int16_t stripW = (int16_t)(textW + 8 > 240 ? 240 : textW + 8);
+
+  labelCanvas->fillScreen(panelGrey(0));
+  labelCanvas->setTextSize(2);
   for (size_t i = 0; i < len; ++i) {
     const float d = fabsf((float)i - head);
-    const float lift = d > 2.2f ? 0.0f : (1.0f - d / 2.2f);
-    const uint8_t grey = (uint8_t)(96 + lift * 159);
-    labelCanvas->setTextColor(greyToRgb565(grey));
-    labelCanvas->setCursor(x0 + (int16_t)(i * charW), 4);
+    const float lift = d > 2.6f ? 0.0f : (1.0f - d / 2.6f);
+    const uint8_t grey = (uint8_t)(150 + lift * 85);
+    labelCanvas->setTextColor(panelGrey(grey));
+    labelCanvas->setCursor((x0 - stripX) + (int16_t)(i * charW), 4);
     labelCanvas->write(label[i]);
   }
 
-  displayPanel().drawRGBBitmap(0, cy - 4, labelCanvas->getBuffer(), 240, kLabelH);
+  // Blit the sub-rectangle the text actually occupies. GFXcanvas16 has no stride-aware push, so the
+  // rows are sent one at a time; that is still one transaction per row against 240 px of untouched
+  // background per frame.
+  Adafruit_ILI9341& g = displayPanel();
+  const uint16_t* buf = labelCanvas->getBuffer();
+  g.startWrite();
+  g.setAddrWindow(stripX, cy - 4, stripW, kLabelH);
+  for (int16_t row = 0; row < kLabelH; ++row) {
+    g.writePixels(const_cast<uint16_t*>(buf + (size_t)row * 240), stripW);
+  }
+  g.endWrite();
 }

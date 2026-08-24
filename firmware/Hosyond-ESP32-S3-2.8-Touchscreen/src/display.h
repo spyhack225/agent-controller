@@ -14,6 +14,35 @@
 #include <Adafruit_GFX.h>
 #include <ThinkingOrb.h>
 
+// Panel output polarity.
+//
+// This glass renders what we send inverted: a 0x0000 fill comes out white. Both invertDisplay(true)
+// and invertDisplay(false) were flashed and photographed, and the screen was identical white both
+// times — the ILI9341's INVON/INVOFF simply does not control this panel's polarity, whatever the
+// vendor's own init sequence does with 0x21 alongside their own gamma and power registers.
+//
+// So the correction happens here, where the bytes are ours and the result is deterministic. Every
+// colour written to the panel goes through panelRgb()/panelGrey(). Flip this to 0 for a panel that
+// behaves normally; it is one constant rather than a hunt through the drawing code.
+#ifndef PANEL_OUTPUT_INVERTED
+#define PANEL_OUTPUT_INVERTED 1
+#endif
+
+// Applies the panel's polarity to a finished RGB565 value.
+inline uint16_t panelRgb(uint16_t rgb565) {
+#if PANEL_OUTPUT_INVERTED
+  return (uint16_t)~rgb565;
+#else
+  return rgb565;
+#endif
+}
+
+// Greyscale convenience: 0 is ink-black on screen, 255 is white on screen, whatever the panel does.
+inline uint16_t panelGrey(uint8_t g) {
+  const uint16_t c = (uint16_t)(((g & 0xF8) << 8) | ((g & 0xFC) << 3) | (g >> 3));
+  return panelRgb(c);
+}
+
 bool displayBegin();
 
 // Allocates the off-screen canvases the orb and label composite into. Must be called after
