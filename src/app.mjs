@@ -10,7 +10,7 @@ import { fileURLToPath } from "node:url";
 import { createClerkAuthenticator } from "./clerkAuth.mjs";
 import { loadConfig } from "./config.mjs";
 import { buildConnectCommand, normalizeConnectAccessMode } from "./connectSession.mjs";
-import { buildDeviceDisplayState, buildUserDisplayState } from "./displayState.mjs";
+import { buildDeviceDisplayState, buildUserDisplayState, invalidateDisplayCache } from "./displayState.mjs";
 import { createEventBroker } from "./events.mjs";
 import {
   HttpError,
@@ -157,10 +157,15 @@ export function createApp({
   // user whose data changed. Both end up as a state.changed event for that user.
   store.subscribe((change) => {
     if (change && Array.isArray(change.users)) {
+      // A full snapshot names no single user, so nothing can be assumed still fresh.
+      invalidateDisplayCache();
       events.broadcastStateChange(change);
       return;
     }
-    if (change?.userId) events.broadcastUserChange(change.userId, { action: change.action ?? null });
+    if (change?.userId) {
+      invalidateDisplayCache(change.userId);
+      events.broadcastUserChange(change.userId, { action: change.action ?? null });
+    }
   });
   const snapshotPoller = createSnapshotPoller({
     store,
@@ -1997,6 +2002,7 @@ export function createApp({
         requireClaimedDevice(device);
         return sendJson(res, 200, {
           display: await buildDeviceDisplayState(store, device, {
+            cache: true,
             environmentId: optionalString(url.searchParams.get("environmentId"))
               ?? optionalString(device.config?.environmentId)
               ?? null,
