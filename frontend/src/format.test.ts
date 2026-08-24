@@ -1,4 +1,10 @@
-import { commandSummary, formatRelativeTime, formatUptime, renderEventResult } from "./format";
+import {
+  commandSummary,
+  formatMediaExpiry,
+  formatRelativeTime,
+  formatUptime,
+  renderEventResult,
+} from "./format";
 
 describe("format helpers", () => {
   test("summarizes commands from their operational payload", () => {
@@ -23,5 +29,27 @@ describe("format helpers", () => {
 
   test("handles missing relative timestamps", () => {
     expect(formatRelativeTime(null)).toBe("never");
+  });
+
+  test("reads a past timestamp as an age", () => {
+    const twoMinutesAgo = new Date(Date.now() - 2 * 60 * 1000).toISOString();
+    expect(formatRelativeTime(twoMinutesAgo)).toBe("2m ago");
+  });
+
+  // The bug this covers: the old clamp turned every future instant into "0s ago", so a clip
+  // uploaded seconds earlier under a 30-day retention claimed to have already expired.
+  test("reads a future timestamp as a deadline rather than clamping it to zero", () => {
+    const inThirtyDays = new Date(Date.now() + 30 * 24 * 60 * 60 * 1000 + 60_000).toISOString();
+    expect(formatRelativeTime(inThirtyDays)).toBe("in 30d");
+    expect(formatRelativeTime(new Date(Date.now() + 90 * 1000).toISOString())).toBe("in 1m");
+  });
+
+  test("describes media retention in the tense that matches the fact", () => {
+    // What the gateway writes for a clip uploaded now under the default 30-day retention.
+    const justUploaded = new Date(Date.now() + 30 * 24 * 60 * 60 * 1000 + 60_000).toISOString();
+    expect(formatMediaExpiry(justUploaded)).toBe("Expires in 30d");
+    expect(formatMediaExpiry(new Date(Date.now() - 2 * 24 * 60 * 60 * 1000 - 60_000).toISOString()))
+      .toBe("Expired 2d ago");
+    expect(formatMediaExpiry(null)).toBe("Expires only when manually deleted");
   });
 });

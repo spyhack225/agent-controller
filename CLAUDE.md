@@ -278,7 +278,14 @@ the words are waiting when the gateway has already declined to act on them.
 
 `TRANSCRIPTION_PROVIDER=parakeet` is its own adapter in `src/transcription.mjs`, not the OpenAI
 branch with a different URL. It talks HTTP to a local sidecar running `nvidia/parakeet-tdt-0.6b-v2`:
-the gateway never imports Python and never blocks its event loop on inference. CPU is the supported
+the gateway never imports Python and never blocks its event loop on inference. The sidecar is
+`scripts/parakeet-sidecar.py` and its weights come from `scripts/fetch-parakeet-model.mjs`
+(`npm run parakeet:fetch` then `npm run parakeet:sidecar`). It runs the ONNX export of the
+checkpoint under onnxruntime rather than the `.nemo` archive under nemo_toolkit — same weights,
+without PyTorch/Lightning/Hydra — and nothing about the ONNX choice is visible to the gateway,
+which only ever sees the HTTP contract in `docs/api.md`. **Leaving `TRANSCRIPTION_PROVIDER` unset
+means `disabled`, and a disabled provider fails every job terminally**: the voice pipeline is inert
+until it names a real provider, which is not obvious from the media UI. CPU is the supported
 default, which is why `PARAKEET_TIMEOUT_MS` is minutes and `PARAKEET_CONCURRENCY` is 1 — the gate in
 `createConcurrencyGate()` hands a released slot straight to the next waiter, because decrementing and
 re-acquiring would let a fresh caller overtake the queue.

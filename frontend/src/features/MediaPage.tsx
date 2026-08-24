@@ -13,6 +13,7 @@ import { useEffect, useRef, useState } from "react";
 import { mediaJobActivity } from "../activity";
 import type { Controller } from "../controller";
 import {
+  formatMediaExpiry,
   formatMediaJob,
   formatMediaProcessing,
   formatRelativeTime,
@@ -164,7 +165,7 @@ export function MediaPage({ controller: c }: { controller: Controller }) {
                     {item.contentType} · {item.sizeBytes ?? 0} B · {formatRelativeTime(item.createdAt)}
                   </p>
                   <p className="mt-1 text-xs text-ink-muted">
-                    Expires {item.expiresAt ? formatRelativeTime(item.expiresAt) : "only when manually deleted"}
+                    {formatMediaExpiry(item.expiresAt)}
                   </p>
                 </div>
                 <div>

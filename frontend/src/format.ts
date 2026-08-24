@@ -1,16 +1,32 @@
 import type { Command, JsonRecord, MediaItem, MediaJob } from "./types";
 
+/**
+ * A timestamp relative to now, in either direction.
+ *
+ * The clamp this used to carry (`Math.max(0, now - timestamp)`) silently assumed every timestamp
+ * was in the past, so anything in the future collapsed to "0s ago": a clip uploaded a minute ago
+ * under a 30-day retention read "Expires 0s ago", and a credential good for another three months
+ * read as already gone. Deadlines are as common as ages in this UI — media expiry, token expiry —
+ * so the direction is part of the answer, not an assumption.
+ */
 export function formatRelativeTime(value?: string | null): string {
   if (!value) return "never";
   const timestamp = Date.parse(value);
   if (!Number.isFinite(timestamp)) return value;
-  const ageSeconds = Math.max(0, Math.floor((Date.now() - timestamp) / 1000));
-  if (ageSeconds < 60) return `${ageSeconds}s ago`;
-  const ageMinutes = Math.floor(ageSeconds / 60);
-  if (ageMinutes < 60) return `${ageMinutes}m ago`;
-  const ageHours = Math.floor(ageMinutes / 60);
-  if (ageHours < 24) return `${ageHours}h ago`;
-  return `${Math.floor(ageHours / 24)}d ago`;
+  const deltaMs = timestamp - Date.now();
+  const amount = formatDuration(Math.abs(deltaMs));
+  return deltaMs > 0 ? `in ${amount}` : `${amount} ago`;
+}
+
+/** Coarsest unit that still reads as a number: seconds, then minutes, hours, days. */
+function formatDuration(milliseconds: number): string {
+  const seconds = Math.floor(milliseconds / 1000);
+  if (seconds < 60) return `${seconds}s`;
+  const minutes = Math.floor(seconds / 60);
+  if (minutes < 60) return `${minutes}m`;
+  const hours = Math.floor(minutes / 60);
+  if (hours < 24) return `${hours}h`;
+  return `${Math.floor(hours / 24)}d`;
 }
 
 export function formatUptime(value?: number | null): string {
@@ -77,6 +93,23 @@ function isT3DispatchReceipt(record: JsonRecord): boolean {
   return isSequenceReceipt(record)
     || isSequenceReceipt(record.createThread)
     || isSequenceReceipt(record.startTurn);
+}
+
+/**
+ * Retention, said the way a person would read it.
+ *
+ * Split from the raw relative time so the tense matches the fact: a clip with time left "expires
+ * in 29d", one past its retention "expired 2d ago", and one the owner has to delete by hand never
+ * expires at all. Rendering all three through a single "Expires …" prefix produced the nonsense
+ * this screen used to show.
+ */
+export function formatMediaExpiry(expiresAt?: string | null): string {
+  if (!expiresAt) return "Expires only when manually deleted";
+  const timestamp = Date.parse(expiresAt);
+  if (!Number.isFinite(timestamp)) return `Expires ${expiresAt}`;
+  return timestamp > Date.now()
+    ? `Expires ${formatRelativeTime(expiresAt)}`
+    : `Expired ${formatRelativeTime(expiresAt)}`;
 }
 
 export function formatMediaProcessing(media: MediaItem): string {

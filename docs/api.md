@@ -646,6 +646,33 @@ defaults to minutes and concurrency to one.
 | `PARAKEET_LANGUAGE` | `PARAKEET_LANGUAGE` → `TRANSCRIPTION_LANGUAGE` → `en` | Declared on every request, never detected. |
 | `PARAKEET_CONCURRENCY` | `1` | How many clips may be inside the sidecar at once. |
 | `PARAKEET_ACCEPTED_CONTENT_TYPES` | `audio/wav,audio/webm,audio/ogg,audio/mp4` | Containers the sidecar's decoder can open. |
+| `PARAKEET_MODEL_DIR` | `.data/models/parakeet-tdt-0.6b-v2-onnx` | Read by the fetch script and the sidecar, not by the gateway. |
+| `PARAKEET_MODEL_PRECISION` | `int8` | `int8` (~630 MB) or `fp32` (~2.5 GB). Sidecar-side only. |
+
+**Running it.** The sidecar ships in this repo as `scripts/parakeet-sidecar.py`, and the weights are
+fetched by `scripts/fetch-parakeet-model.mjs`:
+
+```bash
+uv venv --python 3.12 .venv-parakeet
+uv pip install --python .venv-parakeet/bin/python onnx-asr onnxruntime
+npm run parakeet:fetch          # ~630 MB into PARAKEET_MODEL_DIR, digest-verified, resumable
+npm run parakeet:sidecar        # loads the model, then listens on 127.0.0.1:8977
+```
+
+Then set `TRANSCRIPTION_PROVIDER=parakeet` and restart the gateway. `GET /healthz` on the sidecar
+reports the loaded checkpoint, precision and model directory; `npm run parakeet:fetch -- --check`
+re-verifies the weights on disk without downloading anything.
+
+The runtime is **onnxruntime via onnx-asr, not nemo_toolkit**. NVIDIA publishes the checkpoint as a
+2.4 GB `.nemo` archive only NeMo can open, and NeMo pulls in PyTorch, Lightning and Hydra to run
+600M parameters of CPU inference; `istupakov/parakeet-tdt-0.6b-v2-onnx` is that same checkpoint
+exported to ONNX, and its int8 export runs under onnxruntime with numpy as the only other
+dependency. Measured on an M-series CPU Mac, a 4.6 s clip transcribes in ~1.2 s — a `realtimeFactor`
+around `0.26`.
+
+The download is CC-BY-4.0 and ungated, so no Hugging Face token is involved. **The weights are never
+committed**: they live under `.data/`, and the sidecar's virtualenv under `.venv-parakeet/`, both
+gitignored.
 
 **Containers.** Browser capture arrives as WebM/Opus (Chrome, Firefox) or MP4/AAC (Safari); a
 controller uploads 16 kHz mono WAV, which needs no decoding at all. Anything outside the accepted
