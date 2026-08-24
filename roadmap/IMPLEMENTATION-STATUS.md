@@ -5,35 +5,58 @@ Canonical progress ledger for
 This file records what the repository can do now; the roadmap records the target and sequence.
 Anything not marked **done** is not complete.
 
-Last verified: **2026-08-24**, at commit `c8e1c90`.
+Last verified: **2026-08-24**, at commit `da62ef0`.
 
 ## Verified baseline
 
-- **Delivery:** Milestones 0.5 and 1 are complete. Milestone 2 (voice pipeline) and the firmware
-  operate flow are in progress. Milestones 0, 3–5 are not started.
-- **Web/server gate:** production frontend build and typecheck pass; 188 frontend tests pass;
-  363 server tests pass and 3 S3 integration tests are intentionally skipped when no S3 service is
-  configured.
-- **Firmware gate:** all 11 PlatformIO environments across four board folders compile: CrowPanel
-  4, Hosyond 4, Waveshare 2, and Vision Master T190 1.
-- **Hardware evidence:** Hosyond ES3C28P has been flashed. Its 8 MB PSRAM, 16 MB flash, battery
-  reading, ES8311 codec, microphone samples, SoftAP provisioning, ILI9341 display, panel polarity,
-  and orb UI have been exercised on silicon. Other boards remain unvalidated on hardware.
+- **Delivery:** Milestone 0.5 is complete. Milestones 2 and 3 are substantially complete —
+  this file previously recorded both as not started, which was wrong. Milestone 4 is partial.
+  Milestones 0, 1 and 5 are not started.
+- **Web/server gate:** production frontend build and typecheck pass; 204 frontend tests pass;
+  439 server tests, 436 passing, 3 S3 integration tests intentionally skipped when no S3 service
+  is configured.
+- **Firmware gate:** all PlatformIO environments across four board folders compile.
+- **Hardware evidence:** Hosyond ES3C28P has been flashed and exercised on silicon: 8 MB PSRAM,
+  16 MB flash, battery reading, ES8311 codec, microphone samples, SoftAP provisioning, ILI9341
+  display, panel polarity, and the orb UI. Other boards remain unvalidated on hardware.
 - **Onboarding proven end to end, without user-side flashing:** a factory NVS seed was written
   once, after which the owner entered Wi-Fi through the SoftAP portal, the device discovered the
   gateway over LAN broadcast, reported itself unclaimed, displayed its claim code, and was claimed
-  from the console. The device logged `link: claimed` and cleared the spent code.
-- **Reboot loop diagnosed and fixed:** both HTTP call sites declared `HTTPClient` before the
-  `WiFiClient` handed to `begin()`. C++ destroys locals in reverse order, so `~HTTPClient()` ran
-  `stop()` on freed memory — crashing as `InstrFetchProhibited` at PC `0xfffffffd` and corrupting
-  the lwIP heap, which panicked the tcpip thread separately. Two symptoms, one bug. The fix is
-  committed but **not yet flashed**: the board is wedged and needs a physical power cycle.
+  from the console.
+- **Reboot loop fixed and verified on hardware.** Two distinct bugs, found in sequence:
+  1. Both HTTP call sites declared `HTTPClient` before the `WiFiClient` handed to `begin()`. C++
+     destroys locals in reverse order, so `~HTTPClient()` ran `stop()` on freed memory.
+  2. `ThinkingOrb`'s scratch buffer was a file-scope global shared by every orb instance while
+     `capacity_` stayed per-instance, so `pushDot()`'s bound check guarded the wrong object. The
+     UI builds a 900-dot orb then a 180-dot one; the smaller `begin()` ran last and shrank the
+     shared buffer, and the main orb kept writing 405 entries into room for 180 — 2.7 KB past the
+     end, thirty times a second, into the internal-RAM pool the WiFi driver takes its buffers
+     from. Hence panics inside `ieee80211_crypto_decap` and `etharp_tmr` with none of our code on
+     the stack, and hence invisible to `heap_caps_check_integrity_all()`, which validates block
+     headers while the overrun landed in payload.
+
+  **150 s soak after the fix: 0 resets, 0 panics** (previously 18 resets in 120 s). This also
+  explains the "device only ever shows Ready" symptom: the device reached `link: claimed` and then
+  crashed during the config burst before it could paint the operate screens. One bug, two symptoms.
+- **Known non-blocking issue:** the render loop makes blocking HTTP calls, so frames still hitch
+  (worst gap ~1.0-1.7 s). Moving the cycle to a second core was tried and withdrawn — `ui.cpp`
+  reads gateway state in 68 places across its render path, so a task mutating those Strings
+  faults. The correct fix is for the client to do its request unlocked and publish a finished
+  snapshot under a short lock; not yet done.
 - **Critical product gap:** a request can be dispatched to T3 Code, but Agent Controller still
   cannot show and interact with the complete live response, provider approvals/questions,
-  subagents, or parallel work.
+  subagents, or parallel work. This is Milestone 1 and it is not started.
 
 The frontend build also reports a non-blocking JavaScript chunk-size warning (about 655 kB).
 Firmware compilation reports deprecated ESP32 legacy I2S/PCNT API warnings in capture/probe code.
+
+## Correction notice
+
+Milestone numbering clashes between artefacts: commit `49caa52` calls the Parakeet/voice work
+"Milestone 2" while the roadmap calls it Milestone 3. The roadmap's numbering is authoritative
+here. Earlier revisions of this file recorded Milestones 2 and 3 as `todo` when both were largely
+implemented, and listed "shared firmware gateway client" as an active blocker after it had been
+resolved. Status claims in this file are now expected to cite the file or test that evidences them.
 
 ## Legend
 
@@ -86,24 +109,52 @@ questions, route provider approvals with their full decision set, or inspect sub
 tasks. Existing snapshot normalization and one-shot RPC helpers are prerequisites, not milestone
 completion.
 
-### Milestone 2 — composer and connection: partial
+### Milestone 2 — composer and connection: substantially done
 
-Operate already has free-form text and the Milestone 0.5 ordered-attachment controls. Environment
-updates can preserve an existing record. The unified picker/capture composer, QuickPage composer,
-console-first connection handoff, local discovery, and guided re-pair flow have not landed.
+Corrected: this was recorded as `partial` with the composer "not landed". It had landed.
+`frontend/src/features/Composer.tsx` exports `ComposerShell`, `useComposerDraft`,
+`buildComposerIntent` and `sendComposerIntent`, and pulls `MediaPicker`/`MediaCaptureDialog` from
+`MediaCapture.tsx`; `Composer.test.tsx` covers ten cases including paste/drop, the single source
+menu, camera reuse, and the server attachment ceiling. `QuickPage.tsx` imports the same composer
+rather than forking it, and `MediaPage.tsx` reuses `MediaCaptureDialog` — a real extraction.
+Console-first connection landed as `POST /v1/t3/connect-sessions` + `/redeem` +
+`GET /v1/t3/connect-sessions/:id` (`src/connectSession.mjs`, 7 tests); local discovery as
+`GET /v1/discovery` (`src/discovery.mjs`, 5 tests); guided re-pair as
+`PUT /v1/t3/environments/:id`.
 
-### Milestone 3 — automatic Parakeet voice pipeline: todo
+Outstanding: funnel instrumentation for the Add-environment flow.
 
-No Parakeet code, ASR service, processing queue, raw upload/finalize protocol, transcript versioning,
-automatic transcription, retry, or auto-send policy exists. Current transcription remains an
-explicit, synchronous Media-page operation. The target is CPU-hosted Parakeet V2; a GPU is optional
-for higher concurrency, not a server requirement.
+### Milestone 3 — automatic Parakeet voice pipeline: substantially done
+
+Corrected: this was recorded as `todo` asserting none of it existed. Most of it does.
+`src/transcription.mjs` lists `parakeet` in `TRANSCRIPTION_PROVIDERS` with a dedicated adapter,
+concurrency gate and three terminal pre-checks (`test/parakeet.test.mjs`, 16 tests).
+`src/mediaJobs.mjs` implements the durable stage machine
+`queued → transcribing → normalizing → review_required|ready → dispatching → dispatched`
+(`test/mediaJobs.test.mjs`, 19 tests). Transcript versioning exists as
+`rawTranscript`/`normalizedTranscript`/`userEditedTranscript` with the `describeTranscriptChange`
+letter-preservation guard. Auto-send is `PUT /v1/devices/:id/voice-auto-send` with the policy
+re-read at dispatch. Metrics cover `queueWaitMs`, `gateWaitMs`, `inferenceMs`, `realtimeFactor`.
+The device loop is `POST /v1/device/media` → `GET /v1/device/media/jobs/:id`
+(`src/deviceAudio.mjs`, 13 tests).
+
+Outstanding, and genuinely missing: the two-step raw upload/finalize protocol. Media still moves as
+base64 JSON through `POST /v1/media`; there is no `uploadStatus` field distinct from processing
+status, no presigned PUT, and no abandoned-session cleanup.
 
 ### Milestone 4 — controller voice paths: partial
 
-Hosyond hardware capture and visual status work are real. The clip remains local to the device
-because the shared gateway client has not been extracted. The PWA companion/deep link and compact
-response/interaction experience are also missing.
+Corrected: the shared gateway client HAS been extracted. `firmware/shared/AgentControllerCore/src/`
+now holds `GatewayClient.{h,cpp}`, `GatewayDiscovery.{h,cpp}`, `GatewayOperate.cpp`,
+`MediaUpload.{h,cpp}` and `OperateModel.h`; the Hosyond `main.cpp` instantiates `GatewayClient` and
+`ui.cpp` includes `MediaUpload.h`. Three boards pull `lib_extra_dirs = ../shared`.
+
+The device can also now list and select its environment, project and thread — `GET/POST
+/v1/device/environments`, `/v1/device/projects`, `/v1/device/threads` and the matching
+`/v1/device/config/*` setters (documented in `docs/hardware-protocol.md`).
+
+Outstanding: the PWA deep-link/QR companion (`claimLink.ts` handles device *claiming*, not thread
+deep links), and silicon validation of the operate UI and its gateway calls.
 
 ### Milestone 5 — adapter hardening and rollout: todo
 
@@ -116,18 +167,16 @@ live threads and voice.
 | Board / component | State | Current evidence |
 |---|---|---|
 | CrowPanel 2.13-inch e-paper | partial | Most complete gateway-connected firmware; four environments compile; no current silicon validation recorded |
-| Hosyond ES3C28P | partial | Four environments compile; provisioning, flash/PSRAM, battery, codec, microphone, ILI9341 display, polarity, orb rendering, and BOOT recovery were exercised on hardware; no gateway client, touch, upload, or agent-state feed; orb buffer/anti-alias tuning is active |
+| Hosyond ES3C28P | partial | Only board validated end to end on silicon: provisioning, LAN discovery, claim, flash/PSRAM, battery, codec, microphone, ILI9341 display, polarity, touch, orb rendering, BOOT recovery, and a clean 150 s soak after the orb scratch-buffer fix. Operate screens exist but are not yet confirmed on glass; render loop still hitches on blocking HTTP |
 | Waveshare AMOLED 1.75C | partial | Two scaffold environments compile; board and pin map remain unverified on silicon |
 | Vision Master T190 | partial | One bring-up environment compiles; placeholder pins and incomplete protocol client remain |
-| Shared `AgentControllerCore` | partial | `DeviceStore`, `Provisioning`, and `ThinkingOrb` are shared; gateway transport, heartbeat, display-state, intent, OTA, and media upload are not |
+| Shared `AgentControllerCore` | done | `DeviceStore`, `Provisioning`, `ThinkingOrb`, `OrbPainter`, `GatewayClient`, `GatewayDiscovery`, `GatewayOperate`, `MediaUpload` and `OperateModel` are all shared and consumed by three boards |
 
 ## Active blockers and next dependency
 
 1. **Live T3 event contract:** Milestone 0 must define the long-lived subscription, sequence,
    resume, deduplication, interaction, and work-node contracts before the conversation UI can be
    reliable.
-2. **Shared firmware gateway client:** Hosyond can capture audio but cannot upload or dispatch it
-   until the CrowPanel gateway logic is extracted into `firmware/shared/AgentControllerCore`.
 3. **Request API decision:** choose either one expanded `/v1/intents` path or a new
    `/v1/requests` path with a dated intent deprecation. Do not leave two indefinite policy entry
    paths.
