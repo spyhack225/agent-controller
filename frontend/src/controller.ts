@@ -23,6 +23,7 @@ import type {
   JsonRecord,
   Macro,
   MediaItem,
+  MediaJob,
   ModelRecovery,
   ModelSelection,
   OnboardingReadiness,
@@ -220,6 +221,7 @@ export function useController({ authConfig, clerk }: UseControllerOptions) {
   const [macros, setMacros] = useState<Macro[]>([]);
   const [actions, setActions] = useState<SavedAction[]>([]);
   const [media, setMedia] = useState<MediaItem[]>([]);
+  const [mediaJobs, setMediaJobs] = useState<MediaJob[]>([]);
   const [audit, setAudit] = useState<AuditEvent[]>([]);
   const [display, setDisplay] = useState<DisplayState | null>(null);
   const [privacyDays, setPrivacyDays] = useState<number | null>(30);
@@ -325,6 +327,7 @@ export function useController({ authConfig, clerk }: UseControllerOptions) {
         api<{ macros: Macro[] }>("/v1/macros"),
         api<{ privacy: { mediaRetentionDays: number | null } }>("/v1/settings/privacy"),
         api<{ media: MediaItem[] }>("/v1/media"),
+        api<{ jobs: MediaJob[] }>("/v1/media/jobs"),
         api<{ events: AuditEvent[] }>("/v1/audit"),
         api<{ display: DisplayState }>("/v1/display"),
         api<OnboardingResponse>("/v1/onboarding"),
@@ -335,8 +338,8 @@ export function useController({ authConfig, clerk }: UseControllerOptions) {
 
       const [
         environmentResult, deviceResult, commandResult, macroResult, privacyResult,
-        mediaResult, auditResult, displayResult, onboardingResult, actionsResult, remoteAccessResult,
-        gatewayProfilesResult,
+        mediaResult, mediaJobsResult, auditResult, displayResult, onboardingResult, actionsResult,
+        remoteAccessResult, gatewayProfilesResult,
       ] = results;
 
       const valueOf = <T,>(result: PromiseSettledResult<T>): T | null =>
@@ -352,6 +355,7 @@ export function useController({ authConfig, clerk }: UseControllerOptions) {
         setPrivacyDays(privacyResult.value.privacy?.mediaRetentionDays ?? null);
       }
       if (mediaResult.status === "fulfilled") setMedia(mediaResult.value.media ?? []);
+      if (mediaJobsResult.status === "fulfilled") setMediaJobs(mediaJobsResult.value.jobs ?? []);
       if (auditResult.status === "fulfilled") {
         setAudit((auditResult.value.events ?? []).slice(-120).reverse());
       }
@@ -436,8 +440,14 @@ export function useController({ authConfig, clerk }: UseControllerOptions) {
 
   const refreshMedia = useCallback(async () => {
     if (!authenticated) return;
-    const result = await api<{ media: MediaItem[] }>("/v1/media");
+    // Transcription is a background job now, so the library and the job list move together: the
+    // media row shows the stored transcript, the job shows how it got there.
+    const [result, jobs] = await Promise.all([
+      api<{ media: MediaItem[] }>("/v1/media"),
+      api<{ jobs: MediaJob[] }>("/v1/media/jobs"),
+    ]);
     setMedia(result.media ?? []);
+    setMediaJobs(jobs.jobs ?? []);
   }, [api, authenticated]);
 
   // Every capture surface funnels through here so the library, the Operate composer and the Quick
@@ -459,6 +469,7 @@ export function useController({ authConfig, clerk }: UseControllerOptions) {
     setMacros([]);
     setActions([]);
     setMedia([]);
+    setMediaJobs([]);
     setAudit([]);
     setDisplay(null);
     setRemoteAccess(null);
@@ -863,6 +874,7 @@ export function useController({ authConfig, clerk }: UseControllerOptions) {
     macros,
     actions,
     media,
+    mediaJobs,
     audit,
     display,
     privacyDays,

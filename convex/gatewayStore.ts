@@ -687,6 +687,43 @@ export const updateDeviceConfig = gatewayMutation({
   },
 });
 
+/**
+ * Grants or revokes this device's licence to auto-send a finished voice transcript.
+ *
+ * Mirrors setDeviceVoiceAutoSend() in src/store.mjs. Scoped to one device on purpose: an
+ * account-wide switch would silently extend the grant to the next controller the owner claims.
+ */
+export const setDeviceVoiceAutoSend = gatewayMutation({
+  args: {
+    userId: v.string(),
+    deviceId: v.id("devices"),
+    enabled: v.boolean(),
+    actorId: v.optional(v.union(v.string(), v.null())),
+    actorType: v.optional(v.string()),
+  },
+  handler: async (ctx, args) => {
+    const device = await getDeviceForOwner(ctx, args.userId, args.deviceId);
+    if (!device || device.revokedAt) return null;
+    const voiceAutoSend = normalizeVoiceAutoSend(
+      args.enabled === true
+        ? { enabled: true, enabledBy: args.actorId ?? args.userId, enabledAt: nowIso() }
+        : { enabled: false },
+    );
+    await ctx.db.patch(device._id, { voiceAutoSend, updatedAt: nowIso() });
+    await audit(ctx, {
+      userExternalId: args.userId,
+      actorType: args.actorType ?? "user",
+      ...(args.actorId ? { actorId: args.actorId } : {}),
+      action: args.enabled === true
+        ? "device.voice_auto_send_enabled"
+        : "device.voice_auto_send_disabled",
+      targetId: device._id,
+      metadata: voiceAutoSend,
+    });
+    return publicDevice(await ctx.db.get(device._id));
+  },
+});
+
 export const createGatewayProfile = gatewayMutation({
   args: { userId: v.string(), label: v.string(), mode: v.string(), url: v.string() },
   handler: async (ctx, args) => {
@@ -1374,6 +1411,41 @@ export const updateMediaTranscript = gatewayMutation({
   },
 });
 
+export const updateMediaDescription = gatewayMutation({
+  args: {
+    userId: v.string(),
+    mediaId: v.id("mediaUploads"),
+    description: v.string(),
+    source: v.optional(v.string()),
+  },
+  handler: async (ctx, args) => {
+    const media = await ctx.db.get(args.mediaId);
+    if (!media || media.userExternalId !== args.userId || media.kind !== "image") return null;
+    const description = normalizeTranscript(args.description) ?? null;
+    await ctx.db.patch(media._id, {
+      description,
+      processing: normalizeMediaProcessing({
+        visionStatus: description ? "ready" : "pending",
+        descriptionSource: args.source ?? "manual",
+        lastError: null,
+      }, media.kind, media.transcript ?? null, description),
+    });
+    const updated = await ctx.db.get(media._id);
+    await audit(ctx, {
+      userExternalId: args.userId,
+      actorType: "user",
+      action: "media.description_updated",
+      targetId: media._id,
+      metadata: {
+        previousLength: media.description?.length ?? 0,
+        descriptionLength: description?.length ?? 0,
+        source: args.source ?? "manual",
+      },
+    });
+    return publicMediaUpload(updated);
+  },
+});
+
 export const updateMediaProcessing = gatewayMutation({
   args: {
     userId: v.string(),
@@ -1382,8 +1454,14 @@ export const updateMediaProcessing = gatewayMutation({
   },
   handler: async (ctx, args) => {
     const media = await ctx.db.get(args.mediaId);
-    if (!media || media.userExternalId !== args.userId || media.kind !== "audio") return null;
-    const processing = normalizeMediaProcessing(args.processing, media.kind, media.transcript ?? null);
+    if (!media || media.userExternalId !== args.userId) return null;
+    if (media.kind !== "audio" && media.kind !== "image") return null;
+    const processing = normalizeMediaProcessing(
+      args.processing,
+      media.kind,
+      media.transcript ?? null,
+      media.description ?? null,
+    );
     await ctx.db.patch(media._id, { processing });
     const updated = await ctx.db.get(media._id);
     await audit(ctx, {
@@ -1448,6 +1526,13 @@ export const deleteMediaUpload = gatewayMutation({
     const media = await ctx.db.get(args.mediaId);
     if (!media || media.userExternalId !== args.userId) return null;
     await ctx.db.delete(media._id);
+    // A job whose media is gone can never finish; leaving it queued would make the worker
+    // rediscover it on every tick until the retry budget burned out.
+    const orphaned = await ctx.db
+      .query("mediaJobs")
+      .withIndex("byMediaId", (q: any) => q.eq("mediaId", args.mediaId))
+      .collect();
+    for (const job of orphaned) await ctx.db.delete(job._id);
     await audit(ctx, {
       userExternalId: args.userId,
       actorType: "user",
@@ -1462,6 +1547,257 @@ export const deleteMediaUpload = gatewayMutation({
       },
     });
     return publicMediaUpload(media);
+  },
+});
+
+// --- Durable media processing jobs -----------------------------------------------------------
+//
+// Mirrors createMediaJob/claimMediaJobs/updateMediaJob in src/store.mjs. Convex cannot import from
+// src/, so normalizeMediaJobStage() and resumeStageFor() are duplicated here; test/storeParity
+// fails the moment the two copies disagree.
+
+const mediaJobStages = [
+  "queued",
+  "transcribing",
+  "normalizing",
+  "review_required",
+  "ready",
+  "dispatching",
+  "dispatched",
+  "failed",
+];
+const mediaJobTerminalStages = new Set(["dispatched", "failed"]);
+const defaultMediaJobMaxAttempts = 3;
+
+export const createMediaJob = gatewayMutation({
+  args: {
+    userId: v.string(),
+    mediaId: v.id("mediaUploads"),
+    kind: v.optional(v.string()),
+    provider: v.optional(v.union(v.string(), v.null())),
+    model: v.optional(v.union(v.string(), v.null())),
+    language: v.optional(v.union(v.string(), v.null())),
+    maxAttempts: v.optional(v.number()),
+    reviewRequired: v.optional(v.boolean()),
+    deviceId: v.optional(v.union(v.id("devices"), v.null())),
+    environmentId: v.optional(v.union(v.id("environments"), v.null())),
+    threadId: v.optional(v.union(v.string(), v.null())),
+  },
+  handler: async (ctx, args) => {
+    const media = await ctx.db.get(args.mediaId);
+    if (!media || media.userExternalId !== args.userId) return null;
+    const kind = args.kind ?? "transcription";
+
+    // Enqueue is idempotent. Two clicks on "Transcribe" must not produce two workers racing to
+    // write the same transcript.
+    const existing = await ctx.db
+      .query("mediaJobs")
+      .withIndex("byMediaId", (q: any) => q.eq("mediaId", args.mediaId))
+      .collect();
+    const active = existing.find((job: any) => job.userExternalId === args.userId
+      && job.kind === kind
+      && !mediaJobTerminalStages.has(job.stage));
+    if (active) return mediaJobForGateway(active);
+
+    const id = await ctx.db.insert("mediaJobs", {
+      userExternalId: args.userId,
+      mediaId: args.mediaId,
+      kind,
+      stage: "queued",
+      // Where the capture came from, and where a finished transcript would be sent. Recorded at
+      // enqueue because the worker runs long after the request that created the job is gone.
+      deviceId: args.deviceId ?? null,
+      environmentId: args.environmentId ?? null,
+      threadId: args.threadId ?? null,
+      autoSend: false,
+      dispatchStatus: null,
+      dispatchError: null,
+      commandId: null,
+      provider: args.provider ?? null,
+      model: args.model ?? null,
+      language: args.language ?? null,
+      rawTranscript: null,
+      normalizedTranscript: null,
+      userEditedTranscript: null,
+      attempts: 0,
+      maxAttempts: normalizeAttemptLimit(args.maxAttempts),
+      reviewRequired: args.reviewRequired === true,
+      leaseOwner: null,
+      leaseExpiresAt: null,
+      lastError: null,
+      failureKind: null,
+      timings: { queuedAt: nowIso() },
+      createdAt: nowIso(),
+      updatedAt: nowIso(),
+    });
+    const job = await ctx.db.get(id);
+    await audit(ctx, {
+      userExternalId: args.userId,
+      actorType: "user",
+      action: "media_job.queued",
+      targetId: id,
+      metadata: {
+        mediaId: args.mediaId,
+        kind,
+        provider: args.provider ?? null,
+        maxAttempts: normalizeAttemptLimit(args.maxAttempts),
+        deviceId: args.deviceId ?? null,
+      },
+    });
+    return mediaJobForGateway(job);
+  },
+});
+
+export const getMediaJobForUser = gatewayQuery({
+  args: { userId: v.string(), jobId: v.id("mediaJobs") },
+  handler: async (ctx, args) => {
+    const job = await ctx.db.get(args.jobId);
+    if (!job || job.userExternalId !== args.userId) return null;
+    return mediaJobForGateway(job);
+  },
+});
+
+export const listMediaJobs = gatewayQuery({
+  args: {
+    userId: v.string(),
+    mediaId: v.optional(v.union(v.id("mediaUploads"), v.null())),
+    stage: v.optional(v.union(v.string(), v.null())),
+  },
+  handler: async (ctx, args) => {
+    const jobs = await ctx.db
+      .query("mediaJobs")
+      .withIndex("byUserExternalId", (q: any) => q.eq("userExternalId", args.userId))
+      .collect();
+    return jobs
+      .filter((job: any) => (!args.mediaId || job.mediaId === args.mediaId)
+        && (!args.stage || job.stage === args.stage))
+      .sort((left: any, right: any) => left.createdAt.localeCompare(right.createdAt))
+      .map(mediaJobForGateway);
+  },
+});
+
+/**
+ * Takes a lease on runnable jobs, across every user — the worker is not user-scoped.
+ *
+ * The lease is what makes a crashed worker survivable: it holds the job for `leaseMs`, and once
+ * that expires any worker may pick it up again. Resumption reads the stage back off the evidence
+ * already stored, so nothing is redone. `review_required` waits on a person, not a worker.
+ */
+export const claimMediaJobs = gatewayMutation({
+  args: {
+    owner: v.optional(v.union(v.string(), v.null())),
+    leaseMs: v.optional(v.number()),
+    limit: v.optional(v.number()),
+    now: v.optional(v.string()),
+  },
+  handler: async (ctx, args) => {
+    const leaseMs = args.leaseMs ?? 60_000;
+    const limit = args.limit ?? 4;
+    const now = args.now ?? nowIso();
+    const nowMs = Date.parse(now);
+
+    const runnable: any[] = [];
+    for (const stage of mediaJobStages) {
+      if (mediaJobTerminalStages.has(stage) || stage === "review_required") continue;
+      const rows = await ctx.db
+        .query("mediaJobs")
+        .withIndex("byStage", (q: any) => q.eq("stage", stage))
+        .collect();
+      runnable.push(...rows);
+    }
+    runnable.sort((left: any, right: any) => left.createdAt.localeCompare(right.createdAt));
+
+    const claimed: any[] = [];
+    for (const job of runnable) {
+      if (claimed.length >= limit) break;
+      const leaseExpiresAtMs = Date.parse(job.leaseExpiresAt ?? "");
+      if (Number.isFinite(leaseExpiresAtMs) && leaseExpiresAtMs > nowMs) continue;
+
+      if (job.attempts >= job.maxAttempts) {
+        // The budget is spent. Failing here rather than handing the job out again keeps an
+        // exhausted job from being rediscovered on every single tick.
+        await ctx.db.patch(job._id, {
+          stage: "failed",
+          failureKind: "terminal",
+          lastError: job.lastError ?? `Media job abandoned after ${job.attempts} attempts.`,
+          leaseOwner: null,
+          leaseExpiresAt: null,
+          timings: { ...(job.timings ?? {}), failedAt: nowIso() },
+          updatedAt: nowIso(),
+        });
+        continue;
+      }
+
+      await ctx.db.patch(job._id, {
+        attempts: job.attempts + 1,
+        leaseOwner: args.owner ?? null,
+        leaseExpiresAt: new Date(nowMs + leaseMs).toISOString(),
+        stage: resumeStageFor(job),
+        timings: { ...(job.timings ?? {}), startedAt: job.timings?.startedAt ?? nowIso() },
+        updatedAt: nowIso(),
+      });
+      claimed.push(mediaJobForGateway(await ctx.db.get(job._id)));
+    }
+    return claimed;
+  },
+});
+
+export const updateMediaJob = gatewayMutation({
+  args: {
+    jobId: v.id("mediaJobs"),
+    userId: v.optional(v.union(v.string(), v.null())),
+    stage: v.optional(v.string()),
+    rawTranscript: v.optional(v.union(v.string(), v.null())),
+    normalizedTranscript: v.optional(v.union(v.string(), v.null())),
+    userEditedTranscript: v.optional(v.union(v.string(), v.null())),
+    provider: v.optional(v.union(v.string(), v.null())),
+    model: v.optional(v.union(v.string(), v.null())),
+    language: v.optional(v.union(v.string(), v.null())),
+    lastError: v.optional(v.union(v.string(), v.null())),
+    failureKind: v.optional(v.union(v.string(), v.null())),
+    autoSend: v.optional(v.boolean()),
+    dispatchStatus: v.optional(v.union(v.string(), v.null())),
+    dispatchError: v.optional(v.union(v.string(), v.null())),
+    commandId: v.optional(v.union(v.id("commands"), v.null())),
+    timings: v.optional(v.any()),
+    releaseLease: v.optional(v.boolean()),
+  },
+  handler: async (ctx, args) => {
+    const job = await ctx.db.get(args.jobId);
+    if (!job) return null;
+    if (args.userId !== undefined && args.userId !== null && job.userExternalId !== args.userId) return null;
+
+    const patch: any = { updatedAt: nowIso() };
+    // rawTranscript and normalizedTranscript are versions, not a field to overwrite: once the ASR
+    // output is recorded it is the immutable record of what the provider actually heard. Only the
+    // user-edited version stays writable.
+    if (args.rawTranscript !== undefined && (job.rawTranscript ?? null) === null) {
+      patch.rawTranscript = normalizeRawTranscript(args.rawTranscript);
+    }
+    if (args.normalizedTranscript !== undefined && (job.normalizedTranscript ?? null) === null) {
+      patch.normalizedTranscript = normalizeTranscript(args.normalizedTranscript) ?? null;
+    }
+    if (args.userEditedTranscript !== undefined) {
+      patch.userEditedTranscript = normalizeTranscript(args.userEditedTranscript) ?? null;
+    }
+    for (const key of ["provider", "model", "language", "dispatchStatus", "dispatchError", "commandId"]) {
+      if ((args as any)[key] !== undefined) patch[key] = (args as any)[key] ?? null;
+    }
+    if (args.autoSend !== undefined) patch.autoSend = args.autoSend === true;
+    if (args.stage !== undefined && mediaJobStages.includes(args.stage)) patch.stage = args.stage;
+    if (args.lastError !== undefined) patch.lastError = args.lastError ?? null;
+    if (args.failureKind !== undefined) {
+      patch.failureKind = ["retryable", "terminal"].includes(args.failureKind as string)
+        ? args.failureKind
+        : null;
+    }
+    if (args.timings !== undefined) patch.timings = { ...(job.timings ?? {}), ...(args.timings ?? {}) };
+    if (args.releaseLease === true) {
+      patch.leaseOwner = null;
+      patch.leaseExpiresAt = null;
+    }
+    await ctx.db.patch(job._id, patch);
+    return mediaJobForGateway(await ctx.db.get(job._id));
   },
 });
 
@@ -2538,8 +2874,49 @@ function normalizeTranscript(value: any) {
   return transcript.length > 0 ? transcript.slice(0, 12000) : undefined;
 }
 
-function normalizeMediaProcessing(input: any = null, kind = "image", transcript: any = null) {
+// The raw ASR version is kept verbatim — leading and trailing whitespace included — because the
+// point of storing it is to be able to see exactly what the provider returned. Only the length is
+// bounded, and only so one runaway response cannot bloat the row.
+const mediaProcessingStatuses = new Set(["pending", "processing", "ready", "failed", "unavailable"]);
+
+function normalizeRawTranscript(value: any) {
+  if (typeof value !== "string" || value.length === 0) return null;
+  return value.slice(0, 12000);
+}
+
+function normalizeAttemptLimit(value: any) {
+  const parsed = Number(value);
+  if (!Number.isInteger(parsed) || parsed < 1) return defaultMediaJobMaxAttempts;
+  return Math.min(parsed, 10);
+}
+
+/**
+ * Where a claimed job picks back up.
+ *
+ * Derived from what is already stored rather than from the stage it crashed in, so a worker that
+ * died after writing the raw transcript does not pay for the ASR call twice.
+ */
+function resumeStageFor(job: any) {
+  if (job.rawTranscript === null) return "transcribing";
+  if (job.normalizedTranscript === null) return "normalizing";
+  return "dispatching";
+}
+
+function normalizeMediaProcessing(input: any = null, kind = "image", transcript: any = null, description: any = null) {
   const now = nowIso();
+  if (kind === "image") {
+    const status = mediaProcessingStatuses.has(input?.visionStatus)
+      ? input.visionStatus
+      : (description ? "ready" : "pending");
+    return {
+      transcriptionStatus: "not_applicable",
+      transcriptSource: null,
+      visionStatus: status,
+      descriptionSource: input?.descriptionSource ?? (description ? "upload" : null),
+      lastError: input?.lastError ?? null,
+      updatedAt: input?.updatedAt ?? now,
+    };
+  }
   if (kind !== "audio") {
     return {
       transcriptionStatus: "not_applicable",
@@ -2548,7 +2925,7 @@ function normalizeMediaProcessing(input: any = null, kind = "image", transcript:
       updatedAt: input?.updatedAt ?? now,
     };
   }
-  const allowed = new Set(["pending", "processing", "ready", "failed", "unavailable"]);
+  const allowed = mediaProcessingStatuses;
   const status = allowed.has(input?.transcriptionStatus)
     ? input.transcriptionStatus
     : (transcript ? "ready" : "pending");
@@ -2641,8 +3018,23 @@ function publicDevice(device: any) {
     config: publicDeviceConfig(device.config),
     gatewaySelection: normalizeGatewaySelection(device.gatewaySelection),
     actions: deviceActions(device),
+    voiceAutoSend: normalizeVoiceAutoSend(device.voiceAutoSend),
     createdAt: device.createdAt,
     claimed: Boolean(device.claimedAt),
+  };
+}
+
+/**
+ * Mirrors normalizeVoiceAutoSend() in src/store.mjs. Off unless the owner turned it on, and
+ * `enabledBy` records which owner did — turning it off clears the grant rather than leaving a
+ * stale name attached to a permission nobody holds any more.
+ */
+function normalizeVoiceAutoSend(input: any = null) {
+  const enabled = input?.enabled === true;
+  return {
+    enabled,
+    enabledBy: enabled ? normalizeNullableString(input?.enabledBy) : null,
+    enabledAt: enabled ? normalizeNullableString(input?.enabledAt) : null,
   };
 }
 
@@ -2898,9 +3290,49 @@ function mediaForGateway(media: any) {
     storagePath: media.storagePath,
     originalName: media.originalName ?? null,
     transcript: media.transcript ?? null,
-    processing: normalizeMediaProcessing(media.processing, media.kind, media.transcript ?? null),
+    description: media.description ?? null,
+    processing: normalizeMediaProcessing(
+      media.processing,
+      media.kind,
+      media.transcript ?? null,
+      media.description ?? null,
+    ),
     expiresAt: media.expiresAt ?? null,
     createdAt: media.createdAt,
+  };
+}
+
+function mediaJobForGateway(job: any) {
+  if (!job) return null;
+  return {
+    id: job._id,
+    userId: job.userExternalId,
+    mediaId: job.mediaId,
+    kind: job.kind,
+    stage: job.stage,
+    deviceId: job.deviceId ?? null,
+    environmentId: job.environmentId ?? null,
+    threadId: job.threadId ?? null,
+    autoSend: job.autoSend === true,
+    dispatchStatus: job.dispatchStatus ?? null,
+    dispatchError: job.dispatchError ?? null,
+    commandId: job.commandId ?? null,
+    provider: job.provider ?? null,
+    model: job.model ?? null,
+    language: job.language ?? null,
+    rawTranscript: job.rawTranscript ?? null,
+    normalizedTranscript: job.normalizedTranscript ?? null,
+    userEditedTranscript: job.userEditedTranscript ?? null,
+    attempts: job.attempts,
+    maxAttempts: job.maxAttempts,
+    reviewRequired: job.reviewRequired === true,
+    leaseOwner: job.leaseOwner ?? null,
+    leaseExpiresAt: job.leaseExpiresAt ?? null,
+    lastError: job.lastError ?? null,
+    failureKind: job.failureKind ?? null,
+    timings: job.timings ?? {},
+    createdAt: job.createdAt,
+    updatedAt: job.updatedAt,
   };
 }
 

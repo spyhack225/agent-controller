@@ -269,7 +269,7 @@ test("openai transcription provider transcribes stored audio", async (t) => {
   const mediaDir = await mkdtemp(join(tmpdir(), "agent-controller-stt-"));
   t.after(() => rm(mediaDir, { recursive: true, force: true }));
 
-  const { server } = createApp({
+  const { server, mediaJobRunner } = createApp({
     config: {
       ...MEDIA_CONFIG,
       mediaDir,
@@ -296,14 +296,36 @@ test("openai transcription provider transcribes stored audio", async (t) => {
     },
   });
 
-  const result = await requestJson(originalFetch, baseUrl, `/v1/media/${upload.media.id}/transcribe`, {
+  const queued = await requestJson(originalFetch, baseUrl, `/v1/media/${upload.media.id}/transcribe`, {
     method: "POST",
     headers: authHeaders,
   });
+  assert.equal(queued.job.stage, "queued");
+  assert.equal(calls.length, 0, "enqueuing must not call the provider from inside the request.");
 
-  assert.equal(result.provider, "openai");
-  assert.equal(result.transcript, "Deploy the staging branch.");
-  assert.equal(result.media.transcript, "Deploy the staging branch.");
+  await mediaJobRunner.runOnce();
+
+  const { job } = await requestJson(originalFetch, baseUrl, `/v1/media/jobs/${queued.job.id}`, {
+    headers: authHeaders,
+  });
+  assert.equal(job.stage, "dispatched");
+  assert.equal(job.provider, "openai");
+  // The versions are distinct records: raw is verbatim ASR output, normalized is the cleanup.
+  assert.equal(job.rawTranscript, "  Deploy the staging branch.  ");
+  assert.equal(job.normalizedTranscript, "Deploy the staging branch.");
+  assert.equal(job.userEditedTranscript, null);
+
+  const listed = await requestJson(originalFetch, baseUrl, "/v1/media", { headers: authHeaders });
+  const stored = listed.media.find((item) => item.id === upload.media.id);
+  assert.equal(stored.transcript, "Deploy the staging branch.");
+  assert.equal(stored.processing.transcriptionStatus, "ready");
+
+  // The audio is a source, not an intermediate: a transcript never consumes it.
+  const audio = await originalFetch(new URL(`/v1/media/${upload.media.id}`, baseUrl), {
+    headers: authHeaders,
+  });
+  assert.equal(audio.status, 200);
+  assert.equal(Buffer.from(await audio.arrayBuffer()).toString(), "fake audio bytes");
 
   const [call] = calls;
   assert.equal(call.url, "https://stt.example/v1/audio/transcriptions");
@@ -312,9 +334,173 @@ test("openai transcription provider transcribes stored audio", async (t) => {
   assert.equal(call.init.body.get("model"), "whisper-1");
 });
 
-test("transcription failures surface as 502 and record the error", async (t) => {
+test("the parakeet sidecar drives the same job pipeline, over HTTP and off the request path", async (t) => {
   const originalFetch = globalThis.fetch;
-  globalThis.fetch = async () => jsonResponse({ error: "rate limited" }, 429);
+  const calls = [];
+  globalThis.fetch = async (url, init = {}) => {
+    calls.push({ url: String(url), init });
+    return jsonResponse({
+      text: "Deploy the staging branch.",
+      model: "nvidia/parakeet-tdt-0.6b-v2",
+      language: "en",
+      duration_seconds: 4,
+      timings: { decode_ms: 24, inference_ms: 2000 },
+    }, 200);
+  };
+  t.after(() => {
+    globalThis.fetch = originalFetch;
+  });
+
+  const mediaDir = await mkdtemp(join(tmpdir(), "agent-controller-parakeet-"));
+  t.after(() => rm(mediaDir, { recursive: true, force: true }));
+
+  const { server, mediaJobRunner } = createApp({
+    config: {
+      ...MEDIA_CONFIG,
+      mediaDir,
+      transcriptionProvider: "parakeet",
+      parakeetUrl: "http://127.0.0.1:8977/v1/transcribe",
+      parakeetModel: "nvidia/parakeet-tdt-0.6b-v2",
+      parakeetLanguage: "en",
+      parakeetMaxClipSeconds: 120,
+      parakeetConcurrency: 1,
+      parakeetAcceptedContentTypes: ["audio/wav", "audio/webm", "audio/ogg", "audio/mp4"],
+    },
+  });
+  await listen(server);
+  t.after(() => server.close());
+  const baseUrl = `http://127.0.0.1:${server.address().port}`;
+  const authHeaders = await createAuthHeaders(originalFetch, baseUrl);
+
+  const upload = await requestJson(originalFetch, baseUrl, "/v1/media", {
+    method: "POST",
+    headers: authHeaders,
+    body: {
+      kind: "audio",
+      contentType: "audio/webm",
+      dataBase64: Buffer.from("fake opus bytes").toString("base64"),
+      originalName: "voice.webm",
+    },
+  });
+
+  const queued = await requestJson(originalFetch, baseUrl, `/v1/media/${upload.media.id}/transcribe`, {
+    method: "POST",
+    headers: authHeaders,
+  });
+  assert.equal(queued.job.stage, "queued");
+  assert.equal(queued.job.provider, "parakeet");
+  // Local inference is still inference: the request must not hold a socket open for it.
+  assert.equal(calls.length, 0);
+
+  await mediaJobRunner.runOnce();
+
+  const [call] = calls;
+  assert.equal(call.url, "http://127.0.0.1:8977/v1/transcribe");
+  assert.ok(call.init.body instanceof FormData);
+  assert.equal(call.init.body.get("model"), "nvidia/parakeet-tdt-0.6b-v2");
+  assert.equal(call.init.body.get("language"), "en");
+  assert.equal(call.init.body.get("max_clip_seconds"), "120");
+  assert.equal(call.init.body.get("file").name, "voice.webm");
+
+  const { job } = await requestJson(originalFetch, baseUrl, `/v1/media/jobs/${queued.job.id}`, {
+    headers: authHeaders,
+  });
+  assert.equal(job.stage, "dispatched");
+  assert.equal(job.provider, "parakeet");
+  assert.equal(job.model, "nvidia/parakeet-tdt-0.6b-v2");
+  assert.equal(job.language, "en");
+  // Parakeet already punctuates and capitalises, so cleanup has nothing left to do here.
+  assert.equal(job.rawTranscript, "Deploy the staging branch.");
+  assert.equal(job.normalizedTranscript, "Deploy the staging branch.");
+  // The diff is served alongside the versions, so a rewrite could never pass unnoticed.
+  assert.equal(job.transcriptChange.changed, false);
+  assert.equal(job.transcriptChange.contentPreserved, true);
+  // Per-stage timings, including the two only the sidecar can measure.
+  assert.equal(job.timings.decodeMs, 24);
+  assert.equal(job.timings.inferenceMs, 2000);
+  assert.equal(job.timings.realtimeFactor, 0.5);
+  assert.equal(typeof job.timings.queueWaitMs, "number");
+  assert.equal(typeof job.timings.normalizeMs, "number");
+  assert.equal(typeof job.timings.totalMs, "number");
+
+  const listed = await requestJson(originalFetch, baseUrl, "/v1/media", { headers: authHeaders });
+  assert.equal(listed.media[0].transcript, "Deploy the staging branch.");
+  assert.equal(listed.media[0].processing.transcriptSource, "parakeet");
+});
+
+test("a container the sidecar cannot open fails clearly and leaves the audio playable", async (t) => {
+  const originalFetch = globalThis.fetch;
+  const calls = [];
+  globalThis.fetch = async (url, init = {}) => {
+    calls.push({ url: String(url), init });
+    return jsonResponse({ text: "should never happen" }, 200);
+  };
+  t.after(() => {
+    globalThis.fetch = originalFetch;
+  });
+
+  const mediaDir = await mkdtemp(join(tmpdir(), "agent-controller-parakeet-container-"));
+  t.after(() => rm(mediaDir, { recursive: true, force: true }));
+
+  const { server, mediaJobRunner } = createApp({
+    config: {
+      ...MEDIA_CONFIG,
+      mediaDir,
+      transcriptionProvider: "parakeet",
+      parakeetUrl: "http://127.0.0.1:8977/v1/transcribe",
+    },
+  });
+  await listen(server);
+  t.after(() => server.close());
+  const baseUrl = `http://127.0.0.1:${server.address().port}`;
+  const authHeaders = await createAuthHeaders(originalFetch, baseUrl);
+
+  const upload = await requestJson(originalFetch, baseUrl, "/v1/media", {
+    method: "POST",
+    headers: authHeaders,
+    body: {
+      kind: "audio",
+      contentType: "audio/mpeg",
+      dataBase64: Buffer.from("fake mp3 bytes").toString("base64"),
+      originalName: "voice.mp3",
+    },
+  });
+
+  const queued = await requestJson(originalFetch, baseUrl, `/v1/media/${upload.media.id}/transcribe`, {
+    method: "POST",
+    headers: authHeaders,
+  });
+  await mediaJobRunner.runOnce();
+
+  const { job } = await requestJson(originalFetch, baseUrl, `/v1/media/jobs/${queued.job.id}`, {
+    headers: authHeaders,
+  });
+  assert.equal(job.stage, "failed");
+  assert.equal(job.failureKind, "terminal", "an unopenable container is not worth the retry budget.");
+  assert.equal(job.attempts, 1, "and it is refused on the first attempt, not the third.");
+  assert.match(job.lastError, /does not accept audio\/mpeg/u);
+  assert.match(job.lastError, /Accepted: audio\/wav, audio\/webm, audio\/ogg, audio\/mp4/u);
+  assert.equal(calls.length, 0, "nothing unsupported reaches the sidecar in the first place.");
+
+  // The upload itself survives: the owner can still play it back, or transcribe it elsewhere.
+  const audio = await originalFetch(new URL(`/v1/media/${upload.media.id}`, baseUrl), {
+    headers: authHeaders,
+  });
+  assert.equal(audio.status, 200);
+  assert.equal(Buffer.from(await audio.arrayBuffer()).toString(), "fake mp3 bytes");
+
+  const listed = await requestJson(originalFetch, baseUrl, "/v1/media", { headers: authHeaders });
+  assert.equal(listed.media[0].transcript, null);
+  assert.equal(listed.media[0].processing.transcriptionStatus, "failed");
+});
+
+test("a rate-limited provider is retried until the budget runs out, then fails terminally", async (t) => {
+  const originalFetch = globalThis.fetch;
+  let providerCalls = 0;
+  globalThis.fetch = async () => {
+    providerCalls += 1;
+    return jsonResponse({ error: "rate limited" }, 429);
+  };
   t.after(() => {
     globalThis.fetch = originalFetch;
   });
@@ -322,13 +508,14 @@ test("transcription failures surface as 502 and record the error", async (t) => 
   const mediaDir = await mkdtemp(join(tmpdir(), "agent-controller-stt-fail-"));
   t.after(() => rm(mediaDir, { recursive: true, force: true }));
 
-  const { server } = createApp({
+  const { server, mediaJobRunner } = createApp({
     config: {
       ...MEDIA_CONFIG,
       mediaDir,
       transcriptionProvider: "openai",
       transcriptionApiKey: "sk-test",
       transcriptionTimeoutMs: 5000,
+      transcriptionMaxAttempts: 2,
     },
   });
   await listen(server);
@@ -350,12 +537,193 @@ test("transcription failures surface as 502 and record the error", async (t) => 
     method: "POST",
     headers: { "content-type": "application/json", ...authHeaders },
   });
-  assert.equal(response.status, 502);
+  // Enqueued, not run: the caller is no longer waiting on the provider.
+  assert.equal(response.status, 202);
+  const { job: queued } = await response.json();
+
+  // 429 is retryable, so the first tick puts the job back in the queue rather than failing it.
+  await mediaJobRunner.runOnce();
+  const afterFirst = await requestJson(originalFetch, baseUrl, `/v1/media/jobs/${queued.id}`, {
+    headers: authHeaders,
+  });
+  assert.equal(afterFirst.job.stage, "queued");
+  assert.equal(afterFirst.job.attempts, 1);
+  assert.equal(afterFirst.job.failureKind, "retryable");
+  assert.match(afterFirst.job.lastError, /HTTP 429/u);
+  assert.equal(afterFirst.job.leaseExpiresAt, null, "a failed attempt must release its lease.");
+
+  await mediaJobRunner.runOnce();
+  const afterSecond = await requestJson(originalFetch, baseUrl, `/v1/media/jobs/${queued.id}`, {
+    headers: authHeaders,
+  });
+  assert.equal(afterSecond.job.stage, "failed");
+  assert.equal(afterSecond.job.attempts, 2);
+  assert.equal(providerCalls, 2);
+
+  // A terminal job is never handed out again, however many ticks run.
+  await mediaJobRunner.runOnce();
+  assert.equal(providerCalls, 2);
 
   const listed = await requestJson(originalFetch, baseUrl, "/v1/media", { headers: authHeaders });
   const stored = listed.media.find((item) => item.id === upload.media.id);
   assert.equal(stored.processing.transcriptionStatus, "failed");
   assert.match(stored.processing.lastError, /HTTP 429/u);
+});
+
+test("a provider error that cannot succeed on retry fails on the first attempt", async (t) => {
+  const originalFetch = globalThis.fetch;
+  let providerCalls = 0;
+  globalThis.fetch = async () => {
+    providerCalls += 1;
+    return jsonResponse({ error: "bad audio" }, 400);
+  };
+  t.after(() => {
+    globalThis.fetch = originalFetch;
+  });
+
+  const mediaDir = await mkdtemp(join(tmpdir(), "agent-controller-stt-terminal-"));
+  t.after(() => rm(mediaDir, { recursive: true, force: true }));
+
+  const { server, mediaJobRunner } = createApp({
+    config: {
+      ...MEDIA_CONFIG,
+      mediaDir,
+      transcriptionProvider: "openai",
+      transcriptionApiKey: "sk-test",
+      transcriptionTimeoutMs: 5000,
+      transcriptionMaxAttempts: 5,
+    },
+  });
+  await listen(server);
+  t.after(() => server.close());
+  const baseUrl = `http://127.0.0.1:${server.address().port}`;
+  const authHeaders = await createAuthHeaders(originalFetch, baseUrl);
+
+  const upload = await requestJson(originalFetch, baseUrl, "/v1/media", {
+    method: "POST",
+    headers: authHeaders,
+    body: {
+      kind: "audio",
+      contentType: "audio/webm",
+      dataBase64: Buffer.from("fake audio bytes").toString("base64"),
+    },
+  });
+  const queued = await requestJson(originalFetch, baseUrl, `/v1/media/${upload.media.id}/transcribe`, {
+    method: "POST",
+    headers: authHeaders,
+  });
+
+  await mediaJobRunner.runOnce();
+  await mediaJobRunner.runOnce();
+
+  const { job } = await requestJson(originalFetch, baseUrl, `/v1/media/jobs/${queued.job.id}`, {
+    headers: authHeaders,
+  });
+  // A 400 will answer identically forever; spending the other four attempts on it is waste.
+  assert.equal(job.stage, "failed");
+  assert.equal(job.failureKind, "terminal");
+  assert.equal(job.attempts, 1);
+  assert.equal(providerCalls, 1);
+});
+
+test("transcription is refused up front when no provider is configured", async (t) => {
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = async () => jsonResponse({ error: "unexpected" }, 500);
+  t.after(() => {
+    globalThis.fetch = originalFetch;
+  });
+
+  const mediaDir = await mkdtemp(join(tmpdir(), "agent-controller-stt-off-"));
+  t.after(() => rm(mediaDir, { recursive: true, force: true }));
+
+  const { server } = createApp({
+    config: { ...MEDIA_CONFIG, mediaDir, transcriptionProvider: "disabled" },
+  });
+  await listen(server);
+  t.after(() => server.close());
+  const baseUrl = `http://127.0.0.1:${server.address().port}`;
+  const authHeaders = await createAuthHeaders(originalFetch, baseUrl);
+
+  const upload = await requestJson(originalFetch, baseUrl, "/v1/media", {
+    method: "POST",
+    headers: authHeaders,
+    body: {
+      kind: "audio",
+      contentType: "audio/webm",
+      dataBase64: Buffer.from("fake audio bytes").toString("base64"),
+    },
+  });
+
+  // Queueing work guaranteed to fail identically on every attempt would swap a clear error for a
+  // silent one, so this stays a synchronous refusal.
+  const response = await originalFetch(new URL(`/v1/media/${upload.media.id}/transcribe`, baseUrl), {
+    method: "POST",
+    headers: { "content-type": "application/json", ...authHeaders },
+  });
+  assert.equal(response.status, 409);
+
+  const jobs = await requestJson(originalFetch, baseUrl, "/v1/media/jobs", { headers: authHeaders });
+  assert.deepEqual(jobs.jobs, []);
+
+  const listed = await requestJson(originalFetch, baseUrl, "/v1/media", { headers: authHeaders });
+  const stored = listed.media.find((item) => item.id === upload.media.id);
+  assert.equal(stored.processing.transcriptionStatus, "unavailable");
+});
+
+test("transcript versions are redacted from a support bundle, the stage machine is not", async (t) => {
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = async () => jsonResponse({ error: "unexpected" }, 500);
+  t.after(() => {
+    globalThis.fetch = originalFetch;
+  });
+
+  const mediaDir = await mkdtemp(join(tmpdir(), "agent-controller-stt-support-"));
+  t.after(() => rm(mediaDir, { recursive: true, force: true }));
+
+  const { server, mediaJobRunner } = createApp({
+    config: { ...MEDIA_CONFIG, mediaDir, transcriptionProvider: "mock" },
+  });
+  await listen(server);
+  t.after(() => server.close());
+  const baseUrl = `http://127.0.0.1:${server.address().port}`;
+  const authHeaders = await createAuthHeaders(originalFetch, baseUrl);
+
+  const upload = await requestJson(originalFetch, baseUrl, "/v1/media", {
+    method: "POST",
+    headers: authHeaders,
+    body: {
+      kind: "audio",
+      contentType: "audio/webm",
+      dataBase64: Buffer.from("fake audio bytes").toString("base64"),
+      originalName: "standup.webm",
+    },
+  });
+  const queued = await requestJson(originalFetch, baseUrl, `/v1/media/${upload.media.id}/transcribe`, {
+    method: "POST",
+    headers: authHeaders,
+  });
+  await mediaJobRunner.runOnce();
+
+  const { job } = await requestJson(originalFetch, baseUrl, `/v1/media/jobs/${queued.job.id}`, {
+    headers: authHeaders,
+  });
+  const diagnostics = await requestJson(originalFetch, baseUrl, "/v1/support/diagnostics", {
+    headers: authHeaders,
+  });
+  const serialized = JSON.stringify(diagnostics);
+
+  for (const version of [job.rawTranscript, job.normalizedTranscript]) {
+    assert.ok(version);
+    assert.ok(
+      !serialized.includes(version),
+      "every transcript version is user content and must not appear verbatim in a support bundle",
+    );
+  }
+  // The part worth shipping to support is the machine around the text, not the text.
+  assert.equal(diagnostics.counts.mediaJobs, 1);
+  assert.equal(diagnostics.mediaJobs[0].stage, "dispatched");
+  assert.equal(diagnostics.mediaJobs[0].attempts, 1);
+  assert.equal(typeof diagnostics.mediaJobs[0].rawTranscript.sha256, "string");
 });
 
 test("a project launch carries media on its very first turn", async (t) => {

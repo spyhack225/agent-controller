@@ -8,6 +8,7 @@ import { MediaPage } from "./MediaPage";
 function controller(overrides: Record<string, unknown> = {}) {
   return {
     media: [],
+    mediaJobs: [],
     busyAction: null,
     setNotice: vi.fn(),
     api: vi.fn(async () => ({ media: {} })),
@@ -19,13 +20,26 @@ function controller(overrides: Record<string, unknown> = {}) {
   } as unknown as Controller;
 }
 
-function renderMedia() {
+function renderMedia(overrides: Record<string, unknown> = {}) {
+  const c = controller(overrides);
   render(
     <ConfirmProvider>
-      <MediaPage controller={controller()} />
+      <MediaPage controller={c} />
     </ConfirmProvider>,
   );
+  return c;
 }
+
+const AUDIO = {
+  id: "media_1",
+  kind: "audio",
+  contentType: "audio/webm",
+  sizeBytes: 16,
+  originalName: "clip.webm",
+  transcript: null,
+  createdAt: "2026-06-14T23:00:00.000Z",
+  processing: { transcriptionStatus: "processing", transcriptSource: "openai" },
+};
 
 test("keeps creation controls out of the library until Add media is requested", () => {
   renderMedia();
@@ -77,4 +91,132 @@ test("Escape closes Add media and returns to the library", () => {
 
   expect(screen.queryByRole("dialog", { name: "Add media" })).toBeNull();
   expect(screen.getByText("No stored media")).toBeVisible();
+});
+
+test("a queued transcription reports the job stage, not just the media status", () => {
+  renderMedia({
+    media: [AUDIO],
+    mediaJobs: [{
+      id: "mjob_1",
+      mediaId: "media_1",
+      kind: "transcription",
+      stage: "transcribing",
+      provider: "openai",
+      attempts: 2,
+      maxAttempts: 3,
+      createdAt: "2026-06-14T23:00:01.000Z",
+    }],
+  });
+
+  // A retry is visible: the media record only ever says "processing".
+  expect(screen.getByText(/Transcribing · via openai · attempt 2\/3/)).toBeVisible();
+  expect(screen.queryByRole("button", { name: /Approve transcript/ })).toBeNull();
+});
+
+test("a job waiting on review offers approval and posts the reviewed version", async () => {
+  const api = vi.fn(async () => ({ job: { id: "mjob_1", stage: "ready" } }));
+  const c = renderMedia({
+    media: [{ ...AUDIO, transcript: "Deploy the staging branch." }],
+    mediaJobs: [{
+      id: "mjob_1",
+      mediaId: "media_1",
+      kind: "transcription",
+      stage: "review_required",
+      provider: "openai",
+      attempts: 1,
+      maxAttempts: 3,
+      createdAt: "2026-06-14T23:00:01.000Z",
+    }],
+    api,
+  });
+
+  expect(screen.getByText(/Needs review/)).toBeVisible();
+  fireEvent.click(screen.getByRole("button", { name: /Approve transcript/ }));
+
+  await vi.waitFor(() => expect(api).toHaveBeenCalled());
+  expect(api).toHaveBeenCalledWith("/v1/media/jobs/mjob_1/transcript", {
+    method: "POST",
+    body: { transcript: "Deploy the staging branch." },
+  });
+  expect(c.refreshMedia).toHaveBeenCalled();
+});
+
+test("the newest job describes a re-transcribed clip", () => {
+  renderMedia({
+    media: [AUDIO],
+    mediaJobs: [
+      {
+        id: "mjob_old",
+        mediaId: "media_1",
+        kind: "transcription",
+        stage: "failed",
+        lastError: "Transcription provider returned HTTP 429.",
+        createdAt: "2026-06-14T23:00:01.000Z",
+      },
+      {
+        id: "mjob_new",
+        mediaId: "media_1",
+        kind: "transcription",
+        stage: "queued",
+        createdAt: "2026-06-14T23:05:00.000Z",
+      },
+    ],
+  });
+
+  expect(screen.getByText("Queued")).toBeVisible();
+  expect(screen.queryByText(/HTTP 429/)).toBeNull();
+});
+
+test("a cleanup that changed the wording is shown as a diff, never applied silently", () => {
+  renderMedia({
+    media: [AUDIO],
+    mediaJobs: [{
+      id: "mjob_1",
+      mediaId: "media_1",
+      kind: "transcription",
+      stage: "review_required",
+      provider: "parakeet",
+      rawTranscript: "deploy the staging branch",
+      normalizedTranscript: "Deploy the stating branch.",
+      createdAt: "2026-06-14T23:00:01.000Z",
+      transcriptChange: {
+        changed: true,
+        contentPreserved: false,
+        rawLength: 25,
+        normalizedLength: 26,
+        firstDivergenceIndex: 12,
+      },
+    }],
+  });
+
+  expect(screen.getByText("Cleanup changed the wording")).toBeVisible();
+  // Both versions are on screen, because the point is that the speaker can tell them apart.
+  expect(screen.getByText("deploy the staging branch")).toBeVisible();
+  expect(screen.getByText("Deploy the stating branch.")).toBeVisible();
+  expect(screen.getByRole("button", { name: /Approve transcript/ })).toBeVisible();
+});
+
+test("an untouched transcript carries no diff notice", () => {
+  renderMedia({
+    media: [AUDIO],
+    mediaJobs: [{
+      id: "mjob_1",
+      mediaId: "media_1",
+      kind: "transcription",
+      stage: "dispatched",
+      provider: "parakeet",
+      rawTranscript: "Deploy the staging branch.",
+      normalizedTranscript: "Deploy the staging branch.",
+      createdAt: "2026-06-14T23:00:01.000Z",
+      transcriptChange: {
+        changed: false,
+        contentPreserved: true,
+        rawLength: 26,
+        normalizedLength: 26,
+        firstDivergenceIndex: null,
+      },
+    }],
+  });
+
+  expect(screen.queryByText("Cleanup changed the wording")).toBeNull();
 });

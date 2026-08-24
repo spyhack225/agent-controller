@@ -11,6 +11,23 @@ import { createSecretBox } from "./secretBox.mjs";
 const DEFAULT_PRIVACY_SETTINGS = {
   mediaRetentionDays: 30,
 };
+
+// The media processing job state machine. `queued` and the three working stages are driven by the
+// worker; `review_required` waits on a person; `dispatched` and `failed` are terminal and never
+// re-claimed, which is what stops a restart from dispatching the same transcript twice.
+export const MEDIA_JOB_STAGES = [
+  "queued",
+  "transcribing",
+  "normalizing",
+  "review_required",
+  "ready",
+  "dispatching",
+  "dispatched",
+  "failed",
+];
+const MEDIA_JOB_STAGE_SET = new Set(MEDIA_JOB_STAGES);
+export const MEDIA_JOB_TERMINAL_STAGES = new Set(["dispatched", "failed"]);
+const DEFAULT_MEDIA_JOB_MAX_ATTEMPTS = 3;
 const DEVICE_ONLINE_THRESHOLD_MS = 90_000;
 // A claim code has to outlive warehouse-to-customer transit, because the printed label is issued at
 // manufacture and read by the owner weeks later. Units that sit in inventory past this refresh from
@@ -56,6 +73,7 @@ export function createStore(seed = {}, options = {}) {
   const firmwareReleases = new Map((seed.firmwareReleases ?? []).map((release) => [release.id, release]));
   const gatewayProfiles = new Map((seed.gatewayProfiles ?? []).map((profile) => [profile.id, profile]));
   const mediaUploads = new Map((seed.mediaUploads ?? []).map((media) => [media.id, media]));
+  const mediaJobs = new Map((seed.mediaJobs ?? []).map((job) => [job.id, job]));
   const macros = new Map((seed.macros ?? []).map((macro) => [macro.id, macro]));
   const actions = new Map((seed.actions ?? []).map((action) => [action.id, action]));
   const deviceControls = new Map(
@@ -94,6 +112,7 @@ export function createStore(seed = {}, options = {}) {
       firmwareReleases: [...firmwareReleases.values()],
       gatewayProfiles: [...gatewayProfiles.values()],
       mediaUploads: [...mediaUploads.values()],
+      mediaJobs: [...mediaJobs.values()],
       macros: [...macros.values()],
       actions: [...actions.values()],
       deviceControls: [...deviceControls.values()],
@@ -565,6 +584,32 @@ export function createStore(seed = {}, options = {}) {
         gatewayUrl: device.config.gatewayUrl,
         menu: device.config.menu,
       },
+    });
+    notifyChanged();
+    return publicDevice(device);
+  }
+
+  /**
+   * Grants or revokes this device's licence to auto-send a finished voice transcript.
+   *
+   * Scoped to one device on purpose. Audio is captured by a particular microphone in a particular
+   * room, so the trust question is about that unit — an account-wide switch would silently extend
+   * the grant to the next controller the owner claims.
+   */
+  function setDeviceVoiceAutoSend({ userId, deviceId, enabled, actorId = null, actorType = "user" }) {
+    const device = devices.get(deviceId);
+    if (!device || device.userId !== userId || device.revokedAt) return null;
+    device.voiceAutoSend = normalizeVoiceAutoSend(
+      enabled === true ? { enabled: true, enabledBy: actorId ?? userId, enabledAt: nowIso() } : { enabled: false },
+    );
+    device.updatedAt = nowIso();
+    audit({
+      userId,
+      actorType,
+      ...(actorId ? { actorId } : {}),
+      action: enabled === true ? "device.voice_auto_send_enabled" : "device.voice_auto_send_disabled",
+      targetId: deviceId,
+      metadata: device.voiceAutoSend,
     });
     notifyChanged();
     return publicDevice(device);
@@ -1449,6 +1494,11 @@ export function createStore(seed = {}, options = {}) {
     const media = mediaUploads.get(mediaId);
     if (!media || media.userId !== userId) return null;
     mediaUploads.delete(mediaId);
+    // A job whose media is gone can never finish; leaving it queued would make the worker
+    // rediscover it on every tick until the retry budget burned out.
+    for (const [jobId, job] of mediaJobs) {
+      if (job.mediaId === mediaId) mediaJobs.delete(jobId);
+    }
     audit({
       userId,
       actorType: "user",
@@ -1464,6 +1514,182 @@ export function createStore(seed = {}, options = {}) {
     });
     notifyChanged();
     return publicMediaUpload(media);
+  }
+
+  // --- Durable media processing jobs -------------------------------------------------------
+  //
+  // Transcription used to run inside the HTTP handler, so a 30-second ASR call held a socket open
+  // and died with the process. Jobs are rows now: the request enqueues one and the worker in
+  // src/mediaJobs.mjs drives it, so a restart mid-flight resumes instead of losing the work.
+
+  function createMediaJob(input) {
+    const media = mediaUploads.get(input.mediaId);
+    if (!media || media.userId !== input.userId) return null;
+    const kind = input.kind ?? "transcription";
+
+    // Enqueue is idempotent. Two clicks on "Transcribe" (or a retry after a flaky response) must
+    // not produce two workers racing to write the same transcript.
+    const active = [...mediaJobs.values()].find((job) => job.userId === input.userId
+      && job.mediaId === input.mediaId
+      && job.kind === kind
+      && !MEDIA_JOB_TERMINAL_STAGES.has(job.stage));
+    if (active) return structuredClone(active);
+
+    const job = {
+      id: createId("mjob"),
+      userId: input.userId,
+      mediaId: input.mediaId,
+      kind,
+      stage: "queued",
+      // Where the capture came from, and where a finished transcript would be sent. Recorded at
+      // enqueue because the worker runs long after the request that created the job is gone, and
+      // a controller's configured thread can change in the meantime — the capture belongs to the
+      // thread the owner was looking at when they pressed record.
+      deviceId: input.deviceId ?? null,
+      environmentId: input.environmentId ?? null,
+      threadId: input.threadId ?? null,
+      // The dispatch outcome, filled in by the worker. `autoSend` is the decision it actually
+      // acted on, not the preference read at enqueue: a grant revoked while the job sat in the
+      // queue has to win.
+      autoSend: false,
+      dispatchStatus: null,
+      dispatchError: null,
+      commandId: null,
+      provider: input.provider ?? null,
+      model: input.model ?? null,
+      language: input.language ?? null,
+      rawTranscript: null,
+      normalizedTranscript: null,
+      userEditedTranscript: null,
+      attempts: 0,
+      maxAttempts: normalizeAttemptLimit(input.maxAttempts),
+      reviewRequired: input.reviewRequired === true,
+      leaseOwner: null,
+      leaseExpiresAt: null,
+      lastError: null,
+      failureKind: null,
+      timings: { queuedAt: nowIso() },
+      createdAt: nowIso(),
+      updatedAt: nowIso(),
+    };
+    mediaJobs.set(job.id, job);
+    audit({
+      userId: input.userId,
+      actorType: "user",
+      action: "media_job.queued",
+      targetId: job.id,
+      metadata: {
+        mediaId: job.mediaId,
+        kind: job.kind,
+        provider: job.provider,
+        maxAttempts: job.maxAttempts,
+        deviceId: job.deviceId,
+      },
+    });
+    notifyChanged();
+    return structuredClone(job);
+  }
+
+  function getMediaJobForUser(userId, jobId) {
+    const job = mediaJobs.get(jobId);
+    if (!job || job.userId !== userId) return null;
+    return structuredClone(job);
+  }
+
+  function listMediaJobs({ userId, mediaId = null, stage = null } = {}) {
+    return [...mediaJobs.values()]
+      .filter((job) => job.userId === userId
+        && (!mediaId || job.mediaId === mediaId)
+        && (!stage || job.stage === stage))
+      .sort((left, right) => left.createdAt.localeCompare(right.createdAt))
+      .map((job) => structuredClone(job));
+  }
+
+  /**
+   * Takes a lease on runnable jobs.
+   *
+   * The lease is what makes a crashed worker survivable: it holds the job for `leaseMs`, and once
+   * that expires any worker may pick it up again. Resumption reads the stage back off the evidence
+   * already stored (a raw transcript means transcription is done), so nothing is redone.
+   *
+   * `review_required` is deliberately not runnable — it waits on a person, not a worker.
+   */
+  function claimMediaJobs({ owner, leaseMs = 60_000, limit = 4, now = nowIso() } = {}) {
+    const nowMs = Date.parse(now);
+    const claimed = [];
+    let mutated = false;
+
+    for (const job of [...mediaJobs.values()].sort((a, b) => a.createdAt.localeCompare(b.createdAt))) {
+      if (claimed.length >= limit) break;
+      if (MEDIA_JOB_TERMINAL_STAGES.has(job.stage)) continue;
+      if (job.stage === "review_required") continue;
+
+      const leaseExpiresAtMs = Date.parse(job.leaseExpiresAt ?? "");
+      if (Number.isFinite(leaseExpiresAtMs) && leaseExpiresAtMs > nowMs) continue;
+
+      if (job.attempts >= job.maxAttempts) {
+        // The budget is spent. Failing here rather than handing the job out again keeps an
+        // exhausted job from being rediscovered on every single tick.
+        job.stage = "failed";
+        job.failureKind = "terminal";
+        job.lastError = job.lastError ?? `Media job abandoned after ${job.attempts} attempts.`;
+        job.leaseOwner = null;
+        job.leaseExpiresAt = null;
+        job.timings = { ...job.timings, failedAt: nowIso() };
+        job.updatedAt = nowIso();
+        mutated = true;
+        continue;
+      }
+
+      job.attempts += 1;
+      job.leaseOwner = owner ?? null;
+      job.leaseExpiresAt = new Date(nowMs + leaseMs).toISOString();
+      job.stage = resumeStageFor(job);
+      job.timings = { ...job.timings, startedAt: job.timings?.startedAt ?? nowIso() };
+      job.updatedAt = nowIso();
+      mutated = true;
+      claimed.push(structuredClone(job));
+    }
+
+    if (mutated) notifyChanged();
+    return claimed;
+  }
+
+  function updateMediaJob({ jobId, userId = null, ...input }) {
+    const job = mediaJobs.get(jobId);
+    if (!job) return null;
+    if (userId !== null && job.userId !== userId) return null;
+
+    // rawTranscript and normalizedTranscript are versions, not a field to overwrite: once the ASR
+    // output is recorded it is the immutable record of what the provider actually heard. Only the
+    // user-edited version stays writable.
+    if (input.rawTranscript !== undefined && job.rawTranscript === null) {
+      job.rawTranscript = normalizeRawTranscript(input.rawTranscript);
+    }
+    if (input.normalizedTranscript !== undefined && job.normalizedTranscript === null) {
+      job.normalizedTranscript = normalizeTranscript(input.normalizedTranscript) ?? null;
+    }
+    if (input.userEditedTranscript !== undefined) {
+      job.userEditedTranscript = normalizeTranscript(input.userEditedTranscript) ?? null;
+    }
+
+    for (const key of ["provider", "model", "language", "dispatchStatus", "dispatchError", "commandId"]) {
+      if (input[key] !== undefined) job[key] = input[key] ?? null;
+    }
+    if (input.autoSend !== undefined) job.autoSend = input.autoSend === true;
+    if (input.stage !== undefined && MEDIA_JOB_STAGE_SET.has(input.stage)) job.stage = input.stage;
+    if (input.lastError !== undefined) job.lastError = input.lastError ?? null;
+    if (input.failureKind !== undefined) {
+      job.failureKind = ["retryable", "terminal"].includes(input.failureKind) ? input.failureKind : null;
+    }
+    if (input.timings !== undefined) job.timings = { ...job.timings, ...structuredClone(input.timings ?? {}) };
+    if (input.releaseLease === true) {
+      job.leaseOwner = null;
+      job.leaseExpiresAt = null;
+    }
+    job.updatedAt = nowIso();
+    notifyChanged();
+    return structuredClone(job);
   }
 
   function createMacro(input) {
@@ -1689,6 +1915,7 @@ export function createStore(seed = {}, options = {}) {
     listDevices,
     getDeviceForUser,
     updateDeviceConfig,
+    setDeviceVoiceAutoSend,
     upsertEnvironment,
     deleteEnvironment,
     updateEnvironmentHealth,
@@ -1726,6 +1953,11 @@ export function createStore(seed = {}, options = {}) {
     listMediaUploads,
     listExpiredMediaUploads,
     deleteMediaUpload,
+    createMediaJob,
+    getMediaJobForUser,
+    listMediaJobs,
+    claimMediaJobs,
+    updateMediaJob,
     createAction,
     getActionForUser,
     listActions,
@@ -2023,6 +2255,32 @@ function normalizeTranscript(value) {
   return transcript.length > 0 ? transcript.slice(0, 12000) : undefined;
 }
 
+// The raw ASR version is kept verbatim — leading and trailing whitespace included — because the
+// point of storing it is to be able to see exactly what the provider returned. Only the length is
+// bounded, and only so one runaway response cannot bloat the row.
+function normalizeRawTranscript(value) {
+  if (typeof value !== "string" || value.length === 0) return null;
+  return value.slice(0, 12000);
+}
+
+function normalizeAttemptLimit(value) {
+  const parsed = Number(value);
+  if (!Number.isInteger(parsed) || parsed < 1) return DEFAULT_MEDIA_JOB_MAX_ATTEMPTS;
+  return Math.min(parsed, 10);
+}
+
+/**
+ * Where a claimed job picks back up.
+ *
+ * Derived from what is already stored rather than from the stage it crashed in, so a worker that
+ * died after writing the raw transcript does not pay for the ASR call twice.
+ */
+function resumeStageFor(job) {
+  if (job.rawTranscript === null) return "transcribing";
+  if (job.normalizedTranscript === null) return "normalizing";
+  return "dispatching";
+}
+
 const MEDIA_PROCESSING_STATUSES = new Set(["pending", "processing", "ready", "failed", "unavailable"]);
 
 function normalizeMediaProcessing(input = null, kind = "image", transcript = null, description = null) {
@@ -2082,7 +2340,25 @@ function publicDevice(device) {
     firmwarePolicy: normalizeFirmwarePolicy({}, device.firmwarePolicy),
     presence: buildDevicePresence(device),
     actions: deviceActions(device),
+    voiceAutoSend: normalizeVoiceAutoSend(device.voiceAutoSend),
     claimed: Boolean(device.claimedAt),
+  };
+}
+
+/**
+ * Whether this device may dispatch a finished voice transcript without a person looking at it.
+ *
+ * Always off until the owner says otherwise, and `enabledBy` records which owner that was — an
+ * auto-sending microphone is a standing grant to act on whatever it happens to hear, so who issued
+ * it has to survive in the record and not only in the audit log. Turning it off clears the grant
+ * rather than keeping a stale name attached to a permission nobody holds any more.
+ */
+function normalizeVoiceAutoSend(input = null) {
+  const enabled = input?.enabled === true;
+  return {
+    enabled,
+    enabledBy: enabled ? normalizeNullableString(input?.enabledBy) : null,
+    enabledAt: enabled ? normalizeNullableString(input?.enabledAt) : null,
   };
 }
 

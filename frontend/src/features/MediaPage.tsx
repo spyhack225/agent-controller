@@ -12,10 +12,12 @@ import { useEffect, useRef, useState } from "react";
 
 import type { Controller } from "../controller";
 import {
+  formatMediaJob,
   formatMediaProcessing,
   formatRelativeTime,
+  mediaJobTone,
 } from "../format";
-import type { MediaItem } from "../types";
+import type { MediaItem, MediaJob } from "../types";
 import {
   Button,
   EmptyState,
@@ -58,8 +60,10 @@ export function MediaPage({ controller: c }: { controller: Controller }) {
     });
   };
 
+  // The gateway answers 202 with a job: the transcription itself runs on its worker, survives a
+  // restart, and reports back over the event stream.
   const transcribe = async (item: MediaItem) => {
-    await c.run(`transcribe-${item.id}`, "Transcription requested.", async () => {
+    await c.run(`transcribe-${item.id}`, "Transcription queued.", async () => {
       const result = await c.api(`/v1/media/${encodeURIComponent(item.id)}/transcribe`, {
         method: "POST",
         body: {},
@@ -68,6 +72,31 @@ export function MediaPage({ controller: c }: { controller: Controller }) {
       return result;
     });
   };
+
+  // Accepting or correcting a transcript records a new version; the raw ASR output is untouched.
+  const submitReview = async (item: MediaItem, job: MediaJob) => {
+    const transcript = transcriptDrafts[item.id]?.trim();
+    if (!transcript) {
+      c.setNotice({ tone: "danger", message: "Enter a transcript before approving." });
+      return;
+    }
+    await c.run(`review-${job.id}`, "Transcript approved.", async () => {
+      const result = await c.api(`/v1/media/jobs/${encodeURIComponent(job.id)}/transcript`, {
+        method: "POST",
+        body: { transcript },
+      });
+      await c.refreshMedia();
+      return result;
+    });
+  };
+
+  // The newest job wins: re-transcribing an old clip should not be described by the first attempt.
+  const latestJobFor = (mediaId: string): MediaJob | null => c.mediaJobs
+    .filter((job) => job.mediaId === mediaId)
+    .reduce<MediaJob | null>(
+      (latest, job) => (!latest || (job.createdAt ?? "") >= (latest.createdAt ?? "") ? job : latest),
+      null,
+    );
 
   const deleteMedia = async (item: MediaItem) => {
     const accepted = await confirm({
@@ -111,7 +140,9 @@ export function MediaPage({ controller: c }: { controller: Controller }) {
       <Panel className="media-library overflow-hidden">
         {c.media.length ? (
           <div className="divide-y divide-control">
-            {c.media.map((item) => (
+            {c.media.map((item) => {
+              const job = latestJobFor(item.id);
+              return (
               <article key={item.id} className="grid gap-4 p-4 lg:grid-cols-[auto_minmax(180px,0.55fr)_minmax(260px,1fr)_auto] lg:items-center">
                 <div className="grid size-10 place-items-center rounded-lg border border-control bg-surface-inset text-primary">
                   {item.kind === "audio" ? <FileAudio className="size-5" /> : <FileImage className="size-5" />}
@@ -123,6 +154,7 @@ export function MediaPage({ controller: c }: { controller: Controller }) {
                       tone={item.processing?.lastError ? "danger" : item.processing?.transcriptionStatus === "processing" ? "warning" : "success"}
                       label={formatMediaProcessing(item)}
                     />
+                    {job ? <StatusBadge tone={mediaJobTone(job)} label={formatMediaJob(job)} /> : null}
                   </div>
                   <p className="mt-1 truncate font-mono text-[11px] text-ink-faint">{item.id}</p>
                   <p className="mt-1 text-xs text-ink-muted">
@@ -134,18 +166,38 @@ export function MediaPage({ controller: c }: { controller: Controller }) {
                 </div>
                 <div>
                   {item.kind === "audio" ? (
-                    <Field label="Transcript" htmlFor={`transcript-${item.id}`}>
-                      <textarea
-                        id={`transcript-${item.id}`}
-                        rows={3}
-                        value={transcriptDrafts[item.id] ?? ""}
-                        onChange={(event) => setTranscriptDrafts((current) => ({
-                          ...current,
-                          [item.id]: event.target.value,
-                        }))}
-                        placeholder="No transcript"
-                      />
-                    </Field>
+                    <>
+                      <Field label="Transcript" htmlFor={`transcript-${item.id}`}>
+                        <textarea
+                          id={`transcript-${item.id}`}
+                          rows={3}
+                          value={transcriptDrafts[item.id] ?? ""}
+                          onChange={(event) => setTranscriptDrafts((current) => ({
+                            ...current,
+                            [item.id]: event.target.value,
+                          }))}
+                          placeholder="No transcript"
+                        />
+                      </Field>
+                      {/*
+                        Cleanup may only move spacing, punctuation and case. When it moved letters
+                        instead, nothing is applied — the speaker sees both versions and picks.
+                      */}
+                      {job?.transcriptChange?.contentPreserved === false ? (
+                        <div className="mt-2 rounded-lg border border-control bg-surface-inset p-2 text-xs">
+                          <p className="font-semibold text-ink">Cleanup changed the wording</p>
+                          <p className="mt-1 text-ink-muted">
+                            Heard: <span className="font-mono">{job.rawTranscript}</span>
+                          </p>
+                          <p className="mt-1 text-ink-muted">
+                            Cleaned: <span className="font-mono">{job.normalizedTranscript}</span>
+                          </p>
+                          <p className="mt-1 text-ink-muted">
+                            Nothing was applied. Approve the version you meant.
+                          </p>
+                        </div>
+                      ) : null}
+                    </>
                   ) : (
                     <div className="rounded-lg border border-dashed border-control p-4 text-center text-xs text-ink-muted">
                       Image context is ready to attach from Operations.
@@ -161,6 +213,11 @@ export function MediaPage({ controller: c }: { controller: Controller }) {
                       <Button size="sm" onClick={() => void saveTranscript(item)}>
                         <Save className="size-3.5" /> Save
                       </Button>
+                      {job?.stage === "review_required" ? (
+                        <Button size="sm" variant="primary" onClick={() => void submitReview(item, job)}>
+                          <Save className="size-3.5" /> Approve transcript
+                        </Button>
+                      ) : null}
                     </>
                   ) : null}
                   <Button size="sm" variant="danger-ghost" onClick={() => void deleteMedia(item)}>
@@ -168,7 +225,8 @@ export function MediaPage({ controller: c }: { controller: Controller }) {
                   </Button>
                 </div>
               </article>
-            ))}
+              );
+            })}
           </div>
         ) : (
           <EmptyState

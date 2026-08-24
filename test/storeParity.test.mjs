@@ -150,3 +150,122 @@ test("deleteEnvironment repairs the same dependencies in both store implementati
     assert.match(body, /firstThreadId: null/u, `${label} deleteEnvironment() no longer clears the onboarding selection.`);
   }
 });
+
+test("resumeStageFor() agrees between the memory store and the Convex function", async () => {
+  const [memory, convex] = await Promise.all([
+    readFile(join(ROOT, "src", "store.mjs"), "utf8"),
+    readFile(join(ROOT, "convex", "gatewayStore.ts"), "utf8"),
+  ]);
+
+  // Where a claimed job restarts decides whether a crashed worker re-pays for the ASR call. Two
+  // backends answering differently would mean the same job costs money on one and not the other.
+  assert.equal(
+    normalize(extractFunction(convex, "resumeStageFor")),
+    normalize(extractFunction(memory, "resumeStageFor")),
+    "resumeStageFor() has drifted between src/store.mjs and convex/gatewayStore.ts.",
+  );
+  assert.equal(
+    normalize(extractFunction(convex, "normalizeRawTranscript")),
+    normalize(extractFunction(memory, "normalizeRawTranscript")),
+    "normalizeRawTranscript() has drifted; the raw ASR version must be stored identically.",
+  );
+  // The two files spell their constants differently by house style, so fold the one name that
+  // legitimately differs rather than comparing the identifier.
+  const foldAttemptDefault = (body) =>
+    normalize(body).replaceAll(/DEFAULT_MEDIA_JOB_MAX_ATTEMPTS|defaultMediaJobMaxAttempts/gu, "DEFAULT");
+  assert.equal(
+    foldAttemptDefault(extractFunction(convex, "normalizeAttemptLimit")),
+    foldAttemptDefault(extractFunction(memory, "normalizeAttemptLimit")),
+    "normalizeAttemptLimit() has drifted; the retry budget must be the same on both backends.",
+  );
+  assert.match(memory, /const DEFAULT_MEDIA_JOB_MAX_ATTEMPTS = 3;/u);
+  assert.match(convex, /const defaultMediaJobMaxAttempts = 3;/u);
+});
+
+test("the media job stage machine is spelled the same way in both backends", async () => {
+  const [memory, convex] = await Promise.all([
+    readFile(join(ROOT, "src", "store.mjs"), "utf8"),
+    readFile(join(ROOT, "convex", "gatewayStore.ts"), "utf8"),
+  ]);
+
+  const stages = (source, name) => {
+    const start = source.indexOf(name);
+    assert.notEqual(start, -1, `${name} not found.`);
+    const open = source.indexOf("[", start);
+    const close = source.indexOf("]", open);
+    return [...source.slice(open, close).matchAll(/"([a-z_]+)"/gu)].map((match) => match[1]);
+  };
+
+  const memoryStages = stages(memory, "export const MEDIA_JOB_STAGES");
+  assert.deepEqual(memoryStages, [
+    "queued",
+    "transcribing",
+    "normalizing",
+    "review_required",
+    "ready",
+    "dispatching",
+    "dispatched",
+    "failed",
+  ]);
+  assert.deepEqual(
+    stages(convex, "const mediaJobStages"),
+    memoryStages,
+    "The media job stages have drifted between src/store.mjs and convex/gatewayStore.ts.",
+  );
+
+  // Terminal stages are what stop a restart from dispatching the same transcript twice.
+  for (const [label, source] of [["memory", memory], ["convex", convex]]) {
+    assert.match(
+      source,
+      /(MEDIA_JOB_TERMINAL_STAGES|mediaJobTerminalStages) = new Set\(\["dispatched", "failed"\]\)/u,
+      `${label} no longer treats dispatched and failed as terminal.`,
+    );
+  }
+});
+
+test("every Convex function the adapter maps actually exists", async () => {
+  const [adapter, convex] = await Promise.all([
+    readFile(join(ROOT, "src", "convexStore.mjs"), "utf8"),
+    readFile(join(ROOT, "convex", "gatewayStore.ts"), "utf8"),
+  ]);
+
+  // A mapping to a function that was never written fails only on the live backend, at the moment
+  // a user hits it — the missing updateMediaDescription went unnoticed exactly this way.
+  const mapped = [...new Set([...adapter.matchAll(/name: "gatewayStore:(\w+)"/gu)].map((match) => match[1]))];
+  const exported = new Set(
+    [...convex.matchAll(/export const (\w+) = gateway(?:Query|Mutation)/gu)].map((match) => match[1]),
+  );
+  assert.ok(mapped.length > 40, "the adapter's function table looks truncated.");
+  assert.deepEqual(
+    mapped.filter((name) => !exported.has(name)),
+    [],
+    "src/convexStore.mjs maps a gatewayStore function that convex/gatewayStore.ts does not export.",
+  );
+});
+
+test("the Convex media serialisers return every field written to the row", async () => {
+  const convex = await readFile(join(ROOT, "convex", "gatewayStore.ts"), "utf8");
+  const schema = await readFile(join(ROOT, "convex", "schema.ts"), "utf8");
+
+  // A field a mutation writes but the serialiser drops reads back null on the live backend, which
+  // is silent and has bitten this project before.
+  const tableFields = (name) => {
+    const start = schema.indexOf(`${name}: defineTable({`);
+    assert.notEqual(start, -1, `${name} table not found.`);
+    const body = matchBraces(schema, schema.indexOf("{", schema.indexOf("(", start)));
+    return [...body.matchAll(/^\s{4}(\w+):/gmu)].map((match) => match[1]);
+  };
+
+  const jobBody = extractFunctionWithParams(convex, "mediaJobForGateway");
+  for (const field of tableFields("mediaJobs")) {
+    if (field === "userExternalId") continue;
+    assert.match(jobBody, new RegExp(`\\b${field}\\b`, "u"), `mediaJobForGateway() drops ${field}.`);
+  }
+  assert.match(jobBody, /userId: job\.userExternalId/u);
+
+  const mediaBody = extractFunctionWithParams(convex, "mediaForGateway");
+  for (const field of tableFields("mediaUploads")) {
+    if (field === "userExternalId") continue;
+    assert.match(mediaBody, new RegExp(`\\b${field}\\b`, "u"), `mediaForGateway() drops ${field}.`);
+  }
+});

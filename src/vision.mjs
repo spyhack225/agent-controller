@@ -1,9 +1,14 @@
 // OCR / vision step of the camera flow (roadmap Phase 6):
 //   device/phone -> VPS image upload -> OCR/vision/attachment -> prompt -> dispatch
 //
-// Mirrors `transcribeStoredAudio` in mediaStore.mjs: a provider chosen by config, a `mock`
-// provider for tests and local dev, processing-state updates around the call, and failures
-// mapped to HttpError so the route handler needs no special casing.
+// A provider chosen by config, a `mock` provider for tests and local dev, processing-state
+// updates around the call, and failures mapped to HttpError so the route handler needs no
+// special casing.
+//
+// Vision is still synchronous inside the request. Transcription is not any more — it runs as a
+// durable job (src/transcription.mjs + src/mediaJobs.mjs) because an ASR call is long enough that
+// holding the socket, and losing the work on restart, both mattered. The same treatment is the
+// obvious next step here; the provider interface in transcription.mjs is the shape to copy.
 
 import { HttpError } from "./http.mjs";
 import { readStoredMedia } from "./mediaStore.mjs";

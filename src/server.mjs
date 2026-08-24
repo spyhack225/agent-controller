@@ -21,7 +21,7 @@ if (config.rateLimits?.redisUrl) {
   rateLimiter = createRateLimiter();
 }
 
-const { server, snapshotPoller } = createApp({
+const { server, snapshotPoller, mediaJobRunner } = createApp({
   config,
   rateLimiter,
   ...(store ? { store } : {}),
@@ -41,5 +41,13 @@ server.listen(config.port, config.host, async () => {
   if (config.snapshotPollEnabled) {
     snapshotPoller.start();
     console.log(`T3 snapshot poller running every ${config.snapshotPollIntervalMs}ms`);
+  }
+  // Same reasoning as the poller: started here, not in createApp(), so tests never race a timer.
+  if (config.transcriptionWorkerEnabled) {
+    mediaJobRunner.start();
+    console.log(
+      `media job worker ${mediaJobRunner.workerId} running every ${config.transcriptionWorkerIntervalMs}ms`
+      + ` (transcription provider: ${config.transcriptionProvider})`,
+    );
   }
 });

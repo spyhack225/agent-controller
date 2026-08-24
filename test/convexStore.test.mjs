@@ -477,6 +477,84 @@ test("Convex store uses direct HTTP endpoints without the Convex runtime package
   });
 });
 
+test("media job methods reach the Convex functions the worker depends on", async () => {
+  const calls = [];
+  const client = {
+    query: async (name, args) => {
+      calls.push({ type: "query", name, args });
+      return name === "gatewayStore:listMediaJobs" ? [] : { id: "mjob_1" };
+    },
+    mutation: async (name, args) => {
+      calls.push({ type: "mutation", name, args });
+      return name === "gatewayStore:claimMediaJobs" ? [] : { id: "mjob_1" };
+    },
+  };
+  const store = createConvexStoreAdapter({ client, gatewaySecret: "gateway-secret" });
+
+  await store.createMediaJob({
+    userId: "user_1",
+    mediaId: "media_1",
+    kind: "transcription",
+    provider: "openai",
+    model: "whisper-1",
+    language: null,
+    maxAttempts: 3,
+    reviewRequired: false,
+  });
+  await store.getMediaJobForUser("user_1", "mjob_1");
+  await store.listMediaJobs({ userId: "user_1", stage: "queued" });
+  await store.claimMediaJobs({ owner: "worker-a", leaseMs: 60_000, limit: 4, now: "2026-06-14T23:40:00.000Z" });
+  await store.updateMediaJob({ jobId: "mjob_1", stage: "dispatched", releaseLease: true });
+
+  assert.deepEqual(calls.map((call) => `${call.type} ${call.name}`), [
+    "mutation gatewayStore:createMediaJob",
+    "query gatewayStore:getMediaJobForUser",
+    "query gatewayStore:listMediaJobs",
+    "mutation gatewayStore:claimMediaJobs",
+    "mutation gatewayStore:updateMediaJob",
+  ]);
+
+  // The optional filters have to be sent explicitly: a Convex validator that declares
+  // v.optional(v.union(..., v.null())) rejects nothing, but an absent key and a null one read
+  // differently on the other side.
+  assert.deepEqual(calls[2].args, {
+    userId: "user_1",
+    mediaId: null,
+    stage: "queued",
+    gatewaySecret: "gateway-secret",
+  });
+  // The claim is not user-scoped: the worker drains every tenant's queue.
+  assert.deepEqual(calls[3].args, {
+    owner: "worker-a",
+    leaseMs: 60_000,
+    limit: 4,
+    now: "2026-06-14T23:40:00.000Z",
+    gatewaySecret: "gateway-secret",
+  });
+});
+
+test("every media job store method exists on the Convex adapter and the memory store alike", async () => {
+  const store = createConvexStoreAdapter({
+    client: { query: async () => null, mutation: async () => null },
+    gatewaySecret: "gateway-secret",
+  });
+  const { createMemoryStore } = await import("../src/store.mjs");
+  const memory = createMemoryStore();
+
+  // Adding a store method means touching all three implementations. This is the cheap guard that
+  // fails when one of them is forgotten.
+  for (const method of [
+    "createMediaJob",
+    "getMediaJobForUser",
+    "listMediaJobs",
+    "claimMediaJobs",
+    "updateMediaJob",
+  ]) {
+    assert.equal(typeof store[method], "function", `Convex adapter is missing ${method}().`);
+    assert.equal(typeof memory[method], "function", `memory store is missing ${method}().`);
+  }
+});
+
 function sha256(value) {
   return createHash("sha256").update(value, "utf8").digest("hex");
 }

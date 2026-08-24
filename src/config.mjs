@@ -1,5 +1,14 @@
 import { loadAlertThresholds } from "./alerts.mjs";
 import { loadRateLimitConfig } from "./rateLimit.mjs";
+import {
+  PARAKEET_ACCEPTED_CONTENT_TYPES,
+  PARAKEET_DEFAULT_CONCURRENCY,
+  PARAKEET_DEFAULT_MAX_CLIP_SECONDS,
+  PARAKEET_DEFAULT_MODEL,
+  PARAKEET_DEFAULT_TIMEOUT_MS,
+  PARAKEET_DEFAULT_URL,
+  TRANSCRIPTION_PROVIDERS,
+} from "./transcription.mjs";
 
 export function loadConfig(env = process.env) {
   const authProvider = env.AUTH_PROVIDER ?? (env.CLERK_SECRET_KEY ? "clerk" : "dev");
@@ -42,6 +51,39 @@ export function loadConfig(env = process.env) {
     transcriptionApiKey: env.TRANSCRIPTION_API_KEY ?? null,
     transcriptionModel: env.TRANSCRIPTION_MODEL ?? "whisper-1",
     transcriptionTimeoutMs: normalizePositiveInt(env.TRANSCRIPTION_TIMEOUT_MS, 30_000),
+    transcriptionLanguage: env.TRANSCRIPTION_LANGUAGE ?? null,
+    // Transcription runs as a durable job, not inside the request. These govern the worker.
+    transcriptionWorkerEnabled: normalizeBoolean(env.TRANSCRIPTION_WORKER_ENABLED, true),
+    transcriptionWorkerIntervalMs: normalizePositiveInt(env.TRANSCRIPTION_WORKER_INTERVAL_MS, 2000),
+    transcriptionBatchSize: normalizePositiveInt(env.TRANSCRIPTION_BATCH_SIZE, 4),
+    // The lease has to outlast one provider call, or a slow transcription gets picked up a second
+    // time while the first is still running.
+    transcriptionLeaseMs: normalizePositiveInt(env.TRANSCRIPTION_LEASE_MS, 60_000),
+    transcriptionMaxAttempts: normalizePositiveInt(env.TRANSCRIPTION_MAX_ATTEMPTS, 3),
+    // When set, a finished transcript parks at `review_required` until a person accepts or edits
+    // it, instead of being written straight onto the media record.
+    transcriptionReviewRequired: normalizeBoolean(env.TRANSCRIPTION_REVIEW_REQUIRED, false),
+    // Parakeet is a local ASR sidecar, not a hosted API, so it gets its own settings rather than
+    // borrowing the TRANSCRIPTION_* ones: the defaults differ in kind. A CPU box is slow, so the
+    // timeout is minutes rather than seconds, the model is a checkpoint name rather than a whisper
+    // id, and there is a clip ceiling because inference cost scales with audio length.
+    parakeetUrl: env.PARAKEET_URL ?? PARAKEET_DEFAULT_URL,
+    parakeetModel: env.PARAKEET_MODEL ?? PARAKEET_DEFAULT_MODEL,
+    // Optional: only needed when the sidecar sits behind an authenticated hop.
+    parakeetApiKey: env.PARAKEET_API_KEY ?? null,
+    parakeetTimeoutMs: normalizePositiveInt(env.PARAKEET_TIMEOUT_MS, PARAKEET_DEFAULT_TIMEOUT_MS),
+    parakeetMaxClipSeconds: normalizePositiveInt(
+      env.PARAKEET_MAX_CLIP_SECONDS,
+      PARAKEET_DEFAULT_MAX_CLIP_SECONDS,
+    ),
+    // v2 is an English model. A different language means a different checkpoint, not this one
+    // trying harder — the adapter refuses the mismatch rather than returning poor English.
+    parakeetLanguage: env.PARAKEET_LANGUAGE ?? env.TRANSCRIPTION_LANGUAGE ?? "en",
+    // How many clips may be inside the sidecar at once. One model in memory on a CPU is one clip;
+    // a GPU box can raise it.
+    parakeetConcurrency: normalizePositiveInt(env.PARAKEET_CONCURRENCY, PARAKEET_DEFAULT_CONCURRENCY),
+    parakeetAcceptedContentTypes: parseCsv(env.PARAKEET_ACCEPTED_CONTENT_TYPES)
+      ?? PARAKEET_ACCEPTED_CONTENT_TYPES,
     visionProvider: normalizeVisionProvider(env.VISION_PROVIDER),
     visionUrl: env.VISION_URL ?? null,
     visionApiKey: env.VISION_API_KEY ?? null,
@@ -92,7 +134,9 @@ export function loadConfig(env = process.env) {
 function normalizeTranscriptionProvider(value) {
   if (!value) return "disabled";
   const provider = String(value).trim().toLowerCase();
-  return ["disabled", "mock", "openai"].includes(provider) ? provider : "disabled";
+  // An unrecognised name degrades to "disabled" rather than throwing, so the list is read from
+  // the adapters themselves: a provider that exists but is missing here is a silent 409 later.
+  return TRANSCRIPTION_PROVIDERS.includes(provider) ? provider : "disabled";
 }
 
 function normalizeOptionalBoolean(value) {

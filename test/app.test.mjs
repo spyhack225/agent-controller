@@ -1022,7 +1022,7 @@ test("audio media can be transcribed through the configured provider", async (t)
     globalThis.fetch = originalFetch;
   });
 
-  const { server } = createApp({
+  const { server, mediaJobRunner } = createApp({
     config: {
       mediaDir,
       maxMediaBytes: 1024,
@@ -1058,13 +1058,31 @@ test("audio media can be transcribed through the configured provider", async (t)
   assert.equal(mediaUpload.media.transcript, null);
   assert.equal(mediaUpload.media.processing.transcriptionStatus, "pending");
 
-  const transcribed = await requestJson(originalFetch, baseUrl, `/v1/media/${mediaUpload.media.id}/transcribe`, {
+  // Transcription is a durable job now: the request enqueues, the worker runs it. The route no
+  // longer holds the socket open for the length of an ASR call.
+  const queued = await requestJson(originalFetch, baseUrl, `/v1/media/${mediaUpload.media.id}/transcribe`, {
     method: "POST",
     headers: authHeaders,
     body: {},
   });
-  assert.equal(transcribed.provider, "mock");
-  assert.match(transcribed.transcript, /Mock transcript/u);
+  assert.equal(queued.job.stage, "queued");
+  assert.equal(queued.job.provider, "mock");
+  assert.equal(queued.media.processing.transcriptionStatus, "processing");
+
+  const { processed } = await mediaJobRunner.runOnce();
+  assert.deepEqual(processed.map((entry) => entry.stage), ["dispatched"]);
+
+  const job = await requestJson(originalFetch, baseUrl, `/v1/media/jobs/${queued.job.id}`, {
+    headers: authHeaders,
+  });
+  assert.equal(job.job.stage, "dispatched");
+  assert.match(job.job.rawTranscript, /Mock transcript/u);
+  assert.match(job.job.normalizedTranscript, /Mock transcript/u);
+  assert.equal(job.job.userEditedTranscript, null);
+
+  const listed = await requestJson(originalFetch, baseUrl, "/v1/media", { headers: authHeaders });
+  const transcribed = { media: listed.media.find((item) => item.id === mediaUpload.media.id) };
+  assert.match(transcribed.media.transcript, /Mock transcript/u);
   assert.equal(transcribed.media.processing.transcriptionStatus, "ready");
   assert.equal(transcribed.media.processing.transcriptSource, "mock");
 

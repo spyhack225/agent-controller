@@ -1,4 +1,4 @@
-import type { Command, JsonRecord, MediaItem } from "./types";
+import type { Command, JsonRecord, MediaItem, MediaJob } from "./types";
 
 export function formatRelativeTime(value?: string | null): string {
   if (!value) return "never";
@@ -84,6 +84,35 @@ export function formatMediaProcessing(media: MediaItem): string {
   if (media.processing?.transcriptSource) parts.push(`via ${media.processing.transcriptSource}`);
   if (media.processing?.lastError) parts.push(media.processing.lastError);
   return parts.join(" · ");
+}
+
+const MEDIA_JOB_STAGE_LABELS: Record<string, string> = {
+  queued: "Queued",
+  transcribing: "Transcribing",
+  normalizing: "Cleaning up",
+  review_required: "Needs review",
+  ready: "Ready to apply",
+  dispatching: "Applying",
+  dispatched: "Applied",
+  failed: "Failed",
+};
+
+/**
+ * The job's own progress, which is finer than the media record's coarse processing status: a
+ * transcript can be finished and still be waiting on a person.
+ */
+export function formatMediaJob(job: MediaJob): string {
+  const parts = [MEDIA_JOB_STAGE_LABELS[job.stage] ?? job.stage];
+  if (job.provider) parts.push(`via ${job.provider}`);
+  if ((job.attempts ?? 0) > 1) parts.push(`attempt ${job.attempts}/${job.maxAttempts ?? job.attempts}`);
+  if (job.lastError) parts.push(job.lastError);
+  return parts.join(" · ");
+}
+
+export function mediaJobTone(job: MediaJob): "danger" | "warning" | "success" {
+  if (job.stage === "failed") return "danger";
+  if (job.stage === "dispatched") return "success";
+  return "warning";
 }
 
 export function fileToBase64(file: Blob): Promise<string> {

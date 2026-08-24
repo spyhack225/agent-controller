@@ -100,6 +100,12 @@ export default defineSchema({
     })),
     firmwarePolicy: v.optional(v.any()),
     gatewaySelection: v.optional(v.any()),
+    // The owner's standing grant for this device to auto-send a finished voice transcript.
+    voiceAutoSend: v.optional(v.object({
+      enabled: v.boolean(),
+      enabledBy: v.union(v.string(), v.null()),
+      enabledAt: v.union(v.string(), v.null()),
+    })),
     config: v.object({
       environmentId: v.optional(v.string()),
       threadId: v.optional(v.string()),
@@ -165,10 +171,56 @@ export default defineSchema({
     storagePath: v.string(),
     originalName: v.optional(v.string()),
     transcript: v.optional(v.union(v.string(), v.null())),
+    // Vision descriptions had no column, so updateMediaDescription wrote a field the serialiser
+    // then dropped: the whole vision path read back null on the live backend.
+    description: v.optional(v.union(v.string(), v.null())),
     processing: v.optional(v.any()),
     expiresAt: v.optional(v.union(v.string(), v.null())),
     createdAt: v.string(),
   }).index("byUserExternalId", ["userExternalId"]),
+
+  // Durable media processing jobs. Transcription runs here rather than inside the HTTP request,
+  // so a restart mid-ASR-call resumes the job instead of losing it. The transcript is kept as
+  // versions — raw ASR output, the normalized cleanup, and the reviewed value — never one
+  // overwritten string.
+  //
+  // `byStage` exists because the worker enumerates runnable jobs across all users; that is the one
+  // place in this schema where a global scan is the point rather than a mistake.
+  mediaJobs: defineTable({
+    userExternalId: v.string(),
+    mediaId: v.id("mediaUploads"),
+    kind: v.string(),
+    stage: v.string(),
+    // Which controller recorded the capture, and where a finished transcript would be sent.
+    deviceId: v.optional(v.union(v.id("devices"), v.null())),
+    environmentId: v.optional(v.union(v.id("environments"), v.null())),
+    threadId: v.optional(v.union(v.string(), v.null())),
+    // The dispatch outcome. Separate from lastError/failureKind because transcription succeeding
+    // and the send being refused are independent, and a device has to tell them apart.
+    autoSend: v.optional(v.boolean()),
+    dispatchStatus: v.optional(v.union(v.string(), v.null())),
+    dispatchError: v.optional(v.union(v.string(), v.null())),
+    commandId: v.optional(v.union(v.id("commands"), v.null())),
+    provider: v.optional(v.union(v.string(), v.null())),
+    model: v.optional(v.union(v.string(), v.null())),
+    language: v.optional(v.union(v.string(), v.null())),
+    rawTranscript: v.optional(v.union(v.string(), v.null())),
+    normalizedTranscript: v.optional(v.union(v.string(), v.null())),
+    userEditedTranscript: v.optional(v.union(v.string(), v.null())),
+    attempts: v.number(),
+    maxAttempts: v.number(),
+    reviewRequired: v.boolean(),
+    leaseOwner: v.optional(v.union(v.string(), v.null())),
+    leaseExpiresAt: v.optional(v.union(v.string(), v.null())),
+    lastError: v.optional(v.union(v.string(), v.null())),
+    failureKind: v.optional(v.union(v.string(), v.null())),
+    timings: v.optional(v.any()),
+    createdAt: v.string(),
+    updatedAt: v.string(),
+  })
+    .index("byUserExternalId", ["userExternalId"])
+    .index("byMediaId", ["mediaId"])
+    .index("byStage", ["stage"]),
 
   macros: defineTable({
     userExternalId: v.string(),

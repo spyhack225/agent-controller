@@ -46,8 +46,10 @@ import {
   deleteStoredMedia,
   readStoredMedia,
   storeUploadedMedia,
-  transcribeStoredAudio,
 } from "./mediaStore.mjs";
+import { createMediaJobRunner } from "./mediaJobs.mjs";
+import { deviceJobStatus, mediaJobEvent, voiceAutoSendEnabled } from "./deviceAudio.mjs";
+import { describeTranscriptChange, isTranscriptionProviderEnabled } from "./transcription.mjs";
 import { buildUserObservabilitySummary } from "./observability.mjs";
 import {
   checkResourceLimit,
@@ -164,6 +166,18 @@ export function createApp({
     store,
     events,
     ...(config.snapshotPollIntervalMs ? { intervalMs: config.snapshotPollIntervalMs } : {}),
+  });
+  // Constructed here, started from server.mjs. Tests drive runOnce() so nothing depends on a timer.
+  const mediaJobRunner = createMediaJobRunner({
+    store,
+    config,
+    events,
+    // Closed over the store and config rather than imported by the worker, which has no business
+    // knowing what a policy is. Every send is decided here, at the moment it happens.
+    dispatchTranscript: ({ job, transcript }) => dispatchVoiceTranscript({ store, config, job, transcript }),
+    ...(config.transcriptionWorkerIntervalMs ? { intervalMs: config.transcriptionWorkerIntervalMs } : {}),
+    ...(config.transcriptionLeaseMs ? { leaseMs: config.transcriptionLeaseMs } : {}),
+    ...(config.transcriptionBatchSize ? { batchSize: config.transcriptionBatchSize } : {}),
   });
   let remoteAccessCache = null;
   let remoteAccessCacheExpiresAt = 0;
@@ -766,6 +780,35 @@ export function createApp({
         });
         if (!policy) throw new HttpError(404, "Device not found or revoked.");
         return sendJson(res, 200, await firmwarePolicyResponse({ store, device, policy, config }));
+      }
+
+      // The auto-send grant. Owner realm only: a device must never be able to widen its own
+      // licence to act on what it hears.
+      const deviceVoiceAutoSendMatch = url.pathname.match(/^\/v1\/devices\/([^/]+)\/voice-auto-send$/u);
+      if (deviceVoiceAutoSendMatch && req.method === "GET") {
+        const user = await authenticateUser(req, store, config, null, clerkAuth);
+        await enforceUserRead(req, res, rateLimiter, config, user);
+        const device = await store.getDeviceForUser(user.id, deviceVoiceAutoSendMatch[1]);
+        if (!device) throw new HttpError(404, "Device not found.");
+        return sendJson(res, 200, { deviceId: device.id, voiceAutoSend: device.voiceAutoSend });
+      }
+
+      if (deviceVoiceAutoSendMatch && req.method === "PUT") {
+        const user = await authenticateUser(req, store, config, null, clerkAuth);
+        await enforceUserWrite(req, res, rateLimiter, config, user);
+        const body = await readJson(req);
+        if (typeof body.enabled !== "boolean") {
+          throw new HttpError(400, "enabled must be a boolean.");
+        }
+        const device = await store.setDeviceVoiceAutoSend({
+          userId: user.id,
+          deviceId: deviceVoiceAutoSendMatch[1],
+          enabled: body.enabled,
+          actorId: user.id,
+          actorType: "user",
+        });
+        if (!device) throw new HttpError(404, "Device not found or revoked.");
+        return sendJson(res, 200, { device, voiceAutoSend: device.voiceAutoSend });
       }
 
       const deviceProfileMatch = url.pathname.match(/^\/v1\/devices\/([^/]+)\/profile$/u);
@@ -1794,17 +1837,62 @@ export function createApp({
         }));
       }
 
+      // Job reads sit above the bare /v1/media/:id match, which would otherwise swallow "jobs".
+      if (req.method === "GET" && url.pathname === "/v1/media/jobs") {
+        const user = await authenticateUser(req, store, config, null, clerkAuth);
+        await enforceUserRead(req, res, rateLimiter, config, user);
+        const jobs = await store.listMediaJobs({
+          userId: user.id,
+          ...(url.searchParams.get("mediaId") ? { mediaId: url.searchParams.get("mediaId") } : {}),
+          ...(url.searchParams.get("stage") ? { stage: url.searchParams.get("stage") } : {}),
+        });
+        return sendJson(res, 200, { jobs: jobs.map(withTranscriptChange) });
+      }
+
+      const mediaJobMatch = url.pathname.match(/^\/v1\/media\/jobs\/([^/]+)$/u);
+      if (req.method === "GET" && mediaJobMatch) {
+        const user = await authenticateUser(req, store, config, null, clerkAuth);
+        await enforceUserRead(req, res, rateLimiter, config, user);
+        const job = await store.getMediaJobForUser(user.id, mediaJobMatch[1]);
+        if (!job) throw new HttpError(404, "Media job not found.");
+        return sendJson(res, 200, { job: withTranscriptChange(job) });
+      }
+
+      // The review gate. Accepting or correcting a transcript writes a new *version* — the raw ASR
+      // output stays exactly as the provider returned it — and re-arms the job for dispatch.
+      const mediaJobTranscriptMatch = url.pathname.match(/^\/v1\/media\/jobs\/([^/]+)\/transcript$/u);
+      if (req.method === "POST" && mediaJobTranscriptMatch) {
+        const user = await authenticateUser(req, store, config, null, clerkAuth);
+        await enforceUserWrite(req, res, rateLimiter, config, user);
+        const body = await readJson(req);
+        const existing = await store.getMediaJobForUser(user.id, mediaJobTranscriptMatch[1]);
+        if (!existing) throw new HttpError(404, "Media job not found.");
+        if (!["review_required", "ready", "dispatched"].includes(existing.stage)) {
+          throw new HttpError(409, `A media job at stage ${existing.stage} cannot be reviewed yet.`);
+        }
+        const job = await store.updateMediaJob({
+          jobId: existing.id,
+          userId: user.id,
+          userEditedTranscript: requireString(body.transcript, "transcript"),
+          stage: "ready",
+          lastError: null,
+          failureKind: null,
+          timings: { reviewedAt: new Date().toISOString() },
+        });
+        return sendJson(res, 200, { job: withTranscriptChange(job) });
+      }
+
       const mediaTranscribeMatch = url.pathname.match(/^\/v1\/media\/([^/]+)\/transcribe$/u);
       if (req.method === "POST" && mediaTranscribeMatch) {
         const user = await authenticateUser(req, store, config, null, clerkAuth);
         await enforceUserWrite(req, res, rateLimiter, config, user);
-        const result = await transcribeStoredAudio({
+        return await enqueueTranscription({
           store,
           config,
           userId: user.id,
           mediaId: mediaTranscribeMatch[1],
+          res,
         });
-        return sendJson(res, 200, result);
       }
 
       if (req.method === "POST" && url.pathname === "/v1/media/purge-expired") {
@@ -2446,7 +2534,26 @@ export function createApp({
           actor: { type: "device", id: device.id, userId: device.userId },
           payload: body,
         });
-        return sendJson(res, 201, { media });
+        // Audio is queued for transcription here rather than waiting for someone to ask. A
+        // controller uploads and moves on, so the one identifier it gets back is the job id: it
+        // polls /v1/device/media/jobs/:id and needs nothing else.
+        const queued = await enqueueDeviceTranscription({ store, config, events, device, media, body });
+        return sendJson(res, 201, { media: queued.media, job: deviceJobStatus(queued.job) });
+      }
+
+      // The single status endpoint a controller polls. Deliberately not a view onto the job row:
+      // see src/deviceAudio.mjs for what a few square centimetres of screen can actually render.
+      const deviceMediaJobMatch = url.pathname.match(/^\/v1\/device\/media\/jobs\/([^/]+)$/u);
+      if (req.method === "GET" && deviceMediaJobMatch) {
+        const device = await authenticateDevice(req, store, null, config);
+        await enforceDeviceRead(req, res, rateLimiter, config, device);
+        requireClaimedDevice(device);
+        const job = await store.getMediaJobForUser(device.userId, deviceMediaJobMatch[1]);
+        // Scoped to the device that recorded it, not merely to the owner. Two controllers on one
+        // account are two microphones in two rooms, and one has no business reading the other's
+        // capture — the transcript is in this response.
+        if (!job || job.deviceId !== device.id) throw new HttpError(404, "Media job not found.");
+        return sendJson(res, 200, { job: deviceJobStatus(job) });
       }
 
       if (req.method === "GET" && url.pathname === "/v1/device/state") {
@@ -2532,6 +2639,7 @@ export function createApp({
     store,
     events,
     snapshotPoller,
+    mediaJobRunner,
     server: createServer((req, res) => void handle(req, res)),
   };
 }
@@ -3559,6 +3667,216 @@ async function purgeExpiredMedia({ store, userId, config = null, now = new Date(
   return { purged, count: purged.length, checkedAt: now };
 }
 
+/**
+ * Enqueues transcription instead of running it.
+ *
+ * The 202 is the contract change: the caller gets a job id and polls (or listens on SSE for
+ * `media.job`) rather than holding a socket open for the length of an ASR call. An unconfigured
+ * provider is still refused synchronously with 409 — queueing work that is guaranteed to fail
+ * identically on every attempt would replace a clear error with a silent one.
+ */
+async function enqueueTranscription({ store, config, userId, mediaId, res }) {
+  const media = await store.getMediaForUser(userId, mediaId);
+  if (!media) throw new HttpError(404, "Media upload not found.");
+  if (media.kind !== "audio") throw new HttpError(400, "Only audio media can be transcribed.");
+
+  if (!isTranscriptionProviderEnabled(config.transcriptionProvider)) {
+    const message = "No transcription provider is configured.";
+    const updated = await store.updateMediaProcessing?.({
+      userId,
+      mediaId,
+      processing: { transcriptionStatus: "unavailable", transcriptSource: null, lastError: message },
+    });
+    throw new HttpError(409, message, { media: updated ?? publicMediaRecord(media) });
+  }
+
+  const job = await store.createMediaJob({
+    userId,
+    mediaId,
+    kind: "transcription",
+    provider: config.transcriptionProvider,
+    model: config.transcriptionModel ?? null,
+    language: config.transcriptionLanguage ?? null,
+    maxAttempts: config.transcriptionMaxAttempts ?? 3,
+    reviewRequired: config.transcriptionReviewRequired === true,
+  });
+  if (!job) throw new HttpError(404, "Media upload not found.");
+
+  const withProcessing = await store.updateMediaProcessing?.({
+    userId,
+    mediaId,
+    processing: {
+      transcriptionStatus: "processing",
+      transcriptSource: config.transcriptionProvider,
+      lastError: null,
+    },
+  });
+
+  return sendJson(res, 202, { job, media: withProcessing ?? publicMediaRecord(media) });
+}
+
+/**
+ * Enqueues transcription for audio a controller just uploaded.
+ *
+ * The device does not ask for this. A controller with a microphone records, uploads, and is done;
+ * if the gateway did not queue the work here the audio would sit in storage forever, which is
+ * exactly what it did before. Unlike the owner-facing endpoint an unconfigured provider is not an
+ * error: the upload itself succeeded, so the media is marked `unavailable` and the device is told
+ * there is no job to poll rather than having its upload rejected after the bytes are already
+ * stored.
+ */
+async function enqueueDeviceTranscription({ store, config, events, device, media, body = {} }) {
+  if (media.kind !== "audio") return { job: null, media };
+  if (!isTranscriptionProviderEnabled(config.transcriptionProvider)) {
+    const unavailable = await store.updateMediaProcessing?.({
+      userId: device.userId,
+      mediaId: media.id,
+      processing: {
+        transcriptionStatus: "unavailable",
+        transcriptSource: null,
+        lastError: "No transcription provider is configured.",
+      },
+    });
+    return { job: null, media: unavailable ?? media };
+  }
+
+  const job = await store.createMediaJob({
+    userId: device.userId,
+    mediaId: media.id,
+    kind: "transcription",
+    deviceId: device.id,
+    // Pinned to the target the controller was pointed at when it recorded. Reading the device's
+    // config at dispatch instead would send a delayed capture to whatever thread happens to be
+    // selected by then, which is not the thread the owner was talking to.
+    environmentId: optionalString(body.environmentId) ?? optionalString(device.config?.environmentId) ?? null,
+    threadId: optionalString(body.threadId) ?? optionalString(device.config?.threadId) ?? null,
+    provider: config.transcriptionProvider,
+    model: config.transcriptionModel ?? null,
+    language: config.transcriptionLanguage ?? null,
+    maxAttempts: config.transcriptionMaxAttempts ?? 3,
+    reviewRequired: config.transcriptionReviewRequired === true,
+  });
+  if (!job) return { job: null, media };
+
+  const queued = await store.updateMediaProcessing?.({
+    userId: device.userId,
+    mediaId: media.id,
+    processing: {
+      transcriptionStatus: "processing",
+      transcriptSource: config.transcriptionProvider,
+      lastError: null,
+    },
+  });
+  // The console should see the capture appear the moment it lands, not on the worker's next tick.
+  events?.broadcastToUser?.(device.userId, "media.job", {
+    ...mediaJobEvent(job, new Date().toISOString()),
+    terminal: false,
+  });
+  return { job, media: queued ?? media };
+}
+
+/**
+ * Decides whether a finished voice transcript is sent on, and sends it.
+ *
+ * Called by the job worker at the moment of dispatch, never at enqueue. That ordering is the point:
+ * a capture can sit in the queue through a retry budget while the owner tightens a profile, revokes
+ * the device, or turns auto-send back off, and a request recorded under the old rules must not
+ * carry the old answer past the new ones. Everything below — the grant, the device, the policy
+ * evaluation inside submitIntent() — is read fresh here.
+ *
+ * Refusals are returned, not thrown. The transcript is already on the media record by this point,
+ * so a blocked send leaves the owner a transcript to look at and a reason it did not go.
+ */
+async function dispatchVoiceTranscript({ store, config, job, transcript }) {
+  // Console uploads have no device and never auto-send; the owner is already looking at the screen.
+  if (!job?.deviceId) return null;
+
+  const device = await store.getDeviceForUser(job.userId, job.deviceId);
+  // Revoked or deleted between record and dispatch. The grant died with the pairing.
+  if (!device || device.revokedAt) return null;
+  if (!voiceAutoSendEnabled(device)) return null;
+
+  const environmentId = job.environmentId ?? device.config?.environmentId ?? null;
+  const threadId = job.threadId ?? device.config?.threadId ?? null;
+  if (!environmentId || !threadId) {
+    return {
+      autoSend: true,
+      dispatchStatus: "failed",
+      dispatchError: "This device has no environment and thread configured to send to.",
+    };
+  }
+  const environment = await store.getEnvironmentForUser(job.userId, environmentId);
+  if (!environment) {
+    return { autoSend: true, dispatchStatus: "failed", dispatchError: "Environment not found." };
+  }
+
+  try {
+    // The ordinary device intent path, not a shortcut around it: normalizeIntent turns the audio
+    // intent into a prompt with the recording attached, and evaluateIntentPolicy runs against this
+    // device's profile before anything is dispatched.
+    const output = await submitIntent({
+      store,
+      environment,
+      body: {
+        threadId,
+        environmentId,
+        intent: { type: "audio_prompt", transcript, mediaUploadIds: [job.mediaId] },
+      },
+      actor: { type: "device", id: device.id, userId: job.userId, profile: device.profile },
+      config,
+      baseUrl: config.publicBaseUrl ?? null,
+    });
+    const status = output?.command?.status ?? null;
+    if (status === "approval_required") {
+      return {
+        autoSend: true,
+        dispatchStatus: "approval_required",
+        commandId: output.command.id,
+        dispatchError: null,
+      };
+    }
+    if (status === "dispatched" || status === "completed") {
+      return { autoSend: true, dispatchStatus: "sent", commandId: output.command.id, dispatchError: null };
+    }
+    return {
+      autoSend: true,
+      dispatchStatus: "failed",
+      commandId: output?.command?.id ?? null,
+      dispatchError: `T3 dispatch ended at status ${status ?? "unknown"}.`,
+    };
+  } catch (error) {
+    const blocked = error instanceof HttpError && error.status === 403;
+    return {
+      autoSend: true,
+      dispatchStatus: blocked ? "blocked" : "failed",
+      commandId: error?.details?.command?.id ?? null,
+      dispatchError: errorMessage(error),
+    };
+  }
+}
+
+/**
+ * The diff between what the provider heard and what cleanup produced, attached on read.
+ *
+ * Derived rather than stored: both versions are already on the job, so a computed answer cannot go
+ * stale against them. `contentPreserved: false` is the reason a job can park at `review_required`
+ * even where review was never configured — normalisation moved the user's words, so a person
+ * decides rather than the worker.
+ */
+function withTranscriptChange(job) {
+  if (!job) return job;
+  return {
+    ...job,
+    transcriptChange: describeTranscriptChange(job.rawTranscript, job.normalizedTranscript),
+  };
+}
+
+/** getMediaForUser hands back the raw record; storagePath must never leave the gateway. */
+function publicMediaRecord(media) {
+  const { storagePath, ...rest } = media;
+  return rest;
+}
+
 function normalizePrivacySettingsInput(body) {
   if (!body || typeof body !== "object") throw new HttpError(400, "Privacy settings body is required.");
   if (!Object.hasOwn(body, "mediaRetentionDays")) {
@@ -3594,6 +3912,7 @@ async function buildSupportDiagnosticsBundle({ store, user }) {
     devices,
     environments,
     media,
+    mediaJobs,
     macros,
     commands,
     audit,
@@ -3603,6 +3922,9 @@ async function buildSupportDiagnosticsBundle({ store, user }) {
     store.listDevices(user.id),
     store.listEnvironments(user.id),
     store.listMediaUploads(user.id),
+    // "Why is my transcription stuck?" is answerable from the job's stage, attempts and lastError
+    // and from nothing else, so the bundle carries them.
+    store.listMediaJobs?.({ userId: user.id }) ?? [],
     store.listMacros(user.id),
     store.listCommands(user.id),
     store.listAuditLogs(user.id),
@@ -3618,6 +3940,7 @@ async function buildSupportDiagnosticsBundle({ store, user }) {
     redaction: {
       rawPromptText: "redacted with length and sha256",
       rawShellCommands: "redacted with length and sha256",
+      transcripts: "redacted with length and sha256",
       secrets: "not included",
       mediaBytes: "not included",
     },
@@ -3629,6 +3952,7 @@ async function buildSupportDiagnosticsBundle({ store, user }) {
       devices: devices.length,
       environments: environments.length,
       media: media.length,
+      mediaJobs: mediaJobs.length,
       macros: macros.length,
       commands: commands.length,
       audit: audit.length,
@@ -3638,6 +3962,7 @@ async function buildSupportDiagnosticsBundle({ store, user }) {
     devices,
     environments,
     media: media.map(redactMediaForSupport),
+    mediaJobs: mediaJobs.map(redactMediaJobForSupport),
     macros: macros.map(redactMacroForSupport),
     recentCommands,
     recentAudit,
@@ -3649,6 +3974,21 @@ function redactMacroForSupport(macro) {
     ...macro,
     intent: redactIntent(macro.intent),
   };
+}
+
+// Every transcript version is user content. The stage machine around them is not, and is the
+// whole reason a job is worth including.
+function redactMediaJobForSupport(job) {
+  return {
+    ...job,
+    rawTranscript: redactOptionalText(job.rawTranscript),
+    normalizedTranscript: redactOptionalText(job.normalizedTranscript),
+    userEditedTranscript: redactOptionalText(job.userEditedTranscript),
+  };
+}
+
+function redactOptionalText(value) {
+  return typeof value === "string" && value.length > 0 ? redactText(value) : value ?? null;
 }
 
 function redactMediaForSupport(media) {

@@ -128,118 +128,6 @@ export async function deleteStoredMedia(media, config = null) {
   await rm(media.storagePath, { force: true });
 }
 
-export async function transcribeStoredAudio({ store, config, userId, mediaId }) {
-  const media = await store.getMediaForUser(userId, mediaId);
-  if (!media) throw new HttpError(404, "Media upload not found.");
-  if (media.kind !== "audio") throw new HttpError(400, "Only audio media can be transcribed.");
-
-  await store.updateMediaProcessing?.({
-    userId,
-    mediaId,
-    processing: {
-      transcriptionStatus: "processing",
-      transcriptSource: config.transcriptionProvider,
-      lastError: null,
-    },
-  });
-
-  if (config.transcriptionProvider === "mock") {
-    const transcript = buildMockTranscript(media);
-    const updated = await store.updateMediaTranscript({
-      userId,
-      mediaId,
-      transcript,
-      source: "mock",
-    });
-    return { media: updated, transcript, provider: "mock" };
-  }
-
-  if (config.transcriptionProvider === "openai") {
-    let transcript;
-    try {
-      transcript = await transcribeWithOpenAi(media, config);
-    } catch (error) {
-      const failureMessage = error instanceof Error ? error.message : String(error);
-      const failed = await store.updateMediaProcessing?.({
-        userId,
-        mediaId,
-        processing: {
-          transcriptionStatus: "failed",
-          transcriptSource: "openai",
-          lastError: failureMessage,
-        },
-      });
-      throw new HttpError(502, "Audio transcription failed.", {
-        media: failed ?? media,
-        cause: failureMessage,
-      });
-    }
-    const updated = await store.updateMediaTranscript({
-      userId,
-      mediaId,
-      transcript,
-      source: "openai",
-    });
-    return { media: updated, transcript, provider: "openai" };
-  }
-
-  const message = "No transcription provider is configured.";
-  const updated = await store.updateMediaProcessing?.({
-    userId,
-    mediaId,
-    processing: {
-      transcriptionStatus: "unavailable",
-      transcriptSource: null,
-      lastError: message,
-    },
-  });
-  throw new HttpError(409, message, { media: updated ?? media });
-}
-
-async function transcribeWithOpenAi(media, config) {
-  if (!config.transcriptionApiKey) {
-    throw new Error("TRANSCRIPTION_API_KEY is required when TRANSCRIPTION_PROVIDER=openai.");
-  }
-
-  const endpoint = config.transcriptionUrl ?? "https://api.openai.com/v1/audio/transcriptions";
-  const buffer = await readStoredMedia(media, config);
-  const form = new FormData();
-  form.append("model", config.transcriptionModel);
-  form.append(
-    "file",
-    new Blob([buffer], { type: media.contentType }),
-    media.originalName ?? `${media.id}.${EXTENSIONS.get(media.contentType) ?? "bin"}`,
-  );
-
-  const controller = new AbortController();
-  const timeout = setTimeout(() => controller.abort(), config.transcriptionTimeoutMs);
-  let response;
-  try {
-    response = await fetch(endpoint, {
-      method: "POST",
-      headers: { authorization: `Bearer ${config.transcriptionApiKey}` },
-      body: form,
-      signal: controller.signal,
-    });
-  } catch (error) {
-    if (error?.name === "AbortError") {
-      throw new Error(`Transcription timed out after ${config.transcriptionTimeoutMs}ms.`);
-    }
-    throw error;
-  } finally {
-    clearTimeout(timeout);
-  }
-
-  if (!response.ok) {
-    throw new Error(`Transcription provider returned HTTP ${response.status}.`);
-  }
-
-  const payload = await response.json();
-  const transcript = normalizeTranscript(payload?.text ?? "");
-  if (!transcript) throw new Error("Transcription provider returned an empty transcript.");
-  return transcript;
-}
-
 // Builds the payload T3 receives in message.attachments. Includes a signed callback URL and,
 // for small files, the bytes inline so an environment that cannot reach the gateway still
 // gets the content.
@@ -307,11 +195,6 @@ export function mediaToPromptContext(media) {
     `sizeBytes=${media.sizeBytes}`,
     `sha256=${media.sha256}`,
   ].join(" ");
-}
-
-function buildMockTranscript(media) {
-  const name = media.originalName ? ` ${media.originalName}` : "";
-  return `Mock transcript for audio${name} (${media.contentType}, ${media.sizeBytes} bytes, sha256 ${media.sha256.slice(0, 12)}).`;
 }
 
 function decodeBase64(value) {

@@ -569,6 +569,58 @@ export interface MediaItem {
   };
 }
 
+/**
+ * A durable media processing job. Transcription runs on the gateway's worker, not inside the
+ * request, so the client watches a stage rather than awaiting a response.
+ *
+ * The three transcript fields are versions, not alternatives to each other: `rawTranscript` is
+ * exactly what the ASR provider returned and never changes, `normalizedTranscript` is the
+ * punctuation cleanup, and `userEditedTranscript` is the reviewed value when someone corrected it.
+ */
+export interface MediaJob {
+  id: string;
+  mediaId: string;
+  kind: string;
+  stage:
+    | "queued"
+    | "transcribing"
+    | "normalizing"
+    | "review_required"
+    | "ready"
+    | "dispatching"
+    | "dispatched"
+    | "failed"
+    | string;
+  provider?: string | null;
+  model?: string | null;
+  language?: string | null;
+  rawTranscript?: string | null;
+  normalizedTranscript?: string | null;
+  userEditedTranscript?: string | null;
+  attempts?: number;
+  maxAttempts?: number;
+  reviewRequired?: boolean;
+  lastError?: string | null;
+  failureKind?: "retryable" | "terminal" | null;
+  timings?: Record<string, string | number | null>;
+  /**
+   * What the cleanup did to the raw transcript, computed by the gateway on every read.
+   *
+   * `contentPreserved: false` means normalisation moved letters rather than only spacing,
+   * punctuation and case. The job then parks at `review_required` whatever the configuration
+   * says, and the change is shown as a diff rather than applied on the speaker's behalf.
+   */
+  transcriptChange?: {
+    changed: boolean;
+    contentPreserved: boolean;
+    rawLength: number;
+    normalizedLength: number;
+    firstDivergenceIndex: number | null;
+  } | null;
+  createdAt?: string;
+  updatedAt?: string;
+}
+
 export interface AuditEvent {
   id?: string;
   action: string;

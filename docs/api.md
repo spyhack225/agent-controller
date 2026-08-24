@@ -532,7 +532,9 @@ content-type: application/json
 }
 ```
 
-Request transcription for an uploaded audio file:
+### Transcription jobs
+
+Transcription is a durable background job, not something the request waits on. Enqueue one:
 
 ```http
 POST /v1/media/media_.../transcribe
@@ -544,7 +546,146 @@ content-type: application/json
 {}
 ```
 
-When `TRANSCRIPTION_PROVIDER=mock`, this returns a deterministic development transcript and marks the media as `processing.transcriptionStatus: "ready"` with `transcriptSource: "mock"`. If no provider is configured, the route returns `409` and marks the media as `unavailable`.
+Answers `202` with `{ "job": {...}, "media": {...} }`. The job is picked up by the gateway's media
+job worker, which survives a restart: an in-flight job is held by a lease and, once that lease
+lapses, any worker may resume it from the evidence already stored. Enqueueing twice while a job is
+unfinished returns the same job rather than starting a second one.
+
+If no provider is configured the route still refuses synchronously with `409` and marks the media
+`unavailable` — queueing work that would fail identically on every attempt only hides the error.
+
+Stages:
+
+```text
+queued -> transcribing -> normalizing -> review_required | ready -> dispatching -> dispatched
+                                                                                   failed
+```
+
+`dispatched` means the finished transcript has been written onto the media record, which is what an
+`audio_prompt` reads. `dispatched` and `failed` are terminal and are never re-claimed.
+
+The job keeps transcript **versions**, not one overwritten string:
+
+| Field | Meaning |
+|---|---|
+| `rawTranscript` | Exactly what the ASR provider returned, whitespace included. Immutable once written. |
+| `normalizedTranscript` | Punctuation and spacing cleanup. Immutable once written. |
+| `userEditedTranscript` | The reviewed value, when a person corrected it. Writable. |
+
+Plus `provider`, `model`, `language`, `attempts` / `maxAttempts`, `lastError`, `failureKind`
+(`retryable` or `terminal`), a `timings` map, and the lease fields. The last version present wins:
+user-edited, else normalized, else raw.
+
+A retryable failure (timeout, 429, 5xx, unreadable bytes) returns the job to `queued` and costs one
+attempt; a terminal one (no provider, missing key, 4xx, empty result) fails immediately rather than
+spending the budget on an answer that will not change.
+
+Read jobs:
+
+```http
+GET /v1/media/jobs?mediaId=media_...&stage=queued
+GET /v1/media/jobs/mjob_...
+authorization: Bearer PLATFORM_TOKEN
+```
+
+With `TRANSCRIPTION_REVIEW_REQUIRED=1` a finished transcript parks at `review_required` instead of
+being applied. Accepting or correcting it records the reviewed version and re-arms dispatch:
+
+```http
+POST /v1/media/jobs/mjob_.../transcript
+authorization: Bearer PLATFORM_TOKEN
+content-type: application/json
+```
+
+```json
+{
+  "transcript": "Deploy the staging branch."
+}
+```
+
+Refused with `409` unless the job is at `review_required`, `ready` or `dispatched`.
+
+Stage changes are pushed on `/v1/events` as `media.job`, carrying the `milestone` below alongside
+the stage so a console and a controller never disagree about where a capture got to. Worker settings:
+`TRANSCRIPTION_WORKER_ENABLED`, `TRANSCRIPTION_WORKER_INTERVAL_MS`, `TRANSCRIPTION_BATCH_SIZE`,
+`TRANSCRIPTION_LEASE_MS`, `TRANSCRIPTION_MAX_ATTEMPTS`, `TRANSCRIPTION_LANGUAGE`.
+
+Reading a job also returns a computed `transcriptChange`:
+
+```json
+{
+  "changed": true,
+  "contentPreserved": true,
+  "rawLength": 56,
+  "normalizedLength": 52,
+  "firstDivergenceIndex": null
+}
+```
+
+Cleanup may move spacing, punctuation and case and nothing else. `contentPreserved` compares the
+letters and digits of the two versions with everything else stripped out; when it is `false`
+something rewrote what the speaker said, so the job parks at `review_required` whatever
+`TRANSCRIPTION_REVIEW_REQUIRED` says and the change is shown as a diff rather than dispatched as a
+command. `rawTranscript` is kept verbatim either way.
+
+### The parakeet sidecar
+
+`TRANSCRIPTION_PROVIDER=parakeet` talks to a small local ASR service running
+`nvidia/parakeet-tdt-0.6b-v2`. The gateway never imports Python and never blocks its event loop on
+inference: it POSTs the clip over HTTP and waits on a socket, exactly as it does for a hosted API.
+CPU inference is the supported default and a GPU is only an accelerator, which is why the timeout
+defaults to minutes and concurrency to one.
+
+| Variable | Default | Meaning |
+|---|---|---|
+| `PARAKEET_URL` | `http://127.0.0.1:8977/v1/transcribe` | The sidecar endpoint. |
+| `PARAKEET_MODEL` | `nvidia/parakeet-tdt-0.6b-v2` | Checkpoint the sidecar should load. |
+| `PARAKEET_API_KEY` | unset | Only needed when the sidecar sits behind an authenticated hop. |
+| `PARAKEET_TIMEOUT_MS` | `120000` | A long clip on CPU takes far more than a hosted API would. |
+| `PARAKEET_MAX_CLIP_SECONDS` | `120` | Clip ceiling; inference cost scales with audio length. |
+| `PARAKEET_LANGUAGE` | `PARAKEET_LANGUAGE` → `TRANSCRIPTION_LANGUAGE` → `en` | Declared on every request, never detected. |
+| `PARAKEET_CONCURRENCY` | `1` | How many clips may be inside the sidecar at once. |
+| `PARAKEET_ACCEPTED_CONTENT_TYPES` | `audio/wav,audio/webm,audio/ogg,audio/mp4` | Containers the sidecar's decoder can open. |
+
+**Containers.** Browser capture arrives as WebM/Opus (Chrome, Firefox) or MP4/AAC (Safari); a
+controller uploads 16 kHz mono WAV, which needs no decoding at all. Anything outside the accepted
+list is refused by the adapter, with the list in the message, rather than posted and returned as an
+opaque 4xx. A WAV's length is read from its own header, so an over-long clip is refused before any
+inference is paid for; a compressed container's length is enforced by the sidecar, which is why
+`max_clip_seconds` is sent with every request.
+
+**Language.** v2 is an English model. Pointing it at another language does not produce that
+language, it produces confident English-shaped nonsense — so a language the configured checkpoint
+cannot speak is refused as the configuration error it is. Another language means a different
+`PARAKEET_MODEL`, not this one trying harder.
+
+**The request** is `multipart/form-data` with `model`, `language`, `max_clip_seconds`, the `file`,
+and `sample_rate` / `channels` when they are already known from a WAV header. A successful response
+is JSON:
+
+```json
+{
+  "text": "Deploy the staging branch.",
+  "model": "nvidia/parakeet-tdt-0.6b-v2",
+  "language": "en",
+  "duration_seconds": 4.0,
+  "timings": { "decode_ms": 24, "inference_ms": 2000 }
+}
+```
+
+`camelCase` and `snake_case` keys are both read. A non-2xx quotes the sidecar's own `error`,
+`detail` or `message` back in `lastError`; `408`, `425`, `429` and `5xx` are retryable, everything
+else is terminal. A timeout or an unreachable sidecar is retryable, because a restart looks
+identical to an outage.
+
+**Timings.** A finished job's `timings` map carries `queueWaitMs` (row queued to worker pickup),
+`gateWaitMs` (waiting for a sidecar slot), `decodeMs` and `inferenceMs` (reported by the sidecar),
+`providerMs` (the round trip), `normalizeMs`, and `totalMs`. When the sidecar reports the clip
+length, `realtimeFactor` is seconds of compute per second of audio — above `1.0` the box cannot
+keep up with speech in real time, which is the number that decides whether a GPU is worth adding.
+
+The audio itself is never consumed: a transcript is a derived artefact and `GET /v1/media/media_...`
+keeps returning the original bytes for as long as retention allows.
 
 Reference the `media.id` from an audio or camera prompt:
 
@@ -587,6 +728,99 @@ authorization: Bearer PLATFORM_TOKEN
 Deleting media removes the stored file bytes and hides the upload from future media lists. Existing command audit records keep redacted metadata only.
 
 Media responses include `expiresAt`. New uploads use the user's privacy retention setting. `expiresAt: null` means the capture is kept until manual deletion.
+
+### The device voice loop
+
+Audio uploaded by a device is queued for transcription automatically — nothing has to ask for it.
+The response carries the one identifier the controller needs:
+
+```json
+{
+  "media": { "id": "media_...", "kind": "audio", "processing": { "transcriptionStatus": "processing" } },
+  "job": {
+    "jobId": "mjob_...",
+    "mediaId": "media_...",
+    "milestone": "transcribing",
+    "label": "Transcribing",
+    "done": false,
+    "ok": true,
+    "transcript": null,
+    "autoSend": false,
+    "commandId": null,
+    "updatedAt": "2026-02-01T10:15:00.000Z"
+  }
+}
+```
+
+`job` is `null` when the upload was an image, or when no transcription provider is configured — the
+upload still succeeds and the media is marked `unavailable`. The capture pins the `environmentId`
+and `threadId` the controller was pointed at (from the body, else from the device config), so a
+delayed transcript reaches the thread the owner was talking to rather than whichever one is
+selected by the time the worker runs.
+
+Poll one endpoint:
+
+```http
+GET /v1/device/media/jobs/mjob_...
+x-device-id: dev_...
+x-device-secret: ...
+```
+
+Answers `404` unless the job was recorded by *this* device. Two controllers on one account are two
+microphones in two rooms, and the transcript is in the response.
+
+The reply is the projection above and nothing else — stages, leases, attempt counts, provider names
+and timings stay on the owner-facing `/v1/media/jobs/:id`. Milestones:
+
+| Milestone | Meaning |
+|---|---|
+| `recorded` | Device-local. Capture finished, upload not started. |
+| `uploading` | Device-local. Bytes in flight. |
+| `transcribing` | Queued or being transcribed. |
+| `review` | Waiting on a person: review was configured, cleanup altered the wording, or policy asked for approval. |
+| `ready` | Transcript is on the media record and waiting. Auto-send is off. |
+| `sent` | Dispatched to the agent; `commandId` names the command. |
+| `failed` | Transcription failed, or the send was refused. `error` says which. |
+
+`done` is true for every milestone that stops the polling; `ok` is false only for `failed`.
+
+### Auto-send
+
+A finished transcript **waits** by default. Sending it on is a per-device grant the owner issues:
+
+```http
+PUT /v1/devices/dev_.../voice-auto-send
+authorization: Bearer PLATFORM_TOKEN
+content-type: application/json
+```
+
+```json
+{ "enabled": true }
+```
+
+Answers `{ "device": {...}, "voiceAutoSend": { "enabled": true, "enabledBy": "user_...", "enabledAt": "..." } }`.
+`GET` on the same path reads it. Turning it off clears `enabledBy`/`enabledAt` rather than leaving a
+name on a permission nobody holds. There is deliberately no account-wide switch: auto-send is a
+trust decision about one microphone in one room, and a controller claimed later must not inherit it.
+
+Owner realm only — a device cannot widen its own licence to act on what it hears.
+
+The grant, the device, and the **policy** are all read at the moment of dispatch, never at enqueue.
+A capture that sat in the queue while the owner tightened the device profile, revoked the device, or
+turned auto-send back off is judged by the newer rules. When auto-send is on, the transcript goes
+out through the ordinary device intent path (`normalizeIntent` → `evaluateIntentPolicy` →
+`thread.turn.start`) with the recording attached, producing a normal command on the timeline
+credited to the device that recorded it.
+
+A refusal is not a transcription failure. The transcript is written to the media record either way;
+only the send is declined, and the job records that separately:
+
+| Field | Meaning |
+|---|---|
+| `dispatchStatus` | `null` (never attempted), `sent`, `approval_required`, `blocked` (policy), `failed`. |
+| `dispatchError` | Why the send did not go. Distinct from `lastError`, which is why transcription did not. |
+| `commandId` | The command the transcript became, when one was created. |
+| `autoSend` | The decision the worker actually acted on. |
 
 ## Privacy Settings
 
