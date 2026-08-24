@@ -2,6 +2,8 @@
 
 #include <esp_heap_caps.h>
 
+#include <OrbPainter.h>
+
 #ifndef DISPLAY_FRAME_PROBE
 #define DISPLAY_FRAME_PROBE 0
 #endif
@@ -210,108 +212,10 @@ void displayDrawOrb(ThinkingOrb& orb, int16_t cx, int16_t cy, uint32_t elapsedMs
   const int16_t h = orbDim;
   const int16_t mid = w / 2;
 
-  memset(orbGrey, 0, (size_t)w * h);
-
-  // Edges first, so nodes sit on top of their own links.
-  //
-  // Walked along the segment rather than rasterised over its bounding box. A near-diagonal edge
-  // fills a box that is almost entirely empty, and at 30 nodes the constellation can have a hundred
-  // of them — that approach measured 41 ms a frame against a 33 ms budget. Walking makes the cost
-  // proportional to length instead of area.
-  for (uint16_t i = 0; i < frame.lineCount; ++i) {
-    const OrbLine& L = frame.lines[i];
-    const float ax = mid + L.x16a / 16.0f, ay = mid + L.y16a / 16.0f;
-    const float bx = mid + L.x16b / 16.0f, by = mid + L.y16b / 16.0f;
-    const float ink = L.ink * (L.alpha / 255.0f);
-    if (ink < 1.0f) continue;
-
-    const float ex = bx - ax, ey = by - ay;
-    const float len = sqrtf(ex * ex + ey * ey);
-    if (len < 0.5f) continue;
-
-    const int steps = (int)ceilf(len);
-    const float sx = ex / steps, sy = ey / steps;
-
-    for (int st = 0; st <= steps; ++st) {
-      const float cxp = ax + sx * st;
-      const float cyp = ay + sy * st;
-      const int16_t bx0 = (int16_t)floorf(cxp - 1.0f);
-      const int16_t by0 = (int16_t)floorf(cyp - 1.0f);
-
-      // A 3x3 neighbourhood is enough for a hairline: anything wider is a stroke width this design
-      // never uses.
-      for (int16_t py = by0; py <= by0 + 2; ++py) {
-        if (py < 0 || py >= h) continue;
-        uint8_t* row = orbGrey + (size_t)py * w;
-        for (int16_t px = bx0; px <= bx0 + 2; ++px) {
-          if (px < 0 || px >= w) continue;
-          const float dx = (px + 0.5f) - cxp, dy = (py + 0.5f) - cyp;
-          const float d2 = dx * dx + dy * dy;
-          if (d2 >= 1.0f) continue;         // outside the hairline; no sqrt needed
-          float cov = 1.0f - sqrtf(d2);
-          if (cov <= 0.0f) continue;
-          const uint8_t v = (uint8_t)(ink * cov);
-          if (v > row[px]) row[px] = v;
-        }
-      }
-    }
-  }
-
-  // Anti-aliased splat, in 8-bit coverage rather than colour.
-  //
-  // Each dot contributes brightness proportional to how much of the pixel it actually covers, so a
-  // dot drifting across a pixel boundary fades over rather than jumping. That is the whole
-  // difference between "rotating sphere" and "twitching dots", and it is only possible because the
-  // renderer now hands over sixteenths of a pixel instead of rounded integers.
-  //
-  // Overlap takes the maximum, not a sum: the dots are one colour on one ground, so adding would
-  // blow out crossings into blobs, and the painter's far-to-near order already decides what should
-  // read as being in front.
-  for (uint16_t i = 0; i < frame.count; ++i) {
-    const OrbDot& d = frame.dots[i];
-
-    const float fx = mid + d.x16 / 16.0f;
-    const float fy = mid + d.y16 / 16.0f;
-    const float r = d.r16 / 16.0f;
-    // Alpha folds into coverage: the ground is uniform, so a half-transparent dot and a
-    // half-covered pixel are indistinguishable here, and one multiply is cheaper than a blend.
-    const float ink = d.ink * (d.alpha / 255.0f);
-
-    // Coverage falls off over one pixel at the rim. Wider looks blurred; narrower reintroduces the
-    // hard edge that was aliasing in the first place.
-    const float outer = r + 0.5f;
-    const float outer2 = outer * outer;
-    const float innerEdge = r - 0.5f;
-    const float inner2 = innerEdge > 0.0f ? innerEdge * innerEdge : 0.0f;
-    const int16_t x0 = (int16_t)floorf(fx - outer);
-    const int16_t x1 = (int16_t)ceilf(fx + outer);
-    const int16_t y0 = (int16_t)floorf(fy - outer);
-    const int16_t y1 = (int16_t)ceilf(fy + outer);
-
-    for (int16_t py = y0; py <= y1; ++py) {
-      if (py < 0 || py >= h) continue;
-      const float dy = (py + 0.5f) - fy;
-      const float dy2 = dy * dy;
-      uint8_t* row = orbGrey + (size_t)py * w;
-      for (int16_t px = x0; px <= x1; ++px) {
-        if (px < 0 || px >= w) continue;
-        const float dx = (px + 0.5f) - fx;
-        const float d2 = dx * dx + dy2;
-        // Reject on squared distance first. The bounding box corners are always outside the disc,
-        // so roughly a fifth of every dot's pixels were paying for a sqrt only to be discarded.
-        if (d2 >= outer2) continue;
-        // Fully-interior pixels are opaque and need no distance at all — for anything but the
-        // smallest dots that is most of them.
-        float cov = 1.0f;
-        if (d2 > inner2) cov = outer - sqrtf(d2);
-        if (cov <= 0.0f) continue;
-        if (cov > 1.0f) cov = 1.0f;
-
-        const uint8_t v = (uint8_t)(ink * cov);
-        if (v > row[px]) row[px] = v;
-      }
-    }
-  }
+  // Rasterised by the shared painter, so this board and every other draw the identical orb. An
+  // e-paper controller and an AMOLED one should be recognisably the same product, which they will
+  // not be if each grows its own rasteriser.
+  paintOrbCoverage(frame, orbGrey, w);
 
   // Convert a row at a time straight into the DMA staging buffer. The 8-bit coverage buffer is half
   // the RAM of the RGB565 canvas it replaces, and the colour conversion has to happen on the way

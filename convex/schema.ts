@@ -76,6 +76,7 @@ export default defineSchema({
     userExternalId: v.optional(v.string()),
     label: v.string(),
     profile: v.string(),
+    hardwareModel: v.optional(v.union(v.string(), v.null())),
     secretHash: v.string(),
     claimCodeHash: v.optional(v.string()),
     claimCodeExpiresAt: v.optional(v.string()),

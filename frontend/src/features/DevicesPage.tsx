@@ -57,6 +57,7 @@ import type {
   DeviceGatewaySwitch,
   DeviceProfile,
   GatewayProfile,
+  HardwareBoard,
   SavedAction,
 } from "../types";
 import {
@@ -82,6 +83,12 @@ interface CredentialResult {
   device: Device;
   secret?: string;
   claimCode?: string;
+  /**
+   * Returned by POST /v1/factory/devices. A correct NVS seed still produces a dead device when the
+   * wrong image is on it, and there is now one firmware image per board — so the completion screen
+   * has to name which one.
+   */
+  board?: HardwareBoard;
 }
 
 const FALLBACK_PROFILES: DeviceProfile[] = [
@@ -119,7 +126,7 @@ const FLOW_COPY: Record<DeviceOnboardingFlow, {
     introTitle: "Create an identity before the device ships",
     intro: "Issue a hardware credential and single-use claim code. The controller stays unowned until its recipient claims it.",
     accent: "Factory identity",
-    steps: ["Purpose", "Identity", "Review"],
+    steps: ["Purpose", "Board", "Identity", "Review"],
   },
   register: {
     title: "Register a controller",
@@ -588,6 +595,10 @@ function OnboardingDialog({
   const [claimCode, setClaimCode] = useState("");
   const [environmentId, setEnvironmentId] = useState("");
   const [threadId, setThreadId] = useState("");
+  // Empty means "whatever the gateway calls the default". The catalogue arrives asynchronously, so
+  // holding an explicit pick separately from the default keeps a late response from clobbering a
+  // choice the operator already made.
+  const [boardChoice, setBoardChoice] = useState("");
   const [result, setResult] = useState<CredentialResult | null>(null);
 
   useEffect(() => {
@@ -598,13 +609,20 @@ function OnboardingDialog({
     setClaimCode("");
     setEnvironmentId(c.selectedEnvironmentId ?? "");
     setThreadId(c.selectedThreadId ?? "");
+    setBoardChoice("");
     setResult(null);
   }, [flow]);
 
   if (!flow) return null;
   const copy = FLOW_COPY[flow];
+  const boards = c.hardwareBoards ?? [];
+  const boardId = boardChoice || c.defaultHardwareBoard || boards[0]?.id || "";
+  const selectedBoard = boards.find((board) => board.id === boardId) ?? null;
+  const stepName = copy.steps[step];
   const isLastStep = step === copy.steps.length - 1;
-  const valid = step !== 1 || (flow === "claim" ? Boolean(claimCode.trim()) : Boolean(label.trim()));
+  const valid = stepName === "Identity"
+    ? Boolean(label.trim())
+    : stepName === "Claim code" ? Boolean(claimCode.trim()) : true;
 
   const configure = async (deviceId: string) => {
     if (!environmentId && !threadId) return;
@@ -622,10 +640,17 @@ function OnboardingDialog({
     const created = await c.run(action, success, async () => {
       let next: CredentialResult;
       if (flow === "preprovision") {
-        const response = await c.api<{ device: Device; secret: string; claimCode: string }>("/v1/factory/devices", {
+        const response = await c.api<{
+          device: Device;
+          secret: string;
+          claimCode: string;
+          board?: HardwareBoard;
+        }>("/v1/factory/devices", {
           method: "POST",
           auth: false,
-          body: { label: label.trim(), profile },
+          body: boardId
+            ? { label: label.trim(), profile, hardwareModel: boardId }
+            : { label: label.trim(), profile },
         });
         next = response;
       } else if (flow === "register") {
@@ -689,15 +714,22 @@ function OnboardingDialog({
         <>
           <FlowStepper steps={copy.steps} current={step} />
           <div className="device-flow__body">
-            {step === 0 ? <FlowIntro flow={flow} copy={copy} /> : null}
-            {step === 1 ? (
-              flow === "claim" ? (
-                <ClaimFields claimCode={claimCode} label={label} onClaimCode={setClaimCode} onLabel={setLabel} />
-              ) : (
-                <IdentityFields label={label} profile={profile} profiles={profiles} onLabel={setLabel} onProfile={setProfile} />
-              )
+            {stepName === "Purpose" || stepName === "Prepare" ? <FlowIntro flow={flow} copy={copy} /> : null}
+            {stepName === "Board" ? (
+              <BoardFields
+                boards={boards}
+                value={boardId}
+                defaultBoardId={c.defaultHardwareBoard ?? null}
+                onChange={setBoardChoice}
+              />
             ) : null}
-            {(flow === "register" || flow === "claim") && step === 2 ? (
+            {stepName === "Claim code" ? (
+              <ClaimFields claimCode={claimCode} label={label} onClaimCode={setClaimCode} onLabel={setLabel} />
+            ) : null}
+            {stepName === "Identity" ? (
+              <IdentityFields label={label} profile={profile} profiles={profiles} onLabel={setLabel} onProfile={setProfile} />
+            ) : null}
+            {stepName === "Defaults" ? (
               <DefaultFields
                 controller={c}
                 environmentId={environmentId}
@@ -714,6 +746,8 @@ function OnboardingDialog({
                 claimCode={claimCode}
                 environmentId={environmentId}
                 threadId={threadId}
+                board={selectedBoard}
+                boardId={boardId}
               />
             ) : null}
           </div>

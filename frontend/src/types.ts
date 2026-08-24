@@ -366,6 +366,37 @@ export interface DeviceConfig {
   menu?: string[];
 }
 
+/**
+ * One entry from `GET /v1/hardware/boards`. The four supported boards are not interchangeable —
+ * they differ in display, input, and whether they have a microphone at all — so pre-provisioning
+ * has to say which one it is stamping, and the operator flashing the unit needs its firmware
+ * environment. `maturity` is deliberately part of the shape: only one board has a firmware
+ * validated end to end, and hiding that from whoever is stamping hardware would be dishonest.
+ */
+export interface HardwareBoard {
+  id: string;
+  label: string;
+  vendor?: string | null;
+  firmwareEnv?: string | null;
+  firmwareDir?: string | null;
+  display?: {
+    kind?: string | null;
+    width?: number | null;
+    height?: number | null;
+    colors?: number | null;
+  } | null;
+  input?: {
+    touch?: boolean;
+    keys?: number | null;
+  } | null;
+  audio?: {
+    microphone?: boolean;
+    speaker?: boolean;
+  } | null;
+  camera?: boolean;
+  maturity?: "complete" | "bring-up" | "scaffold" | "unknown" | string;
+}
+
 export interface DeviceStatus {
   lastHeartbeatAt?: string | null;
   firmwareVersion?: string | null;
@@ -388,6 +419,11 @@ export interface Device {
   id: string;
   label: string;
   profile: string;
+  /**
+   * The board this unit was stamped as at pre-provision. Absent on devices created before the
+   * catalogue existed, which is why nothing here invents a value when it is missing.
+   */
+  hardwareModel?: string | null;
   claimed?: boolean;
   revokedAt?: string | null;
   lastSeenAt?: string | null;

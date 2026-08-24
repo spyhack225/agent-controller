@@ -279,7 +279,7 @@ export function createStore(seed = {}, options = {}) {
     return { device: publicDevice(device), secret };
   }
 
-  function preprovisionDevice({ label, profile = "agent-controller" }) {
+  function preprovisionDevice({ label, profile = "agent-controller", hardwareModel = null }) {
     const secret = createSecret();
     const claimCode = createHumanCode();
     const device = {
@@ -287,6 +287,10 @@ export function createStore(seed = {}, options = {}) {
       userId: null,
       label,
       profile,
+      // Stamped at pre-provision because it is a property of the physical unit, not of whoever
+      // ends up owning it. An OTA release targets this, and the console uses it to say which
+      // firmware image to flash — of which there is now one per board.
+      hardwareModel,
       secretHash: hashSecret(secret),
       claimCodeHash: hashSecret(normalizeClaimCode(claimCode)),
       claimCodeExpiresAt: claimCodeExpiryFrom(Date.now()),
@@ -304,7 +308,7 @@ export function createStore(seed = {}, options = {}) {
       actorType: "system",
       action: "device.preprovisioned",
       targetId: device.id,
-      metadata: { label, profile },
+      metadata: { label, profile, hardwareModel },
     });
     notifyChanged();
     return { device: publicDevice(device), secret, claimCode };

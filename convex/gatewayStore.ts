@@ -330,6 +330,7 @@ export const preprovisionDevice = gatewayMutation({
   args: {
     label: v.string(),
     profile: v.optional(v.string()),
+    hardwareModel: v.optional(v.union(v.string(), v.null())),
     secretHash: v.string(),
     claimCodeHash: v.string(),
     claimCodeExpiresAt: v.optional(v.string()),
@@ -338,6 +339,9 @@ export const preprovisionDevice = gatewayMutation({
     const id = await ctx.db.insert("devices", {
       label: args.label,
       profile: args.profile ?? "agent-controller",
+      // A property of the physical unit, stamped at pre-provision: an OTA release targets it and
+      // the console uses it to name which firmware image belongs on this board.
+      hardwareModel: args.hardwareModel ?? null,
       secretHash: args.secretHash,
       claimCodeHash: args.claimCodeHash,
       claimCodeExpiresAt: args.claimCodeExpiresAt,

@@ -19,6 +19,7 @@ import type {
   Environment,
   EnvironmentFailure,
   EnvironmentFailureReason,
+  HardwareBoard,
   JsonRecord,
   Macro,
   MediaItem,
@@ -204,6 +205,10 @@ export function useController({ authConfig, clerk }: UseControllerOptions) {
   });
 
   const [deviceProfiles, setDeviceProfiles] = useState<DeviceProfile[]>([]);
+  // The board catalogue is static for the life of a gateway build, so it is fetched once on mount
+  // rather than joining refreshAll — that is already twelve parallel requests against a rate limit.
+  const [hardwareBoards, setHardwareBoards] = useState<HardwareBoard[]>([]);
+  const [defaultHardwareBoard, setDefaultHardwareBoard] = useState<string | null>(null);
   const [environments, setEnvironments] = useState<Environment[]>([]);
   const [projects, setProjects] = useState<T3Project[]>([]);
   const [threads, setThreads] = useState<T3Thread[]>([]);
@@ -482,6 +487,28 @@ export function useController({ authConfig, clerk }: UseControllerOptions) {
       }
     }
     void loadProfiles();
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
+  useEffect(() => {
+    let cancelled = false;
+    async function loadHardwareBoards() {
+      try {
+        const result = await requestJson<{ boards: HardwareBoard[]; defaultBoard: string | null }>(
+          "/v1/hardware/boards",
+          { auth: false },
+        );
+        if (cancelled) return;
+        setHardwareBoards(result.boards ?? []);
+        setDefaultHardwareBoard(result.defaultBoard ?? result.boards?.[0]?.id ?? null);
+      } catch {
+        // Non-fatal: the catalogue only decorates pre-provisioning. Failing loudly here would put a
+        // danger banner in front of every signed-out visitor on a gateway too old to serve it.
+      }
+    }
+    void loadHardwareBoards();
     return () => {
       cancelled = true;
     };
@@ -817,6 +844,8 @@ export function useController({ authConfig, clerk }: UseControllerOptions) {
     lastResult,
     setLastResult,
     deviceProfiles,
+    hardwareBoards,
+    defaultHardwareBoard,
     environments,
     projects,
     threads,

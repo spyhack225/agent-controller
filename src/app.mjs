@@ -2,6 +2,8 @@ import { createHash, createHmac, timingSafeEqual } from "node:crypto";
 import { readFile } from "node:fs/promises";
 import { createServer } from "node:http";
 import { hostname } from "node:os";
+
+import { DEFAULT_HARDWARE_BOARD, HARDWARE_BOARDS, describeHardwareBoard } from "./hardware.mjs";
 import { dirname, extname, join, resolve, sep } from "node:path";
 import { fileURLToPath } from "node:url";
 
@@ -199,6 +201,10 @@ export function createApp({
       // from /health. Its job is to let a controller CONFIRM that a candidate address is a gateway
       // — after a UDP discovery reply, or after the owner typed something — before it commits the
       // URL to NVS and reboots into it.
+      if (req.method === "GET" && url.pathname === "/v1/hardware/boards") {
+        return sendJson(res, 200, { boards: HARDWARE_BOARDS, defaultBoard: DEFAULT_HARDWARE_BOARD });
+      }
+
       if (req.method === "GET" && url.pathname === "/v1/discovery") {
         return sendJson(res, 200, {
           service: "agent-controller",
@@ -331,9 +337,13 @@ export function createApp({
         await enforceFactoryWrite(req, res, rateLimiter, config);
         const body = await readJson(req);
         const profile = requireDeviceProfile(body.profile);
+        // Defaults to the CrowPanel because it is the one board with a firmware validated end to
+        // end; an unspecified model should mean the proven one, not an arbitrary one.
+        const hardwareModel = optionalString(body.hardwareModel) ?? DEFAULT_HARDWARE_BOARD;
         const result = await store.preprovisionDevice({
           label: requireString(body.label, "label"),
           profile,
+          hardwareModel,
         });
         const gatewayBaseUrl = optionalString(body.gatewayBaseUrl)
           ?? config.publicBaseUrl
@@ -351,7 +361,11 @@ export function createApp({
             gatewayBaseUrl,
             claimCode: result.claimCode,
             claimCodeExpiresAt: result.device.claimCodeExpiresAt,
+            hardwareModel,
           }),
+          // Whoever is flashing this unit needs to know WHICH image, now that there is one per
+          // board. Without it a correct seed still produces a dead device.
+          board: describeHardwareBoard(hardwareModel),
         });
       }
 

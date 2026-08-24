@@ -106,6 +106,7 @@ export function buildNvsSeedCsv({
   gatewayBaseUrl,
   claimCode,
   claimCodeExpiresAt,
+  hardwareModel,
 }) {
   if (!deviceId || !deviceSecret) {
     throw new Error("buildNvsSeedCsv requires deviceId and deviceSecret.");
@@ -117,6 +118,10 @@ export function buildNvsSeedCsv({
     `dev_secret,data,string,${csvValue(deviceSecret)}`,
   ];
   if (gatewayBaseUrl) rows.push(`gw_url,data,string,${csvValue(gatewayBaseUrl)}`);
+  // NVS keys are capped at 15 characters, hence hw_model. Seeding it means a unit reports the board
+  // it actually is rather than whatever the image it happens to be running was compiled for — which
+  // is the difference between a mis-flashed unit that says so and one that lies.
+  if (hardwareModel) rows.push(`hw_model,data,string,${csvValue(hardwareModel)}`);
   if (claimCode) {
     rows.push(`claim_code,data,string,${csvValue(claimCode)}`);
     if (claimCodeExpiresAt) rows.push(`claim_exp,data,string,${csvValue(claimCodeExpiresAt)}`);
