@@ -355,3 +355,22 @@ prototype shared-key HMAC); on-device claim QR rendering.
 - **Claim code TTL.** 30 days is a guess. It should outlive warehouse-to-customer transit; if units
   sit in retail inventory longer, the code has to be refreshable from the device menu without the
   owner having claimed it first — which the phase 1 `rotate: true` path already allows.
+
+## Recovering a device
+
+Three escalating recoveries, all on the single BOOT key, because that is the only button firmware
+can read — RESET is wired to the chip's reset line.
+
+| Action | Effect | When |
+|---|---|---|
+| **Tap BOOT** | Re-opens the setup portal without wiping anything | A wrong gateway URL, or moving the device to a different gateway |
+| **Hold BOOT ~1 s** (capture builds) | Push-to-talk recording | Normal use |
+| **Hold BOOT 10 s** | Wipes Wi-Fi credentials and re-enters provisioning | House move, resale, revoked device |
+
+The tap exists because the portal closes the moment Wi-Fi joins. Before it, a typo in the gateway
+URL left the device online, unable to reach any gateway, and recoverable only by the 10-second wipe
+— which also destroyed Wi-Fi credentials the owner had no reason to lose.
+
+In the reopened portal the network dropdown offers **Keep &lt;current SSID&gt;** as its first entry.
+Choosing that and pressing Save updates only the gateway and rejoins the known-good network, so a
+URL correction never becomes a second chance to mistype a Wi-Fi password.
