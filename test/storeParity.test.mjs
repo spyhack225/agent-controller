@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import { readFile } from "node:fs/promises";
+import { pathToFileURL } from "node:url";
 import { dirname, join } from "node:path";
 import test from "node:test";
 import { fileURLToPath } from "node:url";
@@ -235,11 +236,38 @@ test("every Convex function the adapter maps actually exists", async () => {
   const exported = new Set(
     [...convex.matchAll(/export const (\w+) = gateway(?:Query|Mutation)/gu)].map((match) => match[1]),
   );
-  assert.ok(mapped.length > 40, "the adapter's function table looks truncated.");
+  // Was `> 40` when the table held roughly that many. It has since grown past ninety, so the
+  // sentinel stopped being able to notice a table that had lost half its entries.
+  assert.ok(mapped.length > 85, "the adapter's function table looks truncated.");
   assert.deepEqual(
     mapped.filter((name) => !exported.has(name)),
     [],
     "src/convexStore.mjs maps a gatewayStore function that convex/gatewayStore.ts does not export.",
+  );
+});
+
+test("every store method exists on the Convex adapter", async () => {
+  // CLAUDE.md's rule is that adding a store method means touching all three implementations, and
+  // this is the case that rule exists for: a method present only on the memory store passes the
+  // whole suite, because every test runs against memory, and then throws "not a function" the
+  // first time a Convex deployment reaches it. Nothing here checked that until now — the previous
+  // test only checks the reverse direction, that mapped names exist in Convex.
+  const { createStore } = await import(pathToFileURL(join(ROOT, "src", "store.mjs")).href);
+  const adapter = await readFile(join(ROOT, "src", "convexStore.mjs"), "utf8");
+
+  const memoryMethods = Object.entries(createStore())
+    .filter(([, value]) => typeof value === "function")
+    .map(([name]) => name);
+
+  // The adapter defines its surface as `name(...)` or `name: async (...)` or via the mapped
+  // function table; a method it never names cannot be reachable.
+  const missing = memoryMethods.filter((name) => !new RegExp(`\\b${name}\\b`, "u").test(adapter));
+
+  assert.deepEqual(
+    missing,
+    [],
+    `src/store.mjs exposes methods that src/convexStore.mjs never names, so they throw under `
+      + `STORAGE_PROVIDER=convex: ${missing.join(", ")}`,
   );
 });
 

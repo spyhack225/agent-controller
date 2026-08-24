@@ -398,6 +398,12 @@ function emptyState() {
     deviceControls: [],
     macroRuns: [],
     commands: [],
+    // Present in the memory store's exportState(); omitting them here handed callers `undefined`
+    // where every other collection gives an empty array.
+    connectSessions: [],
+    mediaJobs: [],
+    deviceProfiles: [],
+    commandEvents: [],
     auditLogs: [],
   };
 }
