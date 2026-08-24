@@ -58,6 +58,13 @@ export function loadConfig(env = process.env) {
     // every existing deployment would silently drop to the free tier's 0-device, no-shell limits.
     billingEnforced: normalizeBoolean(env.BILLING_ENFORCED, false),
     otaSigningKey: env.OTA_SIGNING_KEY ?? null,
+    // Shown to a controller during LAN discovery so two gateways on one network are tellable
+    // apart. Defaults to the machine's hostname, which is what a person already calls it.
+    discoveryName: env.DISCOVERY_NAME ?? null,
+    // Discovery answers a broadcast from anything on the LAN, so it is opt-out for anyone who
+    // does not want that on their network. On by default: the whole point is that setup works
+    // without configuration.
+    discoveryEnabled: env.DISCOVERY_ENABLED !== "0",
     defaultHardwareModel: env.DEFAULT_HARDWARE_MODEL ?? "e213-esp32-s3r8",
     authProvider,
     devTokenCreationEnabled: normalizeBoolean(env.ENABLE_DEV_TOKENS, authProvider === "dev" || demoMode),

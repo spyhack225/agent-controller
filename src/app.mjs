@@ -1,6 +1,7 @@
 import { createHash, createHmac, timingSafeEqual } from "node:crypto";
 import { readFile } from "node:fs/promises";
 import { createServer } from "node:http";
+import { hostname } from "node:os";
 import { dirname, extname, join, resolve, sep } from "node:path";
 import { fileURLToPath } from "node:url";
 
@@ -191,6 +192,19 @@ export function createApp({
 
       if (req.method === "GET" && url.pathname === "/health") {
         return sendJson(res, 200, { ok: true, service: "agent-controller", demoMode: config.demoMode });
+      }
+
+      // Unauthenticated on purpose, and it says nothing a probe on the LAN could not already infer
+      // from /health. Its job is to let a controller CONFIRM that a candidate address is a gateway
+      // — after a UDP discovery reply, or after the owner typed something — before it commits the
+      // URL to NVS and reboots into it.
+      if (req.method === "GET" && url.pathname === "/v1/discovery") {
+        return sendJson(res, 200, {
+          service: "agent-controller",
+          name: config.discoveryName ?? hostname(),
+          authProvider: config.authProvider,
+          claimRequired: true,
+        });
       }
 
       if (req.method === "GET" && url.pathname === "/v1/auth/config") {

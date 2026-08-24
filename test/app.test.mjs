@@ -3357,3 +3357,19 @@ test("one owner cannot delete another owner's revoked device", async (t) => {
   const stillThere = await requestJson(originalFetch, baseUrl, "/v1/devices", { headers: owner });
   assert.equal(stillThere.devices.length, 1, "the owner's device survives a stranger's delete");
 });
+
+test("the discovery endpoint identifies the gateway without authentication", async (t) => {
+  // A controller has no credentials at the moment it needs this: it is deciding whether a
+  // candidate address, from a UDP reply or a typed URL, is a gateway at all.
+  const { server } = createApp();
+  await listen(server);
+  t.after(() => server.close());
+  const baseUrl = `http://127.0.0.1:${server.address().port}`;
+
+  const response = await fetch(`${baseUrl}/v1/discovery`);
+  assert.equal(response.status, 200);
+  const body = await response.json();
+  assert.equal(body.service, "agent-controller");
+  assert.equal(body.claimRequired, true);
+  assert.equal(typeof body.name, "string");
+});

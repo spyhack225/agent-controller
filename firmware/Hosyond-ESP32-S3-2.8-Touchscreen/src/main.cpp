@@ -17,6 +17,7 @@
 #include <WiFi.h>
 
 #include "display.h"
+#include "gatewayProbe.h"
 #include "touch.h"
 
 #ifndef ORB_BENCH
@@ -418,7 +419,23 @@ void reportState(ProvisioningState state) {
       setOrbState(OrbMode::Web, "Connecting", status.detail);
       break;
     case ProvisioningState::Online:
-      setOrbState(OrbMode::Ring, "Ready", WiFi.localIP().toString());
+      // "Ready" only if the gateway answers. Wi-Fi joining says nothing about whether the address
+      // the owner typed is real, and a device that claims to be ready while nothing works is worse
+      // than one that admits it does not know.
+      switch (gatewayStatus()) {
+        case GatewayStatus::Reachable:
+          setOrbState(OrbMode::Ring, "Ready", WiFi.localIP().toString());
+          break;
+        case GatewayStatus::Unreachable:
+          setOrbState(OrbMode::Web, "No gateway", "hold to fix the address");
+          break;
+        case GatewayStatus::BadResponse:
+          setOrbState(OrbMode::Web, "Wrong host", "hold to fix the address");
+          break;
+        default:
+          setOrbState(OrbMode::Web, "Checking", store.gatewayUrl());
+          break;
+      }
       break;
     case ProvisioningState::Failed:
       setOrbState(OrbMode::Ring, "Offline", status.detail);
@@ -619,6 +636,13 @@ void pollOrbBrowser() {
   const TouchGesture g = touchPoll();
   if (g == TouchGesture::None) return;
 
+  if (g == TouchGesture::LongPress) {
+    Serial.println("[provisioning] long press — opening the config portal.");
+    orbBrowsing = false;
+    provisioning.openConfigPortal();
+    return;
+  }
+
   if (g == TouchGesture::Tap && orbBrowsing) {
     orbBrowsing = false;
     Serial.println("[orb] browser off; following device state again");
@@ -708,6 +732,10 @@ void tickScreen() {
 
 }  // namespace
 
+// Handed to the gateway probe task, which runs outside this translation unit's anonymous
+// namespace and must not keep its own copy of the store.
+DeviceStore& deviceStore() { return store; }
+
 void setup() {
   Serial.begin(115200);
 
@@ -777,6 +805,7 @@ void setup() {
   Serial.println("[audio] Disabled. Build -e hosyond-es3c28p-capture to enable the microphone.");
 #endif
 
+  gatewayProbeBegin();
   provisioning.begin(store, store.deviceId());
   lastState = provisioning.status().state;
   reportState(lastState);
@@ -803,8 +832,20 @@ void loop() {
     reportState(state);
   }
 
+  // The gateway verdict arrives asynchronously, long after the provisioning state last changed,
+  // so the screen has to be driven by it too.
+  {
+    static GatewayStatus lastGateway = GatewayStatus::Unknown;
+    const GatewayStatus g = gatewayStatus();
+    if (g != lastGateway) {
+      lastGateway = g;
+      if (state == ProvisioningState::Online) reportState(state);
+    }
+  }
+
   if (provisioning.consumeJustConnected()) {
     Serial.println("[provisioning] joined — the gateway handshake would run here.");
+    gatewayProbeNow();
   }
 
 #if ENABLE_AUDIO_CAPTURE

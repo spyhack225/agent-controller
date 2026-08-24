@@ -2,6 +2,7 @@ import { createApp } from "./app.mjs";
 import { loadConfig } from "./config.mjs";
 import { createRateLimiter, createRedisBackend } from "./rateLimit.mjs";
 import { createRespClient } from "./resp.mjs";
+import { createDiscoveryResponder } from "./discovery.mjs";
 import { createConfiguredStore } from "./storage.mjs";
 
 const config = loadConfig();
@@ -26,8 +27,17 @@ const { server, snapshotPoller } = createApp({
   ...(store ? { store } : {}),
 });
 
-server.listen(config.port, config.host, () => {
+server.listen(config.port, config.host, async () => {
   console.log(`agent-controller listening on http://${config.host}:${config.port}`);
+
+  // Started here rather than in createApp() so tests stay hermetic: binding a fixed UDP port in
+  // every test process would collide, and discovery is a deployment concern, not an app one.
+  if (config.discoveryEnabled) {
+    const responder = createDiscoveryResponder({ config });
+    await responder.start();
+    process.on("SIGTERM", () => responder.stop());
+    process.on("SIGINT", () => responder.stop());
+  }
   if (config.snapshotPollEnabled) {
     snapshotPoller.start();
     console.log(`T3 snapshot poller running every ${config.snapshotPollIntervalMs}ms`);
