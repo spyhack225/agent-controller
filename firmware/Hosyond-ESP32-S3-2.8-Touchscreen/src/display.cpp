@@ -17,8 +17,24 @@ bool displayReady() { return ready; }
 Adafruit_ILI9341& displayPanel() { return panel; }
 
 void displayBacklight(bool on) {
-  pinMode(LCD_BL, OUTPUT);
-  digitalWrite(LCD_BL, on ? HIGH : LOW);
+  // Ramped, not switched. The vendor spec rates this board at 140 mA with the display alone and
+  // 560 mA with display + speaker + charging, and the backlight is four white LEDs. Slamming the
+  // pin high draws the inrush in one step, which on a weak USB port is enough to brown out the
+  // regulator — and a brownout during Wi-Fi bring-up looks exactly like the crash-reboot loop the
+  // first hardware flash of this adapter produced.
+  //
+  // Ramping also avoids driving GPIO45 to a hard rail instantly. That pin is the VDD_SPI strapping
+  // pin as well as the backlight, so it is the one pin here worth being gentle with.
+  ledcAttach(LCD_BL, 5000, 8);
+  if (!on) {
+    ledcWrite(LCD_BL, 0);
+    return;
+  }
+  for (int duty = 0; duty <= 255; duty += 5) {
+    ledcWrite(LCD_BL, duty);
+    delay(2);
+  }
+  ledcWrite(LCD_BL, 255);
 }
 
 bool displayBegin() {
@@ -32,6 +48,9 @@ bool displayBegin() {
   panel.begin();
   panel.setRotation(0);            // portrait, 240x320, ribbon at the bottom
   panel.fillScreen(ILI9341_BLACK);
+
+  // Let the panel's own rails settle before adding the backlight load on top of them.
+  delay(20);
 
   // Backlight goes on only after the framebuffer has been cleared. Enabling it first shows the
   // panel's power-on noise for a few hundred milliseconds, which reads as a fault.

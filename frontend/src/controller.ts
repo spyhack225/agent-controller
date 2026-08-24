@@ -15,6 +15,8 @@ import type {
   DeviceSecret,
   DisplayState,
   Environment,
+  EnvironmentFailure,
+  EnvironmentFailureReason,
   JsonRecord,
   Macro,
   MediaItem,
@@ -37,15 +39,56 @@ interface Notice {
   message: string;
 }
 
-interface WorkspaceRecovery {
+export interface WorkspaceRecovery {
   environmentId: string;
-  message: string;
+  /** The gateway's classification of the failure, never inferred from the message text. */
+  failure: EnvironmentFailure;
 }
 
 export const T3_SNAPSHOT_UNAVAILABLE_MESSAGE = "T3 snapshot is unavailable.";
 
+const ENVIRONMENT_FAILURE_REASONS: readonly EnvironmentFailureReason[] = [
+  "process_not_running",
+  "network_unreachable",
+  "timeout",
+  "tls_error",
+  "token_expired",
+  "authentication_failed",
+  "contract_incompatible",
+  "unknown",
+];
+
 export function isT3SnapshotUnavailableError(error: unknown): error is Error {
   return error instanceof Error && error.message === T3_SNAPSHOT_UNAVAILABLE_MESSAGE;
+}
+
+/** The fallback for a gateway that classified nothing: retry is still worth offering. */
+export function genericEnvironmentFailure(): EnvironmentFailure {
+  return { reason: "unknown", message: T3_SNAPSHOT_UNAVAILABLE_MESSAGE, retryable: true };
+}
+
+/** Reads the `failure` envelope off an error body. An unrecognised reason is treated as absent. */
+export function parseEnvironmentFailure(details: unknown): EnvironmentFailure | null {
+  if (!details || typeof details !== "object") return null;
+  const envelope = (details as { failure?: unknown }).failure;
+  if (!envelope || typeof envelope !== "object") return null;
+  const record = envelope as Record<string, unknown>;
+  const reason = record.reason;
+  if (typeof reason !== "string") return null;
+  if (!ENVIRONMENT_FAILURE_REASONS.includes(reason as EnvironmentFailureReason)) return null;
+  return {
+    reason: reason as EnvironmentFailureReason,
+    message: typeof record.message === "string" && record.message
+      ? record.message
+      : T3_SNAPSHOT_UNAVAILABLE_MESSAGE,
+    retryable: record.retryable !== false,
+    baseUrl: typeof record.baseUrl === "string" ? record.baseUrl : null,
+    installedVersion: typeof record.installedVersion === "string" ? record.installedVersion : null,
+    minimumVersion: typeof record.minimumVersion === "string" ? record.minimumVersion : null,
+    maximumTestedVersion: typeof record.maximumTestedVersion === "string"
+      ? record.maximumTestedVersion
+      : null,
+  };
 }
 
 interface UseControllerOptions {
@@ -600,7 +643,9 @@ export function useController({ authConfig, clerk }: UseControllerOptions) {
       setWorkspaceRecovery(null);
     } catch (error) {
       if (isT3SnapshotUnavailableError(error)) {
-        setWorkspaceRecovery({ environmentId, message: T3_SNAPSHOT_UNAVAILABLE_MESSAGE });
+        const failure = (error instanceof ApiError ? parseEnvironmentFailure(error.details) : null)
+          ?? genericEnvironmentFailure();
+        setWorkspaceRecovery({ environmentId, failure });
       }
       throw error;
     }
