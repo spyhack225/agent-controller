@@ -77,6 +77,10 @@ ProvisioningState lastState = ProvisioningState::Unprovisioned;
 // because reportState() consults it long before the screen code is defined.
 bool orbBrowsing = false;
 uint8_t browseIndex = 0;
+
+// While the claim screen owns the lower half, the shimmer label and context line must not paint
+// over its instructions.
+bool claimScreenActive = false;
 uint32_t bootHeldSince = 0;
 bool bootWasDown = false;
 
@@ -392,6 +396,7 @@ void reportIdentity() {
 
 // Defined further down, with the rest of the screen code.
 void setOrbState(OrbMode mode, const String& label, const String& context);
+void showClaimScreen(const String& code);
 
 void reportState(ProvisioningState state) {
   const ProvisioningStatus& status = provisioning.status();
@@ -416,17 +421,29 @@ void reportState(ProvisioningState state) {
   if (state == ProvisioningState::Online) {
     switch (gateway.link()) {
       case GatewayLink::Unclaimed:
-        setOrbState(OrbMode::Ring, gateway.claimCode().length() ? gateway.claimCode() : "Setup",
-                    "enter this code in the console");
+        showClaimScreen(gateway.claimCode());
         return;
-      case GatewayLink::AuthFailed:
-        setOrbState(OrbMode::Web, "Not paired", gateway.detail());
+      case GatewayLink::NoIdentity:
+        // Terminal: identity is written at manufacture and nothing the owner does here recovers it.
+        setOrbState(OrbMode::Ring, "Not provisioned", "factory flash needed");
+        return;
+      case GatewayLink::Revoked:
+        // The way out is on the device itself, so say what it is.
+        setOrbState(OrbMode::Web, "Revoked", "hold BOOT 10s to reset");
         return;
       case GatewayLink::Claimed:
         setOrbState(OrbMode::Ring, "Ready", WiFi.localIP().toString());
         return;
+      case GatewayLink::Unreachable:
+        setOrbState(OrbMode::Web, "No gateway", store.gatewayUrl());
+        return;
       default:
-        break;
+        // Idle: online, but the first heartbeat has not come back yet. Deliberately NOT falling
+        // through to the /health probe below — that probe proves a gateway is listening, which is
+        // a different question from whether this device is claimed. Answering "Ready" on the
+        // strength of it told the owner of an unclaimed controller that it was good to go.
+        setOrbState(OrbMode::Web, "Checking", store.gatewayUrl());
+        return;
     }
   }
 
@@ -445,7 +462,9 @@ void reportState(ProvisioningState state) {
       // than one that admits it does not know.
       switch (gatewayStatus()) {
         case GatewayStatus::Reachable:
-          setOrbState(OrbMode::Ring, "Ready", WiFi.localIP().toString());
+          // Reachable, but claim status is decided above; getting here means the link state was
+          // not conclusive, so say what is actually known rather than claiming readiness.
+          setOrbState(OrbMode::Web, "Checking", store.gatewayUrl());
           break;
         case GatewayStatus::Unreachable:
           setOrbState(OrbMode::Web, "No gateway", "hold to fix the address");
@@ -528,6 +547,10 @@ constexpr int16_t kContextY = 244;
 // cadence the hardware can actually hold rather than an aspiration.
 constexpr uint32_t kFrameMs = 33;
 
+// Where the claim screen begins. Everything from here down is its own, footer included: three
+// instruction lines plus a large code do not fit above the diagnostics strip.
+constexpr int16_t kClaimTop = 196;
+
 // Frame statistics.
 //
 // Draw time alone was not enough to explain a visible hitch: it stayed at 27 ms while the animation
@@ -583,6 +606,9 @@ void drawChrome() {
 // load, and one that flickers is worse than none.
 void drawFpsReadout() {
   if (!displayReady()) return;
+  // Suppressed while claiming: the claim screen owns the footer strip, and a counter repainting
+  // over the instructions is exactly the collision this screen had.
+  if (claimScreenActive) return;
   static uint32_t lastDrawAt = 0;
   static int lastShown = -1;
 
@@ -609,6 +635,66 @@ void drawFpsReadout() {
   g.print(buf);
 }
 
+// The claim screen.
+//
+// A brand-new controller has one job: tell its owner how to take possession of it. CrowPanel does
+// this in two lines because a 122x250 e-ink panel has room for two lines. This panel has room to
+// actually explain, and an owner holding an unfamiliar device should not have to consult a manual
+// to find out what the code on the screen is for.
+//
+// Drawn once per code change, not per frame: the orb above it animates, the instructions do not.
+void drawClaimScreen(const String& code, const String& gatewayUrl) {
+  if (!displayReady()) return;
+  Adafruit_ILI9341& g = displayPanel();
+
+  // The claim screen owns everything below the orb, INCLUDING the footer strip. The first version
+  // kept the model/fps footer and its rule, and the third instruction line ran straight through
+  // them. A setup screen has one job; the diagnostics can wait until the device is doing something.
+  g.fillRect(0, kClaimTop, kScreenW, kScreenH - kClaimTop, panelGrey(kBgGrey));
+
+  g.setTextSize(1);
+  g.setTextColor(panelGrey(kMutedGrey));
+  const char* heading = "CLAIM THIS CONTROLLER";
+  g.setCursor((kScreenW - (int16_t)(strlen(heading) * 6)) / 2, kClaimTop + 6);
+  g.print(heading);
+
+  if (code.length() > 0) {
+    // The largest thing on the screen: it is read from across a desk and typed by hand into
+    // another device.
+    g.setTextSize(3);
+    g.setTextColor(panelGrey(255));
+    const int16_t codeW = (int16_t)(code.length() * 18);
+    g.setCursor((kScreenW - codeW) / 2, kClaimTop + 24);
+    g.print(code);
+  } else {
+    // Transient: the device asks the gateway to mint one as soon as it knows it is unowned. There
+    // is no printed code to fall back on, so this is a wait, not a dead end.
+    g.setTextSize(2);
+    g.setTextColor(panelGrey(160));
+    const char* wait = "Getting code...";
+    g.setCursor((kScreenW - (int16_t)(strlen(wait) * 12)) / 2, kClaimTop + 26);
+    g.print(wait);
+  }
+
+  // The steps, in the order they are performed, with room to breathe above the bottom edge.
+  g.setTextSize(1);
+  int16_t y = kClaimTop + 62;
+  const String steps[3] = {
+    gatewayUrl.length() ? gatewayUrl : String("Open the console"),
+    String("Devices  >  Claim"),
+    String("Enter the code above"),
+  };
+  for (uint8_t i = 0; i < 3; ++i) {
+    g.setTextColor(panelGrey(kDimGrey));
+    g.setCursor(18, y);
+    g.print(i + 1);
+    g.setTextColor(panelGrey(kMutedGrey));
+    g.setCursor(32, y);
+    g.print(steps[i]);
+    y += 18;
+  }
+}
+
 void drawContext(const String& text) {
   if (!displayReady()) return;
   Adafruit_ILI9341& g = displayPanel();
@@ -622,7 +708,39 @@ void drawContext(const String& text) {
   g.print(text);
 }
 
+// Ring, not Web: the device is not doing anything, it is waiting to be owned. A calm orb above a
+// code reads as "ready for you"; a busy one reads as "wait".
+void showClaimScreen(const String& code) {
+  static String shownCode;
+  static bool shown = false;
+
+  currentMode = OrbMode::Ring;
+  orb.setMode(OrbMode::Ring);
+  if (!chromeDrawn) drawChrome();
+
+  if (!shown || code != shownCode) {
+    shownCode = code;
+    shown = true;
+    claimScreenActive = true;
+    drawClaimScreen(code, store.gatewayUrl());
+  }
+}
+
 void setOrbState(OrbMode mode, const String& label, const String& context) {
+  // Leaving the claim screen means the whole lower half has to be reclaimed from its instructions.
+  if (claimScreenActive) {
+    claimScreenActive = false;
+    if (displayReady()) {
+      Adafruit_ILI9341& g = displayPanel();
+      g.fillRect(0, kClaimTop, kScreenW, kScreenH - kClaimTop, panelGrey(kBgGrey));
+      // The claim screen painted over the footer, so it has to be put back.
+      g.drawFastHLine(12, kScreenH - 34, kScreenW - 24, panelGrey(kDimGrey));
+      g.setTextSize(1);
+      g.setTextColor(panelGrey(kDimGrey));
+      g.setCursor(12, kScreenH - 24);
+      g.print(HARDWARE_MODEL);
+    }
+  }
   const bool contextChanged = context != contextLine;
   const bool labelChanged = label != statusLabel;
   currentMode = mode;
@@ -716,7 +834,7 @@ void tickScreen() {
   const uint32_t elapsed = now - orbStartedAt;
   const uint32_t drawStart = millis();
   displayDrawOrb(orb, kOrbCx, kOrbCy, elapsed);
-  displayDrawStatus(statusLabel.c_str(), kLabelY, elapsed);
+  if (!claimScreenActive) displayDrawStatus(statusLabel.c_str(), kLabelY, elapsed);
 
   // Frame pacing is the other half of smoothness: an animation that renders beautifully but
   // arrives at uneven intervals still reads as stutter. Reported rarely, and only worst-case,
@@ -854,7 +972,13 @@ void loop() {
     reportState(state);
   }
 
-  gateway.poll();
+  // Mirrors the reference loop: while the link is down the portal owns the screen, and polling the
+  // gateway would only stack up failures.
+  if (state == ProvisioningState::Online) {
+    gateway.runCycle(provisioning.consumeJustConnected());
+  } else {
+    gateway.goOffline();
+  }
 
   // Claim state changes asynchronously — it is the owner typing a code on another device — so the
   // screen has to be driven by it rather than only by provisioning transitions.
@@ -879,8 +1003,8 @@ void loop() {
     }
   }
 
-  if (provisioning.consumeJustConnected()) {
-    Serial.println("[provisioning] joined — the gateway handshake would run here.");
+  if (gateway.consumeJustClaimed()) {
+    Serial.println("[gateway] claim confirmed; loading configuration");
     gatewayProbeNow();
   }
 

@@ -2628,6 +2628,9 @@ function publicDevice(device: any) {
     userId: device.userExternalId ?? null,
     label: device.label,
     profile: device.profile,
+    // Stamped at pre-provision. Absent on devices created before the board catalogue existed, so
+    // it is null rather than a guessed default — the console must not invent a board.
+    hardwareModel: device.hardwareModel ?? null,
     claimedAt: device.claimedAt ?? null,
     claimCodeExpiresAt: device.claimCodeExpiresAt ?? null,
     revokedAt: device.revokedAt ?? null,

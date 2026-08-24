@@ -1,10 +1,37 @@
-import { fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { vi } from "vitest";
 
 import type { Controller } from "../controller";
-import type { Device } from "../types";
+import type { Device, HardwareBoard } from "../types";
 import { ConfirmProvider } from "../ui";
 import { DevicesPage } from "./DevicesPage";
+
+const BOARDS: HardwareBoard[] = [
+  {
+    id: "e213-esp32-s3r8",
+    label: "CrowPanel 2.13\" e-paper",
+    vendor: "Elecrow",
+    firmwareEnv: "crowpanel-esp32-213-epaper",
+    firmwareDir: "firmware/CrowPanel-ESP32-2.13-E-paper",
+    display: { kind: "epaper", width: 122, height: 250, colors: 2 },
+    input: { touch: false, keys: 5 },
+    audio: { microphone: false, speaker: false },
+    camera: false,
+    maturity: "complete",
+  },
+  {
+    id: "ips28-esp32-s3r8",
+    label: "Hosyond 2.8\" IPS touch",
+    vendor: "Hosyond / LCDWIKI",
+    firmwareEnv: "hosyond-es3c28p-display",
+    firmwareDir: "firmware/Hosyond-ESP32-S3-2.8-Touchscreen",
+    display: { kind: "ips", width: 240, height: 320, colors: 65536 },
+    input: { touch: true, keys: 1 },
+    audio: { microphone: true, speaker: true },
+    camera: false,
+    maturity: "bring-up",
+  },
+];
 
 function controller(devices: Device[] = []): Controller {
   const api = vi.fn(async (path: string) => {
@@ -19,6 +46,8 @@ function controller(devices: Device[] = []): Controller {
   return {
     devices,
     deviceProfiles: [],
+    hardwareBoards: BOARDS,
+    defaultHardwareBoard: "e213-esp32-s3r8",
     environments: [{ id: "env_1", label: "Studio Mac" }],
     threads: [],
     selectedEnvironmentId: "env_1",
@@ -307,4 +336,113 @@ test("surfaces a failed gateway switch and allows rollback to the confirmed prof
   fireEvent.click(screen.getByRole("button", { name: "Keep current" }));
   fireEvent.click(await screen.findByRole("button", { name: "Cancel switch" }));
   await waitFor(() => expect(c.api).toHaveBeenCalledWith("/v1/devices/dev_failed_gateway/gateway/rollback", { method: "POST", body: {} }));
+});
+
+function preprovisionController() {
+  const c = controller();
+  vi.mocked(c.api).mockImplementation(async (path: string, options?: { body?: unknown }) => {
+    if (path === "/v1/factory/devices") {
+      const body = (options?.body ?? {}) as { hardwareModel?: string };
+      const board = BOARDS.find((candidate) => candidate.id === body.hardwareModel) ?? BOARDS[0];
+      return {
+        device: { id: "dev_factory", label: "Desk controller", profile: "agent-controller", hardwareModel: board.id },
+        secret: "secret-once",
+        claimCode: "ABCDE-23456",
+        board,
+      };
+    }
+    return {};
+  });
+  return c;
+}
+
+test("makes the operator choose a board, defaulting to the one proven board", async () => {
+  const c = preprovisionController();
+  renderPage(c);
+
+  fireEvent.click(screen.getAllByRole("button", { name: /^Pre-provision$/u })[0]);
+  const dialog = screen.getByRole("dialog", { name: "Pre-provision hardware" });
+  // Purpose -> Board -> Identity -> Review: the board step is inserted second, before identity.
+  expect(within(dialog).getByText("Board")).toBeVisible();
+
+  fireEvent.click(screen.getByRole("button", { name: /Continue/u }));
+  const crowpanel = screen.getByRole("radio", { name: /CrowPanel/u });
+  expect(crowpanel).toBeChecked();
+  // The four boards are not interchangeable, so the picker says what each one can actually do.
+  expect(screen.getByText("E-paper 122x250, monochrome")).toBeVisible();
+  expect(screen.getByText("5 keys, no touch")).toBeVisible();
+  expect(screen.getAllByText("No microphone").length).toBeGreaterThan(0);
+  expect(screen.getByText("IPS 240x320, 65536 colors")).toBeVisible();
+  expect(screen.getByText("Touch + 1 key")).toBeVisible();
+  expect(screen.getByText("Microphone")).toBeVisible();
+  // Maturity is stated honestly: only the default board has a validated firmware.
+  expect(screen.getByText("Proven")).toBeVisible();
+  expect(screen.getByText("Bring-up")).toBeVisible();
+  expect(screen.getByText(/has not been validated on hardware/u)).toBeVisible();
+
+  fireEvent.click(screen.getByRole("button", { name: /Continue/u }));
+  expect(screen.getByLabelText("Device label")).toHaveValue("Desk controller");
+  fireEvent.click(screen.getByRole("button", { name: /Continue/u }));
+  fireEvent.click(screen.getByRole("button", { name: "Create factory identity" }));
+
+  await screen.findByText("Identity created");
+  expect(c.api).toHaveBeenCalledWith("/v1/factory/devices", {
+    method: "POST",
+    auth: false,
+    body: { label: "Desk controller", profile: "agent-controller", hardwareModel: "e213-esp32-s3r8" },
+  });
+  // A correct seed on the wrong image is still a dead device, so the image is named on completion.
+  expect(screen.getAllByText("crowpanel-esp32-213-epaper").length).toBeGreaterThan(0);
+  expect(screen.getAllByText("firmware/CrowPanel-ESP32-2.13-E-paper").length).toBeGreaterThan(0);
+});
+
+test("stamps the board the operator picked and names its firmware image", async () => {
+  const c = preprovisionController();
+  renderPage(c);
+
+  fireEvent.click(screen.getAllByRole("button", { name: /^Pre-provision$/u })[0]);
+  fireEvent.click(screen.getByRole("button", { name: /Continue/u }));
+  fireEvent.click(screen.getByRole("radio", { name: /Hosyond/u }));
+  fireEvent.click(screen.getByRole("button", { name: /Continue/u }));
+  fireEvent.click(screen.getByRole("button", { name: /Continue/u }));
+  // The review restates the board before the identity is minted.
+  expect(screen.getByText("Hosyond 2.8\" IPS touch")).toBeVisible();
+  fireEvent.click(screen.getByRole("button", { name: "Create factory identity" }));
+
+  await screen.findByText("Identity created");
+  expect(c.api).toHaveBeenCalledWith("/v1/factory/devices", {
+    method: "POST",
+    auth: false,
+    body: { label: "Desk controller", profile: "agent-controller", hardwareModel: "ips28-esp32-s3r8" },
+  });
+  expect(screen.getAllByText("hosyond-es3c28p-display").length).toBeGreaterThan(0);
+});
+
+test("shows a stamped board on the device tile and editor, and invents nothing when absent", async () => {
+  const stamped: Device = {
+    id: "dev_stamped",
+    label: "Bench controller",
+    profile: "agent-controller",
+    hardwareModel: "ips28-esp32-s3r8",
+  };
+  const c = controller([stamped]);
+  renderPage(c);
+
+  // No heartbeat yet, so the tile falls back to the model the factory stamped.
+  expect(screen.getByText("ips28-esp32-s3r8")).toBeVisible();
+  fireEvent.click(screen.getByRole("button", { name: "Edit Bench controller" }));
+  expect(await screen.findByText("Hosyond 2.8\" IPS touch")).toBeVisible();
+  expect(screen.getByText("hosyond-es3c28p-display")).toBeVisible();
+});
+
+test("leaves the board blank for a device stamped before the catalogue existed", async () => {
+  const legacy: Device = { id: "dev_legacy", label: "Legacy controller", profile: "agent-controller" };
+  const c = controller([legacy]);
+  renderPage(c);
+
+  fireEvent.click(screen.getByRole("button", { name: "Edit Legacy controller" }));
+  await screen.findByText("Device ID");
+  expect(screen.queryByText("Board")).not.toBeInTheDocument();
+  expect(screen.queryByText("Firmware image")).not.toBeInTheDocument();
+  expect(screen.getAllByText("unknown").length).toBeGreaterThan(0);
 });

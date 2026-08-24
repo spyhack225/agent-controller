@@ -23,10 +23,12 @@
 #include "DeviceStore.h"
 
 enum class GatewayLink : uint8_t {
-  Idle,          // no network yet
-  Unclaimed,     // authenticated as a device, but no owner — claimCode() is what to show
+  NoIdentity,    // never provisioned: terminal, and the owner cannot fix it
+  Idle,          // no network yet, or nothing asked since
+  Connecting,    // online, first cycle not yet answered
+  Unclaimed,     // authenticated, but no owner — claimCode() is what to show
   Claimed,       // owned and talking
-  AuthFailed,    // credentials rejected: revoked, or seeded against a different gateway
+  Revoked,       // credential rejected: revoked, or transfer-reset
   Unreachable,   // no gateway answered
 };
 
@@ -34,9 +36,15 @@ class GatewayClient {
  public:
   void begin(DeviceStore& store, const String& hardwareModel, const String& firmwareVersion);
 
-  // Non-blocking. Call from loop(); it does at most one HTTP request per invocation and rate-limits
-  // itself, so the render loop keeps its frame budget.
-  void poll();
+  // Run once the Wi-Fi link is up. `justConnected` fires every poll immediately rather than
+  // waiting out its timer, which is what makes a fresh join show real state at once instead of up
+  // to a minute later.
+  //
+  // Non-blocking in the sense that matters: at most one HTTP request per call.
+  void runCycle(bool justConnected);
+
+  // Call when the link is NOT up, so the client stops claiming to know anything.
+  void goOffline();
 
   GatewayLink link() const { return link_; }
   const String& claimCode() const { return claimCode_; }
@@ -52,6 +60,7 @@ class GatewayClient {
  private:
   int request(const char* method, const char* path, const String& body, String& response);
   void sendHeartbeat();
+  void fetchConfig();
   void fetchSetupCode(bool rotate);
 
   DeviceStore* store_ = nullptr;
@@ -63,8 +72,13 @@ class GatewayClient {
   String detail_;
   bool justClaimed_ = false;
 
+  // Separate cadences, following the reference firmware: a heartbeat is cheap and proves liveness,
+  // config changes rarely, and a claim code must not be re-requested on a timer at all.
   uint32_t nextHeartbeatAt_ = 0;
+  uint32_t nextConfigAt_ = 0;
   uint32_t nextSetupCodeAt_ = 0;
+  uint32_t backoffUntil_ = 0;   // honours 429 retry-after
+  bool revoked_ = false;
 };
 
 const char* gatewayLinkName(GatewayLink link);

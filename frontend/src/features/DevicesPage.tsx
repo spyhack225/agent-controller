@@ -539,7 +539,11 @@ function DeviceTile({
         <TileMetric icon={Clock3} label="Last seen" value={formatRelativeTime(status?.lastHeartbeatAt ?? device.lastSeenAt)} />
         <TileMetric icon={Gauge} label="Uptime" value={formatUptime(status?.uptimeMs)} />
         <TileMetric icon={Radio} label="Firmware" value={status?.firmwareVersion ?? "unknown"} />
-        <TileMetric icon={Cpu} label="Hardware" value={status?.hardwareModel ?? "unknown"} />
+        <TileMetric
+          icon={Cpu}
+          label="Hardware"
+          value={status?.hardwareModel ?? device.hardwareModel ?? "unknown"}
+        />
         <TileMetric icon={Wifi} label="IP address" value={status?.ipAddress ?? "unknown"} />
         <TileMetric
           icon={Battery}
@@ -794,6 +798,147 @@ function FlowIntro({
   );
 }
 
+/**
+ * How honest to be about each board. Only the CrowPanel has a firmware validated end to end; the
+ * other three ship as bring-up or scaffold, and an operator stamping a unit that will be flashed
+ * with an unproven image has to be told so before the identity is minted, not after.
+ */
+const BOARD_MATURITY: Record<string, { label: string; tone: StatusTone; note: string }> = {
+  complete: {
+    label: "Proven",
+    tone: "success",
+    note: "Firmware is complete and validated on this board end to end.",
+  },
+  "bring-up": {
+    label: "Bring-up",
+    tone: "warning",
+    note: "Firmware exists but has not been validated on hardware. Expect to debug the unit.",
+  },
+  scaffold: {
+    label: "Scaffold",
+    tone: "danger",
+    note: "Only a firmware skeleton exists. This board is not ready to ship to an owner.",
+  },
+  unknown: {
+    label: "Unknown",
+    tone: "neutral",
+    note: "This gateway has no catalogue entry for the board.",
+  },
+};
+
+function boardMaturity(board: HardwareBoard) {
+  return BOARD_MATURITY[board.maturity ?? "unknown"] ?? BOARD_MATURITY.unknown;
+}
+
+const DISPLAY_KIND_LABELS: Record<string, string> = {
+  epaper: "E-paper",
+  ips: "IPS",
+  amoled: "AMOLED",
+  tft: "TFT",
+};
+
+/** The one-line answer to "what can this thing actually do?" */
+function describeBoardAbilities(board: HardwareBoard): string[] {
+  const abilities: string[] = [];
+  const display = board.display;
+  if (display?.width && display?.height) {
+    const kind = DISPLAY_KIND_LABELS[display.kind ?? ""] ?? display.kind ?? "Display";
+    const colors = display.colors === 2 ? "monochrome" : display.colors ? `${display.colors} colors` : null;
+    abilities.push([`${kind} ${display.width}x${display.height}`, colors].filter(Boolean).join(", "));
+  }
+  const keys = board.input?.keys ?? 0;
+  if (board.input?.touch) abilities.push(keys ? `Touch + ${keys} key${keys === 1 ? "" : "s"}` : "Touch input");
+  else abilities.push(keys ? `${keys} key${keys === 1 ? "" : "s"}, no touch` : "No touch, no keys");
+  abilities.push(board.audio?.microphone ? "Microphone" : "No microphone");
+  if (board.audio?.speaker) abilities.push("Speaker");
+  if (board.camera) abilities.push("Camera");
+  return abilities;
+}
+
+function BoardFields({
+  boards,
+  value,
+  defaultBoardId,
+  onChange,
+}: {
+  boards: readonly HardwareBoard[];
+  value: string;
+  defaultBoardId: string | null;
+  onChange: (boardId: string) => void;
+}) {
+  if (boards.length === 0) {
+    return (
+      <div className="mx-auto grid w-full max-w-lg gap-3 py-6">
+        <p className="font-display text-base font-semibold">Board catalogue unavailable</p>
+        <p className="text-sm leading-relaxed text-ink-muted">
+          This gateway did not return a hardware catalogue, so the identity will be stamped with its
+          own default board. Continue only if you know which image this unit will be flashed with.
+        </p>
+      </div>
+    );
+  }
+  return (
+    <fieldset className="min-w-0">
+      <legend className="text-xs font-semibold text-ink-muted">Hardware board</legend>
+      <p className="mt-1 text-xs leading-relaxed text-ink-faint">
+        The board is stamped into the identity and the NVS seed. These four are not interchangeable
+        — they differ in display, input, and whether they can capture audio at all.
+      </p>
+      <div className="mt-2 grid gap-2">
+        {boards.map((board) => {
+          const selected = board.id === value;
+          const maturity = boardMaturity(board);
+          return (
+            <label
+              key={board.id}
+              className={cn("profile-card", selected && "profile-card--selected")}
+              data-selected={selected || undefined}
+            >
+              <input
+                type="radio"
+                name="flow-hardware-board"
+                value={board.id}
+                checked={selected}
+                onChange={() => onChange(board.id)}
+                className="mt-0.5"
+              />
+              <span className="min-w-0">
+                <span className="flex flex-wrap items-center gap-2">
+                  <span className="font-display text-sm font-semibold">{board.label}</span>
+                  <StatusBadge tone={maturity.tone} label={maturity.label} />
+                  {board.id === defaultBoardId ? <StatusBadge tone="info" label="Default" /> : null}
+                </span>
+                <span className="mt-0.5 block text-xs text-ink-faint">
+                  {board.vendor ? `${board.vendor} · ` : ""}
+                  <span className="font-mono">{board.id}</span>
+                </span>
+                <span className="mt-2 flex flex-wrap gap-1.5">
+                  {describeBoardAbilities(board).map((ability) => (
+                    <span key={ability} className="rounded-md border border-control bg-surface-inset px-1.5 py-0.5 text-[10px] text-ink-muted">
+                      {ability}
+                    </span>
+                  ))}
+                </span>
+                <span className="mt-2 flex items-start gap-1.5 text-xs leading-snug text-ink-muted">
+                  {board.maturity === "complete"
+                    ? <CheckCircle2 className="mt-0.5 size-3 shrink-0 text-success" aria-hidden="true" />
+                    : <AlertTriangle className="mt-0.5 size-3 shrink-0 text-warning" aria-hidden="true" />}
+                  <span>{maturity.note}</span>
+                </span>
+                {board.firmwareEnv ? (
+                  <span className="mt-1.5 block font-mono text-[10px] text-ink-faint">
+                    pio run -e {board.firmwareEnv}
+                  </span>
+                ) : null}
+              </span>
+            </label>
+          );
+        })}
+      </div>
+    </fieldset>
+  );
+}
+
 function IdentityFields({
   label,
   profile,
@@ -896,6 +1041,8 @@ function FlowReview({
   claimCode,
   environmentId,
   threadId,
+  board,
+  boardId,
 }: {
   flow: DeviceOnboardingFlow;
   label: string;
@@ -903,6 +1050,8 @@ function FlowReview({
   claimCode: string;
   environmentId: string;
   threadId: string;
+  board?: HardwareBoard | null;
+  boardId?: string;
 }) {
   return (
     <div className="device-flow__review">
@@ -914,6 +1063,8 @@ function FlowReview({
       <dl>
         <ReviewRow label="Label" value={label || "Keep factory label"} />
         {flow === "claim" ? <ReviewRow label="Claim code" value={claimCode.toUpperCase()} mono /> : <ReviewRow label="Policy" value={profile} mono />}
+        {flow === "preprovision" ? <ReviewRow label="Board" value={board?.label ?? boardId ?? "Gateway default"} /> : null}
+        {flow === "preprovision" && board?.firmwareEnv ? <ReviewRow label="Firmware image" value={board.firmwareEnv} mono /> : null}
         {flow !== "preprovision" ? <ReviewRow label="Environment" value={environmentId || "Not assigned"} mono /> : null}
         {flow !== "preprovision" ? <ReviewRow label="Thread" value={threadId || "Not assigned"} mono /> : null}
         <ReviewRow label="Ownership" value={flow === "preprovision" ? "Unowned until claimed" : "This account"} />
@@ -954,7 +1105,20 @@ function WorkflowResult({
         <ReviewRow label="Device ID" value={result.device.id} mono />
         {result.secret ? <ReviewRow label="Secret" value={result.secret} mono /> : null}
         {result.claimCode ? <ReviewRow label="Claim code" value={result.claimCode} mono /> : null}
+        {result.board ? <ReviewRow label="Board" value={result.board.label} /> : null}
+        {result.board?.firmwareEnv ? <ReviewRow label="Firmware image" value={result.board.firmwareEnv} mono /> : null}
+        {result.board?.firmwareDir ? <ReviewRow label="Firmware source" value={result.board.firmwareDir} mono /> : null}
       </dl>
+      {result.board?.firmwareEnv ? (
+        <p className="rounded-lg border border-warning/20 bg-warning/8 p-3 text-left text-xs leading-relaxed text-warning-strong">
+          Flash this unit with <code className="font-mono">{result.board.firmwareEnv}</code>. There is one
+          image per board — a correct seed on the wrong image still produces a dead device.
+          {result.board.firmwareDir ? (
+            <> Build it from <code className="font-mono">{result.board.firmwareDir}</code> with{" "}
+              <code className="font-mono">pio run -e {result.board.firmwareEnv}</code>.</>
+          ) : null}
+        </p>
+      ) : null}
       {(result.secret || result.claimCode) ? <Button onClick={copyCredential}><Clipboard className="size-4" /> Copy credential</Button> : null}
     </div>
   );
@@ -1072,6 +1236,9 @@ function DeviceEditorDialog({
   }, [device?.id]);
   if (!device) return null;
   const state = deviceStatus(device);
+  const stampedBoard = device.hardwareModel
+    ? (c.hardwareBoards ?? []).find((board) => board.id === device.hardwareModel) ?? null
+    : null;
   const allowedToSave = (device.actions?.updateConfig ?? true)
     && (profile === device.profile || (device.actions?.updateProfile ?? true))
     && !device.revokedAt
@@ -1135,7 +1302,19 @@ function DeviceEditorDialog({
               </Field>
               <dl className="device-editor__facts">
                 <ReviewRow label="Device ID" value={device.id} mono />
-                <ReviewRow label="Hardware" value={device.status?.hardwareModel ?? "unknown"} mono />
+                <ReviewRow
+                  label="Hardware"
+                  value={device.status?.hardwareModel ?? device.hardwareModel ?? "unknown"}
+                  mono
+                />
+                {/* Only shown when the record actually carries one — devices stamped before the
+                    board catalogue existed have none, and inventing a value would be a lie. */}
+                {device.hardwareModel ? (
+                  <ReviewRow label="Board" value={stampedBoard?.label ?? device.hardwareModel} />
+                ) : null}
+                {stampedBoard?.firmwareEnv ? (
+                  <ReviewRow label="Firmware image" value={stampedBoard.firmwareEnv} mono />
+                ) : null}
                 <ReviewRow label="Firmware" value={device.status?.firmwareVersion ?? "unknown"} mono />
                 <ReviewRow label="Last seen" value={formatRelativeTime(device.status?.lastHeartbeatAt ?? device.lastSeenAt)} />
               </dl>
