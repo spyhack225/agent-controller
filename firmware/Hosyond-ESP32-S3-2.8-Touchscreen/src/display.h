@@ -55,7 +55,11 @@ void displayDrawOrb(ThinkingOrb& orb, int16_t cx, int16_t cy, uint32_t elapsedMs
 
 // The status line under the orb, with the shimmer sweep the web component uses. `phase` advances
 // the highlight; pass the same elapsedMs as the orb.
+// Only the rectangle the current text occupies is repainted, so switching to a SHORTER label must
+// be preceded by displayClearStatus() — otherwise the wider previous word leaves its ends on the
+// glass ("Connecting" showing around "Weaving").
 void displayDrawStatus(const char* label, int16_t cy, uint32_t elapsedMs);
+void displayClearStatus(int16_t cy);
 void displayBacklight(bool on);
 Adafruit_ILI9341& displayPanel();
 

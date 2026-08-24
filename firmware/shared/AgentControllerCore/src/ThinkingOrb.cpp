@@ -92,7 +92,14 @@ float vnoise(float x, float y) {
 }
 
 // Shortest signed angular distance, wrapped to (-pi, pi].
-float angleDelta(float a, float b) { return atan2f(sinf(a - b), cosf(a - b)); }
+//
+// The reference uses atan2(sin(d), cos(d)), which is three transcendentals; called once per dot on
+// a 500-dot globe that is 1500 a frame for something a subtraction and a wrap can do exactly.
+float angleDelta(float a, float b) {
+  float d = fmodf(a - b + kPi, 2.0f * kPi);
+  if (d < 0.0f) d += 2.0f * kPi;
+  return d - kPi;
+}
 
 void fibDir(int i, int n, float& x, float& y, float& z) {
   const float golden = kPi * (3.0f - sqrtf(5.0f));
@@ -476,6 +483,25 @@ uint16_t ThinkingOrb::emitRubik(float t) {
     }
   }
 
+  // The move table is built ONCE per frame, not once per dot.
+  //
+  // These values depend only on the move index, but they were being recomputed inside the per-dot
+  // loop: three hashD calls (each a sinf) and a cos/sin pair, for every one of ~500 dots times 14
+  // moves. That is roughly 35,000 transcendental calls a frame, and it measured as a draw time of
+  // 184 ms against a 33 ms budget — the freeze. Hoisted, it is 14 iterations.
+  struct MoveRow { int axis; float lo; float ca; float sa; bool live; };
+  MoveRow rows[kMoves];
+  for (int i = 0; i < kMoves; ++i) {
+    rows[i].live = amount[i] > 0.0f;
+    if (!rows[i].live) continue;
+    rows[i].axis = (int)fminf(2.0f, floorf(hashD(i, 2.3f) * 3.0f));
+    rows[i].lo = -1.0f + 0.5f * fminf(3.0f, floorf(hashD(i, 5.9f) * 4.0f));
+    const float dir = hashD(i, 7.7f) < 0.5f ? 1.0f : -1.0f;
+    const float a = dir * (kPi / 2.0f) * amount[i];
+    rows[i].ca = cosf(a);
+    rows[i].sa = sinf(a);
+  }
+
   uint16_t n = 0;
   for (uint8_t li = 0; li <= latRings_; ++li) {
     const float lat = -kPi / 2.0f + ((float)li / latRings_) * kPi;
@@ -487,19 +513,15 @@ uint16_t ThinkingOrb::emitRubik(float t) {
       bool inActive = false;
 
       for (int i = 0; i < kMoves; ++i) {
-        if (amount[i] <= 0.0f) continue;
-        const int axis = (int)fminf(2.0f, floorf(hashD(i, 2.3f) * 3.0f));
-        const float lo = -1.0f + 0.5f * fminf(3.0f, floorf(hashD(i, 5.9f) * 4.0f));
-        const float dir = hashD(i, 7.7f) < 0.5f ? 1.0f : -1.0f;
-        const float coord = axis == 0 ? x : (axis == 1 ? y : z);
-        if (coord < lo || coord >= lo + 0.5f) continue;
+        const MoveRow& m = rows[i];
+        if (!m.live) continue;
+        const float coord = m.axis == 0 ? x : (m.axis == 1 ? y : z);
+        if (coord < m.lo || coord >= m.lo + 0.5f) continue;
         if (i == active) inActive = true;
 
-        const float a = dir * (kPi / 2.0f) * amount[i];
-        const float ca = cosf(a), sa = sinf(a);
-        if (axis == 0)      { const float y2 = y * ca - z * sa; z = y * sa + z * ca; y = y2; }
-        else if (axis == 1) { const float x2 = x * ca + z * sa; z = -x * sa + z * ca; x = x2; }
-        else                { const float x2 = x * ca - y * sa; y = x * sa + y * ca; x = x2; }
+        if (m.axis == 0)      { const float y2 = y * m.ca - z * m.sa; z = y * m.sa + z * m.ca; y = y2; }
+        else if (m.axis == 1) { const float x2 = x * m.ca + z * m.sa; z = -x * m.sa + z * m.ca; x = x2; }
+        else                  { const float x2 = x * m.ca - y * m.sa; y = x * m.sa + y * m.ca; x = x2; }
       }
 
       float px, py, depth;

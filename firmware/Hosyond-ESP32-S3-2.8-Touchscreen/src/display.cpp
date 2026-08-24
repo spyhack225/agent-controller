@@ -246,9 +246,10 @@ void displayDrawOrb(ThinkingOrb& orb, int16_t cx, int16_t cy, uint32_t elapsedMs
         for (int16_t px = bx0; px <= bx0 + 2; ++px) {
           if (px < 0 || px >= w) continue;
           const float dx = (px + 0.5f) - cxp, dy = (py + 0.5f) - cyp;
-          float cov = 1.0f - sqrtf(dx * dx + dy * dy);
+          const float d2 = dx * dx + dy * dy;
+          if (d2 >= 1.0f) continue;         // outside the hairline; no sqrt needed
+          float cov = 1.0f - sqrtf(d2);
           if (cov <= 0.0f) continue;
-          if (cov > 1.0f) cov = 1.0f;
           const uint8_t v = (uint8_t)(ink * cov);
           if (v > row[px]) row[px] = v;
         }
@@ -279,6 +280,9 @@ void displayDrawOrb(ThinkingOrb& orb, int16_t cx, int16_t cy, uint32_t elapsedMs
     // Coverage falls off over one pixel at the rim. Wider looks blurred; narrower reintroduces the
     // hard edge that was aliasing in the first place.
     const float outer = r + 0.5f;
+    const float outer2 = outer * outer;
+    const float innerEdge = r - 0.5f;
+    const float inner2 = innerEdge > 0.0f ? innerEdge * innerEdge : 0.0f;
     const int16_t x0 = (int16_t)floorf(fx - outer);
     const int16_t x1 = (int16_t)ceilf(fx + outer);
     const int16_t y0 = (int16_t)floorf(fy - outer);
@@ -287,13 +291,19 @@ void displayDrawOrb(ThinkingOrb& orb, int16_t cx, int16_t cy, uint32_t elapsedMs
     for (int16_t py = y0; py <= y1; ++py) {
       if (py < 0 || py >= h) continue;
       const float dy = (py + 0.5f) - fy;
+      const float dy2 = dy * dy;
       uint8_t* row = orbGrey + (size_t)py * w;
       for (int16_t px = x0; px <= x1; ++px) {
         if (px < 0 || px >= w) continue;
         const float dx = (px + 0.5f) - fx;
-        const float dist = sqrtf(dx * dx + dy * dy);
-
-        float cov = (r + 0.5f) - dist;      // 1 well inside, 0 well outside
+        const float d2 = dx * dx + dy2;
+        // Reject on squared distance first. The bounding box corners are always outside the disc,
+        // so roughly a fifth of every dot's pixels were paying for a sqrt only to be discarded.
+        if (d2 >= outer2) continue;
+        // Fully-interior pixels are opaque and need no distance at all — for anything but the
+        // smallest dots that is most of them.
+        float cov = 1.0f;
+        if (d2 > inner2) cov = outer - sqrtf(d2);
         if (cov <= 0.0f) continue;
         if (cov > 1.0f) cov = 1.0f;
 
@@ -315,6 +325,13 @@ void displayDrawOrb(ThinkingOrb& orb, int16_t cx, int16_t cy, uint32_t elapsedMs
     g.writePixels(dmaRow, w);
   }
   g.endWrite();
+}
+
+void displayClearStatus(int16_t cy) {
+  if (!displayReady()) return;
+  // Full width, because only the caller knows the label changed and the incoming word may be
+  // narrower than the outgoing one.
+  displayPanel().fillRect(0, cy - 4, 240, kLabelH, panelGrey(0));
 }
 
 void displayDrawStatus(const char* label, int16_t cy, uint32_t elapsedMs) {

@@ -19,6 +19,10 @@
 #include "display.h"
 #include "touch.h"
 
+#ifndef ORB_BENCH
+#define ORB_BENCH 0
+#endif
+
 #include <ThinkingOrb.h>
 
 #include <DeviceStore.h>
@@ -486,6 +490,25 @@ constexpr int16_t kContextY = 244;
 // cadence the hardware can actually hold rather than an aspiration.
 constexpr uint32_t kFrameMs = 33;
 
+// Frame statistics.
+//
+// Draw time alone was not enough to explain a visible hitch: it stayed at 27 ms while the animation
+// still stumbled, which means the stall was somewhere else in the loop. So the interval BETWEEN
+// frames is measured as well as the work inside one, and anything that blocks — the captive portal,
+// DNS, the Wi-Fi stack — shows up as a gap even though it never touches the renderer.
+struct FrameStats {
+  uint32_t frames = 0;
+  uint32_t worstDrawMs = 0;
+  uint32_t worstGapMs = 0;
+  uint32_t hitches = 0;        // intervals beyond 1.5x the budget
+  uint32_t worstPollMs = 0;    // provisioning/portal work, the prime suspect
+  float fps = 0.0f;
+};
+
+FrameStats stats;
+uint32_t lastFrameAt = 0;
+uint32_t nextFrameAt = 0;
+
 // Greys, resolved through panelGrey() so the panel's polarity is applied in one place.
 constexpr uint8_t kBgGrey = 0;      // #000, the ground the web component sits on
 constexpr uint8_t kDimGrey = 56;    // hairlines
@@ -513,6 +536,36 @@ void drawChrome() {
   chromeDrawn = true;
 }
 
+// Bottom-right, and only when the number changes. A counter that repaints every frame is itself a
+// load, and one that flickers is worse than none.
+void drawFpsReadout() {
+  if (!displayReady()) return;
+  static uint32_t lastDrawAt = 0;
+  static int lastShown = -1;
+
+  const uint32_t now = millis();
+  if (now - lastDrawAt < 1000) return;
+  lastDrawAt = now;
+
+  const int shown = (int)(stats.fps + 0.5f);
+  if (shown == lastShown) return;
+  lastShown = shown;
+
+  Adafruit_ILI9341& g = displayPanel();
+  char buf[16];
+  snprintf(buf, sizeof(buf), "%d fps", shown);
+  const int16_t w = (int16_t)(strlen(buf) * 6);
+  const int16_t x = kScreenW - 12 - w;
+  const int16_t y = kScreenH - 24;
+
+  g.fillRect(x - 2, y - 2, w + 6, 12, panelGrey(kBgGrey));
+  g.setTextSize(1);
+  // Amber when the budget is being missed, so a glance is enough.
+  g.setTextColor(shown >= 27 ? panelGrey(kDimGrey) : panelGrey(200));
+  g.setCursor(x, y);
+  g.print(buf);
+}
+
 void drawContext(const String& text) {
   if (!displayReady()) return;
   Adafruit_ILI9341& g = displayPanel();
@@ -528,12 +581,14 @@ void drawContext(const String& text) {
 
 void setOrbState(OrbMode mode, const String& label, const String& context) {
   const bool contextChanged = context != contextLine;
+  const bool labelChanged = label != statusLabel;
   currentMode = mode;
   statusLabel = label;
   contextLine = context;
 
   orb.setMode(mode);
   if (!chromeDrawn) drawChrome();
+  if (labelChanged) displayClearStatus(kLabelY);
   if (contextChanged || !chromeDrawn) drawContext(context);
 }
 
@@ -541,6 +596,21 @@ void setOrbState(OrbMode mode, const String& label, const String& context) {
 // without starving Wi-Fi or the provisioning portal, both of which share this core.
 // Swipe through the nine states; tap returns to whatever the device is actually doing.
 void pollOrbBrowser() {
+#if ORB_BENCH
+  // Bench build: walk every mode on a timer so each one's cost can be measured without a finger.
+  static uint32_t nextAt = 0;
+  const uint32_t now = millis();
+  if (now >= nextAt) {
+    nextAt = now + 6000;
+    const uint8_t count = (uint8_t)OrbMode::ModeCount;
+    browseIndex = (uint8_t)((browseIndex + 1) % count);
+    orbBrowsing = true;
+    const OrbMode m = orbModeAt(browseIndex);
+    setOrbState(m, orbLabelForMode(m),
+                String(browseIndex + 1) + "/" + String(count) + "  " + orbStateName(m));
+  }
+  return;
+#endif
   const TouchGesture g = touchPoll();
   if (g == TouchGesture::None) return;
 
@@ -568,6 +638,8 @@ void pollOrbBrowser() {
   }
 }
 
+void drawFpsReadout();
+
 void tickScreen() {
   if (!displayReady()) return;
 
@@ -575,7 +647,6 @@ void tickScreen() {
   // adds the draw time to every interval, so a 27 ms draw yields 37 ms frames — 27 fps that also
   // wanders as the draw cost changes. A deadline keeps the cadence even, which the eye notices more
   // than the rate.
-  static uint32_t nextFrameAt = 0;
   const uint32_t now = millis();
   if (nextFrameAt == 0) nextFrameAt = now;
   if ((int32_t)(now - nextFrameAt) < 0) return;
@@ -583,6 +654,13 @@ void tickScreen() {
   // If a frame ran long, do not try to catch up by drawing several back to back — that reads as a
   // stutter followed by a sprint. Drop the missed slots and resync.
   if ((int32_t)(now - nextFrameAt) > (int32_t)kFrameMs) nextFrameAt = now + kFrameMs;
+
+  if (lastFrameAt != 0) {
+    const uint32_t gap = now - lastFrameAt;
+    if (gap > stats.worstGapMs) stats.worstGapMs = gap;
+    if (gap > kFrameMs * 3 / 2) stats.hitches++;
+  }
+  lastFrameAt = now;
 
   const uint32_t elapsed = now - orbStartedAt;
   const uint32_t drawStart = millis();
@@ -592,15 +670,31 @@ void tickScreen() {
   // Frame pacing is the other half of smoothness: an animation that renders beautifully but
   // arrives at uneven intervals still reads as stutter. Reported rarely, and only worst-case,
   // because the average hides exactly the frames that are visible.
-  static uint32_t worstDraw = 0, frames = 0, lastReport = 0;
   const uint32_t drawMs = millis() - drawStart;
-  if (drawMs > worstDraw) worstDraw = drawMs;
-  frames++;
-  if (now - lastReport > 10000) {
-    Serial.printf("[display] %u frames/10s (%.1f fps), worst draw %u ms, budget %u ms\n",
-                  (unsigned)frames, frames / 10.0f, (unsigned)worstDraw, (unsigned)kFrameMs);
-    frames = 0; worstDraw = 0; lastReport = now;
+  if (drawMs > stats.worstDrawMs) stats.worstDrawMs = drawMs;
+  stats.frames++;
+
+  static uint32_t lastReport = 0;
+  if (lastReport == 0) lastReport = now;
+  if (now - lastReport >= 2000) {
+    const uint32_t windowMs = now - lastReport;
+    stats.fps = stats.frames * 1000.0f / windowMs;
+    // The mode is on the line because draw cost varies enormously between them, so a slow frame
+    // is only diagnosable if you know what was being drawn.
+    Serial.printf(
+      "[fps] %-10s %.1f  draw<=%ums  gap<=%ums  poll<=%ums  hitches=%u  budget=%ums  heap=%u\n",
+      orbStateName(currentMode), stats.fps, (unsigned)stats.worstDrawMs,
+      (unsigned)stats.worstGapMs, (unsigned)stats.worstPollMs, (unsigned)stats.hitches,
+      (unsigned)kFrameMs, (unsigned)ESP.getFreeHeap());
+    stats.frames = 0;
+    stats.worstDrawMs = 0;
+    stats.worstGapMs = 0;
+    stats.worstPollMs = 0;
+    stats.hitches = 0;
+    lastReport = now;
   }
+
+  drawFpsReadout();
 }
 
 }  // namespace
@@ -677,7 +771,10 @@ void setup() {
 }
 
 void loop() {
+  const uint32_t pollStart = millis();
   const ProvisioningState state = provisioning.poll();
+  const uint32_t pollMs = millis() - pollStart;
+  if (pollMs > stats.worstPollMs) stats.worstPollMs = pollMs;
   if (state != lastState) {
     lastState = state;
     reportState(state);
@@ -709,7 +806,16 @@ void loop() {
 
   pollOrbBrowser();
   tickScreen();
-
   pollBootButton();
-  delay(1);
+
+  // Sleep until the next frame is actually due, rather than spinning on delay(1).
+  //
+  // Polling in 1 ms steps means a frame fires on the first iteration AFTER its deadline, so the
+  // interval was landing anywhere in 33..36 ms even though the work took 23 ms. That wander is
+  // small in absolute terms and very visible in an animation: the sphere advances by an uneven
+  // amount each frame. Waiting for the deadline directly removes it, and stops the touch
+  // controller being polled over I2C ten times per frame for no benefit.
+  const int32_t waitMs = (int32_t)(nextFrameAt - millis());
+  if (waitMs > 1) delay((uint32_t)(waitMs - 1));
+  else delay(1);
 }
