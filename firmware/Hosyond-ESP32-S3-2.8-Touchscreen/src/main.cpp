@@ -503,6 +503,11 @@ struct FrameStats {
   uint32_t hitches = 0;        // intervals beyond 1.5x the budget
   uint32_t worstPollMs = 0;    // provisioning/portal work, the prime suspect
   float fps = 0.0f;
+
+  // Never reset. The interesting stall is the one that happens while nothing is watching, so the
+  // worst gap since boot has to survive the per-window reset to be reportable after the fact.
+  uint32_t worstGapEverMs = 0;
+  uint32_t hitchesEver = 0;
 };
 
 FrameStats stats;
@@ -658,7 +663,8 @@ void tickScreen() {
   if (lastFrameAt != 0) {
     const uint32_t gap = now - lastFrameAt;
     if (gap > stats.worstGapMs) stats.worstGapMs = gap;
-    if (gap > kFrameMs * 3 / 2) stats.hitches++;
+    if (gap > stats.worstGapEverMs) stats.worstGapEverMs = gap;
+    if (gap > kFrameMs * 3 / 2) { stats.hitches++; stats.hitchesEver++; }
   }
   lastFrameAt = now;
 
@@ -686,6 +692,9 @@ void tickScreen() {
       orbStateName(currentMode), stats.fps, (unsigned)stats.worstDrawMs,
       (unsigned)stats.worstGapMs, (unsigned)stats.worstPollMs, (unsigned)stats.hitches,
       (unsigned)kFrameMs, (unsigned)ESP.getFreeHeap());
+    Serial.printf("      since boot: worst gap %u ms, %u hitches, up %u s\n",
+                  (unsigned)stats.worstGapEverMs, (unsigned)stats.hitchesEver,
+                  (unsigned)(millis() / 1000));
     stats.frames = 0;
     stats.worstDrawMs = 0;
     stats.worstGapMs = 0;
@@ -701,6 +710,20 @@ void tickScreen() {
 
 void setup() {
   Serial.begin(115200);
+
+  // Never block on a serial write.
+  //
+  // This board's Serial is the ESP32-S3's native USB CDC, and by default a write waits for the host
+  // to drain the TX buffer. With a monitor attached that is invisible; with nothing reading, the
+  // buffer fills and every Serial.printf stalls the loop for the timeout — which presents as the
+  // animation freezing at 0 fps for anyone watching the panel rather than the console. The bug is
+  // therefore masked by the very tool used to look for it: measured over 200 s with a monitor
+  // attached, this firmware held 30.3 fps with zero hitches.
+  //
+  // 0 means "write what fits, drop the rest". Diagnostics are worth exactly nothing if printing
+  // them is what stops the device working.
+  Serial.setTxTimeoutMs(0);
+
   // Native USB CDC needs a moment before the host enumerates it; anything printed earlier is lost.
   delay(2000);
 
