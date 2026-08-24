@@ -30,7 +30,7 @@
 #endif
 
 #if ENABLE_AUDIO_CAPTURE
-#include "driver/i2c.h"
+#include <Wire.h>
 #include "driver/i2s_std.h"
 #include "es8311.h"
 #endif
@@ -82,16 +82,11 @@ bool audioReady = false;
 constexpr size_t kFrameSamples = 512;   // per i2s_channel_read, per channel
 
 bool i2cInit() {
-  i2c_config_t cfg = {};
-  cfg.mode = I2C_MODE_MASTER;
-  cfg.sda_io_num = I2C_SDA_PIN;
-  cfg.scl_io_num = I2C_SCL_PIN;
-  cfg.sda_pullup_en = GPIO_PULLUP_ENABLE;
-  cfg.scl_pullup_en = GPIO_PULLUP_ENABLE;
-  cfg.master.clk_speed = I2C_SPEED_HZ;
-
-  if (i2c_param_config((i2c_port_t)I2C_PORT_NUM, &cfg) != ESP_OK) return false;
-  return i2c_driver_install((i2c_port_t)I2C_PORT_NUM, I2C_MODE_MASTER, 0, 0, 0) == ESP_OK;
+  // Wire, not i2c_driver_install. The board shares one I2C bus between the ES8311 codec, the
+  // FT6336G touch controller and the external header, so they must all speak through the same
+  // driver generation — and linking ESP-IDF's legacy I2C driver alongside the new one aborts from
+  // a constructor at boot, before Serial exists. See lib/ES8311/README.md.
+  return Wire.begin(I2C_SDA_PIN, I2C_SCL_PIN, I2C_SPEED_HZ);
 }
 
 bool i2sInit() {

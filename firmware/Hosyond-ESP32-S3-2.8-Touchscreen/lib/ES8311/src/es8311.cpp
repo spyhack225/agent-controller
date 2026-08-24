@@ -6,6 +6,8 @@
 
 #include <string.h>
 #include "es8311.h"
+#include <Wire.h>
+
 #include "driver/gpio.h"
 #include "esp_log.h"
 #include "esp_err.h"
@@ -146,13 +148,25 @@ static inline esp_err_t es8311_write_reg(es8311_handle_t dev, uint8_t reg_addr, 
 {
     es8311_dev_t *es = (es8311_dev_t *) dev;
     const uint8_t write_buf[2] = {reg_addr, data};
-    return i2c_master_write_to_device(es->port, es->dev_addr, write_buf, sizeof(write_buf), pdMS_TO_TICKS(1000));
+    // Arduino Wire, not i2c_master_write_to_device. See lib/ES8311/README.md: the legacy
+    // ESP-IDF I2C driver cannot be linked alongside the new one, and Wire (and therefore every
+    // other I2C device on this shared bus) is on the new one.
+    Wire.beginTransmission((uint8_t)es->dev_addr);
+    Wire.write(write_buf, sizeof(write_buf));
+    return Wire.endTransmission() == 0 ? ESP_OK : ESP_FAIL;
 }
 
 static inline esp_err_t es8311_read_reg(es8311_handle_t dev, uint8_t reg_addr, uint8_t *reg_value)
 {
     es8311_dev_t *es = (es8311_dev_t *) dev;
-    return i2c_master_write_read_device(es->port, es->dev_addr, &reg_addr, 1, reg_value, 1, pdMS_TO_TICKS(1000));
+    Wire.beginTransmission((uint8_t)es->dev_addr);
+    Wire.write(reg_addr);
+    // Repeated start rather than a stop: the ES8311 expects the read to continue the same
+    // transaction, which is what i2c_master_write_read_device did.
+    if (Wire.endTransmission(false) != 0) return ESP_FAIL;
+    if (Wire.requestFrom((int)es->dev_addr, 1) != 1) return ESP_FAIL;
+    *reg_value = (uint8_t)Wire.read();
+    return ESP_OK;
 }
 
 /*
