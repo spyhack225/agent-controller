@@ -105,6 +105,23 @@ against the IDF 5.x I2S API, so the old platform could not build them.
 All four boards and all nine environments were rebuilt and pass on the new platform, so the tree
 runs one toolchain rather than two.
 
+## Display configuration
+
+Taken from the vendor's own init sequence, `docs/.../2-规格书_Specification/ILI9341V_Init.txt`,
+which is the authority for this glass. Adafruit_ILI9341 handles almost all of it; one setting it
+does not:
+
+| Setting | Value | Why |
+|---|---|---|
+| **Display inversion** | **ON (`0x21`)** | **The one thing Adafruit's stock init omits.** Its sequence targets TN glass; this panel is IPS and the vendor sends INVON. Without it every colour is inverted — `fillScreen(BLACK)` renders white — which reads as a broken driver rather than a single wrong bit. Applied as `invertDisplay(true)`. |
+| Pixel format `0x3A` | `0x55` | 16-bit RGB565. Matches the library default. |
+| MADCTL `0x36` | BGR bit set | The vendor sets bit 3 (BGR) in every rotation. Adafruit also sets `MADCTL_BGR`, so rotations agree. |
+| Reset | software only | The panel's reset is tied to CHIP_PU, so there is no GPIO for it. The constructor takes `-1` and the library issues a software reset instead. |
+| SPI mode | 0 | Vendor `spi_dev.h`. |
+| SPI clock | vendor uses 80 MHz | Adafruit defaults to 24 MHz. Safe, but this UI redraws an animated orb, so the bus is the budget — worth raising once the panel is confirmed working. |
+| Interface control `0xF6` | `0x01, 0x30` | Panel-specific; the library's defaults have been fine on this controller elsewhere. |
+| Gamma `0xE0`/`0xE1` | vendor curves | Panel-specific tuning. Only worth porting if the stock gamma looks wrong on real glass. |
+
 ## Audio driver
 
 `lib/ES8311` is Espressif's Apache-2.0 ES8311 driver, vendored from this board's own example pack

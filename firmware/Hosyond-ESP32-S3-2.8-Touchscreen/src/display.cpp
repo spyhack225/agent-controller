@@ -54,6 +54,10 @@ bool displayBegin() {
 #else
   // Remap the bus: these are not the S3's default SPI pins. MISO is passed because the panel
   // shares the bus, though this driver never reads from it.
+  // The vendor drives this panel at 80 MHz in SPI mode 0 (docs/.../Example_01/spi_dev.h). Adafruit
+  // defaults to 24 MHz, which is safe but leaves most of the bandwidth unused — and this UI redraws
+  // an animated orb, so the bus is the budget. 40 MHz is the compromise: a real speed-up, with
+  // margin against the ribbon and the breadboard-grade routing on a module like this.
   SPI.begin(LCD_SCLK, LCD_MISO, LCD_MOSI, LCD_CS);
 
   // Built here, after Arduino's init and after SPI is known to exist.
@@ -61,6 +65,13 @@ bool displayBegin() {
   if (!panel) return false;
 
   panel->begin();
+
+  // Display inversion ON. This is the one thing Adafruit's stock ILI9341 init does not do and this
+  // panel requires: the vendor's own init sequence (docs/.../ILI9341V_Init.txt) sends 0x21 (INVON)
+  // because the glass is IPS, not TN. Without it every colour comes out inverted — a fillScreen
+  // (BLACK) renders white — which reads as "the driver is wrong" rather than "one bit is wrong".
+  panel->invertDisplay(true);
+
   panel->setRotation(0);           // portrait, 240x320, ribbon at the bottom
   panel->fillScreen(ILI9341_BLACK);
 
