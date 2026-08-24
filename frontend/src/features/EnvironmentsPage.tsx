@@ -11,23 +11,33 @@ import {
   Globe2,
   KeyRound,
   Link2,
+  Loader2,
   Network,
   RefreshCw,
   Router,
   Save,
   Server,
   ShieldCheck,
+  Terminal,
   Trash2,
   Users,
   Wifi,
   X,
 } from "lucide-react";
-import { useEffect, useRef, useState, type ReactNode } from "react";
+import { useCallback, useEffect, useRef, useState, type ReactNode } from "react";
 import { createPortal } from "react-dom";
 
 import type { Controller } from "../controller";
 import { formatRelativeTime } from "../format";
-import type { Device, Environment, EnvironmentDependencies, GatewayProfile, RemoteAccessStatus } from "../types";
+import type {
+  ConnectSession,
+  ConnectSessionMint,
+  Device,
+  Environment,
+  EnvironmentDependencies,
+  GatewayProfile,
+  RemoteAccessStatus,
+} from "../types";
 import { Button, Field, StatusBadge, cn, type StatusTone, useConfirm } from "../ui";
 
 interface EnvironmentsPageProps {
@@ -255,6 +265,9 @@ export function EnvironmentsPage({
   const confirm = useConfirm();
   const [internalConnectOpen, setInternalConnectOpen] = useState(false);
   const [editingEnvironment, setEditingEnvironment] = useState<Environment | null>(null);
+  // Re-pairing reuses the connect flow rather than forking one: same command, same polling, but the
+  // session carries this environment's id so the redemption updates it in place.
+  const [repairEnvironment, setRepairEnvironment] = useState<Environment | null>(null);
   const activeConnectOpen = onConnectOpenChange ? connectOpen : internalConnectOpen;
 
   useEffect(() => {
@@ -369,8 +382,12 @@ export function EnvironmentsPage({
 
       <ConnectEnvironmentDialog
         controller={c}
-        open={activeConnectOpen}
-        onClose={() => setConnectOpen(false)}
+        open={activeConnectOpen || Boolean(repairEnvironment)}
+        environment={repairEnvironment}
+        onClose={() => {
+          setRepairEnvironment(null);
+          setConnectOpen(false);
+        }}
       />
 
       <EnvironmentEditorDialog
@@ -380,6 +397,10 @@ export function EnvironmentsPage({
         onCheck={() => editingEnvironment && void checkEnvironment(editingEnvironment)}
         onLoad={() => editingEnvironment && void loadSnapshot(editingEnvironment, true)}
         onRemove={() => editingEnvironment && void removeEnvironment(editingEnvironment)}
+        onRepair={() => {
+          setRepairEnvironment(editingEnvironment);
+          setEditingEnvironment(null);
+        }}
       />
     </div>
   );
@@ -549,66 +570,159 @@ function EnvironmentMetric({ label, value, tone }: { label: string; value: React
   );
 }
 
+// How often the console asks the gateway whether the host has redeemed the code yet. The first poll
+// fires immediately after minting, so a host that was already waiting resolves without a delay.
+const CONNECT_POLL_INTERVAL_MS = 2500;
+
+/**
+ * Console-first pairing.
+ *
+ * The old flow ended by asking the browser for a credential the user had to carry over from another
+ * machine. This one never does: the console mints an enrollment code, shows the single command it
+ * belongs to, and waits. `POST /v1/t3/environments` survives as the manual fallback for a T3 host
+ * with no outbound route to the gateway.
+ *
+ * Passing `environment` turns this into a re-pair. The session then carries that environment's id,
+ * so redeeming updates the row in place — a host that moved to a new URL must not become a second
+ * environment.
+ */
 function ConnectEnvironmentDialog({
   controller: c,
   open,
+  environment = null,
   onClose,
 }: {
   controller: Controller;
   open: boolean;
+  environment?: Environment | null;
   onClose: () => void;
 }) {
+  const repairing = Boolean(environment);
   const [step, setStep] = useState(0);
   const [label, setLabel] = useState("Mac T3 Code");
-  const [baseUrl, setBaseUrl] = useState("");
   const [accessMode, setAccessMode] = useState<EnvironmentAccessMode>("local");
+  const [mint, setMint] = useState<ConnectSessionMint | null>(null);
+  const [session, setSession] = useState<ConnectSession | null>(null);
+  const [mintError, setMintError] = useState<string | null>(null);
+  const [manual, setManual] = useState(false);
+  const [baseUrl, setBaseUrl] = useState("");
   const [credential, setCredential] = useState("");
   const [credentialType, setCredentialType] = useState<CredentialType>("pairingToken");
   const [result, setResult] = useState<Environment | null>(null);
-  const steps = ["Purpose", "Access", "Endpoint", "Credential", "Review"];
+  const mintedForRef = useRef<string | null>(null);
+  const steps = ["Purpose", "Access", "Connect"];
 
   useEffect(() => {
     if (!open) return;
-    setStep(0);
-    setLabel("Mac T3 Code");
-    setBaseUrl("");
-    setAccessMode("local");
+    // Re-pairing already knows the answers to the first two steps, so it starts on the command and
+    // pre-fills both from the environment rather than asking again.
+    setStep(repairing ? 2 : 0);
+    setLabel(environment?.label ?? "Mac T3 Code");
+    setAccessMode(environment ? inferEnvironmentAccessMode(environment.baseUrl) : "local");
+    setMint(null);
+    setSession(null);
+    setMintError(null);
+    setManual(false);
+    setBaseUrl(environment?.baseUrl ?? "");
     setCredential("");
     setCredentialType("pairingToken");
     setResult(null);
-  }, [open]);
+    mintedForRef.current = null;
+  }, [open, environment?.id]);
+
+  const startSession = useCallback(async () => {
+    const key = `${label.trim()}|${accessMode}|${environment?.id ?? ""}`;
+    mintedForRef.current = key;
+    setMintError(null);
+    setSession(null);
+    try {
+      const created = await c.createConnectSession({
+        label: label.trim() || "T3 Code",
+        accessMode,
+        environmentId: environment?.id ?? null,
+      });
+      setMint(created);
+      setSession(created.session);
+    } catch (error) {
+      mintedForRef.current = null;
+      setMint(null);
+      // Minting is the only thing that can fail before the user has done anything, so it opens the
+      // manual path rather than dead-ending them on an error.
+      setMintError(error instanceof Error ? error.message : "Could not create a connect command.");
+      setManual(true);
+    }
+  }, [c, label, accessMode, environment?.id]);
+
+  useEffect(() => {
+    if (!open || step !== 2 || result) return;
+    const key = `${label.trim()}|${accessMode}|${environment?.id ?? ""}`;
+    if (mintedForRef.current === key) return;
+    void startSession();
+  }, [open, step, result, label, accessMode, environment?.id, startSession]);
+
+  const waiting = Boolean(mint) && (session?.status === "pending" || session?.status === "redeeming");
+
+  useEffect(() => {
+    if (!open || step !== 2 || result || !mint || !waiting) return;
+    let active = true;
+    const poll = async () => {
+      try {
+        const polled = await c.fetchConnectSession(mint.session.id);
+        if (!active) return;
+        setSession(polled.session);
+        if (polled.session.status === "completed" && polled.environment) {
+          setResult(polled.environment);
+          c.setSelectedEnvironmentId(polled.environment.id);
+          c.markEnvironmentCredentialChanged();
+          await c.refreshAll();
+        }
+      } catch {
+        // A transient poll failure is not worth surfacing; the next tick retries.
+      }
+    };
+    void poll();
+    const timer = window.setInterval(() => void poll(), CONNECT_POLL_INTERVAL_MS);
+    return () => {
+      active = false;
+      window.clearInterval(timer);
+    };
+  }, [open, step, result, mint?.session.id, waiting]);
 
   if (!open) return null;
-  const canContinue = step === 2
-    ? Boolean(label.trim() && environmentUrlValid(baseUrl, accessMode))
-    : step === 3
-      ? Boolean(credential.trim())
-      : true;
 
-  const connect = async () => {
-    const created = await c.run("pair-environment", "T3 environment connected.", async () => {
-      const response = await c.api<{ environment: Environment }>("/v1/t3/environments", {
-        method: "POST",
-        body: {
-          label: label.trim() || "T3 Code",
-          baseUrl: baseUrl.trim(),
-          [credentialType]: credential.trim(),
-        },
-      });
+  const manualValid = Boolean(label.trim() && environmentUrlValid(baseUrl, accessMode) && credential.trim());
+  const canContinue = step === 1 ? Boolean(label.trim()) : true;
+
+  const connectManually = async () => {
+    const saved = await c.run("pair-environment", "T3 environment connected.", async () => {
+      const body = {
+        label: label.trim() || "T3 Code",
+        baseUrl: baseUrl.trim(),
+        [credentialType]: credential.trim(),
+      };
+      // Re-pairing updates in place here too. Creating a second row for a host that already exists
+      // is the one outcome this flow must never produce, whichever path the user took.
+      const response = environment
+        ? await c.api<{ environment: Environment }>(`/v1/t3/environments/${encodeURIComponent(environment.id)}`, { method: "PUT", body })
+        : await c.api<{ environment: Environment }>("/v1/t3/environments", { method: "POST", body });
       setCredential("");
       c.markEnvironmentCredentialChanged();
       await c.refreshAll();
       c.setSelectedEnvironmentId(response.environment.id);
       return response;
     });
-    if (created) setResult(created.environment);
+    if (saved) setResult(saved.environment);
   };
+
+  const title = result
+    ? (repairing ? "Environment re-paired" : "Environment connected")
+    : (repairing ? `Re-pair ${environment?.label}` : "Connect T3 Code");
 
   return (
     <EnvironmentModalShell
       open
-      title={result ? "Environment connected" : "Connect T3 Code"}
-      eyebrow={result ? "Connection ready" : "Environment onboarding"}
+      title={title}
+      eyebrow={result ? "Connection ready" : repairing ? "Environment recovery" : "Environment onboarding"}
       description={result ? result.baseUrl : "Pair the host that owns your projects and agent sessions."}
       onClose={onClose}
       footer={result ? (
@@ -618,15 +732,22 @@ function ConnectEnvironmentDialog({
           <Button variant="ghost" onClick={step === 0 ? onClose : () => setStep((current) => current - 1)}>
             {step === 0 ? "Cancel" : <><ArrowLeft className="size-4" /> Back</>}
           </Button>
-          <Button
-            variant="primary"
-            busy={c.busyAction === "pair-environment"}
-            disabled={!canContinue}
-            onClick={() => step === steps.length - 1 ? void connect() : setStep((current) => current + 1)}
-          >
-            {step === steps.length - 1 ? "Connect environment" : "Continue"}
-            {step < steps.length - 1 ? <ArrowRight className="size-4" /> : null}
-          </Button>
+          {step === steps.length - 1 ? (
+            manual ? (
+              <Button
+                variant="primary"
+                busy={c.busyAction === "pair-environment"}
+                disabled={!manualValid}
+                onClick={() => void connectManually()}
+              >
+                {repairing ? "Save credential" : "Connect environment"}
+              </Button>
+            ) : null
+          ) : (
+            <Button variant="primary" disabled={!canContinue} onClick={() => setStep((current) => current + 1)}>
+              Continue <ArrowRight className="size-4" />
+            </Button>
+          )}
         </>
       )}
     >
@@ -638,7 +759,8 @@ function ConnectEnvironmentDialog({
           <dl>
             <EnvironmentReviewRow label="Environment" value={result.label} />
             <EnvironmentReviewRow label="Environment ID" value={result.id} mono />
-            <EnvironmentReviewRow label="Access path" value={environmentAccessLabel(accessMode)} />
+            {/* Learned from the endpoint the host actually reported, not from the guess made earlier. */}
+            <EnvironmentReviewRow label="Access path" value={environmentAccessLabel(inferEnvironmentAccessMode(result.baseUrl))} />
             <EnvironmentReviewRow label="Endpoint" value={result.baseUrl} mono />
           </dl>
         </div>
@@ -651,71 +773,173 @@ function ConnectEnvironmentDialog({
               <div className="environment-flow__access">
                 <div>
                   <h3 className="font-display text-base font-semibold">Choose how the gateway reaches T3</h3>
-                  <p className="mt-1 text-sm text-ink-muted">The access path controls who can reach the host and which endpoint you enter next.</p>
+                  <p className="mt-1 text-sm text-ink-muted">The access path scopes the command you run on the host.</p>
                 </div>
+                <Field label="Environment label" htmlFor="connect-environment-label">
+                  <input id="connect-environment-label" autoFocus value={label} onChange={(event) => setLabel(event.target.value)} />
+                </Field>
                 <EnvironmentAccessSelector value={accessMode} onChange={setAccessMode} />
                 <EnvironmentAccessGuidance mode={accessMode} controller={c} />
               </div>
             ) : null}
             {step === 2 ? (
               <div className="environment-flow__form">
-                <div>
-                  <h3 className="font-display text-base font-semibold">Identify the T3 host</h3>
-                  <p className="mt-1 text-sm text-ink-muted">Use a label operators recognize and the {environmentAccessLabel(accessMode).toLowerCase()} endpoint this gateway can reach.</p>
-                </div>
-                <Field label="Environment label" htmlFor="connect-environment-label">
-                  <input id="connect-environment-label" autoFocus value={label} onChange={(event) => setLabel(event.target.value)} />
-                </Field>
-                <Field label="T3 base URL" htmlFor="connect-environment-url" hint={environmentEndpointHint(accessMode)}>
-                  <input id="connect-environment-url" type="url" value={baseUrl} onChange={(event) => setBaseUrl(event.target.value)} placeholder={environmentUrlPlaceholder(accessMode)} />
-                </Field>
-                <EnvironmentAccessSummary mode={accessMode} />
-              </div>
-            ) : null}
-            {step === 3 ? (
-              <div className="environment-flow__form">
-                <div>
-                  <h3 className="font-display text-base font-semibold">Authenticate the connection</h3>
-                  <p className="mt-1 text-sm text-ink-muted">Pairing tokens are exchanged for scoped access. Existing access tokens are stored directly.</p>
-                </div>
-                <CredentialSwitcher value={credentialType} onChange={setCredentialType} />
-                <Field
-                  label={credentialType === "pairingToken" ? "Pairing token" : "Access token"}
-                  htmlFor="connect-environment-token"
-                  hint="The credential is encrypted at rest and never returned by the API."
-                >
-                  <textarea
-                    id="connect-environment-token"
-                    autoFocus
-                    className="font-mono"
-                    rows={4}
-                    value={credential}
-                    onChange={(event) => setCredential(event.target.value)}
-                    placeholder="Paste credential"
-                  />
-                </Field>
-              </div>
-            ) : null}
-            {step === 4 ? (
-              <div className="device-flow__review">
-                <div>
-                  <p className="eyebrow">Confirm connection</p>
-                  <h3 className="font-display text-lg font-semibold">Pair {label}</h3>
-                  <p className="mt-1 text-sm text-ink-muted">After saving, use Check to verify that the gateway can reach this endpoint.</p>
-                </div>
-                <dl>
-                  <EnvironmentReviewRow label="Label" value={label} />
-                  <EnvironmentReviewRow label="Access path" value={environmentAccessLabel(accessMode)} />
-                  <EnvironmentReviewRow label="Endpoint" value={baseUrl} mono />
-                  <EnvironmentReviewRow label="Credential" value={credentialType === "pairingToken" ? "Pairing token" : "Access token"} />
-                  <EnvironmentReviewRow label="Storage" value="Encrypted at rest" />
-                </dl>
+                <ConnectHandoff
+                  mint={mint}
+                  session={session}
+                  error={mintError}
+                  repairing={repairing}
+                  onRetry={() => void startSession()}
+                />
+                <ConnectManualFallback
+                  open={manual}
+                  onToggle={() => setManual((current) => !current)}
+                  accessMode={accessMode}
+                  baseUrl={baseUrl}
+                  onBaseUrlChange={setBaseUrl}
+                  credential={credential}
+                  onCredentialChange={setCredential}
+                  credentialType={credentialType}
+                  onCredentialTypeChange={setCredentialType}
+                />
               </div>
             ) : null}
           </div>
         </>
       )}
     </EnvironmentModalShell>
+  );
+}
+
+function ConnectHandoff({
+  mint,
+  session,
+  error,
+  repairing,
+  onRetry,
+}: {
+  mint: ConnectSessionMint | null;
+  session: ConnectSession | null;
+  error: string | null;
+  repairing: boolean;
+  onRetry: () => void;
+}) {
+  const status = session?.status ?? "pending";
+  const dead = status === "expired" || status === "failed";
+
+  if (error) {
+    return (
+      <section className="environment-connect-handoff" data-tone="danger" aria-label="Connect command">
+        <div className="environment-connect-handoff__heading">
+          <ShieldCheck className="size-4" />
+          <div>
+            <strong>Could not create a connect command</strong>
+            <span>{error}</span>
+          </div>
+        </div>
+        <p>Pair by pasting the credential from the T3 host instead.</p>
+      </section>
+    );
+  }
+
+  if (!mint) {
+    return (
+      <section className="environment-connect-handoff" data-tone="neutral" aria-label="Connect command">
+        <p role="status">Preparing your connect command…</p>
+      </section>
+    );
+  }
+
+  return (
+    <section className="environment-connect-handoff" data-tone={dead ? "danger" : "info"} aria-label="Connect command">
+      <div className="environment-connect-handoff__heading">
+        <Terminal className="size-4" />
+        <div>
+          <strong>Run this on the T3 host</strong>
+          <span>
+            {repairing
+              ? "It exchanges a fresh credential and updates this environment in place."
+              : "It installs and starts T3 Code if needed, then finishes the pairing for you."}
+          </span>
+        </div>
+      </div>
+      <CopyableSyntax value={mint.command} label="connect command" />
+      {dead ? (
+        <>
+          <p role="alert">
+            {status === "expired"
+              ? "This connect code expired before the host used it."
+              : `Pairing failed on the host: ${session?.error ?? "unknown error"}`}
+          </p>
+          <Button size="sm" onClick={onRetry}><RefreshCw className="size-3.5" /> Get a new command</Button>
+        </>
+      ) : (
+        <p className="environment-connect-handoff__waiting" role="status">
+          <Loader2 className="size-3.5 animate-spin" aria-hidden="true" />
+          {status === "redeeming" ? "Host found. Finishing the pairing…" : "Waiting for the T3 host…"}
+        </p>
+      )}
+      <small>The code is single use and expires in 15 minutes. Nothing needs to be pasted back here.</small>
+    </section>
+  );
+}
+
+function ConnectManualFallback({
+  open,
+  onToggle,
+  accessMode,
+  baseUrl,
+  onBaseUrlChange,
+  credential,
+  onCredentialChange,
+  credentialType,
+  onCredentialTypeChange,
+}: {
+  open: boolean;
+  onToggle: () => void;
+  accessMode: EnvironmentAccessMode;
+  baseUrl: string;
+  onBaseUrlChange: (value: string) => void;
+  credential: string;
+  onCredentialChange: (value: string) => void;
+  credentialType: CredentialType;
+  onCredentialTypeChange: (value: CredentialType) => void;
+}) {
+  return (
+    <section className="environment-connect-manual">
+      <button type="button" aria-expanded={open} onClick={onToggle}>
+        <KeyRound className="size-3.5" /> Paste a credential manually instead
+      </button>
+      {open ? (
+        <div className="environment-connect-manual__body">
+          <p>Use this when the T3 host cannot reach this gateway outbound. Run the pairing wizard there and copy what it prints.</p>
+          <Field label="T3 base URL" htmlFor="connect-environment-url" hint={environmentEndpointHint(accessMode)}>
+            <input
+              id="connect-environment-url"
+              type="url"
+              value={baseUrl}
+              onChange={(event) => onBaseUrlChange(event.target.value)}
+              placeholder={environmentUrlPlaceholder(accessMode)}
+            />
+          </Field>
+          <CredentialSwitcher value={credentialType} onChange={onCredentialTypeChange} />
+          <Field
+            label={credentialType === "pairingToken" ? "Pairing token" : "Access token"}
+            htmlFor="connect-environment-token"
+            hint="The credential is encrypted at rest and never returned by the API."
+          >
+            <textarea
+              id="connect-environment-token"
+              className="font-mono"
+              rows={4}
+              value={credential}
+              onChange={(event) => onCredentialChange(event.target.value)}
+              placeholder="Paste credential"
+            />
+          </Field>
+        </div>
+      ) : null}
+    </section>
   );
 }
 
@@ -922,6 +1146,7 @@ function EnvironmentEditorDialog({
   onCheck,
   onLoad,
   onRemove,
+  onRepair,
 }: {
   controller: Controller;
   environment: Environment | null;
@@ -929,6 +1154,7 @@ function EnvironmentEditorDialog({
   onCheck: () => void;
   onLoad: () => void;
   onRemove: () => void;
+  onRepair: () => void;
 }) {
   const [tab, setTab] = useState<EnvironmentTab>("connection");
   const [label, setLabel] = useState("");
@@ -1027,9 +1253,12 @@ function EnvironmentEditorDialog({
 
           {tab === "credential" ? (
             <div className="environment-editor__section">
-              <div>
-                <p className="font-display text-base font-semibold">Replace the stored credential</p>
-                <p className="mt-1 text-sm leading-relaxed text-ink-muted">Leave this empty to keep the encrypted credential unchanged.</p>
+              <div className="flex flex-wrap items-start justify-between gap-3">
+                <div>
+                  <p className="font-display text-base font-semibold">Replace the stored credential</p>
+                  <p className="mt-1 text-sm leading-relaxed text-ink-muted">Leave this empty to keep the encrypted credential unchanged.</p>
+                </div>
+                <Button size="sm" onClick={onRepair}><Cable className="size-3.5" /> Re-pair from the host</Button>
               </div>
               <CredentialSwitcher value={credentialType} onChange={setCredentialType} />
               <Field label={credentialType === "pairingToken" ? "Replacement pairing token" : "Replacement access token"} htmlFor="edit-environment-token" hint="Saved credentials are never displayed again.">

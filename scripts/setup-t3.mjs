@@ -80,6 +80,7 @@ try {
       gatewayUrl: options.gatewayUrl,
       gatewayToken: options.gatewayToken,
       gatewayDevUser: options.gatewayDevUser,
+      connectCode: options.connectCode,
       label: options.environmentLabel ?? `${projectTitle ?? "Mac"} T3 Code`,
       baseUrl: t3.baseUrl,
       pairingToken: t3.pairingToken,
@@ -136,6 +137,7 @@ function parseArgs(args) {
     else if (arg === "--gateway-url") result.gatewayUrl = requireValue(args, ++index, arg);
     else if (arg === "--gateway-token") result.gatewayToken = requireValue(args, ++index, arg);
     else if (arg === "--gateway-dev-user") result.gatewayDevUser = requireValue(args, ++index, arg);
+    else if (arg === "--connect-code") result.connectCode = requireValue(args, ++index, arg);
     else if (arg === "--environment-label") result.environmentLabel = requireValue(args, ++index, arg);
     else if (arg === "--initial-prompt") result.initialPrompt = requireValue(args, ++index, arg);
     else throw new Error(`Unknown argument: ${arg}`);
@@ -205,6 +207,7 @@ function printHelp() {
 Usage:
   npm run setup:t3
   npm run setup:t3 -- --project /path/to/project --provider openai --tunnel tailscale
+  npm run setup:t3 -- --gateway-url https://gateway.example --connect-code ABCDE-FGHIJ
 
 Provider choices:
   auto, openai, anthropic, cursor, opencode, grok, custom
@@ -223,6 +226,7 @@ Important options:
   --gateway-url URL          Agent Controller gateway URL
   --gateway-token TOKEN      Existing platform token
   --gateway-dev-user ID      Create a local development token
+  --connect-code CODE        Enrollment code copied from the console's Add environment flow
   --initial-prompt TEXT      Launch a first thread after pairing
   --yes                      Non-interactive mode
   --no-install               Do not install missing T3/provider CLIs

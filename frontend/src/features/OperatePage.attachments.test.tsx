@@ -57,6 +57,7 @@ function controller(overrides: Record<string, unknown> = {}) {
     setSelectedThreadId: vi.fn(),
     api: vi.fn(async () => ({ command: { id: "cmd_1" } })),
     refreshAll: vi.fn(),
+    uploadMedia: vi.fn(),
     loadSnapshot: vi.fn(async () => ({})),
     launchProject: vi.fn(),
     run: vi.fn(async (_key: string, _message: string, task: () => Promise<unknown>) => task()),
@@ -64,12 +65,15 @@ function controller(overrides: Record<string, unknown> = {}) {
   } as unknown as Controller;
 }
 
-function openImageComposer() {
-  fireEvent.click(screen.getByRole("button", { name: "Image" }));
+// One attachment button, one source menu. The library stays open between picks so several
+// uploads can be attached in the order the user wants them sent.
+function openLibrary() {
+  fireEvent.click(screen.getByRole("button", { name: "Add attachment" }));
+  fireEvent.click(screen.getByRole("menuitem", { name: "Choose from media library" }));
 }
 
 function attach(name: string) {
-  fireEvent.change(screen.getByLabelText("Attach media"), { target: { value: name } });
+  fireEvent.click(screen.getByRole("button", { name: `Attach ${name}` }));
 }
 
 function chipNames() {
@@ -80,26 +84,26 @@ function chipNames() {
 
 test("several uploads can be attached, and each chip names its kind and state", () => {
   render(<ConfirmProvider><OperatePage controller={controller()} /></ConfirmProvider>);
-  openImageComposer();
+  openLibrary();
 
-  attach("media_1");
-  attach("media_2");
+  attach("first.png");
+  attach("second.png");
 
   expect(chipNames()).toEqual(["first.png", "second.png"]);
   const chips = within(screen.getByRole("list", { name: "Attachments" })).getAllByRole("listitem");
   expect(chips[0].textContent).toContain("image · ready");
   expect(chips[1].textContent).toContain("image · pending");
   // An attached upload is no longer offered a second time.
-  expect(within(screen.getByLabelText("Attach media")).queryByText(/first\.png/u)).toBeNull();
+  expect(screen.queryByRole("button", { name: "Attach first.png" })).toBeNull();
 });
 
 test("an attachment can be removed without disturbing the rest of the order", () => {
   render(<ConfirmProvider><OperatePage controller={controller()} /></ConfirmProvider>);
-  openImageComposer();
+  openLibrary();
 
-  attach("media_1");
-  attach("media_2");
-  attach("media_3");
+  attach("first.png");
+  attach("second.png");
+  attach("third.jpg");
   fireEvent.click(screen.getByRole("button", { name: "Remove second.png" }));
 
   expect(chipNames()).toEqual(["first.png", "third.jpg"]);
@@ -108,11 +112,11 @@ test("an attachment can be removed without disturbing the rest of the order", ()
 test("attachments can be reordered and dispatch in the order shown", async () => {
   const c = controller();
   render(<ConfirmProvider><OperatePage controller={c} /></ConfirmProvider>);
-  openImageComposer();
+  openLibrary();
 
-  attach("media_1");
-  attach("media_2");
-  attach("media_3");
+  attach("first.png");
+  attach("second.png");
+  attach("third.jpg");
   fireEvent.click(screen.getByRole("button", { name: "Move third.jpg earlier" }));
   expect(chipNames()).toEqual(["first.png", "third.jpg", "second.png"]);
 
@@ -129,10 +133,10 @@ test("attachments can be reordered and dispatch in the order shown", async () =>
 
 test("the first and last chips cannot be moved out of the list", () => {
   render(<ConfirmProvider><OperatePage controller={controller()} /></ConfirmProvider>);
-  openImageComposer();
+  openLibrary();
 
-  attach("media_1");
-  attach("media_2");
+  attach("first.png");
+  attach("second.png");
 
   expect(screen.getByRole("button", { name: "Move first.png earlier" })).toBeDisabled();
   expect(screen.getByRole("button", { name: "Move second.png later" })).toBeDisabled();
@@ -141,12 +145,12 @@ test("the first and last chips cannot be moved out of the list", () => {
 test("attachments alone are enough to send, and the draft clears afterwards", async () => {
   const c = controller();
   render(<ConfirmProvider><OperatePage controller={c} /></ConfirmProvider>);
-  openImageComposer();
+  openLibrary();
 
   const send = screen.getByRole("button", { name: "Send message" });
   expect(send).toBeDisabled();
 
-  attach("media_2");
+  attach("second.png");
   expect(send).toBeEnabled();
   fireEvent.click(send);
 

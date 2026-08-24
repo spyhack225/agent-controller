@@ -370,6 +370,70 @@ test("Convex store adapter encrypts T3 access tokens at rest", async () => {
   assert.equal(environment.accessTokenExpiresAt, "2026-06-15T00:00:00.000Z");
 });
 
+test("Convex store adapter hashes connect codes in Node and never sends the plaintext", async () => {
+  const calls = [];
+  const client = {
+    query: async (name, args) => {
+      calls.push({ type: "query", name, args });
+      return { id: "cxn_1", status: "pending" };
+    },
+    mutation: async (name, args) => {
+      calls.push({ type: "mutation", name, args });
+      if (name === "gatewayStore:claimConnectSession") return { session: { id: "cxn_1" }, reason: null };
+      return { id: "cxn_1", status: "pending" };
+    },
+  };
+  const store = createConvexStoreAdapter({ client, gatewaySecret: "gateway-secret" });
+
+  const created = await store.createConnectSession({
+    userId: "user_1",
+    label: "Studio Mac",
+    accessMode: "TAILSCALE",
+    environmentId: null,
+  });
+  const read = await store.getConnectSession({ userId: "user_1", sessionId: "cxn_1" });
+  const claimed = await store.claimConnectSession({ code: created.code });
+  const completed = await store.completeConnectSession({
+    sessionId: "cxn_1",
+    environmentId: "env_1",
+    baseUrl: "https://mac.tailnet.ts.net",
+  });
+
+  assert.match(created.code, /^[A-Z0-9]{5}-[A-Z0-9]{5}$/u);
+  assert.deepEqual(created.session, { id: "cxn_1", status: "pending" });
+  assert.deepEqual(read, { id: "cxn_1", status: "pending" });
+  assert.deepEqual(claimed, { session: { id: "cxn_1" }, reason: null });
+  assert.deepEqual(completed, { id: "cxn_1", status: "pending" });
+
+  const mint = calls.find((call) => call.name === "gatewayStore:createConnectSession");
+  assert.equal(mint.type, "mutation");
+  assert.equal(mint.args.accessMode, "tailscale");
+  assert.equal(mint.args.environmentId, null);
+  assert.match(mint.args.codeHash, /^[a-f0-9]{64}$/u);
+  // The plaintext code is the credential. Convex only ever sees its hash, and the hash is of the
+  // normalized (dash-stripped, upper-cased) form so a user retyping it cannot miss.
+  assert.equal(mint.args.code, undefined);
+  assert.equal(mint.args.codeHash, sha256(created.code.replace("-", "")));
+  assert.match(mint.args.expiresAt, /^\d{4}-\d{2}-\d{2}T/u);
+
+  const claim = calls.find((call) => call.name === "gatewayStore:claimConnectSession");
+  assert.equal(claim.args.code, undefined);
+  assert.equal(claim.args.codeHash, mint.args.codeHash);
+
+  assert.deepEqual(calls.find((call) => call.name === "gatewayStore:getConnectSession").args, {
+    userId: "user_1",
+    sessionId: "cxn_1",
+    gatewaySecret: "gateway-secret",
+  });
+  assert.deepEqual(calls.find((call) => call.name === "gatewayStore:completeConnectSession").args, {
+    sessionId: "cxn_1",
+    environmentId: "env_1",
+    baseUrl: "https://mac.tailnet.ts.net",
+    error: null,
+    gatewaySecret: "gateway-secret",
+  });
+});
+
 test("Convex store uses direct HTTP endpoints without the Convex runtime package", async () => {
   const requests = [];
   const store = await createConvexStore(

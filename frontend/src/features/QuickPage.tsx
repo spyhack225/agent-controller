@@ -1,13 +1,150 @@
-import { ArrowRight, Check, CheckCircle2, CircleAlert, Play, X, Zap } from "lucide-react";
+/**
+ * The phone surface: send something, then clear whatever is waiting on a decision.
+ *
+ * The composer here is the shared one from `Composer.tsx`, deliberately not a fork — a message sent
+ * from a phone must take the same intent path and the same policy screening as one sent from
+ * Operate. It is kept compact on purpose: approvals are why someone opens this page in a hurry, so
+ * the composer must never grow tall enough to push the attention queue past the fold.
+ */
+
+import { ArrowRight, Check, CheckCircle2, CircleAlert, Mic, Play, Send, X, Zap } from "lucide-react";
+import { useState } from "react";
 
 import type { Controller } from "../controller";
 import { commandSummary, commandType, formatRelativeTime } from "../format";
 import type { Command, PageId, SavedAction } from "../types";
 import { Button, StatusBadge, useConfirm } from "../ui";
+import {
+  AttachmentChips,
+  AttachmentSourceMenu,
+  ComposerShell,
+  buildComposerIntent,
+  sendComposerIntent,
+  useComposerDraft,
+  useFileAttachment,
+} from "./Composer";
+import { MediaCaptureDialog } from "./MediaCapture";
 
 interface QuickPageProps {
   controller: Controller;
   onNavigate: (page: PageId) => void;
+}
+
+/**
+ * One field, one attachment button, one push-to-talk button, Send. No project, model or shell
+ * controls — this composer only ever adds to the thread that is already selected, and says so
+ * plainly when there is not one yet.
+ */
+function QuickComposer({
+  controller: c,
+  onNavigate,
+}: {
+  controller: Controller;
+  onNavigate: (page: PageId) => void;
+}) {
+  const draft = useComposerDraft(c.media ?? []);
+  const attachFiles = useFileAttachment({ controller: c, draft });
+  const [recording, setRecording] = useState(false);
+
+  const ready = Boolean(c.selectedEnvironmentId && c.selectedThreadId);
+  const hasRequest = Boolean(draft.prompt.trim()) || draft.attachmentIds.length > 0;
+  const canSend = ready && hasRequest;
+  const blockedReason = c.selectedEnvironmentId
+    ? "Pick a thread in Operations first."
+    : "Pair a T3 environment first.";
+
+  const submit = async () => {
+    if (!canSend) return;
+    const result = await sendComposerIntent(
+      c,
+      buildComposerIntent({ mode: "prompt", text: draft.prompt, attachments: draft.attachments }),
+      "Message sent.",
+    );
+    if (result !== undefined) draft.reset();
+  };
+
+  return (
+    <div className="dashboard-composer">
+      <ComposerShell
+        compact
+        rows={2}
+        textareaId="quick-prompt"
+        label="Message this thread"
+        value={draft.prompt}
+        onChange={draft.setPrompt}
+        placeholder={ready
+          ? "Send a message to this thread…"
+          : "Pick a thread in Operations to send from here"}
+        canSend={canSend}
+        onSubmit={() => void submit()}
+        onFiles={ready ? (files) => void attachFiles(files) : undefined}
+        attachments={
+          <AttachmentChips
+            attachments={draft.attachments}
+            onRemove={draft.removeAttachment}
+            onMove={draft.moveAttachment}
+          />
+        }
+        actions={
+          <>
+            <AttachmentSourceMenu
+              controller={c}
+              draft={draft}
+              disabled={!ready}
+              disabledReason={blockedReason}
+            />
+            <button
+              type="button"
+              className="composer-inline-action"
+              disabled={!ready || draft.atLimit}
+              aria-label="Record voice"
+              title={ready ? "Record a voice message" : blockedReason}
+              onClick={() => setRecording(true)}
+            >
+              <Mic className="size-3.5" aria-hidden="true" /> Voice
+            </button>
+          </>
+        }
+        send={
+          <Button
+            variant="primary"
+            size="icon"
+            busy={c.busyAction === "send-intent"}
+            disabled={!canSend}
+            aria-label="Send message"
+            onClick={() => void submit()}
+          >
+            <Send className="size-4" aria-hidden="true" />
+          </Button>
+        }
+      />
+
+      {ready ? null : (
+        <p className="dashboard-composer__blocked">
+          <span>{blockedReason}</span>
+          {c.selectedEnvironmentId ? (
+            <Button size="sm" variant="ghost" onClick={() => onNavigate("operate")}>
+              Choose a thread
+            </Button>
+          ) : null}
+        </p>
+      )}
+
+      {recording ? (
+        <MediaCaptureDialog
+          controller={c}
+          initialSource="audio"
+          title="Record a voice message"
+          description="The clip is stored in your media library and attached to this message."
+          onClose={() => setRecording(false)}
+          onUploaded={(media) => {
+            draft.addAttachment(media.id);
+            setRecording(false);
+          }}
+        />
+      ) : null}
+    </div>
+  );
 }
 
 export function QuickPage({ controller: c, onNavigate }: QuickPageProps) {
@@ -74,9 +211,10 @@ export function QuickPage({ controller: c, onNavigate }: QuickPageProps) {
           />
         </div>
         <p className="dashboard-home__description">{workspaceDescription}</p>
+        <QuickComposer controller={c} onNavigate={onNavigate} />
         <div className="dashboard-home__workspace-actions">
           <Button
-            variant="primary"
+            variant="ghost"
             onClick={() => onNavigate(selectedEnvironment ? "operate" : "environments")}
           >
             {selectedEnvironment ? "Open Operations" : "Pair an environment"}

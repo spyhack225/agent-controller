@@ -13,6 +13,7 @@ function controller(overrides: Record<string, unknown> = {}) {
     api: vi.fn(async () => ({ media: {} })),
     refreshAll: vi.fn(),
     refreshMedia: vi.fn(),
+    uploadMedia: vi.fn(async () => ({ id: "media_1", kind: "image", contentType: "image/png" })),
     run: vi.fn(async (_key: string, _message: string, task: () => Promise<unknown>) => task()),
     ...overrides,
   } as unknown as Controller;

@@ -2854,6 +2854,89 @@
     line-height: 1.5;
   }
 
+  .environment-connect-handoff {
+    display: grid;
+    gap: 0.6rem;
+    border: 1px solid var(--ac-border);
+    border-radius: 0.7rem;
+    background: var(--ac-surface);
+    padding: 0.85rem;
+    text-align: left;
+  }
+
+  .environment-connect-handoff[data-tone="danger"] {
+    border-color: color-mix(in srgb, var(--ac-danger) 40%, var(--ac-border));
+  }
+
+  .environment-connect-handoff__heading {
+    display: flex;
+    align-items: flex-start;
+    gap: 0.5rem;
+    color: var(--ac-ink);
+  }
+
+  .environment-connect-handoff__heading strong {
+    display: block;
+    font-size: 0.82rem;
+    font-weight: 650;
+  }
+
+  .environment-connect-handoff__heading span {
+    display: block;
+    margin-top: 0.15rem;
+    color: var(--ac-ink-muted);
+    font-size: 0.7rem;
+    line-height: 1.5;
+  }
+
+  .environment-connect-handoff p,
+  .environment-connect-handoff small {
+    color: var(--ac-ink-muted);
+    font-size: 0.7rem;
+    line-height: 1.5;
+  }
+
+  .environment-connect-handoff__waiting {
+    display: flex;
+    align-items: center;
+    gap: 0.4rem;
+    color: var(--ac-ink);
+    font-weight: 600;
+  }
+
+  .environment-connect-manual {
+    display: grid;
+    gap: 0.65rem;
+    border-top: 1px solid var(--ac-border);
+    padding-top: 0.85rem;
+    text-align: left;
+  }
+
+  .environment-connect-manual > button {
+    display: inline-flex;
+    align-items: center;
+    justify-self: start;
+    gap: 0.35rem;
+    color: var(--ac-ink-muted);
+    font-size: 0.72rem;
+    font-weight: 600;
+  }
+
+  .environment-connect-manual > button:hover {
+    color: var(--ac-ink);
+  }
+
+  .environment-connect-manual__body {
+    display: grid;
+    gap: 1rem;
+  }
+
+  .environment-connect-manual__body > p {
+    color: var(--ac-ink-muted);
+    font-size: 0.7rem;
+    line-height: 1.5;
+  }
+
   .environment-access-guide__syntax {
     display: flex;
     min-width: 0;
@@ -4064,6 +4147,248 @@ html:not(.dark)[data-theme="light"] {
     padding: 0.65rem;
   }
 
+  .composer-footer__actions,
+  .composer-footer__send {
+    display: flex;
+    min-width: 0;
+    align-items: center;
+    gap: 0.4rem;
+  }
+
+  .composer-shell {
+    position: relative;
+  }
+
+  .composer-shell[data-dropping] {
+    border-color: var(--ac-focus);
+    box-shadow: 0 0 0 3px color-mix(in srgb, var(--ac-focus) 18%, transparent);
+  }
+
+  .composer-dropzone {
+    position: absolute;
+    display: grid;
+    inset: 0;
+    place-items: center;
+    border-radius: inherit;
+    background: color-mix(in srgb, var(--ac-surface-raised) 88%, transparent);
+    color: var(--ac-ink-muted);
+    pointer-events: none;
+    font-size: 0.8rem;
+    font-weight: 600;
+  }
+
+  .composer-shell .thread-attachment-chips {
+    margin: 0;
+    border-bottom: 1px solid var(--ac-border);
+    padding: 0.55rem 0.65rem;
+  }
+
+  /* The phone composer: tall enough to write in, short enough to leave approvals on screen. */
+  .composer-shell[data-compact] textarea {
+    min-height: 3.6rem;
+    max-height: 7rem;
+    padding: 0.6rem 0.7rem;
+    font-size: 0.9rem;
+    line-height: 1.5;
+  }
+
+  .composer-shell[data-compact] .composer-footer {
+    gap: 0.5rem;
+    padding: 0.4rem 0.45rem;
+  }
+
+  .composer-shell[data-compact] .thread-attachment-chips {
+    padding: 0.4rem 0.45rem;
+  }
+
+  /* The source menu is taller than a compact shell, so it must be allowed to escape it. The
+     footer is the only child with its own background, so it is the only one that needs the
+     rounding back. */
+  .composer-shell[data-compact] {
+    overflow: visible;
+  }
+
+  .composer-shell[data-compact] .composer-footer {
+    border-end-end-radius: inherit;
+    border-end-start-radius: inherit;
+  }
+
+  .composer-shell[data-compact] .thread-attachment-chip {
+    max-width: 100%;
+  }
+
+  .composer-shell[data-compact] .thread-attachment-chip__name {
+    min-width: 0;
+    max-width: 8rem;
+  }
+
+  .composer-shell[data-compact] .thread-attachment-chip small {
+    display: none;
+  }
+
+  .composer-mode-toggle,
+  .composer-inline-action {
+    display: inline-flex;
+    min-height: 2.25rem;
+    cursor: pointer;
+    align-items: center;
+    gap: 0.35rem;
+    border: 1px solid transparent;
+    border-radius: 0.5rem;
+    background: transparent;
+    color: var(--ac-ink-muted);
+    outline: none;
+    padding: 0.35rem 0.6rem;
+    font-size: 0.72rem;
+    font-weight: 600;
+    white-space: nowrap;
+  }
+
+  .composer-mode-toggle:hover,
+  .composer-inline-action:hover:not(:disabled) {
+    background: var(--ac-surface-inset);
+    color: var(--ac-ink);
+  }
+
+  .composer-mode-toggle:focus-visible,
+  .composer-inline-action:focus-visible {
+    box-shadow: 0 0 0 2px var(--ac-focus);
+  }
+
+  .composer-inline-action:disabled {
+    cursor: not-allowed;
+    opacity: 0.45;
+  }
+
+  .composer-mode-toggle[data-active] {
+    border-color: var(--ac-border-strong);
+    background: var(--ac-surface-raised);
+    color: var(--ac-ink);
+  }
+
+  .composer-attach {
+    position: relative;
+    display: inline-flex;
+  }
+
+  .composer-source-menu,
+  .composer-library {
+    position: absolute;
+    z-index: 20;
+    bottom: calc(100% + 0.4rem);
+    left: 0;
+    min-width: 15rem;
+    border: 1px solid var(--ac-border-strong);
+    border-radius: 0.7rem;
+    background: var(--ac-surface-raised);
+    box-shadow: 0 16px 40px rgb(24 33 30 / 16%);
+    padding: 0.3rem;
+  }
+
+  .composer-source-menu button {
+    display: flex;
+    width: 100%;
+    min-height: 2.4rem;
+    cursor: pointer;
+    align-items: center;
+    gap: 0.5rem;
+    border: 0;
+    border-radius: 0.5rem;
+    background: transparent;
+    color: var(--ac-ink);
+    outline: none;
+    padding: 0.4rem 0.55rem;
+    text-align: left;
+    font-size: 0.78rem;
+    font-weight: 600;
+  }
+
+  .composer-source-menu button:hover,
+  .composer-source-menu button:focus-visible {
+    background: var(--ac-surface-inset);
+  }
+
+  .composer-source-menu button:focus-visible {
+    box-shadow: 0 0 0 2px var(--ac-focus);
+  }
+
+  .composer-library {
+    width: min(22rem, 80vw);
+  }
+
+  .composer-library > header {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 0.5rem;
+    padding: 0.35rem 0.35rem 0.35rem 0.6rem;
+  }
+
+  .composer-library > header h3 {
+    color: var(--ac-ink-muted);
+    font-size: 0.68rem;
+    font-weight: 700;
+    letter-spacing: 0.06em;
+    text-transform: uppercase;
+  }
+
+  .media-picker {
+    display: flex;
+    max-height: 15rem;
+    flex-direction: column;
+    gap: 0.15rem;
+    overflow-y: auto;
+    padding: 0;
+    list-style: none;
+  }
+
+  .media-picker button {
+    display: flex;
+    width: 100%;
+    min-height: 2.4rem;
+    cursor: pointer;
+    align-items: center;
+    gap: 0.5rem;
+    border: 0;
+    border-radius: 0.5rem;
+    background: transparent;
+    color: var(--ac-ink);
+    outline: none;
+    padding: 0.35rem 0.5rem;
+    text-align: left;
+    font-size: 0.76rem;
+  }
+
+  .media-picker button:hover,
+  .media-picker button:focus-visible {
+    background: var(--ac-surface-inset);
+  }
+
+  .media-picker button:focus-visible {
+    box-shadow: 0 0 0 2px var(--ac-focus);
+  }
+
+  .media-picker__name {
+    min-width: 0;
+    flex: 1;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    font-weight: 600;
+  }
+
+  .media-picker button small {
+    color: var(--ac-ink-faint);
+    white-space: nowrap;
+    font-size: 0.66rem;
+  }
+
+  .media-picker__empty {
+    color: var(--ac-ink-muted);
+    padding: 0.6rem;
+    font-size: 0.76rem;
+  }
+
   .row-item {
     display: flex;
     min-width: 0;
@@ -4499,8 +4824,12 @@ html:not(.dark)[data-theme="light"] {
     flex-direction: column;
   }
 
-  .composer-footer button {
+  .composer-footer__send button {
     width: 100%;
+  }
+
+  .composer-footer__actions {
+    justify-content: flex-start;
   }
 
   .intent-switcher {
@@ -4516,6 +4845,10 @@ html:not(.dark)[data-theme="light"] {
   .nav-item,
   .inventory-row,
   .intent-switcher__item,
+  .composer-mode-toggle,
+  .composer-inline-action,
+  .composer-source-menu button,
+  .media-picker button,
   .mobile-nav button {
     min-height: 44px;
   }
@@ -5293,12 +5626,6 @@ html:not(.dark)[data-theme="light"] {
     background: var(--ac-surface);
     color: var(--ac-ink);
     box-shadow: none;
-  }
-
-  .thread-media-select {
-    min-height: 2rem;
-    margin-bottom: 0.35rem;
-    font-size: 0.72rem;
   }
 
   .thread-attachment-chips {
@@ -7734,6 +8061,32 @@ html:not(.dark)[data-theme="light"] {
     line-height: 1.5;
   }
 
+  .dashboard-composer {
+    display: grid;
+    min-width: 0;
+    gap: 0.4rem;
+    margin-top: 0.85rem;
+  }
+
+  .dashboard-composer .composer-shell {
+    box-shadow: none;
+  }
+
+  .dashboard-composer__blocked {
+    display: flex;
+    min-width: 0;
+    align-items: center;
+    justify-content: space-between;
+    gap: 0.5rem;
+    margin: 0;
+    color: var(--ac-ink-muted);
+    font-size: 0.78rem;
+  }
+
+  .dashboard-composer__blocked span {
+    min-width: 0;
+  }
+
   .dashboard-home__workspace-actions {
     display: flex;
     align-items: center;
@@ -7904,6 +8257,22 @@ html:not(.dark)[data-theme="light"] {
 
   .dashboard-approval-row__actions > button {
     flex: 1;
+  }
+
+  /* Everything else in the dashboard stacks at this width; the composer must not, or its footer
+     doubles in height and the first approval row falls below the fold. */
+  .dashboard-composer .composer-footer {
+    align-items: center;
+    flex-direction: row;
+    justify-content: space-between;
+  }
+
+  .dashboard-composer .composer-footer__send button {
+    width: auto;
+  }
+
+  .dashboard-composer__blocked {
+    flex-wrap: wrap;
   }
 }
 

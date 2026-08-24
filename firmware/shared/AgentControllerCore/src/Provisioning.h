@@ -64,6 +64,10 @@ class Provisioning {
   // when the station stays up and LAN discovery can work.
   bool configPortalActive() const { return configPortal_; }
 
+  // Leaves the config portal without changing anything, returning the device to normal operation.
+  // Only meaningful while configPortalActive(): during first-time setup there is nowhere to go.
+  void closeConfigPortal();
+
   // True exactly once after a successful join, so the caller can re-run its gateway handshake.
   bool consumeJustConnected();
 

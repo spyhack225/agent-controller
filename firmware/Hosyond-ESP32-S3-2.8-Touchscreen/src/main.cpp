@@ -27,6 +27,7 @@
 #include <ThinkingOrb.h>
 
 #include <DeviceStore.h>
+#include <GatewayClient.h>
 #include <Provisioning.h>
 
 #if __has_include("controller_config.h")
@@ -67,6 +68,7 @@ namespace {
 
 DeviceStore store;
 Provisioning provisioning;
+GatewayClient gateway;
 
 ProvisioningState lastState = ProvisioningState::Unprovisioned;
 
@@ -408,6 +410,25 @@ void reportState(ProvisioningState state) {
   }
 
   if (orbBrowsing) return;
+
+  // An unclaimed device has exactly one thing to say, and it is not its IP address. The claim code
+  // is the only way its owner can take possession of it, so it outranks every other status.
+  if (state == ProvisioningState::Online) {
+    switch (gateway.link()) {
+      case GatewayLink::Unclaimed:
+        setOrbState(OrbMode::Ring, gateway.claimCode().length() ? gateway.claimCode() : "Setup",
+                    "enter this code in the console");
+        return;
+      case GatewayLink::AuthFailed:
+        setOrbState(OrbMode::Web, "Not paired", gateway.detail());
+        return;
+      case GatewayLink::Claimed:
+        setOrbState(OrbMode::Ring, "Ready", WiFi.localIP().toString());
+        return;
+      default:
+        break;
+    }
+  }
 
   switch (state) {
     case ProvisioningState::Provisioning:
@@ -805,6 +826,7 @@ void setup() {
   Serial.println("[audio] Disabled. Build -e hosyond-es3c28p-capture to enable the microphone.");
 #endif
 
+  gateway.begin(store, HARDWARE_MODEL, FIRMWARE_VERSION);
   gatewayProbeBegin();
   provisioning.begin(store, store.deviceId());
   lastState = provisioning.status().state;
@@ -830,6 +852,20 @@ void loop() {
   if (state != lastState) {
     lastState = state;
     reportState(state);
+  }
+
+  gateway.poll();
+
+  // Claim state changes asynchronously — it is the owner typing a code on another device — so the
+  // screen has to be driven by it rather than only by provisioning transitions.
+  {
+    static GatewayLink lastLink = GatewayLink::Idle;
+    const GatewayLink now = gateway.link();
+    if (now != lastLink) {
+      lastLink = now;
+      Serial.printf("[gateway] link: %s\n", gatewayLinkName(now));
+      if (state == ProvisioningState::Online) reportState(state);
+    }
   }
 
   // The gateway verdict arrives asynchronously, long after the provisioning state last changed,

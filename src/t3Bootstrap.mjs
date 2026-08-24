@@ -378,10 +378,64 @@ export async function registerProviderCatalogue({ origin, headers, environmentId
   return response.catalogue;
 }
 
+async function redeemConnectCode({
+  origin,
+  connectCode,
+  label,
+  baseUrl,
+  pairingToken,
+  baseDir,
+  initialPrompt,
+  logger,
+}) {
+  // The provider caches only exist on this machine and the redeem route is the only authenticated
+  // moment this script gets, so the catalogue rides along with the redemption instead of needing a
+  // separate PUT with a platform token.
+  const instances = baseDir ? await collectProviderCatalogue(baseDir) : [];
+  if (instances.length === 0) {
+    logger?.warn?.("No T3 provider caches found; harness and model lists will be limited to what is already in use.");
+  }
+  const redeemed = await requestJson(new URL("/v1/t3/connect-sessions/redeem", origin), {
+    method: "POST",
+    body: {
+      code: connectCode,
+      label,
+      baseUrl,
+      pairingToken,
+      ...(instances.length > 0 ? { instances, catalogueSource: "setup-script" } : {}),
+    },
+  });
+  const registered = redeemed.catalogue?.instances ?? [];
+  if (registered.length > 0) {
+    const ready = registered.filter((instance) => instance.status === "ready");
+    logger?.log?.(
+      `Registered ${registered.length} agent harness(es) with the gateway; ${ready.length} ready: `
+      + ready.map((instance) => `${instance.instanceId} (${instance.models.length} models)`).join(", "),
+    );
+  }
+  if (redeemed.failure) {
+    logger?.warn?.(`The gateway paired this host but could not reach it: ${redeemed.failure.message ?? redeemed.failure.reason}`);
+  }
+  // Launching a first thread needs the platform realm, which a connect code deliberately does not
+  // grant. The console does it instead, on a connection it can already see.
+  if (initialPrompt) {
+    logger?.warn?.("--initial-prompt needs --gateway-token; start the first session from the console instead.");
+  }
+  return {
+    gatewayToken: null,
+    environment: redeemed.environment,
+    snapshot: null,
+    screen: redeemed.screen ?? null,
+    catalogue: redeemed.catalogue ?? null,
+    thread: null,
+  };
+}
+
 export async function connectGateway({
   gatewayUrl,
   gatewayToken,
   gatewayDevUser = null,
+  connectCode = null,
   label,
   baseUrl,
   pairingToken,
@@ -394,6 +448,23 @@ export async function connectGateway({
   logger = console,
 }) {
   const origin = new URL(gatewayUrl).origin;
+
+  // Console-first pairing. The code was minted in the browser by a signed-in user, so this path
+  // needs no platform token at all — which is the whole point, since `POST /v1/users/dev` is
+  // hard-disabled in Clerk mode and a copyable one-liner cannot carry a Bearer credential.
+  if (connectCode) {
+    return await redeemConnectCode({
+      origin,
+      connectCode,
+      label,
+      baseUrl,
+      pairingToken,
+      baseDir,
+      initialPrompt,
+      logger,
+    });
+  }
+
   let token = gatewayToken;
   if (!token && gatewayDevUser) {
     const created = await requestJson(new URL("/v1/users/dev", origin), {
@@ -406,7 +477,7 @@ export async function connectGateway({
     });
     token = created.apiToken.secret;
   }
-  if (!token) throw new Error("Gateway authentication is required. Pass --gateway-token or --gateway-dev-user.");
+  if (!token) throw new Error("Gateway authentication is required. Pass --connect-code, --gateway-token, or --gateway-dev-user.");
   const headers = { authorization: `Bearer ${token}` };
   const registered = await requestJson(new URL("/v1/t3/environments", origin), {
     method: "POST",

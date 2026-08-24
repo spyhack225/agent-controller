@@ -1,8 +1,8 @@
-import { fireEvent, render, screen, waitFor } from "@testing-library/react";
-import { vi } from "vitest";
+import { fireEvent, render, screen, waitFor, within } from "@testing-library/react";
+import { afterEach, vi } from "vitest";
 
 import type { Controller } from "../controller";
-import type { Command } from "../types";
+import type { Command, MediaItem } from "../types";
 import { ConfirmProvider } from "../ui";
 import { QuickPage } from "./QuickPage";
 
@@ -14,18 +14,29 @@ const approval: Command = {
   createdAt: "2026-08-07T09:00:00.000Z",
 };
 
+const CLIP: MediaItem = {
+  id: "media_clip",
+  kind: "audio",
+  contentType: "audio/webm",
+  originalName: "note.webm",
+};
+
 function controller(overrides: Record<string, unknown> = {}) {
   return {
     busyAction: null,
     environments: [{ id: "env_1", label: "Studio Mac", baseUrl: "http://127.0.0.1:3773" }],
     threads: [{ id: "thread_1", label: "Agent Controller", status: "running", messages: [] }],
     actions: [],
+    media: [CLIP],
     pendingApprovals: [],
     selectedEnvironmentId: "env_1",
     selectedThreadId: "thread_1",
     setNotice: vi.fn(),
-    api: vi.fn(async () => ({ ok: true })),
+    api: vi.fn(async () => ({ command: { id: "cmd_9" } })),
     refreshAll: vi.fn(),
+    refreshMedia: vi.fn(),
+    uploadMedia: vi.fn(async () => ({ id: "media_new", kind: "audio", contentType: "audio/webm" })),
+    loadSnapshot: vi.fn(async () => ({})),
     run: vi.fn(async (_key: string, _message: string, task: () => Promise<unknown>) => task()),
     ...overrides,
   } as unknown as Controller;
@@ -40,15 +51,156 @@ function renderDashboard(c: Controller, onNavigate = vi.fn()) {
   return onNavigate;
 }
 
-test("keeps the dashboard focused on workspace, attention, and saved actions", () => {
+const originalMediaDevices = Object.getOwnPropertyDescriptor(navigator, "mediaDevices");
+
+afterEach(() => {
+  if (originalMediaDevices) Object.defineProperty(navigator, "mediaDevices", originalMediaDevices);
+  else delete (navigator as { mediaDevices?: unknown }).mediaDevices;
+  delete (globalThis as { MediaRecorder?: unknown }).MediaRecorder;
+});
+
+/** Enough of MediaRecorder to drive one push-to-talk round trip in jsdom. */
+function stubRecorder() {
+  Object.defineProperty(navigator, "mediaDevices", {
+    configurable: true,
+    value: { getUserMedia: vi.fn(async () => ({ getTracks: () => [] })) },
+  });
+  class FakeMediaRecorder {
+    state = "inactive";
+    private listeners: Record<string, Array<(event: unknown) => void>> = {};
+    addEventListener(name: string, handler: (event: unknown) => void) {
+      (this.listeners[name] ??= []).push(handler);
+    }
+    start() {
+      this.state = "recording";
+    }
+    stop() {
+      this.state = "inactive";
+      for (const handler of this.listeners.dataavailable ?? []) {
+        handler({ data: new Blob(["clip"], { type: "audio/webm" }) });
+      }
+      for (const handler of this.listeners.stop ?? []) handler({});
+    }
+  }
+  (globalThis as { MediaRecorder?: unknown }).MediaRecorder = FakeMediaRecorder;
+}
+
+function chipNames() {
+  return within(screen.getByRole("list", { name: "Attachments" }))
+    .getAllByRole("listitem")
+    .map((chip) => chip.querySelector(".thread-attachment-chip__name")?.textContent);
+}
+
+test("offers a composer alongside workspace, attention, and saved actions", () => {
   renderDashboard(controller());
 
   expect(screen.getByText("Current workspace")).toBeVisible();
   expect(screen.getByText("Needs attention")).toBeVisible();
   expect(screen.getByText("Quick actions")).toBeVisible();
-  expect(screen.queryByText(/Speak a prompt/u)).toBeNull();
-  expect(screen.queryByText(/Show the agent something/u)).toBeNull();
+  // The dashboard can now send: one field, one attachment button, push-to-talk, Send. No project,
+  // model or shell controls — those stay in Operations.
+  expect(screen.getByLabelText("Message this thread")).toBeVisible();
+  expect(screen.getByRole("button", { name: "Add attachment" })).toBeEnabled();
+  expect(screen.getByRole("button", { name: "Record voice" })).toBeEnabled();
+  expect(screen.getByRole("button", { name: "Send message" })).toBeDisabled();
+  expect(screen.queryByRole("button", { name: "Shell" })).toBeNull();
   expect(screen.queryByText(/Device setup/u)).toBeNull();
+});
+
+test("keeps the composer compact so the approval queue stays on screen", () => {
+  const c = controller({ pendingApprovals: [approval] });
+  renderDashboard(c);
+
+  // Two rows, not the Operate composer's nine — the attention section must not be pushed past
+  // the fold on a phone.
+  expect(screen.getByLabelText("Message this thread")).toHaveAttribute("rows", "2");
+
+  const composer = document.querySelector(".dashboard-composer");
+  const attention = document.querySelector(".dashboard-home__attention");
+  expect(composer).not.toBeNull();
+  expect(attention).not.toBeNull();
+  // The composer sits in the workspace section, above attention, and never inside it.
+  expect(attention?.contains(composer as Node)).toBe(false);
+  expect(composer?.compareDocumentPosition(attention as Node))
+    .toBe(Node.DOCUMENT_POSITION_FOLLOWING);
+  expect(within(attention as HTMLElement).getByRole("button", { name: /approve/i })).toBeEnabled();
+});
+
+test("sends a free-form prompt into the selected thread", async () => {
+  const c = controller();
+  renderDashboard(c);
+
+  const textarea = screen.getByLabelText("Message this thread");
+  fireEvent.change(textarea, { target: { value: "Ship the release notes" } });
+  fireEvent.click(screen.getByRole("button", { name: "Send message" }));
+
+  await waitFor(() => expect(c.api).toHaveBeenCalledWith("/v1/intents", {
+    method: "POST",
+    body: {
+      environmentId: "env_1",
+      threadId: "thread_1",
+      intent: { type: "agent_prompt", text: "Ship the release notes" },
+    },
+  }));
+  // A sent message clears the draft rather than inviting a duplicate send.
+  await waitFor(() => expect(textarea).toHaveValue(""));
+});
+
+test("attaches stored media, and removing it puts the draft back", async () => {
+  const c = controller();
+  renderDashboard(c);
+
+  fireEvent.click(screen.getByRole("button", { name: "Add attachment" }));
+  fireEvent.click(screen.getByRole("menuitem", { name: "Choose from media library" }));
+  fireEvent.click(screen.getByRole("button", { name: "Attach note.webm" }));
+
+  expect(chipNames()).toEqual(["note.webm"]);
+  // An attachment alone is a sendable request.
+  expect(screen.getByRole("button", { name: "Send message" })).toBeEnabled();
+
+  fireEvent.click(screen.getByRole("button", { name: "Remove note.webm" }));
+
+  expect(screen.queryByRole("list", { name: "Attachments" })).toBeNull();
+  expect(screen.getByRole("button", { name: "Send message" })).toBeDisabled();
+  expect(c.api).not.toHaveBeenCalled();
+});
+
+test("push-to-talk records, attaches, and sends as an audio prompt", async () => {
+  stubRecorder();
+  const c = controller({
+    uploadMedia: vi.fn(async () => ({ id: "media_voice", kind: "audio", contentType: "audio/webm" })),
+    media: [{ id: "media_voice", kind: "audio", contentType: "audio/webm", originalName: "voice.webm" }],
+  });
+  renderDashboard(c);
+
+  fireEvent.click(screen.getByRole("button", { name: "Record voice" }));
+  fireEvent.click(screen.getByRole("button", { name: "Start recording" }));
+  fireEvent.click(await screen.findByRole("button", { name: "Stop recording" }));
+
+  await waitFor(() => expect(chipNames()).toEqual(["voice.webm"]));
+  expect(screen.queryByRole("dialog", { name: "Record a voice message" })).toBeNull();
+
+  fireEvent.click(screen.getByRole("button", { name: "Send message" }));
+
+  await waitFor(() => expect(c.api).toHaveBeenCalledWith("/v1/intents", {
+    method: "POST",
+    body: {
+      environmentId: "env_1",
+      threadId: "thread_1",
+      intent: { type: "audio_prompt", transcript: "", mediaUploadIds: ["media_voice"] },
+    },
+  }));
+});
+
+test("without a thread the composer explains where to pick one instead of failing at dispatch", () => {
+  const onNavigate = renderDashboard(controller({ selectedThreadId: "" }));
+
+  expect(screen.getByRole("button", { name: "Add attachment" })).toBeDisabled();
+  expect(screen.getByRole("button", { name: "Record voice" })).toBeDisabled();
+  expect(screen.getByRole("button", { name: "Send message" })).toBeDisabled();
+
+  fireEvent.click(screen.getByRole("button", { name: "Choose a thread" }));
+  expect(onNavigate).toHaveBeenCalledWith("operate");
 });
 
 test("resumes the selected thread in Operations", () => {

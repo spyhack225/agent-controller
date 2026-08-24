@@ -1059,6 +1059,117 @@ export const listEnvironments = gatewayQuery({
   },
 });
 
+// Console-first pairing. Mirrors createConnectSession/getConnectSession/claimConnectSession/
+// completeConnectSession in src/store.mjs; the plaintext code is generated in Node and never
+// reaches Convex, so only its hash is stored here.
+export const createConnectSession = gatewayMutation({
+  args: {
+    userId: v.string(),
+    label: v.string(),
+    accessMode: v.string(),
+    environmentId: v.optional(v.union(v.id("environments"), v.null())),
+    codeHash: v.string(),
+    expiresAt: v.string(),
+  },
+  handler: async (ctx, args) => {
+    await ensureUserRecord(ctx, args.userId);
+    const timestamp = nowIso();
+    const id = await ctx.db.insert("connectSessions", {
+      userExternalId: args.userId,
+      label: args.label,
+      accessMode: args.accessMode,
+      environmentId: args.environmentId ?? null,
+      status: "pending",
+      codeHash: args.codeHash,
+      expiresAt: args.expiresAt,
+      baseUrl: null,
+      error: null,
+      completedAt: null,
+      createdAt: timestamp,
+      updatedAt: timestamp,
+    });
+    await audit(ctx, {
+      userExternalId: args.userId,
+      actorType: "user",
+      action: "connect_session.created",
+      targetId: id,
+      metadata: { label: args.label, accessMode: args.accessMode, environmentId: args.environmentId ?? null },
+    });
+    return publicConnectSession(await ctx.db.get(id));
+  },
+});
+
+export const getConnectSession = gatewayQuery({
+  args: {
+    userId: v.string(),
+    sessionId: v.id("connectSessions"),
+  },
+  handler: async (ctx, args) => {
+    const session = await ctx.db.get(args.sessionId);
+    if (!session || session.userExternalId !== args.userId) return null;
+    // A query cannot patch, so expiry is reported without being written back; the next claim or
+    // completion persists it.
+    return publicConnectSession(expiredConnectSessionView(session));
+  },
+});
+
+export const claimConnectSession = gatewayMutation({
+  args: {
+    codeHash: v.string(),
+  },
+  handler: async (ctx, args) => {
+    const session = await ctx.db
+      .query("connectSessions")
+      .withIndex("byCodeHash", (q) => q.eq("codeHash", args.codeHash))
+      .first();
+    if (!session) return { session: null, reason: "unknown" };
+    if (session.status === "pending" && Date.parse(session.expiresAt) <= Date.now()) {
+      await ctx.db.patch(session._id, { status: "expired", updatedAt: nowIso() });
+      return { session: null, reason: "expired" };
+    }
+    if (session.status !== "pending") return { session: null, reason: "used" };
+    await ctx.db.patch(session._id, { status: "redeeming", updatedAt: nowIso() });
+    return { session: publicConnectSession(await ctx.db.get(session._id)), reason: null };
+  },
+});
+
+export const completeConnectSession = gatewayMutation({
+  args: {
+    sessionId: v.id("connectSessions"),
+    environmentId: v.optional(v.union(v.id("environments"), v.null())),
+    baseUrl: v.optional(v.union(v.string(), v.null())),
+    error: v.optional(v.union(v.string(), v.null())),
+  },
+  handler: async (ctx, args) => {
+    const session = await ctx.db.get(args.sessionId);
+    if (!session) return null;
+    const completedAt = nowIso();
+    await ctx.db.patch(session._id, {
+      status: args.error ? "failed" : "completed",
+      environmentId: args.environmentId ?? session.environmentId ?? null,
+      baseUrl: args.baseUrl ?? session.baseUrl ?? null,
+      error: args.error ?? null,
+      // Clearing the hash is what makes the code single-use at the credential level, not merely
+      // at the status level.
+      codeHash: null,
+      completedAt,
+      updatedAt: completedAt,
+    });
+    await audit(ctx, {
+      userExternalId: session.userExternalId,
+      actorType: "user",
+      action: args.error ? "connect_session.failed" : "connect_session.completed",
+      targetId: session._id,
+      metadata: {
+        environmentId: args.environmentId ?? session.environmentId ?? null,
+        baseUrl: args.baseUrl ?? session.baseUrl ?? null,
+        error: args.error ?? null,
+      },
+    });
+    return publicConnectSession(await ctx.db.get(session._id));
+  },
+});
+
 export const createFirmwareRelease = gatewayMutation({
   args: {
     version: v.string(),
@@ -2584,6 +2695,30 @@ function publicDeviceConfig(config: any = {}) {
     defaultPrompt: config.defaultPrompt ?? defaultConfig.defaultPrompt,
     shellCommand: config.shellCommand ?? defaultConfig.shellCommand,
     menu: Array.isArray(config.menu) && config.menu.length > 0 ? config.menu : defaultConfig.menu,
+  };
+}
+
+function expiredConnectSessionView(session: any) {
+  if (session.status !== "pending") return session;
+  if (Date.parse(session.expiresAt) > Date.now()) return session;
+  return { ...session, status: "expired" };
+}
+
+function publicConnectSession(session: any) {
+  if (!session) return null;
+  return {
+    id: session._id,
+    userId: session.userExternalId,
+    label: session.label,
+    accessMode: session.accessMode,
+    environmentId: session.environmentId ?? null,
+    status: session.status,
+    expiresAt: session.expiresAt,
+    baseUrl: session.baseUrl ?? null,
+    error: session.error ?? null,
+    completedAt: session.completedAt ?? null,
+    createdAt: session.createdAt,
+    updatedAt: session.updatedAt,
   };
 }
 

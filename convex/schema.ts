@@ -135,6 +135,25 @@ export default defineSchema({
     updatedAt: v.string(),
   }).index("byUserExternalId", ["userExternalId"]),
 
+  // Short-lived, single-use enrollment codes for console-first pairing. Only the hash is stored;
+  // the plaintext is generated in Node and shown once. See src/connectSession.mjs.
+  connectSessions: defineTable({
+    userExternalId: v.string(),
+    label: v.string(),
+    accessMode: v.string(),
+    environmentId: v.optional(v.union(v.id("environments"), v.null())),
+    status: v.string(),
+    codeHash: v.union(v.string(), v.null()),
+    expiresAt: v.string(),
+    baseUrl: v.optional(v.union(v.string(), v.null())),
+    error: v.optional(v.union(v.string(), v.null())),
+    completedAt: v.optional(v.union(v.string(), v.null())),
+    createdAt: v.string(),
+    updatedAt: v.string(),
+  })
+    .index("byUserExternalId", ["userExternalId"])
+    .index("byCodeHash", ["codeHash"]),
+
   mediaUploads: defineTable({
     userExternalId: v.string(),
     deviceId: v.optional(v.id("devices")),

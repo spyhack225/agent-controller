@@ -2,6 +2,7 @@ import { createHash, timingSafeEqual } from "node:crypto";
 
 import { ENVIRONMENT_REMOVED_REASON } from "./actions.mjs";
 import { defaultSubscription, normalizeSubscription } from "./billing.mjs";
+import { CONNECT_SESSION_TTL_MS, normalizeConnectAccessMode } from "./connectSession.mjs";
 import { ENVIRONMENT_FAILURE_REASONS } from "./environmentFailure.mjs";
 import { createId, createSecret, nowIso } from "./ids.mjs";
 import { normalizeOnboarding, normalizeStoredOnboarding } from "./onboarding.mjs";
@@ -51,6 +52,7 @@ export function createStore(seed = {}, options = {}) {
   const apiTokens = new Map((seed.apiTokens ?? []).map((token) => [token.id, token]));
   const devices = new Map((seed.devices ?? []).map((device) => [device.id, device]));
   const environments = new Map((seed.environments ?? []).map((environment) => [environment.id, environment]));
+  const connectSessions = new Map((seed.connectSessions ?? []).map((session) => [session.id, session]));
   const firmwareReleases = new Map((seed.firmwareReleases ?? []).map((release) => [release.id, release]));
   const gatewayProfiles = new Map((seed.gatewayProfiles ?? []).map((profile) => [profile.id, profile]));
   const mediaUploads = new Map((seed.mediaUploads ?? []).map((media) => [media.id, media]));
@@ -88,6 +90,7 @@ export function createStore(seed = {}, options = {}) {
       apiTokens: [...apiTokens.values()],
       devices: [...devices.values()],
       environments: [...environments.values()],
+      connectSessions: [...connectSessions.values()],
       firmwareReleases: [...firmwareReleases.values()],
       gatewayProfiles: [...gatewayProfiles.values()],
       mediaUploads: [...mediaUploads.values()],
@@ -1087,6 +1090,102 @@ export function createStore(seed = {}, options = {}) {
     return [...uniqueByUrl.values()].map(publicEnvironment);
   }
 
+  // Console-first pairing. The console mints one of these while the user is signed in; the setup
+  // script on the T3 host redeems it with no platform credential of its own. See
+  // src/connectSession.mjs for why the code — not a token — is what travels.
+  function createConnectSession({ userId, label, accessMode, environmentId = null }) {
+    const user = ensureUser({ userId });
+    const code = createHumanCode();
+    const timestamp = nowIso();
+    const session = {
+      id: createId("cxn"),
+      userId: user.id,
+      label: label || "T3 Code",
+      accessMode: normalizeConnectAccessMode(accessMode),
+      // Set only when re-pairing. It is what keeps a re-pair updating the existing row instead of
+      // adding a second one for the same host.
+      environmentId: environmentId ?? null,
+      status: "pending",
+      codeHash: hashSecret(normalizeClaimCode(code)),
+      expiresAt: new Date(Date.now() + CONNECT_SESSION_TTL_MS).toISOString(),
+      baseUrl: null,
+      error: null,
+      completedAt: null,
+      createdAt: timestamp,
+      updatedAt: timestamp,
+    };
+    connectSessions.set(session.id, session);
+    audit({
+      userId: user.id,
+      actorType: "user",
+      action: "connect_session.created",
+      targetId: session.id,
+      metadata: { label: session.label, accessMode: session.accessMode, environmentId: session.environmentId },
+    });
+    notifyChanged();
+    return { session: publicConnectSession(session), code };
+  }
+
+  function getConnectSession({ userId, sessionId }) {
+    const session = connectSessions.get(sessionId);
+    if (!session || session.userId !== userId) return null;
+    return publicConnectSession(expireConnectSessionIfDue(session));
+  }
+
+  // Consumes the code before the caller does any network work. The exchange that follows can fail,
+  // and burning the code either way is the point: a code that survives a failed attempt is a code
+  // that can be replayed.
+  function claimConnectSession({ code }) {
+    const claimHash = hashSecret(normalizeClaimCode(code));
+    for (const session of connectSessions.values()) {
+      if (!session.codeHash || !safeEqual(session.codeHash, claimHash)) continue;
+      if (expireConnectSessionIfDue(session).status === "expired") {
+        notifyChanged();
+        // Matched but refused, so the host can say "expired" rather than the indistinguishable
+        // "no such code" a `continue` would produce.
+        return { session: null, reason: "expired" };
+      }
+      if (session.status !== "pending") return { session: null, reason: "used" };
+      session.status = "redeeming";
+      session.updatedAt = nowIso();
+      notifyChanged();
+      return { session: publicConnectSession(session), reason: null };
+    }
+    return { session: null, reason: "unknown" };
+  }
+
+  function completeConnectSession({ sessionId, environmentId = null, baseUrl = null, error = null }) {
+    const session = connectSessions.get(sessionId);
+    if (!session) return null;
+    session.status = error ? "failed" : "completed";
+    session.environmentId = environmentId ?? session.environmentId;
+    session.baseUrl = baseUrl ?? session.baseUrl;
+    session.error = error ?? null;
+    session.codeHash = null;
+    session.completedAt = nowIso();
+    session.updatedAt = session.completedAt;
+    audit({
+      userId: session.userId,
+      actorType: "user",
+      action: error ? "connect_session.failed" : "connect_session.completed",
+      targetId: session.id,
+      metadata: { environmentId: session.environmentId, baseUrl: session.baseUrl, error: session.error },
+    });
+    notifyChanged();
+    return publicConnectSession(session);
+  }
+
+  // The hash survives an expiry so a late redeem still reports "expired" rather than "unknown"; it
+  // is cleared only when the session reaches a terminal state, which is what makes a replayed code
+  // indistinguishable from one that never existed.
+  function expireConnectSessionIfDue(session) {
+    if (session.status !== "pending") return session;
+    if (Date.parse(session.expiresAt) > Date.now()) return session;
+    session.status = "expired";
+    session.updatedAt = nowIso();
+    return session;
+  }
+
   function createFirmwareRelease(input) {
     const release = {
       id: createId("fw"),
@@ -1592,6 +1691,10 @@ export function createStore(seed = {}, options = {}) {
     updateEnvironmentCatalogue,
     getEnvironmentForUser,
     listEnvironments,
+    createConnectSession,
+    getConnectSession,
+    claimConnectSession,
+    completeConnectSession,
     createGatewayProfile,
     listGatewayProfiles,
     getGatewayProfileForUser,
@@ -2121,6 +2224,11 @@ function publicEnvironment(environment) {
     ...publicFields,
     health: normalizeEnvironmentHealth(environment.health),
   };
+}
+
+function publicConnectSession(session) {
+  const { codeHash, ...publicFields } = session;
+  return { ...publicFields };
 }
 
 function environmentForGateway(environment, tokenBox) {

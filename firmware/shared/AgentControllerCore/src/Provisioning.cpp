@@ -103,6 +103,27 @@ void Provisioning::openConfigPortal() {
   enterProvisioning(configPortal_);
 }
 
+void Provisioning::closeConfigPortal() {
+  if (!configPortal_) return;
+  configPortal_ = false;
+  discovered_ = "";
+  portalError_ = "";
+  stopPortal();
+
+  // The station never dropped — the portal ran AP_STA — so this is a return to what the device was
+  // already doing, not a fresh join. Going through Connecting would tear down a working link and
+  // re-establish it for no reason.
+  if (WiFi.status() == WL_CONNECTED) {
+    WiFi.mode(WIFI_STA);
+    status_.state = ProvisioningState::Online;
+    status_.detail = WiFi.localIP().toString();
+    justConnected_ = true;
+    Serial.println("[wifi] config portal closed; back online");
+  } else {
+    enterConnecting();
+  }
+}
+
 bool Provisioning::consumeJustConnected() {
   const bool value = justConnected_;
   justConnected_ = false;
@@ -285,6 +306,10 @@ void Provisioning::handlePortalRoot() {
     + String(configPortal_
         ? "<button type=\"submit\" name=\"action\" value=\"discover\" class=\"secondary\">"
           "Find gateway on this network</button>"
+          // Leaving without saving has to be possible: the owner may have opened this by accident,
+          // or looked, found nothing wrong, and simply wants their device back.
+          "<button type=\"submit\" name=\"action\" value=\"done\" class=\"secondary\">"
+          "Done — back to the device</button>"
         : "")
     + "<button type=\"submit\">Save</button></form>"
     "<p class=\"hint\">To correct only the gateway, leave the network blank and press Save; "
@@ -298,6 +323,20 @@ void Provisioning::handlePortalRoot() {
 
 void Provisioning::handlePortalSubmit() {
   portalLastClientAt_ = millis();
+
+  if (server_.arg("action") == "done") {
+    server_.send(
+      200,
+      "text/html; charset=utf-8",
+      "<!doctype html><meta charset=\"utf-8\">"
+      "<body style=\"font-family:system-ui;background:#111211;color:#f1f1ef;padding:1.5rem\">"
+      "<p>Done. The controller is back on your network — this setup network has closed.</p>"
+      "</body>"
+    );
+    server_.client().flush();
+    closeConfigPortal();
+    return;
+  }
 
   if (server_.arg("action") == "discover") {
     const GatewayCandidate found = discoverGateway();

@@ -2,17 +2,18 @@ import { fireEvent, render, screen, waitFor, within } from "@testing-library/rea
 import { vi } from "vitest";
 
 import type { Controller } from "../controller";
-import type { Environment } from "../types";
+import type { ConnectSession, Environment } from "../types";
 import { ConfirmProvider } from "../ui";
 import { EnvironmentsPage } from "./EnvironmentsPage";
 
+const connected: Environment = {
+  id: "env_new",
+  label: "Mac T3 Code",
+  baseUrl: "https://mac.tailnet.ts.net",
+  status: "paired",
+};
+
 function controller(environments: Environment[] = []): Controller {
-  const connected: Environment = {
-    id: "env_new",
-    label: "Mac T3 Code",
-    baseUrl: "https://mac.tailnet.ts.net",
-    status: "paired",
-  };
   return {
     environments,
     selectedEnvironmentId: environments[0]?.id ?? "",
@@ -25,6 +26,15 @@ function controller(environments: Environment[] = []): Controller {
     setNotice: vi.fn(),
     refreshAll: vi.fn(async () => undefined),
     loadSnapshot: vi.fn(async () => ({ environment: environments[0] ?? connected })),
+    // Console-first pairing: the dialog mints a session, then polls it. The default stub keeps the
+    // session pending so the waiting state is what renders unless a test says otherwise.
+    createConnectSession: vi.fn(async (input: { accessMode?: string }) => ({
+      session: pendingSession,
+      code: "ABCDE-FGHIJ",
+      gatewayUrl: "https://gateway.example",
+      command: `npm run setup:t3 -- --gateway-url 'https://gateway.example' --connect-code 'ABCDE-FGHIJ' --tunnel '${input.accessMode ?? "local"}'`,
+    })),
+    fetchConnectSession: vi.fn(async () => ({ session: pendingSession, environment: null })),
     api: vi.fn(async (path: string, options?: { method?: string }) => {
       if (path === "/v1/t3/environments" && options?.method === "POST") return { environment: connected };
       return { environment: environments[0] ?? connected };
@@ -33,11 +43,23 @@ function controller(environments: Environment[] = []): Controller {
   } as unknown as Controller;
 }
 
+const pendingSession: ConnectSession = {
+  id: "cxn_1",
+  label: "Mac T3 Code",
+  accessMode: "local",
+  environmentId: null,
+  status: "pending",
+  baseUrl: null,
+  error: null,
+  expiresAt: "2026-08-24T18:15:00.000Z",
+  completedAt: null,
+};
+
 function renderPage(c: Controller) {
   return render(<ConfirmProvider><EnvironmentsPage controller={c} /></ConfirmProvider>);
 }
 
-test("guides an empty account through staged T3 environment pairing", async () => {
+test("hands an empty account a copyable connect command and waits for the host to redeem it", async () => {
   const writeText = vi.fn(async () => undefined);
   Object.defineProperty(navigator, "clipboard", { configurable: true, value: { writeText } });
   const c = controller();
@@ -52,47 +74,145 @@ test("guides an empty account through staged T3 environment pairing", async () =
   expect(screen.getByText("Connect the machine where T3 Code runs")).toBeVisible();
 
   fireEvent.click(screen.getByRole("button", { name: /Continue/u }));
+  fireEvent.change(screen.getByLabelText("Environment label"), { target: { value: "Studio Mac" } });
   fireEvent.click(screen.getByRole("radio", { name: /Tailscale/u }));
-  expect(screen.getByText("npx t3 pair --tailscale")).toBeVisible();
-  fireEvent.click(screen.getByRole("button", { name: "Copy Tailscale command" }));
-  await waitFor(() => expect(writeText).toHaveBeenCalledWith("npx t3 pair --tailscale"));
-  expect(screen.getByRole("button", { name: "Copied Tailscale command" })).toBeVisible();
   fireEvent.click(screen.getByRole("button", { name: /Continue/u }));
-  fireEvent.change(screen.getByLabelText("T3 base URL"), { target: { value: "https://mac.tailnet.ts.net" } });
-  fireEvent.click(screen.getByRole("button", { name: /Continue/u }));
-  fireEvent.change(screen.getByLabelText("Pairing token"), { target: { value: "pair_once" } });
-  fireEvent.click(screen.getByRole("button", { name: /Continue/u }));
-  fireEvent.click(within(dialog).getByRole("button", { name: "Connect environment" }));
 
-  await screen.findByText("Host paired successfully");
-  expect(c.api).toHaveBeenCalledWith("/v1/t3/environments", {
-    method: "POST",
-    body: {
-      label: "Mac T3 Code",
-      baseUrl: "https://mac.tailnet.ts.net",
-      pairingToken: "pair_once",
-    },
-  });
-  expect(c.setSelectedEnvironmentId).toHaveBeenCalledWith("env_new");
+  // The mode the user picked scopes the command the gateway mints.
+  await waitFor(() => expect(c.createConnectSession).toHaveBeenCalledWith({
+    label: "Studio Mac",
+    accessMode: "tailscale",
+    environmentId: null,
+  }));
+
+  const command = "npm run setup:t3 -- --gateway-url 'https://gateway.example' --connect-code 'ABCDE-FGHIJ' --tunnel 'tailscale'";
+  expect(await screen.findByText(command)).toBeVisible();
+  fireEvent.click(screen.getByRole("button", { name: "Copy connect command" }));
+  await waitFor(() => expect(writeText).toHaveBeenCalledWith(command));
+  expect(screen.getByRole("button", { name: "Copied connect command" })).toBeVisible();
+
+  // Nothing is pasted back: the dialog polls until the host lands the pairing.
+  expect(screen.getByText("Waiting for the T3 host…")).toBeVisible();
+  await waitFor(() => expect(c.fetchConnectSession).toHaveBeenCalledWith("cxn_1"));
+  expect(within(dialog).queryByRole("button", { name: /Connect environment/u })).toBeNull();
 });
 
-test("requires HTTPS when connecting an environment over the public internet", () => {
+test("closes the connect flow when the polled session reports the pairing landed", async () => {
+  const c = controller();
+  Object.assign(c, {
+    fetchConnectSession: vi.fn(async () => ({
+      session: { ...pendingSession, status: "completed", environmentId: "env_new" },
+      environment: connected,
+    })),
+  });
+  renderPage(c);
+
+  fireEvent.click(screen.getByRole("button", { name: "Connect T3 Code" }));
+  fireEvent.click(screen.getByRole("button", { name: /Continue/u }));
+  fireEvent.click(screen.getByRole("button", { name: /Continue/u }));
+
+  await screen.findByText("Host paired successfully");
+  expect(c.setSelectedEnvironmentId).toHaveBeenCalledWith("env_new");
+  expect(c.refreshAll).toHaveBeenCalled();
+  // The access path shown is the one inferred from the endpoint the host reported, not the guess
+  // made before the host was reachable.
+  expect(screen.getByText("Tailscale")).toBeVisible();
+});
+
+test("surfaces a pairing that failed on the host instead of spinning forever", async () => {
+  const c = controller();
+  Object.assign(c, {
+    fetchConnectSession: vi.fn(async () => ({
+      session: { ...pendingSession, status: "failed", error: "T3 token exchange failed with HTTP 400." },
+      environment: null,
+    })),
+  });
+  renderPage(c);
+
+  fireEvent.click(screen.getByRole("button", { name: "Connect T3 Code" }));
+  fireEvent.click(screen.getByRole("button", { name: /Continue/u }));
+  fireEvent.click(screen.getByRole("button", { name: /Continue/u }));
+
+  expect(await screen.findByText(/T3 token exchange failed with HTTP 400/u)).toBeVisible();
+  const retry = screen.getByRole("button", { name: "Get a new command" });
+  fireEvent.click(retry);
+  await waitFor(() => expect(c.createConnectSession).toHaveBeenCalledTimes(2));
+});
+
+test("keeps manual credential paste as the fallback and still requires HTTPS for online hosts", async () => {
   const c = controller();
   renderPage(c);
 
   fireEvent.click(screen.getByRole("button", { name: "Connect T3 Code" }));
   fireEvent.click(screen.getByRole("button", { name: /Continue/u }));
   fireEvent.click(screen.getByRole("radio", { name: /Online HTTPS/u }));
-
   expect(screen.getByText("Public internet endpoint")).toBeVisible();
   expect(screen.getByText("Never enter a plain HTTP URL for an internet-accessible host.")).toBeVisible();
   fireEvent.click(screen.getByRole("button", { name: /Continue/u }));
 
-  const continueButton = screen.getByRole("button", { name: /Continue/u });
+  const dialog = screen.getByRole("dialog", { name: "Connect T3 Code" });
+  // The fallback is collapsed by default — a host that can reach the gateway never needs it.
+  expect(within(dialog).queryByLabelText("T3 base URL")).toBeNull();
+  fireEvent.click(screen.getByRole("button", { name: /Paste a credential manually instead/u }));
+
   fireEvent.change(screen.getByLabelText("T3 base URL"), { target: { value: "http://t3.example.com" } });
-  expect(continueButton).toBeDisabled();
+  fireEvent.change(screen.getByLabelText("Pairing token"), { target: { value: "pair_once" } });
+  expect(within(dialog).getByRole("button", { name: "Connect environment" })).toBeDisabled();
+
   fireEvent.change(screen.getByLabelText("T3 base URL"), { target: { value: "https://t3.example.com" } });
-  expect(continueButton).toBeEnabled();
+  const connect = within(dialog).getByRole("button", { name: "Connect environment" });
+  expect(connect).toBeEnabled();
+  fireEvent.click(connect);
+
+  await screen.findByText("Host paired successfully");
+  expect(c.api).toHaveBeenCalledWith("/v1/t3/environments", {
+    method: "POST",
+    body: {
+      label: "Mac T3 Code",
+      baseUrl: "https://t3.example.com",
+      pairingToken: "pair_once",
+    },
+  });
+  expect(c.setSelectedEnvironmentId).toHaveBeenCalledWith("env_new");
+});
+
+test("re-pairing an existing host reuses the same flow and updates it in place", async () => {
+  const environment: Environment = {
+    id: "env_42",
+    label: "Studio Mac",
+    baseUrl: "https://studio.tailnet.ts.net",
+    status: "token_expired",
+  };
+  const c = controller([environment]);
+  renderPage(c);
+
+  fireEvent.click(screen.getByRole("button", { name: "Edit Studio Mac" }));
+  fireEvent.click(within(screen.getByRole("dialog", { name: "Studio Mac" })).getByRole("button", { name: "credential" }));
+  fireEvent.click(screen.getByRole("button", { name: "Re-pair from the host" }));
+
+  const dialog = await screen.findByRole("dialog", { name: "Re-pair Studio Mac" });
+  // Label and access mode are pre-filled from the environment, and the session names it so the
+  // redemption updates that row rather than adding a second one for the same machine.
+  await waitFor(() => expect(c.createConnectSession).toHaveBeenCalledWith({
+    label: "Studio Mac",
+    accessMode: "tailscale",
+    environmentId: "env_42",
+  }));
+  expect(within(dialog).getByText("Run this on the T3 host")).toBeVisible();
+
+  // The manual fallback of a re-pair is a PUT, never a POST.
+  fireEvent.click(within(dialog).getByRole("button", { name: /Paste a credential manually instead/u }));
+  fireEvent.change(within(dialog).getByLabelText("Pairing token"), { target: { value: "pair_again" } });
+  fireEvent.click(within(dialog).getByRole("button", { name: "Save credential" }));
+
+  await waitFor(() => expect(c.api).toHaveBeenCalledWith("/v1/t3/environments/env_42", {
+    method: "PUT",
+    body: {
+      label: "Studio Mac",
+      baseUrl: "https://studio.tailnet.ts.net",
+      pairingToken: "pair_again",
+    },
+  }));
 });
 
 test("renders environment health tiles and edits connection details in a focused modal", async () => {

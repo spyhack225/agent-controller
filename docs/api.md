@@ -690,6 +690,90 @@ Content-Type: application/json
 
 `modelSelection` is optional when the T3 project has a default. Provider instance IDs are not restricted to built-ins, so user-defined T3 provider instances are supported. The gateway dispatches `thread.create` followed by `thread.turn.start` because T3's HTTP orchestration endpoint requires the thread to exist before accepting the first turn.
 
+### Console-first pairing (connect sessions)
+
+`POST /v1/t3/environments` requires the browser to hold a credential the T3 host produced, which
+means the user must copy a token between two machines. Connect sessions invert that: the console
+mints a short-lived, single-use enrollment code while the user is signed in, shows one command to run
+on the host, and polls until the pairing lands.
+
+```http
+POST /v1/t3/connect-sessions
+authorization: Bearer PLATFORM_TOKEN
+content-type: application/json
+```
+
+```json
+{
+  "label": "Mac T3 Code",
+  "accessMode": "tailscale",
+  "environmentId": "env_..."
+}
+```
+
+`accessMode` is `local`, `tailscale`, or `online` (anything else falls back to `local`) and only
+decides which `--tunnel` the returned command carries. `environmentId` is optional and marks the
+session as a **re-pair**: redeeming updates that environment in place rather than creating a row. A
+first pairing is checked against the plan's environment allowance; a re-pair is not.
+
+The response carries the code once — the gateway stores only its SHA-256 hash and cannot show it
+again:
+
+```json
+{
+  "session": { "id": "cxn_...", "status": "pending", "expiresAt": "..." },
+  "code": "ABCDE-FGHIJ",
+  "gatewayUrl": "https://gateway.example",
+  "command": "npm run setup:t3 -- --gateway-url 'https://gateway.example' --connect-code 'ABCDE-FGHIJ' --tunnel 'tailscale'"
+}
+```
+
+Poll while the user is on the other machine:
+
+```http
+GET /v1/t3/connect-sessions/cxn_...
+authorization: Bearer PLATFORM_TOKEN
+```
+
+Returns `{ "session": ..., "environment": ... }`. `session.status` is `pending`, `redeeming`,
+`completed`, `failed`, or `expired`; `environment` is populated only once the status is `completed`,
+and never includes the stored access token. A session belonging to another user answers 404.
+
+The T3 host redeems the code. This route takes **no** platform credential — the code is the
+credential — and is rate limited per client address (`CONNECT_REDEEM_RATE_LIMIT`, default 20/window):
+
+```http
+POST /v1/t3/connect-sessions/redeem
+content-type: application/json
+```
+
+```json
+{
+  "code": "ABCDE-FGHIJ",
+  "baseUrl": "https://mac.tailnet.ts.net",
+  "pairingToken": "...",
+  "instances": [{ "instanceId": "anthropic", "status": "ready", "models": [] }]
+}
+```
+
+`instances` is the provider catalogue read from `<base-dir>/caches/*.json`; it rides along because
+the script has no platform token to `PUT /v1/t3/environments/:id/catalogue` with. `accessToken` may
+replace `pairingToken` for local development. On success the gateway exchanges the token, upserts the
+environment, registers the catalogue, health-checks the host, and returns
+`{ session, environment, screen, failure, catalogue }` with HTTP 201.
+
+A code is single use and lives 15 minutes. A replayed or unknown code returns 404; an expired one
+returns 410 so the host can tell the user to mint a fresh code rather than hunt for a typo. Request
+validation happens **before** the code is consumed, so a malformed body leaves the code usable. If
+the exchange itself fails, the session is marked `failed` with the reason, which is what the polling
+console renders.
+
+`scripts/setup-t3.mjs` drives this with `--connect-code`; `--gateway-token` / `--gateway-dev-user`
+remain for the manual path. Launching a first thread (`--initial-prompt`) still needs a platform
+token, because a connect code deliberately does not grant the platform realm.
+
+### Manual pairing
+
 ```http
 POST /v1/t3/environments
 authorization: Bearer PLATFORM_TOKEN

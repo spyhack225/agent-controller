@@ -210,6 +210,36 @@ export interface Environment {
   health?: EnvironmentHealth;
 }
 
+export type ConnectSessionStatus = "pending" | "redeeming" | "completed" | "failed" | "expired";
+
+/**
+ * A console-first pairing intent. The console mints one, shows the command it comes with, and polls
+ * until the T3 host redeems it. `environmentId` is set from the start when re-pairing, which is what
+ * keeps a re-pair updating the existing environment instead of adding a second row for the host.
+ */
+export interface ConnectSession {
+  id: string;
+  userId?: string;
+  label: string;
+  accessMode: string;
+  environmentId: string | null;
+  status: ConnectSessionStatus;
+  baseUrl: string | null;
+  error: string | null;
+  expiresAt: string;
+  completedAt: string | null;
+  createdAt?: string;
+  updatedAt?: string;
+}
+
+/** The mint response. `code` is shown once and is unrecoverable afterwards. */
+export interface ConnectSessionMint {
+  session: ConnectSession;
+  code: string;
+  gatewayUrl: string;
+  command: string;
+}
+
 /** What still points at an environment, as returned by GET /v1/t3/environments/:id/dependencies. */
 export interface EnvironmentDependencyRef {
   id: string;

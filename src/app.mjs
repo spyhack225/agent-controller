@@ -7,6 +7,7 @@ import { fileURLToPath } from "node:url";
 
 import { createClerkAuthenticator } from "./clerkAuth.mjs";
 import { loadConfig } from "./config.mjs";
+import { buildConnectCommand, normalizeConnectAccessMode } from "./connectSession.mjs";
 import { buildDeviceDisplayState, buildUserDisplayState } from "./displayState.mjs";
 import { createEventBroker } from "./events.mjs";
 import {
@@ -772,6 +773,126 @@ export function createApp({
         const user = await authenticateUser(req, store, config, null, clerkAuth);
         await enforceUserRead(req, res, rateLimiter, config, user);
         return sendJson(res, 200, { devices: await store.listDevices(user.id) });
+      }
+
+      // Console-first pairing. `POST /v1/t3/environments` still exists for the manual-paste
+      // fallback; these three exist so the browser never has to be handed a credential at all.
+      // See src/connectSession.mjs.
+      if (req.method === "POST" && url.pathname === "/v1/t3/connect-sessions") {
+        const user = await authenticateUser(req, store, config, null, clerkAuth);
+        await enforceUserWrite(req, res, rateLimiter, config, user);
+        const body = await readJson(req);
+        const environmentId = optionalString(body.environmentId);
+        if (environmentId) {
+          // Re-pairing. Verified now so the user is not sent to a terminal for a host the gateway
+          // will refuse to update fifteen minutes later.
+          const existing = await store.getEnvironmentForUser(user.id, environmentId);
+          if (!existing) throw new HttpError(404, "Environment not found.");
+        } else {
+          await assertWithinPlan(store, user.id, "environments", config);
+        }
+        const accessMode = normalizeConnectAccessMode(body.accessMode);
+        const created = await store.createConnectSession({
+          userId: user.id,
+          label: optionalString(body.label) ?? "T3 Code",
+          accessMode,
+          environmentId: environmentId ?? null,
+        });
+        // The gateway names itself rather than trusting the browser's origin, because the command
+        // is run on a different machine and has to reach *this* gateway.
+        const gatewayUrl = config.publicBaseUrl ?? requestBaseUrl(req);
+        return sendJson(res, 201, {
+          session: created.session,
+          code: created.code,
+          gatewayUrl,
+          command: buildConnectCommand({ gatewayUrl, code: created.code, accessMode }),
+        });
+      }
+
+      // Code-authenticated, no platform session: scripts/setup-t3.mjs runs on the T3 host and has
+      // no Clerk credential. Registered before the /:id route so the literal path wins.
+      if (req.method === "POST" && url.pathname === "/v1/t3/connect-sessions/redeem") {
+        await enforceConnectRedeem(req, res, rateLimiter, config);
+        const body = await readJson(req);
+        // Validated before the code is consumed — a malformed body must not burn the enrollment.
+        const code = requireString(body.code, "code");
+        const baseUrl = requireString(body.baseUrl, "baseUrl");
+        const scopes = Array.isArray(body.scopes) && body.scopes.length > 0
+          ? body.scopes.map((scope) => requireString(scope, "scope"))
+          : STANDARD_T3_SCOPES;
+        if (!optionalString(body.accessToken)) requireString(body.pairingToken, "pairingToken");
+        const claimed = await store.claimConnectSession({ code });
+        if (!claimed?.session) {
+          throw new HttpError(
+            claimed?.reason === "expired" ? 410 : 404,
+            claimed?.reason === "expired"
+              ? "This connect code has expired. Mint a new one from the console."
+              : "Connect code is invalid, expired, or already used.",
+          );
+        }
+        const session = claimed.session;
+        try {
+          if (!session.environmentId) {
+            await assertWithinPlan(store, session.userId, "environments", config);
+          }
+          const tokenResponse = optionalString(body.accessToken)
+            ? null
+            : await exchangePairingToken({ baseUrl, pairingToken: body.pairingToken, scopes });
+          const environment = await store.upsertEnvironment({
+            // Re-pairing updates the row the console nominated; a first pairing still falls through
+            // to upsertEnvironment's base-URL match, so neither path can add a duplicate host.
+            ...(session.environmentId ? { id: session.environmentId } : {}),
+            userId: session.userId,
+            label: session.label || optionalString(body.label) || "T3 Code",
+            baseUrl,
+            accessToken: optionalString(body.accessToken) ?? tokenResponse.access_token,
+            accessTokenExpiresAt: tokenResponse
+              ? tokenExpiresAt(tokenResponse)
+              : optionalString(body.accessTokenExpiresAt),
+            scopes,
+            status: "paired",
+          });
+          if (!environment) throw new HttpError(404, "Environment not found.");
+          // The host is the only place the provider caches exist, and the script has no platform
+          // token to PUT them with, so the catalogue rides along with the redemption.
+          const catalogue = await registerRedeemedCatalogue({ store, session, environment, body });
+          const paired = await store.getEnvironmentForUser(session.userId, environment.id);
+          const health = await checkEnvironmentHealth({ store, userId: session.userId, environment: paired });
+          const completed = await store.completeConnectSession({
+            sessionId: session.id,
+            environmentId: environment.id,
+            baseUrl: environment.baseUrl,
+          });
+          return sendJson(res, 201, {
+            session: completed,
+            environment: health.environment ?? environment,
+            screen: health.screen ?? null,
+            failure: health.failure ?? null,
+            catalogue,
+          });
+        } catch (error) {
+          // The console is watching this session, so a failure has to land on the record rather
+          // than only in the terminal the user ran the command in.
+          await store.completeConnectSession({
+            sessionId: session.id,
+            error: error?.message || "Pairing failed.",
+          });
+          throw error;
+        }
+      }
+
+      const connectSessionMatch = url.pathname.match(/^\/v1\/t3\/connect-sessions\/([^/]+)$/u);
+      if (req.method === "GET" && connectSessionMatch) {
+        const user = await authenticateUser(req, store, config, null, clerkAuth);
+        await enforceUserRead(req, res, rateLimiter, config, user);
+        const session = await store.getConnectSession({ userId: user.id, sessionId: connectSessionMatch[1] });
+        if (!session) throw new HttpError(404, "Connect session not found.");
+        // listEnvironments, not getEnvironmentForUser: the latter decrypts and returns the access
+        // token, which this polling endpoint must never hand to the browser.
+        const environment = session.environmentId && session.status === "completed"
+          ? (await store.listEnvironments(user.id)).find((item) => item.id === session.environmentId) ?? null
+          : null;
+        return sendJson(res, 200, { session, environment });
       }
 
       if (req.method === "POST" && url.pathname === "/v1/t3/environments") {
@@ -3303,6 +3424,25 @@ function storableT3Command(command) {
   };
 }
 
+async function registerRedeemedCatalogue({ store, session, environment, body }) {
+  const entries = Array.isArray(body.instances)
+    ? body.instances
+    : (Array.isArray(body.catalogue?.instances) ? body.catalogue.instances : null);
+  if (!entries || entries.length === 0) return null;
+  const catalogue = buildProviderCatalogue(entries, {
+    source: optionalString(body.catalogueSource) ?? "setup-script",
+  });
+  // An unusable catalogue is not worth failing a pairing over; the gateway simply falls back to
+  // snapshot-derived harnesses, exactly as it does for a host that never registered one.
+  if (catalogue.instances.length === 0) return null;
+  await store.updateEnvironmentCatalogue({
+    userId: session.userId,
+    environmentId: environment.id,
+    catalogue,
+  });
+  return catalogue;
+}
+
 async function checkEnvironmentHealth({ store, userId, environment }) {
   const checkedAt = new Date().toISOString();
   if (isEnvironmentTokenExpired(environment)) {
@@ -3961,6 +4101,16 @@ async function enforceFactoryWrite(req, res, rateLimiter, config) {
     scope: "factory:write",
     actorId: clientKey(req),
     limit: config.rateLimits?.factoryWrite,
+  });
+}
+
+// The redeem route has no authenticated actor to key on — the code itself is the credential — so
+// the limit is per client address, like the factory realm.
+async function enforceConnectRedeem(req, res, rateLimiter, config) {
+  await enforceRateLimit(req, res, rateLimiter, config, {
+    scope: "t3:connect-redeem",
+    actorId: clientKey(req),
+    limit: config.rateLimits?.connectRedeem,
   });
 }
 

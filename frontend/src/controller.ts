@@ -9,6 +9,8 @@ import type {
   Command,
   CommandEvent,
   ConnectionState,
+  ConnectSession,
+  ConnectSessionMint,
   Device,
   DeviceConfig,
   DeviceProfile,
@@ -414,11 +416,32 @@ export function useController({ authConfig, clerk }: UseControllerOptions) {
     setCommands(result.commands ?? []);
   }, [api, authenticated]);
 
+  // Console-first pairing. Minting is a write; polling is a read the dialog runs on a timer, so it
+  // deliberately bypasses `run()` — a notice per poll would bury everything else.
+  const createConnectSession = useCallback(async (input: {
+    label?: string;
+    accessMode?: string;
+    environmentId?: string | null;
+  }) => api<ConnectSessionMint>("/v1/t3/connect-sessions", { method: "POST", body: input }), [api]);
+
+  const fetchConnectSession = useCallback(async (sessionId: string) => api<{
+    session: ConnectSession;
+    environment: Environment | null;
+  }>(`/v1/t3/connect-sessions/${encodeURIComponent(sessionId)}`), [api]);
+
   const refreshMedia = useCallback(async () => {
     if (!authenticated) return;
     const result = await api<{ media: MediaItem[] }>("/v1/media");
     setMedia(result.media ?? []);
   }, [api, authenticated]);
+
+  // Every capture surface funnels through here so the library, the Operate composer and the Quick
+  // composer all agree on the endpoint and on refreshing the library afterwards.
+  const uploadMedia = useCallback(async (payload: Record<string, unknown>) => {
+    const result = await api<{ media: MediaItem }>("/v1/media", { method: "POST", body: payload });
+    await refreshAll();
+    return result.media;
+  }, [api, refreshAll]);
 
   const clearSessionState = useCallback(() => {
     setConnection("signed-out");
@@ -698,6 +721,9 @@ export function useController({ authConfig, clerk }: UseControllerOptions) {
     projectId: string;
     text: string;
     modelSelection?: ModelSelection;
+    // The launch route accepts attachments on the very first turn, so a composer draft does not
+    // have to be re-attached after the thread exists.
+    mediaUploadIds?: string[];
   }) => {
     if (!selectedEnvironmentId) throw new Error("Select a T3 environment first.");
     const result = await api<{
@@ -838,6 +864,9 @@ export function useController({ authConfig, clerk }: UseControllerOptions) {
     refreshAll,
     refreshCommands,
     refreshMedia,
+    createConnectSession,
+    fetchConnectSession,
+    uploadMedia,
     loadSnapshot,
     launchProject,
     loadCommandTimeline,

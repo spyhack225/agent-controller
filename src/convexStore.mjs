@@ -1,5 +1,6 @@
 import { createHash, randomBytes } from "node:crypto";
 
+import { CONNECT_SESSION_TTL_MS, normalizeConnectAccessMode } from "./connectSession.mjs";
 import { createSecretBox } from "./secretBox.mjs";
 
 const DEFAULT_FUNCTIONS = {
@@ -41,6 +42,10 @@ const DEFAULT_FUNCTIONS = {
   updateEnvironmentCatalogue: { type: "mutation", name: "gatewayStore:updateEnvironmentCatalogue" },
   getEnvironmentForUser: { type: "query", name: "gatewayStore:getEnvironmentForUser" },
   listEnvironments: { type: "query", name: "gatewayStore:listEnvironments" },
+  createConnectSession: { type: "mutation", name: "gatewayStore:createConnectSession" },
+  getConnectSession: { type: "query", name: "gatewayStore:getConnectSession" },
+  claimConnectSession: { type: "mutation", name: "gatewayStore:claimConnectSession" },
+  completeConnectSession: { type: "mutation", name: "gatewayStore:completeConnectSession" },
   createFirmwareRelease: { type: "mutation", name: "gatewayStore:createFirmwareRelease" },
   deleteFirmwareRelease: { type: "mutation", name: "gatewayStore:deleteFirmwareRelease" },
   listFirmwareReleases: { type: "query", name: "gatewayStore:listFirmwareReleases" },
@@ -270,6 +275,30 @@ export function createConvexStoreAdapter({
       };
     },
     listEnvironments: (userId) => call("listEnvironments", { userId }),
+    // The code is generated in Node and only its hash crosses the wire, so Convex never holds
+    // enough to reconstruct a usable enrollment credential.
+    createConnectSession: async (args) => {
+      const code = createHumanCode();
+      const session = await call("createConnectSession", {
+        userId: args.userId,
+        label: args.label ?? "T3 Code",
+        accessMode: normalizeConnectAccessMode(args.accessMode),
+        environmentId: args.environmentId ?? null,
+        codeHash: hashSecret(normalizeClaimCode(code)),
+        expiresAt: new Date(Date.now() + CONNECT_SESSION_TTL_MS).toISOString(),
+      });
+      return { session, code };
+    },
+    getConnectSession: (args) => call("getConnectSession", args),
+    claimConnectSession: (args) => call("claimConnectSession", {
+      codeHash: hashSecret(normalizeClaimCode(args.code)),
+    }),
+    completeConnectSession: (args) => call("completeConnectSession", {
+      sessionId: args.sessionId,
+      environmentId: args.environmentId ?? null,
+      baseUrl: args.baseUrl ?? null,
+      error: args.error ?? null,
+    }),
     createFirmwareRelease: (args) => call("createFirmwareRelease", args),
     deleteFirmwareRelease: (releaseId) => call("deleteFirmwareRelease", { releaseId }),
     listFirmwareReleases: (args) => call("listFirmwareReleases", args ?? {}),

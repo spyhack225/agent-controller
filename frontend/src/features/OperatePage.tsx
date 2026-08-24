@@ -4,16 +4,12 @@ import {
   Bot,
   Braces,
   Check,
-  ChevronDown,
   ChevronRight,
-  ChevronUp,
   CircleStop,
   FolderKanban,
   Gauge,
   History,
-  Image,
   LoaderCircle,
-  Mic,
   Pencil,
   Play,
   Plus,
@@ -21,14 +17,13 @@ import {
   Save,
   Send,
   ShieldAlert,
-  Terminal,
   X,
 } from "lucide-react";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 
 import type { Controller } from "../controller";
 import { commandSummary, commandType, formatRelativeTime, renderEventResult } from "../format";
-import type { Command, JsonRecord, MediaItem, SavedAction, T3SessionFailure } from "../types";
+import type { Command, JsonRecord, SavedAction, T3SessionFailure } from "../types";
 import {
   Button,
   EmptyState,
@@ -39,13 +34,17 @@ import {
   StatusBadge,
   useConfirm,
 } from "../ui";
-
-const intentOptions = [
-  { value: "agent_prompt", label: "Prompt", icon: Bot },
-  { value: "camera_prompt", label: "Image", icon: Image },
-  { value: "audio_prompt", label: "Audio", icon: Mic },
-  { value: "shell_input", label: "Shell", icon: Terminal },
-] as const;
+import {
+  AttachmentChips,
+  AttachmentSourceMenu,
+  ComposerShell,
+  ShellModeToggle,
+  buildComposerIntent,
+  sendComposerIntent,
+  useComposerDraft,
+  useFileAttachment,
+  type ComposerMode,
+} from "./Composer";
 
 function statusTone(status?: string) {
   if (status === "approval_required") return "warning" as const;
@@ -53,41 +52,6 @@ function statusTone(status?: string) {
   if (status === "completed" || status === "approved") return "success" as const;
   if (status === "dispatched" || status === "running") return "live" as const;
   return "neutral" as const;
-}
-
-function intentFromForm(type: string, text: string, mediaUploadIds: string[]): JsonRecord {
-  const trimmed = text.trim();
-  if (type === "shell_input") return { type, command: trimmed };
-  const attached = mediaUploadIds.length > 0 ? { mediaUploadIds } : {};
-  if (type === "camera_prompt") {
-    return {
-      type,
-      prompt: trimmed || "Use the selected images as context.",
-      ...attached,
-    };
-  }
-  if (type === "audio_prompt") {
-    return {
-      type,
-      transcript: trimmed,
-      ...attached,
-    };
-  }
-  return { type: "agent_prompt", text: trimmed };
-}
-
-const MAX_ATTACHMENTS = 8;
-
-function attachmentState(item: MediaItem): string {
-  const processing = item.processing ?? {};
-  const status = item.kind === "image"
-    ? processing.visionStatus ?? (item.description ? "described" : "stored")
-    : processing.transcriptionStatus ?? (item.transcript ? "transcribed" : "stored");
-  return status === "not_applicable" ? "stored" : status;
-}
-
-function attachmentName(item: MediaItem): string {
-  return item.originalName ?? item.id;
 }
 
 function isRecoverableModelFailure(failure: T3SessionFailure) {
@@ -103,9 +67,12 @@ export function OperatePage({ controller }: { controller: Controller }) {
     environmentId: string;
     status: "loading" | "loaded" | "failed";
   } | null>(null);
-  const [intentType, setIntentType] = useState("agent_prompt");
-  const [prompt, setPrompt] = useState("");
-  const [attachmentIds, setAttachmentIds] = useState<string[]>([]);
+  // Shell stays an explicit secondary mode: its policy screening and approval path differ, so it
+  // must never be something a request falls into by accident.
+  const [composerMode, setComposerMode] = useState<ComposerMode>("prompt");
+  const draft = useComposerDraft(c.media);
+  const { prompt, attachmentIds } = draft;
+  const attachFiles = useFileAttachment({ controller: c, draft });
   const [providerInstance, setProviderInstance] = useState("");
   const [model, setModel] = useState("");
   const [modelSelectionMode, setModelSelectionMode] = useState<"automatic" | "manual">("automatic");
@@ -246,8 +213,8 @@ export function OperatePage({ controller }: { controller: Controller }) {
     setModelSelectionMode("automatic");
     setProviderInstance("");
     setModel("");
-    setIntentType("agent_prompt");
-    setAttachmentIds([]);
+    setComposerMode("prompt");
+    draft.clearAttachments();
     c.setSelectedEnvironmentId(environmentId);
     void loadWorkspace(environmentId);
   };
@@ -257,8 +224,8 @@ export function OperatePage({ controller }: { controller: Controller }) {
     const nextThread = c.threads.find((thread) => thread.projectId === projectId) ?? null;
     c.setSelectedProjectId(projectId);
     c.setSelectedThreadId(nextThread?.id ?? "");
-    setIntentType("agent_prompt");
-    setAttachmentIds([]);
+    setComposerMode("prompt");
+    draft.clearAttachments();
   };
 
   const selectThread = (threadId: string) => {
@@ -269,98 +236,56 @@ export function OperatePage({ controller }: { controller: Controller }) {
     }
     c.setSelectedThreadId(threadId);
     if (!threadId) {
-      setIntentType("agent_prompt");
-      setAttachmentIds([]);
+      setComposerMode("prompt");
+      draft.clearAttachments();
     }
   };
 
-  // The draft is an ordered list: its order is the attachment order the agent receives, so the
-  // composer has to let the user reorder it, not just add and drop items.
-  const attachments = useMemo(
-    () => attachmentIds.map((id) =>
-      c.media.find((item) => item.id === id) ?? { id, kind: "unknown", contentType: "" }),
-    [attachmentIds, c.media],
-  );
-  const attachableMedia = c.media.filter((item) => !attachmentIds.includes(item.id));
+  const composerIntent = () => buildComposerIntent({
+    mode: composerMode,
+    text: prompt,
+    attachments: draft.attachments,
+  });
 
-  const addAttachment = (mediaUploadId: string) => {
-    if (!mediaUploadId) return;
-    setAttachmentIds((current) => current.includes(mediaUploadId) || current.length >= MAX_ATTACHMENTS
-      ? current
-      : [...current, mediaUploadId]);
+  // Shell input is never dispatched with attachments, so switching modes drops them rather than
+  // silently discarding them at dispatch time.
+  const selectComposerMode = (mode: ComposerMode) => {
+    setComposerMode(mode);
+    if (mode === "shell") draft.clearAttachments();
   };
 
-  const removeAttachment = (mediaUploadId: string) => {
-    setAttachmentIds((current) => current.filter((id) => id !== mediaUploadId));
-  };
-
-  const moveAttachment = (index: number, offset: number) => {
-    setAttachmentIds((current) => {
-      const target = index + offset;
-      if (target < 0 || target >= current.length) return current;
-      const next = [...current];
-      const [moved] = next.splice(index, 1);
-      next.splice(target, 0, moved);
-      return next;
-    });
-  };
-
-  const selectedIntent = intentOptions.find((option) => option.value === intentType)
-    ?? intentOptions[0];
-  const SelectedIntentIcon = selectedIntent.icon;
-  const canSendFollowUp = Boolean(c.selectedEnvironmentId && c.selectedThreadId)
-    && (intentType === "camera_prompt" || intentType === "audio_prompt"
-      ? Boolean(prompt.trim() || attachmentIds.length > 0)
-      : Boolean(prompt.trim()));
+  const hasRequest = Boolean(prompt.trim())
+    || (composerMode === "prompt" && attachmentIds.length > 0);
+  const canSendFollowUp = Boolean(c.selectedEnvironmentId && c.selectedThreadId) && hasRequest;
   const canStartThread = Boolean(
     c.selectedEnvironmentId
     && c.selectedProjectId
-    && intentType === "agent_prompt"
-    && prompt.trim()
+    && composerMode === "prompt"
+    && hasRequest
     && model
     && activeHarness?.available !== false,
   );
   const canSend = c.selectedThreadId ? canSendFollowUp : canStartThread;
 
-  const sendIntent = async (intent: JsonRecord, successMessage: string) => {
-    if (!c.selectedEnvironmentId) {
-      c.setNotice({ tone: "danger", message: "Pair and select a T3 environment first." });
-      return;
-    }
-    return c.run("send-intent", successMessage, async () => {
-      const body: JsonRecord = {
-        environmentId: c.selectedEnvironmentId,
-        intent,
-      };
-      if (intent.type !== "status") body.threadId = c.selectedThreadId;
-      const result = await c.api("/v1/intents", { method: "POST", body });
-      await c.refreshAll();
-      // The message has already been accepted at this point. A snapshot outage should open the
-      // existing recovery flow without making the composer imply that the user needs to resend it.
-      try {
-        await c.loadSnapshot(c.selectedEnvironmentId);
-      } catch {
-        // loadSnapshot owns the recovery dialog state.
-      }
-      return result;
-    });
-  };
+  const sendIntent = async (intent: JsonRecord, successMessage: string) =>
+    sendComposerIntent(c, intent, successMessage);
 
   const saveAction = async () => {
-    const intent = intentFromForm(intentType, prompt, attachmentIds);
-    const actionType = intentType === "shell_input"
+    const intent = composerIntent();
+    const actionType = composerMode === "shell"
       ? "shell"
-      : intentType === "camera_prompt" || intentType === "audio_prompt" ? "media" : "prompt";
+      : attachmentIds.length > 0 ? "media" : "prompt";
     const payload = actionType === "shell"
       ? { command: prompt.trim() }
       : actionType === "media"
-        ? { mediaKind: intentType === "audio_prompt" ? "audio" : "image", prompt: prompt.trim() }
+        ? { mediaKind: intent.type === "audio_prompt" ? "audio" : "image", prompt: prompt.trim() }
         : { text: prompt.trim() };
     await c.run(editingActionId ? `update-action-${editingActionId}` : "create-action", editingActionId ? "Action updated." : "Action saved.", async () => {
       const result = await c.api(editingActionId ? `/v1/actions/${encodeURIComponent(editingActionId)}` : "/v1/actions", {
         method: editingActionId ? "PUT" : "POST",
         body: {
-          label: actionLabel.trim() || prompt.trim().slice(0, 32) || selectedIntent.label,
+          label: actionLabel.trim() || prompt.trim().slice(0, 32)
+            || (composerMode === "shell" ? "Shell" : "Prompt"),
           type: actionType,
           payload,
           targetMode: c.selectedEnvironmentId ? "fixed" : "device-current",
@@ -410,16 +335,14 @@ export function OperatePage({ controller }: { controller: Controller }) {
   };
 
   const editSavedAction = (action: SavedAction) => {
-    const type = typeof action.intent?.type === "string" ? action.intent.type : "agent_prompt";
     const content = action.payload?.text ?? action.payload?.prompt ?? action.payload?.command
       ?? action.intent?.text ?? action.intent?.prompt ?? action.intent?.transcript ?? action.intent?.command;
-    const resolvedType = action.type === "shell"
-      ? "shell_input"
-      : action.type === "media"
-        ? action.payload?.mediaKind === "audio" ? "audio_prompt" : "camera_prompt"
-        : type;
-    setIntentType(resolvedType === "audio_prompt" || resolvedType === "camera_prompt" || resolvedType === "shell_input" ? resolvedType : "agent_prompt");
-    setPrompt(typeof content === "string" ? content : "");
+    // A saved media action carries only the kind it expects, not the uploads themselves, so the
+    // draft comes back as text and the user re-attaches from the source menu.
+    const isShell = action.type === "shell" || action.intent?.type === "shell_input";
+    setComposerMode(isShell ? "shell" : "prompt");
+    draft.clearAttachments();
+    draft.setPrompt(typeof content === "string" ? content : "");
     setActionLabel(action.label);
     setEditingActionId(action.id);
   };
@@ -458,7 +381,11 @@ export function OperatePage({ controller }: { controller: Controller }) {
     const result = await c.run("launch-project", "Project session launched.", async () =>
       c.launchProject({
         projectId: c.selectedProjectId,
-        text: prompt.trim() || "Open this project and report that the remote session is ready.",
+        text: prompt.trim()
+          || (attachmentIds.length > 0
+            ? "Use the attached context."
+            : "Open this project and report that the remote session is ready."),
+        ...(attachmentIds.length > 0 ? { mediaUploadIds: attachmentIds } : {}),
         ...(providerInstance && model
           ? { modelSelection: { instanceId: providerInstance, model } }
           : {}),
@@ -482,9 +409,9 @@ export function OperatePage({ controller }: { controller: Controller }) {
     setModelSelectionMode("manual");
     setProviderInstance(recoveryModelSelection.instanceId);
     setModel(recoveryModelSelection.model);
-    setIntentType("agent_prompt");
-    setAttachmentIds([]);
-    setPrompt(failure.title ?? selectedThread?.label ?? "Continue this task.");
+    setComposerMode("prompt");
+    draft.clearAttachments();
+    draft.setPrompt(failure.title ?? selectedThread?.label ?? "Continue this task.");
     c.setSelectedThreadId("");
     c.setNotice({
       tone: "info",
@@ -494,12 +421,9 @@ export function OperatePage({ controller }: { controller: Controller }) {
 
   const submitComposer = async () => {
     const result = c.selectedThreadId
-      ? await sendIntent(intentFromForm(intentType, prompt, attachmentIds), "Message sent.")
+      ? await sendIntent(composerIntent(), "Message sent.")
       : await launchProject();
-    if (result !== undefined) {
-      setPrompt("");
-      setAttachmentIds([]);
-    }
+    if (result !== undefined) draft.reset();
   };
 
   const counts = c.display?.counts ?? {};
@@ -609,8 +533,8 @@ export function OperatePage({ controller }: { controller: Controller }) {
             onClick={() => {
               setModelSelectionMode("automatic");
               c.setSelectedThreadId("");
-              setIntentType("agent_prompt");
-              setAttachmentIds([]);
+              setComposerMode("prompt");
+              draft.clearAttachments();
             }}
           >
             <Plus className="size-3.5" /> New thread
@@ -833,98 +757,39 @@ export function OperatePage({ controller }: { controller: Controller }) {
       <div className="thread-composer-dock">
         {contextToolbar}
 
-        {(intentType === "camera_prompt" || intentType === "audio_prompt") ? (
-          <div className="thread-attachments">
-            <select
-              className="thread-media-select"
-              aria-label="Attach media"
-              value=""
-              disabled={attachmentIds.length >= MAX_ATTACHMENTS || attachableMedia.length === 0}
-              onChange={(event) => addAttachment(event.target.value)}
-            >
-              <option value="">
-                {attachmentIds.length >= MAX_ATTACHMENTS
-                  ? `Attachment limit reached (${MAX_ATTACHMENTS})`
-                  : "Add an attachment…"}
-              </option>
-              {attachableMedia.map((item) => (
-                <option key={item.id} value={item.id}>
-                  {`${attachmentName(item)} · ${item.kind}`}
-                </option>
-              ))}
-            </select>
-            {attachments.length > 0 ? (
-              <ol className="thread-attachment-chips" aria-label="Attachments">
-                {attachments.map((item, index) => (
-                  <li key={item.id} className="thread-attachment-chip">
-                    <span className="thread-attachment-chip__position">{index + 1}</span>
-                    <span className="thread-attachment-chip__name">{attachmentName(item)}</span>
-                    <small>{item.kind} · {attachmentState(item)}</small>
-                    <button
-                      type="button"
-                      aria-label={`Move ${attachmentName(item)} earlier`}
-                      disabled={index === 0}
-                      onClick={() => moveAttachment(index, -1)}
-                    >
-                      <ChevronUp className="size-3.5" />
-                    </button>
-                    <button
-                      type="button"
-                      aria-label={`Move ${attachmentName(item)} later`}
-                      disabled={index === attachments.length - 1}
-                      onClick={() => moveAttachment(index, 1)}
-                    >
-                      <ChevronDown className="size-3.5" />
-                    </button>
-                    <button
-                      type="button"
-                      aria-label={`Remove ${attachmentName(item)}`}
-                      onClick={() => removeAttachment(item.id)}
-                    >
-                      <X className="size-3.5" />
-                    </button>
-                  </li>
-                ))}
-              </ol>
-            ) : null}
-          </div>
-        ) : null}
-
-        <div className="composer-shell">
-          <label htmlFor="operate-prompt" className="sr-only">Command or prompt</label>
-          <textarea
-            id="operate-prompt"
-            value={prompt}
-            onChange={(event) => setPrompt(event.target.value)}
-            rows={4}
-            placeholder={intentType === "shell_input"
-              ? "Enter a shell command, for example: npm test"
-              : c.selectedThreadId
-                ? "Ask for follow-up changes or attach context…"
-                : "Describe the first task for this new thread…"}
-            onKeyDown={(event) => {
-              if ((event.metaKey || event.ctrlKey) && event.key === "Enter" && canSend) {
-                event.preventDefault();
-                void submitComposer();
-              }
-            }}
-          />
-          <div className="composer-footer">
-            <div className="intent-switcher" aria-label="Prompt type">
-              {intentOptions.map(({ value, label, icon: Icon }) => (
-                <button
-                  key={value}
-                  type="button"
-                  className="intent-switcher__item"
-                  data-active={intentType === value || undefined}
-                  aria-pressed={intentType === value}
-                  onClick={() => setIntentType(value)}
-                >
-                  <Icon className="size-3.5" /> {label}
-                </button>
-              ))}
-            </div>
-            <div className="flex items-center gap-2">
+        <ComposerShell
+          textareaId="operate-prompt"
+          label="Command or prompt"
+          value={prompt}
+          onChange={draft.setPrompt}
+          placeholder={composerMode === "shell"
+            ? "Enter a shell command, for example: npm test"
+            : c.selectedThreadId
+              ? "Ask for follow-up changes, or paste, drop, and attach context…"
+              : "Describe the first task for this new thread…"}
+          canSend={canSend}
+          onSubmit={() => void submitComposer()}
+          onFiles={composerMode === "shell" ? undefined : (files) => void attachFiles(files)}
+          attachments={
+            <AttachmentChips
+              attachments={draft.attachments}
+              onRemove={draft.removeAttachment}
+              onMove={draft.moveAttachment}
+            />
+          }
+          actions={
+            <>
+              <AttachmentSourceMenu
+                controller={c}
+                draft={draft}
+                disabled={composerMode === "shell"}
+                disabledReason="Shell commands cannot carry attachments."
+              />
+              <ShellModeToggle mode={composerMode} onChange={selectComposerMode} />
+            </>
+          }
+          send={
+            <>
               <span className="hidden font-mono text-[10px] text-ink-faint sm:inline">⌘↵</span>
               <Button
                 variant="primary"
@@ -936,9 +801,9 @@ export function OperatePage({ controller }: { controller: Controller }) {
               >
                 {c.selectedThreadId ? <Send className="size-4" /> : <Play className="size-4" />}
               </Button>
-            </div>
-          </div>
-        </div>
+            </>
+          }
+        />
 
         <div className="thread-composer-meta">
           <div className="flex gap-1">
