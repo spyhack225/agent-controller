@@ -131,6 +131,7 @@ bool DeviceStore::setGatewayUrl(const String& url) {
   String trimmed = url;
   trimmed.trim();
   while (trimmed.endsWith("/")) trimmed.remove(trimmed.length() - 1);
+  if (gatewayUrl_ == trimmed) return true;
   if (!putString(kKeyGatewayUrl, trimmed)) return false;
   gatewayUrl_ = trimmed;
   return true;
@@ -270,6 +271,9 @@ bool DeviceStore::setWifiCredentials(const String& ssid, const String& password)
 }
 
 bool DeviceStore::setClaimCode(const String& code, const String& expiresAt) {
+  // Same reason as setConfigCache(): an unclaimed device is told its code on every poll, and
+  // rewriting an unchanged code burns flash for no gain.
+  if (claimCode_ == code && claimCodeExpiresAt_ == expiresAt) return true;
   if (!putString(kKeyClaimCode, code)) return false;
   if (!putString(kKeyClaimExpiry, expiresAt)) return false;
   claimCode_ = code;
@@ -282,6 +286,12 @@ bool DeviceStore::clearClaimCode() {
 }
 
 bool DeviceStore::setConfigCache(const String& json) {
+  // fetchConfig() calls this on every successful poll, and the payload is usually byte-identical to
+  // the one already stored. Without this guard that is a full NVS write of the whole config blob
+  // every config interval: flash wear for nothing, and — because an NVS write disables the CPU
+  // cache while the flash operation runs — a repeated window where WiFi buffers living in PSRAM
+  // cannot be read. Comparing first turns the steady state into no flash traffic at all.
+  if (configCache_ == json) return true;
   if (!putString(kKeyConfigCache, json)) return false;
   configCache_ = json;
   return true;
