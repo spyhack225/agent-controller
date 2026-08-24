@@ -2700,6 +2700,19 @@ export function createApp({
 
       throw new HttpError(404, "Route not found.");
     } catch (error) {
+      // A client that gave up and closed its socket is not a server fault, and logging it as one
+      // buries real 500s. A controller does exactly this on every request that outlives its own
+      // timeout, so on a busy gateway this was the most common "error" in the log — complete with
+      // a stack trace pointing into node's http internals, where nothing is wrong.
+      const clientVanished = error?.code === "ECONNRESET" || error?.code === "ECONNABORTED"
+        || error?.message === "aborted" || res.writableEnded || !res.writable;
+      if (clientVanished) {
+        // Nothing to answer: the socket is gone. Say so once, quietly, at a level that can be
+        // filtered out rather than mistaken for a fault.
+        console.warn(`[client-gone] ${req.method} ${req.url}`);
+        return;
+      }
+
       // HttpError carries its own message to the client. Anything else becomes an
       // opaque 500, so without this the server side of a fault leaves no trace at all.
       if (!(error instanceof HttpError)) {
