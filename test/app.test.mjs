@@ -734,7 +734,7 @@ test("expired T3 access tokens are blocked before snapshot or dispatch", async (
   assert.equal(t3Calls, 0);
 });
 
-test("T3 environments can be updated and unpaired", async (t) => {
+test("T3 environments can be updated and removed", async (t) => {
   const originalFetch = globalThis.fetch;
   const snapshots = [];
   globalThis.fetch = async (url, init = {}) => {
@@ -2549,6 +2549,153 @@ test("gateway routes support async Store API implementations", async (t) => {
     },
   });
   assert.equal(deviceDisplay.display.selectedEnvironmentId, environment.environment.id);
+});
+
+test("removing a T3 environment previews, repairs, and reports every dependency", async (t) => {
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = async (url) => {
+    const parsed = new URL(String(url));
+    if (parsed.pathname === "/api/orchestration/snapshot") {
+      return jsonResponse({ projects: [{ id: "p1" }], threads: [{ id: "thread_env" }] }, 200);
+    }
+    if (parsed.pathname === "/api/orchestration/dispatch") return jsonResponse({ accepted: true }, 200);
+    return jsonResponse({ error: "not found" }, 404);
+  };
+  t.after(() => {
+    globalThis.fetch = originalFetch;
+  });
+
+  const { server } = createApp({ config: { demoMode: false } });
+  await listen(server);
+  t.after(() => server.close());
+  const baseUrl = `http://127.0.0.1:${server.address().port}`;
+  const headers = await createAuthHeaders(originalFetch, baseUrl);
+
+  const device = await requestJson(originalFetch, baseUrl, "/v1/devices", {
+    method: "POST",
+    headers,
+    body: { label: "Dependency controller", profile: "agent-controller" },
+  });
+  const environment = await requestJson(originalFetch, baseUrl, "/v1/t3/environments", {
+    method: "POST",
+    headers,
+    body: { label: "Doomed T3", baseUrl: "https://doomed-t3.example", accessToken: "doomed-token" },
+  });
+  const environmentId = environment.environment.id;
+  await requestJson(originalFetch, baseUrl, `/v1/devices/${device.device.id}/config`, {
+    method: "PUT",
+    headers,
+    body: { environmentId, threadId: "thread_env" },
+  });
+  const action = await requestJson(originalFetch, baseUrl, "/v1/actions", {
+    method: "POST",
+    headers,
+    body: {
+      type: "prompt",
+      label: "Ship it",
+      payload: { text: "Continue the task." },
+      targetMode: "fixed",
+      environmentId,
+      threadId: "thread_env",
+    },
+  });
+  assert.equal(action.action.disabled, false);
+  const macro = await requestJson(originalFetch, baseUrl, "/v1/macros", {
+    method: "POST",
+    headers,
+    body: {
+      label: "Nightly sweep",
+      environmentId,
+      threadId: "thread_env",
+      intent: { type: "agent_prompt", text: "Sweep the repo." },
+    },
+  });
+  await requestJson(originalFetch, baseUrl, "/v1/onboarding", {
+    method: "PUT",
+    headers,
+    body: { status: "in_progress", currentStep: "workspace", environmentId, firstThreadId: "thread_env" },
+  });
+
+  const preview = await requestJson(originalFetch, baseUrl, `/v1/t3/environments/${environmentId}/dependencies`, {
+    method: "GET",
+    headers,
+  });
+  assert.deepEqual(preview.counts, { devices: 1, actions: 1, macros: 1, onboarding: 1 });
+  assert.deepEqual(preview.dependencies.actions, [{ id: action.action.id, label: "Ship it" }]);
+  assert.deepEqual(preview.dependencies.macros, [{ id: macro.macro.id, label: "Nightly sweep" }]);
+  assert.deepEqual(preview.dependencies.devices, [{ id: device.device.id, label: "Dependency controller" }]);
+  assert.equal(preview.dependencies.onboarding, true);
+
+  const removed = await requestJson(originalFetch, baseUrl, `/v1/t3/environments/${environmentId}`, {
+    method: "DELETE",
+    headers,
+  });
+  assert.equal(removed.environment.id, environmentId);
+  assert.equal(removed.alreadyRemoved, false);
+  assert.deepEqual(removed.removed, {
+    devices: [device.device.id],
+    actions: [action.action.id],
+    macros: [macro.macro.id],
+    onboarding: true,
+  });
+
+  const config = await requestJson(originalFetch, baseUrl, `/v1/devices/${device.device.id}/config`, {
+    method: "GET",
+    headers,
+  });
+  assert.equal(config.config.environmentId, null);
+
+  const orphanedAction = await requestJson(originalFetch, baseUrl, `/v1/actions/${action.action.id}`, {
+    method: "GET",
+    headers,
+  });
+  assert.equal(orphanedAction.action.disabled, true);
+  assert.equal(orphanedAction.action.disabledReason, "environment_removed");
+  assert.equal(orphanedAction.action.environmentId, null);
+  assert.equal(orphanedAction.action.targetMode, "device-current");
+
+  const macros = await requestJson(originalFetch, baseUrl, "/v1/macros", { method: "GET", headers });
+  assert.equal(macros.macros[0].disabled, true);
+  assert.equal(macros.macros[0].disabledReason, "environment_removed");
+  assert.equal(macros.macros[0].environmentId, null);
+
+  const onboarding = await requestJson(originalFetch, baseUrl, "/v1/onboarding", { method: "GET", headers });
+  assert.equal(onboarding.onboarding.environmentId, null);
+  assert.equal(onboarding.onboarding.firstThreadId, null);
+
+  // A disabled record is refused before anything tries to resolve the environment that is gone.
+  const actionRun = await originalFetch(new URL(`/v1/actions/${action.action.id}/run`, baseUrl), {
+    method: "POST",
+    headers: { ...headers, "content-type": "application/json" },
+    body: JSON.stringify({}),
+  });
+  const actionRunBody = await actionRun.json();
+  assert.equal(actionRun.status, 409);
+  assert.match(actionRunBody.error.message, /environment was removed/u);
+
+  const macroRun = await originalFetch(new URL(`/v1/macros/${macro.macro.id}/run`, baseUrl), {
+    method: "POST",
+    headers: { ...headers, "content-type": "application/json" },
+    body: JSON.stringify({}),
+  });
+  assert.equal(macroRun.status, 409);
+
+  const repeated = await requestJson(originalFetch, baseUrl, `/v1/t3/environments/${environmentId}`, {
+    method: "DELETE",
+    headers,
+  });
+  assert.equal(repeated.environment, null);
+  assert.equal(repeated.alreadyRemoved, true);
+  assert.deepEqual(repeated.removed, { devices: [], actions: [], macros: [], onboarding: false });
+
+  // Saving the action again is the only thing that re-enables it.
+  const rescued = await requestJson(originalFetch, baseUrl, `/v1/actions/${action.action.id}`, {
+    method: "PUT",
+    headers,
+    body: { label: "Ship it later" },
+  });
+  assert.equal(rescued.action.disabled, false);
+  assert.equal(rescued.action.disabledReason, null);
 });
 
 function listen(server) {

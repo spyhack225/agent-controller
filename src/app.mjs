@@ -57,6 +57,7 @@ import { buildBetaReadiness } from "./betaReadiness.mjs";
 import {
   actionControlKind,
   actionIntent,
+  ENVIRONMENT_REMOVED_REASON,
   hardwareSupportsAction,
   normalizeActionInput,
   normalizeDeviceControlItems,
@@ -76,7 +77,7 @@ import { createRateLimiter } from "./rateLimit.mjs";
 import { configurePrivateTailscaleServe, inspectRemoteAccess } from "./remoteAccess.mjs";
 import { normalizeGatewayProfileInput, publicGatewayProfile } from "./gatewayProfiles.mjs";
 import { createSnapshotPoller } from "./snapshotPoller.mjs";
-import { createStore } from "./store.mjs";
+import { createStore, emptyEnvironmentRemoval } from "./store.mjs";
 import { assertSecureTransport } from "./transport.mjs";
 import {
   TERMINAL_SCOPE,
@@ -811,6 +812,25 @@ export function createApp({
         });
       }
 
+      const environmentDependenciesMatch = url.pathname.match(/^\/v1\/t3\/environments\/([^/]+)\/dependencies$/u);
+      if (req.method === "GET" && environmentDependenciesMatch) {
+        const user = await authenticateUser(req, store, config, null, clerkAuth);
+        await enforceUserRead(req, res, rateLimiter, config, user);
+        const environment = await store.getEnvironmentForUser(user.id, environmentDependenciesMatch[1]);
+        if (!environment) throw new HttpError(404, "Environment not found.");
+        const dependencies = await collectEnvironmentDependencies(store, user.id, environment.id);
+        return sendJson(res, 200, {
+          environmentId: environment.id,
+          dependencies,
+          counts: {
+            devices: dependencies.devices.length,
+            actions: dependencies.actions.length,
+            macros: dependencies.macros.length,
+            onboarding: dependencies.onboarding ? 1 : 0,
+          },
+        });
+      }
+
       const environmentMatch = url.pathname.match(/^\/v1\/t3\/environments\/([^/]+)$/u);
       if (environmentMatch && req.method === "PUT") {
         const user = await authenticateUser(req, store, config, null, clerkAuth);
@@ -856,9 +876,21 @@ export function createApp({
       if (environmentMatch && req.method === "DELETE") {
         const user = await authenticateUser(req, store, config, null, clerkAuth);
         await enforceUserWrite(req, res, rateLimiter, config, user);
-        const environment = await store.deleteEnvironment({ userId: user.id, environmentId: environmentMatch[1] });
-        if (!environment) throw new HttpError(404, "Environment not found.");
-        return sendJson(res, 200, { environment });
+        const result = await store.deleteEnvironment({ userId: user.id, environmentId: environmentMatch[1] });
+        // Removal is idempotent: a repeated DELETE reports the same end state rather than 404ing,
+        // so a retry (or a second console tab) cannot strand the owner on an error.
+        if (!result) {
+          return sendJson(res, 200, {
+            environment: null,
+            removed: emptyEnvironmentRemoval(),
+            alreadyRemoved: true,
+          });
+        }
+        return sendJson(res, 200, {
+          environment: result.environment,
+          removed: result.removed ?? emptyEnvironmentRemoval(),
+          alreadyRemoved: false,
+        });
       }
 
       const environmentCheckMatch = url.pathname.match(/^\/v1\/t3\/environments\/([^/]+)\/check$/u);
@@ -1361,7 +1393,12 @@ export function createApp({
           throw new HttpError(404, "Onboarding device not found.");
         }
         const candidateResponse = await onboardingResponse(store, user.id, candidate);
-        if (candidate.status === "completed" && !candidateResponse.readiness.ready) {
+        // Only the transition into completed needs operational evidence. Re-saving an already
+        // completed setup has to stay possible after a dependency is removed, or the owner is
+        // locked out of their own onboarding record.
+        if (candidate.status === "completed"
+          && current.status !== "completed"
+          && !candidateResponse.readiness.ready) {
           throw new HttpError(409, "Complete every required onboarding step first.", {
             readiness: candidateResponse.readiness,
           });
@@ -1461,6 +1498,7 @@ export function createApp({
         const body = await readJson(req);
         const macro = await store.getMacroForUser(user.id, macroActionMatch[1]);
         if (!macro) throw new HttpError(404, "Macro not found.");
+        if (macro.disabled) throw new HttpError(409, disabledRecordMessage("macro", macro));
         const environmentId = requireString(
           optionalString(body.environmentId) ?? optionalString(macro.environmentId),
           "environmentId",
@@ -2189,6 +2227,7 @@ export function createApp({
         const body = await readJson(req);
         const macro = await store.getMacroForUser(device.userId, deviceMacroRunMatch[1]);
         if (!macro) throw new HttpError(404, "Macro not found.");
+        if (macro.disabled) throw new HttpError(409, disabledRecordMessage("macro", macro));
         const environmentId = requireString(
           optionalString(body.environmentId)
             ?? optionalString(macro.environmentId)
@@ -2317,6 +2356,34 @@ export function createApp({
     snapshotPoller,
     server: createServer((req, res) => void handle(req, res)),
   };
+}
+
+async function collectEnvironmentDependencies(store, userId, environmentId) {
+  const [devices, actions, macros, onboarding] = await Promise.all([
+    store.listDevices(userId),
+    store.listActions(userId),
+    store.listMacros(userId),
+    store.getUserOnboarding(userId),
+  ]);
+  return {
+    devices: devices
+      .filter((device) => device.config?.environmentId === environmentId)
+      .map((device) => ({ id: device.id, label: device.label })),
+    actions: actions
+      .filter((action) => action.environmentId === environmentId)
+      .map((action) => ({ id: action.id, label: action.label })),
+    macros: macros
+      .filter((macro) => macro.environmentId === environmentId)
+      .map((macro) => ({ id: macro.id, label: macro.label })),
+    onboarding: onboarding?.environmentId === environmentId,
+  };
+}
+
+function disabledRecordMessage(kind, record) {
+  const cause = record?.disabledReason === ENVIRONMENT_REMOVED_REASON
+    ? " because its T3 environment was removed"
+    : "";
+  return `This ${kind} is disabled${cause}. Save it again with a working target before running it.`;
 }
 
 async function onboardingResponse(store, userId, onboarding) {
@@ -2461,6 +2528,7 @@ async function savedActionAvailability({
   inheritedThreadId = null,
 }) {
   if (seen.has(action.id)) return { enabled: false, reason: "This macro contains a reference cycle." };
+  if (action.disabled) return { enabled: false, reason: disabledRecordMessage("action", action) };
   const hardware = hardwareSupportsAction(action, device.status);
   if (!hardware.supported) return { enabled: false, reason: hardware.reason };
   const environmentId = action.targetMode === "fixed"
@@ -2541,6 +2609,7 @@ async function executeSavedAction({
   stack = [],
 }) {
   if (stack.includes(action.id)) throw new HttpError(409, "Macro actions cannot contain a reference cycle.");
+  if (action.disabled) throw new HttpError(409, disabledRecordMessage("action", action));
   const environmentId = requireString(
     action.targetMode === "fixed" ? action.environmentId : runtime.environmentId,
     "environmentId",
@@ -3257,11 +3326,14 @@ function normalizeMacroInput(body) {
   if (!intent || typeof intent !== "object" || Array.isArray(intent)) {
     throw new HttpError(400, "intent must be an object.");
   }
+  const disabled = body.disabled === true;
   return {
     label: requireString(body.label, "label"),
     environmentId: optionalString(body.environmentId),
     threadId: optionalString(body.threadId),
     intent,
+    disabled,
+    disabledReason: disabled ? optionalString(body.disabledReason) ?? null : null,
   };
 }
 

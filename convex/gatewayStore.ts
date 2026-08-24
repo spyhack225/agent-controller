@@ -35,6 +35,9 @@ const defaultFirmwarePolicy = {
   targetVersion: null,
 };
 const deviceOnlineThresholdMs = 90_000;
+// Mirrors ENVIRONMENT_REMOVED_REASON in src/actions.mjs. Convex functions cannot import from src/,
+// so the literal is duplicated here; change both together.
+const ENVIRONMENT_REMOVED_REASON = "environment_removed";
 
 const defaultEnvironmentHealth = {
   lastCheckedAt: null,
@@ -860,28 +863,93 @@ export const deleteEnvironment = gatewayMutation({
     userId: v.string(),
     environmentId: v.id("environments"),
   },
+  // Mirror of deleteEnvironment in src/store.mjs: nothing may keep pointing at a removed
+  // environment, and a fixed-target action or macro left without one is disabled with a reason
+  // rather than silently retargeted. The two copies must stay in step.
   handler: async (ctx, args) => {
     const environment = await ctx.db.get(args.environmentId);
     if (!environment || environment.userExternalId !== args.userId) return null;
+    const environmentId = String(environment._id);
     await ctx.db.delete(environment._id);
+    const removed: {
+      devices: string[];
+      actions: string[];
+      macros: string[];
+      onboarding: boolean;
+    } = { devices: [], actions: [], macros: [], onboarding: false };
+    const timestamp = nowIso();
+
     const devices = await ctx.db
       .query("devices")
       .withIndex("byUserExternalId", (q) => q.eq("userExternalId", args.userId))
       .collect();
-    await Promise.all(devices
-      .filter((device) => device.config?.environmentId === String(environment._id))
-      .map((device) => ctx.db.patch(device._id, {
+    for (const device of devices) {
+      if (device.config?.environmentId !== environmentId) continue;
+      await ctx.db.patch(device._id, {
         config: normalizeDeviceConfig({ ...device.config, environmentId: null }, device.config),
-        updatedAt: nowIso(),
-      })));
+        updatedAt: timestamp,
+      });
+      removed.devices.push(String(device._id));
+    }
+
+    const actions = await ctx.db
+      .query("actions")
+      .withIndex("byUserExternalId", (q) => q.eq("userExternalId", args.userId))
+      .collect();
+    for (const action of actions) {
+      if (String(action.environmentId ?? "") !== environmentId) continue;
+      await ctx.db.patch(action._id, {
+        environmentId: undefined,
+        threadId: undefined,
+        targetMode: "device-current",
+        disabled: true,
+        disabledReason: ENVIRONMENT_REMOVED_REASON,
+        updatedAt: timestamp,
+      });
+      removed.actions.push(String(action._id));
+    }
+
+    const macros = await ctx.db
+      .query("macros")
+      .withIndex("byUserExternalId", (q) => q.eq("userExternalId", args.userId))
+      .collect();
+    for (const macro of macros) {
+      if (String(macro.environmentId ?? "") !== environmentId) continue;
+      await ctx.db.patch(macro._id, {
+        environmentId: undefined,
+        threadId: undefined,
+        disabled: true,
+        disabledReason: ENVIRONMENT_REMOVED_REASON,
+        updatedAt: timestamp,
+      });
+      removed.macros.push(String(macro._id));
+    }
+
+    const user = await findUser(ctx, args.userId);
+    const onboarding = normalizeOnboarding(user?.onboarding);
+    if (user && onboarding.environmentId === environmentId) {
+      await ctx.db.patch(user._id, {
+        onboarding: { ...onboarding, environmentId: null, firstThreadId: null, updatedAt: timestamp },
+        updatedAt: timestamp,
+      });
+      removed.onboarding = true;
+    }
+
     await audit(ctx, {
       userExternalId: args.userId,
       actorType: "user",
       action: "environment.deleted",
       targetId: environment._id,
-      metadata: { label: environment.label, baseUrl: environment.baseUrl },
+      metadata: {
+        label: environment.label,
+        baseUrl: environment.baseUrl,
+        clearedDeviceIds: removed.devices,
+        disabledActionIds: removed.actions,
+        disabledMacroIds: removed.macros,
+        clearedOnboarding: removed.onboarding,
+      },
     });
-    return publicEnvironment(environment);
+    return { environment: publicEnvironment(environment), removed };
   },
 });
 
@@ -1279,6 +1347,8 @@ export const createAction = gatewayMutation({
     environmentId: v.union(v.id("environments"), v.null()),
     threadId: v.union(v.string(), v.null()),
     steps: v.array(v.object({ actionId: v.id("actions"), continueOnFailure: v.boolean() })),
+    disabled: v.optional(v.boolean()),
+    disabledReason: v.optional(v.union(v.string(), v.null())),
   },
   handler: async (ctx, args) => {
     const timestamp = nowIso();
@@ -1291,6 +1361,8 @@ export const createAction = gatewayMutation({
       ...(args.environmentId ? { environmentId: args.environmentId } : {}),
       ...(args.threadId ? { threadId: args.threadId } : {}),
       steps: args.steps,
+      disabled: args.disabled === true,
+      disabledReason: args.disabled === true ? (args.disabledReason ?? null) : null,
       createdAt: timestamp,
       updatedAt: timestamp,
     });
@@ -1336,12 +1408,14 @@ export const updateAction = gatewayMutation({
     environmentId: v.optional(v.union(v.id("environments"), v.null())),
     threadId: v.optional(v.union(v.string(), v.null())),
     steps: v.optional(v.array(v.object({ actionId: v.id("actions"), continueOnFailure: v.boolean() }))),
+    disabled: v.optional(v.boolean()),
+    disabledReason: v.optional(v.union(v.string(), v.null())),
   },
   handler: async (ctx, args) => {
     const action = await ctx.db.get(args.actionId);
     if (!action || action.userExternalId !== args.userId) return null;
     const patch: any = { updatedAt: nowIso() };
-    for (const key of ["type", "label", "payload", "targetMode", "steps"]) {
+    for (const key of ["type", "label", "payload", "targetMode", "steps", "disabled", "disabledReason"]) {
       if ((args as any)[key] !== undefined) patch[key] = (args as any)[key];
     }
     if (args.environmentId !== undefined) patch.environmentId = args.environmentId ?? undefined;
@@ -1638,6 +1712,8 @@ export const createMacro = gatewayMutation({
     environmentId: v.union(v.id("environments"), v.null()),
     threadId: v.union(v.string(), v.null()),
     intent: v.any(),
+    disabled: v.optional(v.boolean()),
+    disabledReason: v.optional(v.union(v.string(), v.null())),
   },
   handler: async (ctx, args) => {
     const id = await ctx.db.insert("macros", {
@@ -1646,6 +1722,8 @@ export const createMacro = gatewayMutation({
       ...(args.environmentId ? { environmentId: args.environmentId } : {}),
       ...(args.threadId ? { threadId: args.threadId } : {}),
       intent: args.intent,
+      disabled: args.disabled === true,
+      disabledReason: args.disabled === true ? (args.disabledReason ?? null) : null,
       createdAt: nowIso(),
       updatedAt: nowIso(),
     });
@@ -2572,6 +2650,8 @@ function publicMacro(macro: any) {
     environmentId: macro.environmentId ?? null,
     threadId: macro.threadId ?? null,
     intent: macro.intent,
+    disabled: macro.disabled === true,
+    disabledReason: macro.disabled === true ? (macro.disabledReason ?? null) : null,
     createdAt: macro.createdAt,
     updatedAt: macro.updatedAt,
   };
@@ -2589,6 +2669,8 @@ function publicAction(action: any) {
     environmentId: action.environmentId ?? null,
     threadId: action.threadId ?? null,
     steps: action.steps ?? [],
+    disabled: action.disabled === true,
+    disabledReason: action.disabled === true ? (action.disabledReason ?? null) : null,
     createdAt: action.createdAt,
     updatedAt: action.updatedAt,
   };

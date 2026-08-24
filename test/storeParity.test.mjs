@@ -88,3 +88,65 @@ test("every action deviceActions() reports is one a store method actually guards
     );
   }
 });
+
+/** Brace-matches a body starting at `open`, which must index a `{`. */
+function matchBraces(source, open) {
+  let depth = 0;
+  for (let index = open; index < source.length; index += 1) {
+    if (source[index] === "{") depth += 1;
+    else if (source[index] === "}") {
+      depth -= 1;
+      if (depth === 0) return source.slice(open + 1, index);
+    }
+  }
+  throw new Error("Unbalanced braces.");
+}
+
+/** Like extractFunction, but tolerates a destructured parameter list. */
+function extractFunctionWithParams(source, name) {
+  const start = source.indexOf(`function ${name}(`);
+  assert.notEqual(start, -1, `${name}() not found — did it get renamed?`);
+  let depth = 0;
+  for (let index = source.indexOf("(", start); index < source.length; index += 1) {
+    if (source[index] === "(") depth += 1;
+    else if (source[index] === ")") {
+      depth -= 1;
+      if (depth === 0) return matchBraces(source, source.indexOf("{", index));
+    }
+  }
+  throw new Error(`${name}() has an unbalanced parameter list.`);
+}
+
+/** Extracts an `export const name = wrapper({ ... })` body by brace matching. */
+function extractConvexHandler(source, name) {
+  const start = source.indexOf(`export const ${name} = `);
+  assert.notEqual(start, -1, `${name} not found in convex/gatewayStore.ts — did it get renamed?`);
+  return matchBraces(source, source.indexOf("{", start));
+}
+
+test("deleteEnvironment repairs the same dependencies in both store implementations", async () => {
+  const [memory, convex] = await Promise.all([
+    readFile(join(ROOT, "src", "store.mjs"), "utf8"),
+    readFile(join(ROOT, "convex", "gatewayStore.ts"), "utf8"),
+  ]);
+
+  const memoryBody = extractFunctionWithParams(memory, "deleteEnvironment");
+  const convexBody = extractConvexHandler(convex, "deleteEnvironment");
+
+  // The summary keys are the contract: an owner who removes an environment is told exactly what
+  // was cleared, and a backend that repairs one fewer thing leaves an orphan behind.
+  const summaryKeys = (body) => [...new Set([...body.matchAll(/removed\.(\w+)/gu)].map((match) => match[1]))].sort();
+  assert.deepEqual(summaryKeys(memoryBody), ["actions", "devices", "macros", "onboarding"]);
+  assert.deepEqual(
+    summaryKeys(convexBody),
+    summaryKeys(memoryBody),
+    "deleteEnvironment() reports a different removal summary from src/store.mjs and "
+      + "convex/gatewayStore.ts. Both backends must repair — and report — the same dependencies.",
+  );
+
+  for (const [label, body] of [["memory", memoryBody], ["convex", convexBody]]) {
+    assert.match(body, /ENVIRONMENT_REMOVED_REASON/u, `${label} deleteEnvironment() no longer disables orphans.`);
+    assert.match(body, /targetMode\s*[:=]\s*"device-current"/u, `${label} deleteEnvironment() leaves a fixed action without a target.`);
+    assert.match(body, /firstThreadId: null/u, `${label} deleteEnvironment() no longer clears the onboarding selection.`);
+  }
+});

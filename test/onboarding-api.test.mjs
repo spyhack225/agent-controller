@@ -145,6 +145,65 @@ test("onboarding API persists progress and completes only after operational read
   assert.equal(audit.events.some((event) => event.action === "user.onboarding_completed"), true);
 });
 
+test("removing the onboarding environment clears the selection instead of locking the record", async (t) => {
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = async (input, init) => {
+    const url = new URL(input);
+    if (url.origin === "https://t3.example") {
+      return jsonResponse({ projects: [{ id: "project_1" }], threads: [] });
+    }
+    return originalFetch(input, init);
+  };
+  t.after(() => {
+    globalThis.fetch = originalFetch;
+  });
+
+  const { server } = createApp();
+  await listen(server);
+  t.after(() => server.close());
+  const baseUrl = `http://127.0.0.1:${server.address().port}`;
+  const session = await request(baseUrl, "/v1/users/dev", {
+    method: "POST",
+    body: { userId: "user_onboarding_repair", email: "repair@example.test" },
+  });
+  const headers = { authorization: `Bearer ${session.apiToken.secret}` };
+
+  const environment = await request(baseUrl, "/v1/t3/environments", {
+    method: "POST",
+    headers,
+    body: { label: "Doomed T3", baseUrl: "https://t3.example", accessToken: "t3-access-token" },
+  });
+  await request(baseUrl, "/v1/onboarding", {
+    method: "PUT",
+    headers,
+    body: {
+      status: "in_progress",
+      currentStep: "workspace",
+      environmentId: environment.environment.id,
+      firstThreadId: "thread_first_run",
+    },
+  });
+
+  const removed = await request(baseUrl, `/v1/t3/environments/${environment.environment.id}`, {
+    method: "DELETE",
+    headers,
+  });
+  assert.equal(removed.removed.onboarding, true);
+
+  const afterRemoval = await request(baseUrl, "/v1/onboarding", { headers });
+  assert.equal(afterRemoval.onboarding.environmentId, null);
+  assert.equal(afterRemoval.onboarding.firstThreadId, null);
+
+  // The stale id used to make every later save 404 with "Onboarding environment not found."
+  const saved = await request(baseUrl, "/v1/onboarding", {
+    method: "PUT",
+    headers,
+    body: { status: "in_progress", currentStep: "connect" },
+  });
+  assert.equal(saved.onboarding.currentStep, "connect");
+  assert.equal(saved.onboarding.environmentId, null);
+});
+
 async function request(baseUrl, path, { method = "GET", headers = {}, body } = {}) {
   const response = await fetch(new URL(path, baseUrl), {
     method,

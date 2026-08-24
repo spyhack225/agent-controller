@@ -16,6 +16,8 @@
 #include <Arduino.h>
 #include <WiFi.h>
 
+#include "display.h"
+
 #include <DeviceStore.h>
 #include <Provisioning.h>
 
@@ -388,6 +390,8 @@ void reportIdentity() {
   Serial.println("  nvsSeed CSV from POST /v1/factory/batches.");
 }
 
+void drawBootScreen(const char* line1, const char* line2);
+
 void reportState(ProvisioningState state) {
   const ProvisioningStatus& status = provisioning.status();
   Serial.printf("[provisioning] %s", provisioningStateName(state));
@@ -400,6 +404,24 @@ void reportState(ProvisioningState state) {
   }
   if (state == ProvisioningState::Online) {
     Serial.printf("  IP %s, RSSI %d dBm\n", WiFi.localIP().toString().c_str(), WiFi.RSSI());
+  }
+
+  switch (state) {
+    case ProvisioningState::Provisioning:
+      drawBootScreen("Set up Wi-Fi", status.apName.c_str());
+      break;
+    case ProvisioningState::Connecting:
+      drawBootScreen("Connecting", status.detail.c_str());
+      break;
+    case ProvisioningState::Online:
+      drawBootScreen("Online", WiFi.localIP().toString().c_str());
+      break;
+    case ProvisioningState::Failed:
+      drawBootScreen("Wi-Fi failed", status.detail.c_str());
+      break;
+    default:
+      drawBootScreen("Starting", status.detail.c_str());
+      break;
   }
 }
 
@@ -436,6 +458,38 @@ void pollBootButton() {
 #endif
 }
 
+// Provisional boot screen. The real UI is the orb layout; this exists so the panel is verifiable
+// on its own, before anything depends on it.
+void drawBootScreen(const char* line1, const char* line2) {
+  if (!displayReady()) return;
+  Adafruit_ILI9341& g = displayPanel();
+
+  g.fillScreen(0x0000);
+  g.setTextColor(0xFFFF);
+  g.setTextSize(2);
+  g.setCursor(12, 28);
+  g.println("Agent");
+  g.setCursor(12, 50);
+  g.println("Controller");
+
+  g.drawFastHLine(12, 82, 216, 0x39E7);
+
+  g.setTextSize(1);
+  g.setTextColor(0xAD55);
+  g.setCursor(12, 100);
+  g.println(HARDWARE_MODEL);
+  g.setCursor(12, 114);
+  g.println(FIRMWARE_VERSION);
+
+  g.setTextSize(1);
+  g.setTextColor(0xFFFF);
+  g.setCursor(12, 148);
+  g.println(line1);
+  g.setTextColor(0xAD55);
+  g.setCursor(12, 164);
+  g.println(line2);
+}
+
 }  // namespace
 
 void setup() {
@@ -451,6 +505,13 @@ void setup() {
   reportBattery();
 
   pinMode(BOOT_BUTTON_PIN, INPUT_PULLUP);
+
+  if (displayBegin()) {
+    Serial.println("[display] ILI9341V up, 240x320, backlight on.");
+    drawBootScreen("Starting", "");
+  } else {
+    Serial.println("[display] Not initialised (ENABLE_LCD is 0, or init failed).");
+  }
 
   if (!store.begin()) {
     // An NVS failure here means the partition table is wrong. Nothing after this would work.

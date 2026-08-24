@@ -17,9 +17,9 @@ import {
   Save,
   Server,
   ShieldCheck,
+  Trash2,
   Users,
   Wifi,
-  Unplug,
   X,
 } from "lucide-react";
 import { useEffect, useRef, useState, type ReactNode } from "react";
@@ -27,7 +27,7 @@ import { createPortal } from "react-dom";
 
 import type { Controller } from "../controller";
 import { formatRelativeTime } from "../format";
-import type { Device, Environment, GatewayProfile, RemoteAccessStatus } from "../types";
+import type { Device, Environment, EnvironmentDependencies, GatewayProfile, RemoteAccessStatus } from "../types";
 import { Button, Field, StatusBadge, cn, type StatusTone, useConfirm } from "../ui";
 
 interface EnvironmentsPageProps {
@@ -291,14 +291,22 @@ export function EnvironmentsPage({
     await c.run(`environment-snapshot-${environment.id}`, "Workspace snapshot loaded.", () => c.loadSnapshot(environment.id));
   };
 
-  const unpairEnvironment = async (environment: Environment) => {
+  const removeEnvironment = async (environment: Environment) => {
+    // Read the impact before asking: removing an environment also disables every saved action and
+    // macro aimed at it, which the owner cannot see from this screen.
+    let dependencies: EnvironmentDependencies | null = null;
+    try {
+      dependencies = await c.api(`/v1/t3/environments/${encodeURIComponent(environment.id)}/dependencies`) as EnvironmentDependencies;
+    } catch {
+      dependencies = null;
+    }
     const accepted = await confirm({
-      title: `Unpair ${environment.label}?`,
-      description: "Devices using this environment will have their default environment cleared. Stored access credentials will be removed.",
-      confirmLabel: "Unpair environment",
+      title: `Remove ${environment.label}?`,
+      description: describeEnvironmentRemoval(dependencies),
+      confirmLabel: "Remove environment",
     });
     if (!accepted) return;
-    await c.run("unpair-environment", "Environment unpaired.", async () => {
+    await c.run("remove-environment", "Environment removed.", async () => {
       const result = await c.api(`/v1/t3/environments/${encodeURIComponent(environment.id)}`, { method: "DELETE" });
       setEditingEnvironment(null);
       await c.refreshAll();
@@ -371,10 +379,34 @@ export function EnvironmentsPage({
         onClose={() => setEditingEnvironment(null)}
         onCheck={() => editingEnvironment && void checkEnvironment(editingEnvironment)}
         onLoad={() => editingEnvironment && void loadSnapshot(editingEnvironment, true)}
-        onUnpair={() => editingEnvironment && void unpairEnvironment(editingEnvironment)}
+        onRemove={() => editingEnvironment && void removeEnvironment(editingEnvironment)}
       />
     </div>
   );
+}
+
+function describeEnvironmentRemoval(preview: EnvironmentDependencies | null): string {
+  const credential = "Removing deletes the stored T3 credential.";
+  if (!preview) return `${credential} Devices, saved actions, macros, and onboarding that point at it will be cleared or disabled.`;
+  const impacts: string[] = [];
+  if (preview.counts.devices) impacts.push(countLabel(preview.counts.devices, "device default", "device defaults"));
+  if (preview.counts.actions) impacts.push(countLabel(preview.counts.actions, "saved action", "saved actions"));
+  if (preview.counts.macros) impacts.push(countLabel(preview.counts.macros, "macro", "macros"));
+  if (preview.dependencies.onboarding) impacts.push("your onboarding selection");
+  if (impacts.length === 0) return `${credential} Nothing else currently points at this environment.`;
+  const disabled = preview.counts.actions || preview.counts.macros
+    ? " Saved actions and macros that target it are disabled until you re-save them against another environment."
+    : "";
+  return `${credential} It also clears ${joinList(impacts)}.${disabled}`;
+}
+
+function countLabel(count: number, singular: string, plural: string): string {
+  return `${count} ${count === 1 ? singular : plural}`;
+}
+
+function joinList(items: string[]): string {
+  if (items.length <= 1) return items[0] ?? "";
+  return `${items.slice(0, -1).join(", ")} and ${items.at(-1)}`;
 }
 
 export function EnvironmentActionCluster({
@@ -888,14 +920,14 @@ function EnvironmentEditorDialog({
   onClose,
   onCheck,
   onLoad,
-  onUnpair,
+  onRemove,
 }: {
   controller: Controller;
   environment: Environment | null;
   onClose: () => void;
   onCheck: () => void;
   onLoad: () => void;
-  onUnpair: () => void;
+  onRemove: () => void;
 }) {
   const [tab, setTab] = useState<EnvironmentTab>("connection");
   const [label, setLabel] = useState("");
@@ -1031,9 +1063,9 @@ function EnvironmentEditorDialog({
               <section className="device-editor__danger" aria-labelledby="environment-danger-title">
                 <div>
                   <p id="environment-danger-title" className="font-display text-sm font-semibold text-danger">Connection danger zone</p>
-                  <p className="mt-1 text-xs text-ink-muted">Unpairing removes the credential and clears this default from attached devices.</p>
+                  <p className="mt-1 text-xs text-ink-muted">Removing deletes the credential, clears this default from attached devices and from onboarding, and disables saved actions and macros that target it.</p>
                 </div>
-                <Button size="sm" variant="danger-ghost" onClick={onUnpair}><Unplug className="size-3.5" /> Unpair environment</Button>
+                <Button size="sm" variant="danger-ghost" onClick={onRemove}><Trash2 className="size-3.5" /> Remove environment</Button>
               </section>
             </div>
           ) : null}

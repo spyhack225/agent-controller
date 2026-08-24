@@ -472,3 +472,88 @@ test("file store encrypts T3 access tokens when a token key is configured", asyn
     await rm(dir, { recursive: true, force: true });
   }
 });
+
+test("deleting an environment repairs every record that pointed at it", () => {
+  const store = createMemoryStore();
+  store.ensureUser({ userId: "user_1", email: "owner@example.local" });
+  const environment = store.upsertEnvironment({
+    userId: "user_1",
+    label: "Doomed T3",
+    baseUrl: "https://doomed.example",
+    accessToken: "doomed-token",
+    scopes: ["orchestration:read"],
+    status: "paired",
+  });
+  const other = store.upsertEnvironment({
+    userId: "user_1",
+    label: "Kept T3",
+    baseUrl: "https://kept.example",
+    accessToken: "kept-token",
+    scopes: ["orchestration:read"],
+    status: "paired",
+  });
+  const { device } = store.createDevice({ userId: "user_1", label: "Desk", profile: "agent-controller" });
+  store.updateDeviceConfig({
+    userId: "user_1",
+    deviceId: device.id,
+    config: { environmentId: environment.id, threadId: "thread_1" },
+  });
+  const doomedAction = store.createAction({
+    userId: "user_1",
+    type: "prompt",
+    label: "Fixed prompt",
+    payload: { text: "Continue." },
+    targetMode: "fixed",
+    environmentId: environment.id,
+    threadId: "thread_1",
+  });
+  const keptAction = store.createAction({
+    userId: "user_1",
+    type: "prompt",
+    label: "Other prompt",
+    payload: { text: "Continue." },
+    targetMode: "fixed",
+    environmentId: other.id,
+    threadId: "thread_2",
+  });
+  const doomedMacro = store.createMacro({
+    userId: "user_1",
+    label: "Doomed macro",
+    environmentId: environment.id,
+    threadId: "thread_1",
+    intent: { type: "agent_prompt", text: "Sweep." },
+  });
+  store.updateUserOnboarding({
+    userId: "user_1",
+    onboarding: { status: "in_progress", environmentId: environment.id, firstThreadId: "thread_1" },
+  });
+
+  const result = store.deleteEnvironment({ userId: "user_1", environmentId: environment.id });
+
+  assert.equal(result.environment.id, environment.id);
+  assert.deepEqual(result.removed, {
+    devices: [device.id],
+    actions: [doomedAction.id],
+    macros: [doomedMacro.id],
+    onboarding: true,
+  });
+  assert.equal(store.getDeviceForUser("user_1", device.id).config.environmentId, null);
+
+  const repaired = store.getActionForUser("user_1", doomedAction.id);
+  assert.equal(repaired.disabled, true);
+  assert.equal(repaired.disabledReason, "environment_removed");
+  assert.equal(repaired.environmentId, null);
+  assert.equal(repaired.threadId, null);
+  assert.equal(repaired.targetMode, "device-current");
+
+  const untouched = store.getActionForUser("user_1", keptAction.id);
+  assert.equal(untouched.disabled, false);
+  assert.equal(untouched.environmentId, other.id);
+
+  assert.equal(store.listMacros("user_1")[0].disabled, true);
+  assert.equal(store.getUserOnboarding("user_1").environmentId, null);
+  assert.equal(store.getUserOnboarding("user_1").firstThreadId, null);
+
+  // Removal is idempotent: the second call has nothing left to repair.
+  assert.equal(store.deleteEnvironment({ userId: "user_1", environmentId: environment.id }), null);
+});

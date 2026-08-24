@@ -24,8 +24,10 @@ Last updated: 2026-08-24.
 | Hosyond ES3C28P board folder | done | Compiles. Pin map vendor-verified |
 | Hosyond on-board capture path | done | Record to PSRAM, peak/RMS, speaker playback — all offline |
 | Toolchain on ESP-IDF 5.5 / Arduino 3.3 | done | pioarduino fork. All 9 environments across 4 boards build |
-| Hosyond flashed and run on hardware | wip | Board is connected at `/dev/cu.usbmodem1101` |
-| Device UI redesign (orb aesthetic) | wip | See "Device UI" below |
+| Hosyond flashed and run on hardware | done | PSRAM 8MB, flash 16MB, battery 4116mV, codec ACK, SoftAP portal — all confirmed on silicon |
+| Hosyond microphone proven | done | Boot self-test: peak 779 / rms 284 / dc 12 at 30 dB gain, quiet room |
+| Hosyond ILI9341 display | blocked | Adapter written; first flash left the board unbootable. Needs a physical power cycle to recover, then bisecting. `ENABLE_LCD` now defaults to 0 |
+| Device UI redesign (orb aesthetic) | blocked | Blocked on the display adapter above |
 | Gateway client extracted to `firmware/shared` | todo | **The blocker for any second board doing real work** |
 
 ## Milestone 0.5 — independent repairs
@@ -84,14 +86,21 @@ on near-black, with a shimmer-swept label.
 
 | Item | State | Notes |
 |---|---|---|
-| Orb spec vendored | todo | `spec/orbs-spec.json` defines 9 modes and their parameters |
-| Orb renderer in C++ | todo | Point-cloud sphere, 3D rotate + depth-faded projection |
+| Orb spec vendored | done | 9 modes + parameters extracted from the MIT library's own spec |
+| Orb renderer in C++ | wip | `ThinkingOrb.h` interface written in `firmware/shared`; renderer-agnostic by design (emits depth-sorted dots, the board paints them) |
 | Agent-state to orb-mode mapping | todo | The library already maps 9 states to 9 modes |
 | Screen layout on 240x320 | todo | |
 | Web console parity | todo | Same orb for agent thinking states |
 
 ## Known blockers
 
+0. **The Hosyond board is currently unbootable and needs a physical recovery.** Enabling the
+   ILI9341 adapter produced a crash-reboot loop, and the board now returns "No serial data
+   received" to esptool, so it cannot be reflashed over USB. Recovery is a full power cycle
+   (unplug/replug), or holding BOOT while plugging in to force download mode. Prime suspect is
+   GPIO45, the backlight pin, which is also the VDD_SPI strapping pin — documented in
+   `include/controller_config.example.h`. `ENABLE_LCD` defaults to 0 so no default build can
+   repeat it.
 1. **The gateway client is not shared.** Heartbeat, display state, intent submission, OTA, and
    media upload live inside the CrowPanel's 3652-line `main.cpp`. Until they move into
    `firmware/shared/AgentControllerCore`, the Hosyond board can record a clip and do nothing

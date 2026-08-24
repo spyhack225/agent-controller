@@ -1,5 +1,6 @@
 import { createHash, timingSafeEqual } from "node:crypto";
 
+import { ENVIRONMENT_REMOVED_REASON } from "./actions.mjs";
 import { defaultSubscription, normalizeSubscription } from "./billing.mjs";
 import { createId, createSecret, nowIso } from "./ids.mjs";
 import { normalizeOnboarding, normalizeStoredOnboarding } from "./onboarding.mjs";
@@ -35,6 +36,12 @@ function safeEqual(left, right) {
   const leftBuffer = Buffer.from(left);
   const rightBuffer = Buffer.from(right);
   return leftBuffer.length === rightBuffer.length && timingSafeEqual(leftBuffer, rightBuffer);
+}
+
+// The shape every store implementation reports back from deleteEnvironment, and the shape the
+// dependency preview answers with. Kept here so memory, file, and Convex stores cannot drift.
+export function emptyEnvironmentRemoval() {
+  return { devices: [], actions: [], macros: [], onboarding: false };
 }
 
 export function createStore(seed = {}, options = {}) {
@@ -685,6 +692,8 @@ export function createStore(seed = {}, options = {}) {
       environmentId: input.environmentId ?? null,
       threadId: input.threadId ?? null,
       steps: structuredClone(input.steps ?? []),
+      disabled: input.disabled === true,
+      disabledReason: input.disabled === true ? (input.disabledReason ?? null) : null,
       createdAt: nowIso(),
       updatedAt: nowIso(),
     };
@@ -714,7 +723,7 @@ export function createStore(seed = {}, options = {}) {
   function updateAction({ userId, actionId, ...input }) {
     const action = actions.get(actionId);
     if (!action || action.userId !== userId) return null;
-    for (const key of ["type", "label", "targetMode", "environmentId", "threadId"]) {
+    for (const key of ["type", "label", "targetMode", "environmentId", "threadId", "disabled", "disabledReason"]) {
       if (input[key] !== undefined) action[key] = input[key];
     }
     if (input.payload !== undefined) action.payload = structuredClone(input.payload);
@@ -978,23 +987,65 @@ export function createStore(seed = {}, options = {}) {
     return publicEnvironment(environment);
   }
 
+  // Nothing may keep pointing at a removed environment. A fixed-target action or macro without an
+  // environmentId is a row `normalizeActionInput` would refuse to create, so an orphan is disabled
+  // with a reason rather than silently retargeted at whatever the device happens to be using.
   function deleteEnvironment({ userId, environmentId }) {
     const environment = environments.get(environmentId);
     if (!environment || environment.userId !== userId) return null;
     environments.delete(environmentId);
+    const removed = emptyEnvironmentRemoval();
     for (const device of devices.values()) {
       if (device.userId !== userId || device.config?.environmentId !== environmentId) continue;
       device.config = normalizeDeviceConfig({ ...device.config, environmentId: null }, device.config);
+      removed.devices.push(device.id);
+    }
+    for (const action of actions.values()) {
+      if (action.userId !== userId || action.environmentId !== environmentId) continue;
+      action.environmentId = null;
+      action.threadId = null;
+      action.targetMode = "device-current";
+      action.disabled = true;
+      action.disabledReason = ENVIRONMENT_REMOVED_REASON;
+      action.updatedAt = nowIso();
+      removed.actions.push(action.id);
+    }
+    for (const macro of macros.values()) {
+      if (macro.userId !== userId || macro.environmentId !== environmentId) continue;
+      macro.environmentId = null;
+      macro.threadId = null;
+      macro.disabled = true;
+      macro.disabledReason = ENVIRONMENT_REMOVED_REASON;
+      macro.updatedAt = nowIso();
+      removed.macros.push(macro.id);
+    }
+    const user = users.get(userId);
+    const onboarding = user ? normalizeStoredOnboarding(user.onboarding) : null;
+    if (onboarding?.environmentId === environmentId) {
+      user.onboarding = {
+        ...onboarding,
+        environmentId: null,
+        firstThreadId: null,
+        updatedAt: nowIso(),
+      };
+      removed.onboarding = true;
     }
     audit({
       userId,
       actorType: "user",
       action: "environment.deleted",
       targetId: environment.id,
-      metadata: { label: environment.label, baseUrl: environment.baseUrl },
+      metadata: {
+        label: environment.label,
+        baseUrl: environment.baseUrl,
+        clearedDeviceIds: removed.devices,
+        disabledActionIds: removed.actions,
+        disabledMacroIds: removed.macros,
+        clearedOnboarding: removed.onboarding,
+      },
     });
     notifyChanged();
-    return publicEnvironment(environment);
+    return { environment: publicEnvironment(environment), removed };
   }
 
   function updateEnvironmentHealth({ userId, environmentId, status, health }) {
@@ -1319,6 +1370,8 @@ export function createStore(seed = {}, options = {}) {
       environmentId: input.environmentId ?? null,
       threadId: input.threadId ?? null,
       intent: input.intent,
+      disabled: input.disabled === true,
+      disabledReason: input.disabled === true ? (input.disabledReason ?? null) : null,
       createdAt: nowIso(),
       updatedAt: nowIso(),
     };
@@ -2016,6 +2069,8 @@ function publicMacro(macro) {
     environmentId: macro.environmentId ?? null,
     threadId: macro.threadId ?? null,
     intent: macro.intent,
+    disabled: macro.disabled === true,
+    disabledReason: macro.disabled === true ? (macro.disabledReason ?? null) : null,
     createdAt: macro.createdAt,
     updatedAt: macro.updatedAt,
   };
@@ -2032,6 +2087,8 @@ function publicAction(action) {
     environmentId: action.environmentId ?? null,
     threadId: action.threadId ?? null,
     steps: structuredClone(action.steps ?? []),
+    disabled: action.disabled === true,
+    disabledReason: action.disabled === true ? (action.disabledReason ?? null) : null,
     createdAt: action.createdAt,
     updatedAt: action.updatedAt,
   };

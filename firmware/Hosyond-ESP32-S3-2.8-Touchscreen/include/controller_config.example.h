@@ -70,7 +70,13 @@
 #define LCD_CS   10
 #define LCD_DC   46   // high = data, low = command
 #define LCD_RST  -1   // shared with CHIP_PU; no separate GPIO
-#define LCD_BL   45   // high = backlight on
+// GPIO45 is also an ESP32-S3 STRAPPING PIN (VDD_SPI voltage select: low = 3.3 V, high = 1.8 V).
+// The vendor wires the backlight to it and their own demos drive it high, so the board evidently
+// tolerates that — most likely an external pulldown wins during the strap sampling window, or the
+// VDD_SPI_FORCE eFuse is burned. Treat it as a hazard anyway: if a unit ever fails to boot after
+// the backlight has been driven high, suspect this before anything else, and recover with a full
+// power cycle rather than a warm reset so the strap is re-sampled with the pin released.
+#define LCD_BL   45   // high = backlight on; STRAPPING PIN, see above
 #define LCD_SCLK 12
 #define LCD_MOSI 11
 #define LCD_MISO 13
@@ -81,8 +87,12 @@
 // A 240x320 16 bpp framebuffer is 150 KB — it fits in SRAM, unlike the Waveshare's 466x466.
 #define LCD_COLOR_DEPTH 16
 
+// OFF by default, deliberately. The ILI9341 adapter in src/display.cpp is written but UNPROVEN:
+// the first hardware flash that enabled it left the board unable to boot or enter download mode,
+// and it had to be recovered with a manual power cycle. Until that is bisected, the default build
+// must not be able to brick a unit. Build -e hosyond-es3c28p-display to work on it.
 #ifndef ENABLE_LCD
-#define ENABLE_LCD 1
+#define ENABLE_LCD 0
 #endif
 
 // ---------------------------------------------------------------------------

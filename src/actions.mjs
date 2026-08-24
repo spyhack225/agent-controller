@@ -1,6 +1,9 @@
 import { HttpError, optionalString, requireString } from "./http.mjs";
 
 export const ACTION_TYPES = Object.freeze(["prompt", "shell", "media", "macro"]);
+// Why a saved action or macro is parked. Removing the T3 environment a fixed action targets leaves
+// a row that could not be created from scratch, so it is disabled with this reason instead.
+export const ENVIRONMENT_REMOVED_REASON = "environment_removed";
 export const SYSTEM_CONTROL_IDS = Object.freeze({
   status: "system_status",
   stop: "system_stop",
@@ -36,7 +39,20 @@ export function normalizeActionInput(body, existing = null) {
   const payload = normalizeActionPayload(type, payloadInput, body.intent);
   const steps = type === "macro" ? normalizeMacroSteps(stepsInput) : [];
 
-  return { type, label, payload, targetMode, environmentId, threadId, steps };
+  // Saving an action always re-enables it: an edit is the owner's explicit statement that the
+  // record is good again, and nothing else can clear a disabled flag.
+  const disabled = body.disabled === true;
+  return {
+    type,
+    label,
+    payload,
+    targetMode,
+    environmentId,
+    threadId,
+    steps,
+    disabled,
+    disabledReason: disabled ? optionalString(body.disabledReason) ?? null : null,
+  };
 }
 
 export function normalizeDeviceControlItems(input, { menuItems = 8 } = {}) {

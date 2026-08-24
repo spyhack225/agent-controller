@@ -186,6 +186,30 @@ export interface Environment {
   health?: EnvironmentHealth;
 }
 
+/** What still points at an environment, as returned by GET /v1/t3/environments/:id/dependencies. */
+export interface EnvironmentDependencyRef {
+  id: string;
+  label: string;
+}
+
+export interface EnvironmentDependencyCounts {
+  devices: number;
+  actions: number;
+  macros: number;
+  onboarding: number;
+}
+
+export interface EnvironmentDependencies {
+  environmentId: string;
+  dependencies: {
+    devices: EnvironmentDependencyRef[];
+    actions: EnvironmentDependencyRef[];
+    macros: EnvironmentDependencyRef[];
+    onboarding: boolean;
+  };
+  counts: EnvironmentDependencyCounts;
+}
+
 export interface ModelSelection {
   instanceId: string;
   model: string;
@@ -367,6 +391,8 @@ export interface Macro {
   environmentId?: string | null;
   threadId?: string | null;
   intent?: JsonRecord;
+  disabled?: boolean;
+  disabledReason?: string | null;
 }
 
 export type SavedActionType = "prompt" | "shell" | "media" | "macro";
@@ -388,6 +414,8 @@ export interface SavedAction {
   steps?: SavedActionStep[];
   environmentId?: string | null;
   threadId?: string | null;
+  disabled?: boolean;
+  disabledReason?: string | null;
   createdAt?: string;
   updatedAt?: string;
   deviceIds?: string[];
