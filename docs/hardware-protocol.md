@@ -3,6 +3,12 @@
 This document describes hardware protocol v2 for the ESP32 agent controller and the temporary
 protocol-v1 compatibility path.
 
+Project-wide firmware progress is maintained in
+[roadmap/IMPLEMENTATION-STATUS.md](../roadmap/IMPLEMENTATION-STATUS.md). As of 2026-08-24 all 11
+PlatformIO environments compile; Hosyond is the only board with current silicon evidence. The
+CrowPanel sections below deliberately distinguish the implemented slice from the target protocol
+and UI contract.
+
 The current design keeps the ESP32 simple:
 
 - The VPS gateway owns account, device, and T3 environment state.

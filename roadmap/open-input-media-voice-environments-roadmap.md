@@ -1,15 +1,44 @@
 # Open Input, Media, Voice, Live Threads, and Environment Roadmap
 
-Status: proposed after a codebase review on 2026-08-24, revised the same day after every claim in
-"What exists today" was re-verified against the code. Supersedes the product-usability portions of
+Status: **active**. Last code-and-test verification: **2026-08-24**. Milestone 0.5 is complete;
+Milestones 0–5 remain open. The canonical, item-level progress ledger is
+[IMPLEMENTATION-STATUS.md](IMPLEMENTATION-STATUS.md). This roadmap supersedes the
+product-usability portions of
 [agent-controller-implementation-roadmap.md](agent-controller-implementation-roadmap.md), which
-remains the ledger for hardware and commercial execution.
+remains useful for the original platform, hardware, and commercial scope.
 
 This roadmap covers the request to make Agent Controller an unrestricted, convenient control
 surface for arbitrary agent requests; bring media and voice into the main composer; improve the
 T3 Code connection and recovery flow; show and control the complete T3 conversation, including
 approvals, user-input requests, subagents, and parallel work; and make obsolete environments easy
 and safe to remove.
+
+## Current progress snapshot
+
+| Category | State | Progress as of 2026-08-24 |
+|---|---|---|
+| 1. Open request and composer | partial | Operate sends arbitrary text and ordered stored-media attachments; first-turn attachments work. Unified capture/upload and the QuickPage composer do not. |
+| 2. Unified media | partial | The Media page uploads, records, captures photos, transcribes, edits, retains, and deletes. Those controls are not reusable from the composer. |
+| 3. Voice transcription | todo | Manual synchronous providers exist; Parakeet, durable jobs, automatic processing, transcript versions, and auto-send do not. |
+| 4. Controller voice | partial | Hosyond audio capture, microphone proof, display, and orb UI run on hardware. Upload/dispatch and phone-companion flows do not. |
+| 5. T3 environments | partial | Typed recovery and dependency-aware removal are complete. Adapter consolidation, probed capabilities, discovery, console-first pairing, and tombstones remain. |
+| 6. Live T3 conversation | todo | Low-level snapshot/RPC helpers exist, but users still cannot see or interact with the complete live response, T3 approvals/questions, subagents, or parallel tasks. |
+| 7. Security, observability, testing | partial | Strong platform baseline and Milestone 0.5 coverage exist; initiative-specific stream, voice-job, attribution, and end-to-end coverage remain. |
+
+| Milestone | State |
+|---|---|
+| 0.5 — independent repairs | **done** |
+| 0 — contracts and diagnostics | todo |
+| 1 — live conversation and interaction parity | todo |
+| 2 — composer and connection | partial |
+| 3 — automatic Parakeet voice pipeline | todo |
+| 4 — controller voice paths | partial |
+| 5 — adapter hardening and rollout | todo |
+
+Verified gate: production frontend build and typecheck pass; 166 frontend tests pass; 341 server
+tests pass with 3 S3 integration tests skipped when no S3 service is configured; all 11 PlatformIO
+environments across four board folders compile. Hosyond is the only board with current silicon
+evidence.
 
 ## Executive decisions
 
@@ -33,19 +62,19 @@ and safe to remove.
    phone/PWA with the earbuds, or a board with an on-board microphone. Treat a different
    radio/audio coprocessor as a future hardware program. In practice the earbuds were only ever a
    way to get a microphone, and an on-board array gets one without the radio problem.
-6. **Environment failures need reason codes, not a generic outage string.** The recovery UI should
-   distinguish a stopped T3 process, network failure, timeout, TLS error, expired/invalid token,
-   and incompatible T3 contract.
-7. **“Unpair” is already a hard delete in the current backend.** Replace the ambiguous wording with
-   a safe Remove flow, inventory dependencies, erase credentials, and preserve historical audit
-   context without leaving live resources pointed at a missing environment.
+6. **Environment failures need reason codes, not a generic outage string.** Milestone 0.5 shipped
+   eight typed reasons covering stopped/unreachable T3, timeout, TLS, credential, and compatibility
+   failures, with retryability and targeted recovery actions.
+7. **“Unpair” was already a hard delete in the backend.** Milestone 0.5 replaced the ambiguous
+   wording with a dependency-aware Remove flow and repaired live references. Historical tombstones
+   and stronger label confirmation remain Category 5 hardening work.
 8. **Connecting the first environment is part of this initiative, not a prerequisite for it.** The
    current path routes a new user to a terminal on another machine before the product does anything.
    Diagnosis and removal only matter once an environment exists; getting the first one connected is
    the step that decides whether anyone reaches the rest.
-9. **The visible repairs ship before the contract work.** Environment removal, reason-specific
-   recovery, first-turn attachments, and multi-attachment support depend on none of the new
-   infrastructure and are sequenced ahead of it in Milestone 0.5.
+9. **The visible repairs shipped before the contract work.** Dependency-aware environment removal,
+   reason-specific recovery, first-turn attachments, and multi-attachment support landed together
+   as Milestone 0.5.
 10. **A dispatch acknowledgement is not an agent conversation.** T3 remains the canonical source
     for thread messages, activities, session state, checkpoints, and background work. Agent
     Controller must load the selected thread detail and follow its live stream until it settles;
@@ -60,26 +89,25 @@ and safe to remove.
 
 ## What exists today
 
-Every row below was verified against the code on 2026-08-24; file references are given so the claim
-can be re-checked rather than trusted.
+Every row below was re-verified against the code after Milestone 0.5 landed on 2026-08-24.
 
 | Area | Existing implementation | Main gap |
 | --- | --- | --- |
-| Free-form web input | `OperatePage.tsx` sends `agent_prompt` text through `POST /v1/intents` | The UI presents Prompt/Image/Audio/Shell as mutually exclusive modes (`OperatePage.tsx:41`, switcher at `:820`), and media/recording is not integrated into the composer |
-| Mobile / Dashboard input | `QuickPage.tsx` renders the current workspace, the approval queue, and five saved actions | **There is no composer at all** — the page cannot send a free-form request, and has no microphone. This is the surface Category 4 nominates as the recommended voice companion |
+| Free-form web input | `OperatePage.tsx` sends arbitrary `agent_prompt` text through `POST /v1/intents` | Prompt/Image/Audio/Shell remain mutually exclusive intent modes, and upload/record/camera controls are not integrated into the composer |
+| Mobile / Dashboard input | `QuickPage.tsx` renders the current workspace, the approval queue, and five saved actions | **There is no composer at all** — the page cannot send a free-form request and has no microphone. This is the recommended voice-companion surface |
 | Saved controller input | Actions, macros, device controls, and protocol-v1 menu intents | Shortcuts are perceived as the only allowed requests; the small device has no general text-entry path |
-| Browser media | `MediaPage.tsx` supports upload, microphone recording, camera capture, transcription, and deletion (`:26`, `:69`, `:93`, `:106`, `:198`, `:209`) | Capture is a separate workflow — `useAudioRecorder`/`useCameraCapture` have exactly one consumer. Operate selects one stored item from a plain single `<select>` (`OperatePage.tsx:789`) backed by a scalar `mediaId` (`:91`) |
-| Device media | `POST /v1/device/media` (`app.mjs:2221`); CrowPanel capture build uploads WAV/JPEG and submits an intent | Capture is compile-time off on the stock board (`ENABLE_AUDIO_CAPTURE 0`, `media_capture.h:28`); the upload handler never calls `transcribeStoredAudio`, whose only call site is the user-triggered `POST /v1/media/:id/transcribe` (`app.mjs:1585`) |
-| Media attachment transport | Signed media URLs, optional inline bytes, redacted persistence | The UI exposes one attachment. A `body.mediaUploadIds` **array** is already accepted by `collectMediaUploadIds` (`app.mjs:3159`) and fanned out by `buildMediaAttachments` (`mediaStore.mjs:274`), but the intent schema itself is scalar-only (`intent.mjs:21`, `media.mjs:50`) and no client, test, or doc ever sends the array — so the multi-attachment path is reachable dead code, not a working feature |
-| First-turn attachments | `buildT3Command` accepts attachments (`t3Client.mjs:97`) | `buildT3ProjectLaunchCommands` has no attachments parameter and hardcodes `attachments: []` (`t3Client.mjs:212`); the launch endpoint (`app.mjs:1028`) never calls `collectMediaUploadIds`. Follow-up turns can carry media; first turns structurally cannot |
-| Speech-to-text | Synchronous `disabled`, `mock`, and OpenAI branches in `mediaStore.mjs:122-187`; providers enumerated at `config.mjs:85` | Fully awaited inside the HTTP handler. No Parakeet adapter, queue, automatic processing/dispatch, transcript versions, or correction stage. The only background workers in `src/` are the SSE heartbeat and the snapshot poller |
+| Browser media | `MediaPage.tsx` supports upload, microphone recording, camera capture, manual transcription/editing, retention, and deletion | Capture remains a separate workflow. Operate can choose multiple existing media items and reorder/remove them, but cannot upload, record, capture, paste, drag, or preview inline |
+| Device media | `POST /v1/device/media`; the CrowPanel capture build can upload WAV/JPEG and submit an intent; Hosyond records and measures audio locally | Stock CrowPanel capture is compile-time off; Hosyond has no gateway client; device upload does not automatically start transcription |
+| Media attachment transport | Signed media URLs, optional inline bytes, redacted persistence, ordered `mediaUploadIds`, per-item validation, an eight-item limit, and scalar protocol-v1 compatibility | The transport repair is complete. The remaining gap is the unified composer, richer processing state, raw upload/finalize, and durable request orchestration |
+| First-turn attachments | The launch endpoint resolves owned media and passes attachments through `buildT3ProjectLaunchCommands` to the bootstrap turn | **Milestone 0.5 repair complete**; the future request envelope should reuse this path rather than add a third attachment contract |
+| Speech-to-text | Synchronous `disabled`, `mock`, and OpenAI branches in `mediaStore.mjs`; manual trigger and transcript editing in the Media page | No Parakeet adapter, queue, automatic processing/dispatch, transcript versions, correction stage, or retry worker |
 | T3 integration | HTTP snapshot/dispatch, WebSocket catalogue/terminal calls, compatibility checks | Hand-built contracts span several modules; error and attachment capabilities are too coarse |
-| Live T3 response | The frontend can normalize `thread.messages` when they happen to be present in the environment snapshot (`controller.ts:69-121`) | The gateway only fetches `/api/orchestration/snapshot`; `OperatePage.tsx:738-770` falls back to local command cards when no messages are present, so the user sees `dispatched` instead of T3's working state, streamed response, tools, or final answer. `orchestration.subscribeThread` is named in `t3Ws.mjs:23`, but the only RPC helper buffers chunks until exit and closes the socket (`t3Ws.mjs:46-121`) |
-| T3 interactions | `pendingThreadInteractions` detects approval and user-input activity only to produce compact counts (`t3Client.mjs:268-288`); `approval_response` can dispatch `thread.approval.respond` (`t3Client.mjs:160-168`) | Operate renders only Agent Controller `Command` approvals (`OperatePage.tsx:694-720`). T3 approval payloads are not shown, decisions are narrowed to approve/reject, and there is no `thread.user-input.respond` intent, form, or response path |
+| Live T3 response | The frontend normalizes snapshot `thread.messages` when present; `orchestration.subscribeThread` is named in `t3Ws.mjs` | The gateway uses a one-shot RPC helper that buffers until exit and closes. Operate therefore commonly shows the local `dispatched` command instead of T3 working state, streamed content, tools, or final answer |
+| T3 interactions | `pendingThreadInteractions` produces compact approval/user-input counts; low-level approval command building exists | Operate renders only Agent Controller command approvals. T3 approval payloads and full decisions are not shown, and there is no `thread.user-input.respond` path or form |
 | Subagents / parallel work | Full T3 thread activities may contain provider task/workflow lifecycle data | Agent Controller does not normalize task activities, background liveness, plan progress, parent/child identity, or per-task output. There is no agents/work inspector, parallel-task summary, notification, or capability-gated control |
-| Workspace recovery | `WorkspaceRecoveryDialog` plus a four-second availability monitor | It always shows the same instructions: the dialog takes `message: string` (`WorkspaceRecoveryDialog.tsx:10`) and the controller stores one hardcoded constant, `T3_SNAPSHOT_UNAVAILABLE_MESSAGE` (`controller.ts:45`, set at `:603`). `checkEnvironmentHealth` already computes a coarser-but-real `token_expired`/`reachable`/`unreachable` status (`app.mjs:3183-3223`) that the frontend discards |
+| Workspace recovery | Eight typed failure reasons, retryability metadata, reason-specific instructions/actions, and availability polling | **Milestone 0.5 repair complete**. Setup instructions are still client-authored, and re-pairing is not yet a single guided in-place flow |
 | Environment pairing (first run) | Four access modes, gateway profiles, token exchange, `npm run setup:t3` | Connecting a workspace still means running a wizard on the T3 host and pasting a token into the browser. No discovery, no guided handoff, no way to start from the console |
-| Environment removal | `DELETE /v1/t3/environments/:id` hard-deletes (`store.mjs:981`, `convex/gatewayStore.ts:858`) and clears device defaults | The UI calls it “Unpair” (`EnvironmentsPage.tsx:294`). Actions (`actions.mjs:30`, which *hard-requires* `environmentId` when `targetMode === "fixed"`), macros (`store.mjs:1319`), and onboarding (`onboarding.mjs:49`) all pin an environment id and are never inventoried, re-validated, or repaired |
+| Environment removal | The UI calls it Remove, previews dependent devices/actions/macros/onboarding, hard-deletes idempotently, clears defaults/selections, and disables fixed-target actions/macros with `environment_removed` across storage implementations | **Milestone 0.5 repair complete**. Historical tombstones, typed-label confirmation for dependency-heavy removal, and a richer post-removal redirect remain |
 
 ## Category 1 — Open request and composer experience
 
@@ -105,8 +133,8 @@ special command type. Hardware shortcuts remain fast entry points into the same 
    visible focus, screen-reader labels, reduced motion, and coarse-pointer targets.
 6. Keep Saved actions in the existing disclosure below the composer. Copy should present them as
    reusable shortcuts, not as the allowed command vocabulary.
-7. For a new thread, allow the same attachment flow as an existing thread. The current launch path
-   sends no attachments, so extend project launch to accept the same request envelope.
+7. **Completed in Milestone 0.5:** new-thread launch accepts the same ordered attachment list and
+   media validation as an existing thread. Preserve that behavior when the request envelope lands.
 8. **Give `QuickPage.tsx` a composer.** The Dashboard is currently approvals plus five saved actions
    and nothing else, which makes it the strongest single illustration of "the app only runs commands
    someone already defined". It is also the phone-sized surface, so Category 4's recommended voice
@@ -173,7 +201,9 @@ controller. Every item shows where it came from and whether it is ready to send.
    components. Reuse the existing `useAudioRecorder` and `useCameraCapture` hooks.
 2. Mount the picker from the Operate composer and keep the Media page focused on library,
    transcript, processing, retention, and deletion management.
-3. Replace the single `mediaId` state in `OperatePage.tsx` with an ordered attachment draft.
+3. **Completed in Milestone 0.5:** `OperatePage.tsx` uses an ordered attachment draft with add,
+   remove, move-up, and move-down controls. Replace its plain library selector with the reusable
+   picker without regressing ordering.
 4. Filter the library by the T3 adapter's supported types. Do not show audio as directly sendable
    when it still requires transcription; show `Transcribing`, `Ready`, or `Failed` instead.
 5. Add origin metadata to `MediaItem` (`user`, browser/PWA, or device label), audio duration, image
@@ -459,19 +489,14 @@ console helps until that has already succeeded.
 
 ### Remove old environments
 
-1. Rename `Unpair environment` to `Remove environment` because the current DELETE route removes the
-   record, not only its credential.
-2. Add a dependency preview covering assigned devices, saved actions, macros, onboarding progress,
-   and current selection. Show this in the confirmation dialog.
-3. Implement deletion transactionally across every store:
-   - Erase the encrypted T3 credential immediately.
-   - Clear device defaults (already implemented).
-   - Clear onboarding selection.
-   - Disable dependent fixed-target actions/macros with `environment_removed` rather than silently
-     retargeting them. Note that `actions.mjs:30` *requires* `environmentId` when
-     `targetMode === "fixed"`, so a surviving orphan is a record that could not be created today —
-     it must be disabled or repaired, never left to fail at run time.
-   - Retain immutable commands/audit records with a label/base-URL snapshot for history.
+1. **Completed in Milestone 0.5:** rename `Unpair environment` to `Remove environment`; preview
+   assigned devices, saved actions, macros, and onboarding dependencies before confirmation.
+2. **Completed in Milestone 0.5:** erase the credential/record idempotently, clear device and
+   onboarding selections, and disable dependent fixed-target actions/macros with
+   `environment_removed` rather than silently retargeting them.
+3. Extend the dependency preview with current project/thread, recent command count, last
+   reachability, and current UI selection where those are not already represented. Retain immutable
+   command/audit context with an environment label/base-URL snapshot for history.
 4. Prefer a tombstone (`deletedAt`, credential removed) for the environment row so command history
    remains explainable; hide tombstones from normal lists. Add permanent purge only as a separate,
    explicitly destructive maintenance action.
@@ -700,26 +725,22 @@ Initial targets:
 
 ## Recommended delivery sequence
 
-### Milestone 0.5 — Ships first, depends on nothing (3–5 days)
+### Milestone 0.5 — Complete (shipped 2026-08-24)
 
-Everything here is independent of the request envelope, the storage schema, and the ASR pipeline.
-None of it should wait behind Milestone 0.
+Everything here shipped independently of the request envelope and ASR pipeline.
 
-- **Remove environment.** Rename `Unpair` to `Remove`, add the dependency preview, and repair or
-  disable orphaned actions, macros, and onboarding selections on delete. The delete path already
-  exists and already clears device defaults; this extends it to the three record types it currently
-  ignores.
-- **Reason-specific recovery modal.** Widen the `token_expired` / `reachable` / `unreachable`
-  classification `checkEnvironmentHealth` already produces, carry it to the frontend instead of
-  discarding it, and branch the dialog on it. Even three real reasons beats one constant string.
-- **First-turn attachments.** Thread an attachments parameter through
-  `buildT3ProjectLaunchCommands` and the launch endpoint, replacing the hardcoded `attachments: []`.
-- **Multiple attachments end to end.** Widen the intent schema from a scalar `mediaUploadId` to a
-  list and send the array the server already accepts. This is a schema change plus a composer
-  change, not a new API.
+- **Done — Remove environment.** The UI uses Remove, previews dependencies, hard-deletes
+  idempotently, repairs device/onboarding references, and disables dependent fixed-target actions
+  and macros.
+- **Done — reason-specific recovery modal.** Eight typed reasons carry retryability and targeted
+  instructions/actions to the frontend.
+- **Done — first-turn attachments.** Project launch resolves and sends the same validated ordered
+  attachments as follow-up turns.
+- **Done — multiple attachments end to end.** The intent contract accepts an ordered list with an
+  eight-item limit and preserves the scalar field as a protocol-v1 alias; Operate can add, remove,
+  and reorder stored media.
 
-These four are the smallest, most visible repairs in the document, and three of them are the
-literal asks that started it.
+The completed repair has dedicated frontend, server, and store coverage in the current test gate.
 
 ### Milestone 0 — Contracts and diagnostics (1–2 weeks)
 
@@ -756,6 +777,9 @@ what T3 is doing instead of leaving Agent Controller to finish the task in T3 Co
 
 ### Milestone 2 — Composer and connection (2–3 weeks)
 
+**State: partial.** Free-form Operate text, ordered stored-media chips, first-turn attachments, and
+in-place environment updates exist. The deliverables below remain.
+
 - Unified free-form composer with reusable picker and multiple attachment chips.
 - A composer on `QuickPage` so the phone-sized surface can send a request at all.
 - First-run connection flow: copyable host command, gateway-side handoff, LAN discovery, polling
@@ -766,13 +790,18 @@ This delivers the largest usability improvement without waiting for new hardware
 
 ### Milestone 3 — Automatic Parakeet voice pipeline (3–5 weeks)
 
+**State: todo.** Manual synchronous transcription is baseline infrastructure, not this milestone.
+
 - Raw upload/finalize path and durable processing jobs.
-- CPU-hosted local Parakeet service/adapter, format conversion, transcript versions, and retry;
-  retain optional GPU configuration for higher-concurrency deployments.
+- CPU-hosted local Parakeet service/adapter, format conversion, transcript versions, and retry. A
+  GPU is not required; optional acceleration is a later capacity choice.
 - Inline recording, transcript review, opt-in auto-send, SSE progress, and metrics.
 - Direct-audio capability kept disabled on current T3.
 
 ### Milestone 4 — Controller voice paths (2–4 weeks plus hardware lead time)
+
+**State: partial.** Hosyond capture, microphone proof, display, and orb UI are working on silicon;
+gateway upload/dispatch, request status, touch controls, and the PWA companion remain.
 
 - PWA deep link/QR companion path for phone and Bluetooth earbuds.
 - Supported PDM/I2S carrier-board prototype and firmware capability reporting.
@@ -781,6 +810,9 @@ This delivers the largest usability improvement without waiting for new hardware
 Do not block the software voice release on a new controller PCB.
 
 ### Milestone 5 — T3 adapter hardening and rollout (1–2 weeks, then ongoing)
+
+**State: todo.** Existing compatibility and transport helpers have not yet been consolidated into
+the roadmap adapter or rollout gates.
 
 - Versioned adapter consolidation and compatibility UI integration.
 - Load, failure-injection, security, retention, and end-to-end validation.

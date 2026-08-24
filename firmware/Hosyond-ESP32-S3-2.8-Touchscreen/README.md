@@ -3,9 +3,11 @@
 Vendor materials live in [`docs/`](docs/) — schematic, specification, datasheets, and a 30-example
 Arduino pack. This board's pin map and audio driver both come from there, not from guesswork.
 
-**Status: compiles, never flashed.** No board has been in hand. Unlike the Waveshare AMOLED
-scaffold, the audio path here is real code rather than a TODO, because the vendor shipped both a
-verified pin table and a working codec driver.
+**Status: hardware-proven prototype; four environments compile.** The board has been flashed and
+used to verify 8 MB PSRAM, 16 MB flash, battery telemetry, SoftAP provisioning, the ES8311 codec and
+on-board microphone, the ILI9341 display, panel polarity, and the animated orb UI. It still has no
+shared gateway client, media upload/dispatch, touch input, or live agent-state feed. See the
+[canonical implementation ledger](../../roadmap/IMPLEMENTATION-STATUS.md).
 
 ## Why this board runs the full workflow
 
@@ -15,8 +17,9 @@ single **ES8311 mono codec handles both directions** — ADC for the downward-fa
 DAC for the speaker connector. The Waveshare board needs two chips for that (ES7210 to capture,
 ES8311 to play), so this one is less driver work, not more.
 
-Everything runs from on-board hardware. No Bluetooth headset, no external microphone, no cloud
-audio service: press to talk, the ES8311 captures, the gateway transcribes.
+Capture runs from on-board hardware. No Bluetooth headset or external microphone is required: the
+ES8311 records locally today; the planned shared gateway client and CPU-hosted Parakeet service will
+handle upload and transcription.
 
 | Capability | This board |
 |---|---|
@@ -102,7 +105,7 @@ Arduino 2.0.17 on ESP-IDF 4.4 — where `driver/i2s_std.h` does not exist and on
 driver is available. This board's vendored ES8311 driver and its capture path are both written
 against the IDF 5.x I2S API, so the old platform could not build them.
 
-All four boards and all nine environments were rebuilt and pass on the new platform, so the tree
+All four boards and all 11 environments were rebuilt and pass on the new platform, so the tree
 runs one toolchain rather than two.
 
 ## Display configuration
@@ -146,6 +149,22 @@ the capture build — brings up I2C, I2S, and the ES8311, then implements push-t
   capture, the codec, and output in one press, entirely offline.
 - **Hold BOOT for 10 s** to wipe Wi-Fi and re-enter provisioning, matching the CrowPanel's EXIT
   long-press recovery.
+- **Tap BOOT** in the non-capture/recovery flow to reopen the configuration portal without erasing
+  otherwise-valid Wi-Fi credentials.
+- The 240x320 display renders a near-black orb, one state verb, and a context line. The active
+  renderer keeps critical buffers in internal RAM and stages panel rows through DMA-capable memory
+  before SPI transfer; buffer and anti-alias tuning is still in progress.
+
+### Hardware evidence recorded on 2026-08-24
+
+- 8 MB PSRAM and 16 MB flash detected at runtime.
+- Battery telemetry reported 4116 mV on the connected unit.
+- ES8311 acknowledged and the boot microphone self-test produced non-zero, non-clipping samples
+  (`peak 779`, `RMS 284`, `DC offset 12`) at 30 dB gain in a quiet room.
+- SoftAP provisioning and the BOOT recovery path ran on the board.
+- The ILI9341 panel initialized after the ES8311/Adafruit stack was unified on the same `Wire`
+  driver generation; IPS inversion and the orb UI were then exercised visually. Internal-buffer,
+  anti-alias, and flicker tuning is still active.
 
 ## What is missing
 
@@ -153,38 +172,40 @@ In dependency order:
 
 1. **The gateway client.** This is the blocker, and it is not board-specific. Heartbeat, display
    state, intent submission, OTA, and media upload all still live inside the CrowPanel's 3652-line
-   `src/main.cpp`; only `DeviceStore` and `Provisioning` are in `firmware/shared`. Extract it once
+   `src/main.cpp`; `DeviceStore`, `Provisioning`, and `ThinkingOrb` are shared. Extract the client once
    into `AgentControllerCore` and both new boards can talk to the gateway. Until then the capture
    path stops at "clip recorded and measured".
 2. **Upload wiring.** `POST /v1/device/media` then an `audio_prompt` intent — the sequence the
    CrowPanel capture build already exercises. Note the gateway does not currently auto-transcribe
-   device audio; that gap is Category 2 of the
+   device audio; that gap is Category 3 of the
    [open-input roadmap](../../roadmap/open-input-media-voice-environments-roadmap.md).
-3. **ILI9341V display** over SPI, then **FT6336G touch** over I2C.
-4. **On-screen UI:** thread list, agent reply, approve/reject, and a push-to-talk target better
-   than the BOOT key.
+3. **FT6336G touch** over I2C.
+4. **Agent-state and interaction UI:** drive the orb from gateway/T3 state, then add result text,
+   approve/reject or structured-answer controls, and a push-to-talk target better than BOOT.
 5. **RGB LED** as a recording indicator.
 6. **On-screen keyboard**, once voice works. Voice first — the keyboard is for correcting a
    transcript.
 
 ## What is unverified
 
-1. **Nothing has run on hardware.** Verified on paper is not verified on metal.
-2. **`AUDIO_PA_ENABLE_ACTIVE_LOW`.** The vendor echo example drives GPIO1 LOW before streaming, so
+1. **FT6336G touch and RGB LED.** Neither path is implemented or proven on this unit.
+2. **Speaker/PA polarity.** The vendor echo example drives GPIO1 LOW before streaming, so
    the config assumes LOW means enabled. That is an inference from one example, not a datasheet
-   statement.
-3. **Microphone gain.** `es8311_codec_init()` leaves `es8311_microphone_gain_set` commented out, as
-   the vendor shipped it. Expect to need it once real levels are measured.
-4. **The partition table.** 16 MB dual-slot OTA, arithmetic checked and contiguous, but never
-   flashed.
-5. **PSRAM and USB CDC settings.** The build applies `qio_opi` and native USB, per the vendor spec.
-   `src/main.cpp` prints detected PSRAM and flash at boot so the first flash confirms both.
+   statement; speaker playback has not been recorded as a product-level hardware pass.
+3. **OTA rollback.** The 16 MB flash/partition configuration boots, but the dual-slot failure and
+   rollback ceremony has not been tested.
+4. **Touch/display bus coexistence.** Display and codec work, but adding FT6336G on the shared I2C
+   bus still needs a real-board test.
+5. **Sustained capture/upload power and thermals.** Local clips work; Wi-Fi upload under battery
+   load cannot be measured until the gateway client is present.
 
 ## Build
 
 ```
 pio run -e hosyond-es3c28p              # bring-up, audio off
 pio run -e hosyond-es3c28p-capture      # microphone + speaker enabled
+pio run -e hosyond-es3c28p-recovery     # provisioning/recovery image
+pio run -e hosyond-es3c28p-display      # display/orb image
 ```
 
 Copy `include/controller_config.example.h` to `include/controller_config.h` first. Wi-Fi

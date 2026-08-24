@@ -2,8 +2,8 @@
 
 PlatformIO libraries shared by every Agent Controller board, pulled in with `lib_extra_dirs = ../shared`.
 
-Every board runs the same client logic and differs only in its panel and input surface. Keeping that
-logic here is what stops `CrowPanel-ESP32-2.13-E-paper`, `vision-master-t190`,
+The target is for every board to run the same client logic and differ only in its panel and input
+surface. Keeping that logic here is what will stop `CrowPanel-ESP32-2.13-E-paper`, `vision-master-t190`,
 `Waveshare-ESP32-S3-Touch-AMOLED-1.75C`, and `Hosyond-ESP32-S3-2.8-Touchscreen` from drifting into
 four unrelated firmwares.
 
@@ -12,7 +12,7 @@ All four are pinned to one toolchain — ESP-IDF 5.5 / Arduino core 3.3 via the
 `platformio/platform-espressif32` is unmaintained and frozen at Arduino 2.0.17 / ESP-IDF 4.4, which
 has no `driver/i2s_std.h` and therefore cannot build the on-board audio boards.
 
-**This library does not yet hold enough.** Only `DeviceStore` and `Provisioning` are shared today;
+**This library does not yet hold enough.** `DeviceStore`, `Provisioning`, and `ThinkingOrb` are shared today;
 the gateway client — heartbeat, display-state fetch, intent submission, OTA, media upload — still
 lives inside the CrowPanel's 3652-line `src/main.cpp`. That was tolerable with one real board and
 one bring-up sketch. Two audio boards later it is the single thing standing between a recorded
@@ -28,6 +28,7 @@ task. Port plans:
 |---|---|
 | `DeviceStore` | Writable device state in NVS (namespace `agentctl`): identity, gateway profiles and switch journal, Wi-Fi credentials, the cached claim code, and the last-known runtime config. |
 | `Provisioning` | The boot state machine and its first transport, a SoftAP captive portal. |
+| `ThinkingOrb` | Provider-neutral visual state model and point-cloud renderer used by display-capable boards. |
 
 ### Why this exists
 
@@ -83,5 +84,8 @@ returns the owner to the form instead of writing a value that bricks the next bo
 
 ## Status
 
-Compiles on all nine environments across all four boards. **Not yet validated on hardware** — the
-portal, the join-timeout path, and the long-press reset have never run on real silicon.
+Compiles on all 11 environments across all four board folders: CrowPanel 4, Hosyond 4, Waveshare 2,
+and Vision Master T190 1. Hosyond has exercised NVS-backed provisioning, the SoftAP portal, BOOT
+recovery, and `ThinkingOrb` on silicon. That does not validate CrowPanel, Waveshare, or T190, and the
+shared gateway client remains absent. Current evidence and blockers are maintained in
+[roadmap/IMPLEMENTATION-STATUS.md](../../roadmap/IMPLEMENTATION-STATUS.md).

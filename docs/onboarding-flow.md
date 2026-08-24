@@ -1,5 +1,11 @@
 # Agent Controller onboarding flow
 
+Current implementation supports the six-step workbench, host command generation, manual token
+pairing, reachability verification, project/provider/model selection, first-thread proof, and the
+controller/browser-only choice. The active roadmap still treats console-first handoff, LAN
+discovery, polling-based pairing, and guided in-place re-pairing as unfinished Milestone 2 work.
+See [roadmap/IMPLEMENTATION-STATUS.md](../roadmap/IMPLEMENTATION-STATUS.md).
+
 ## Activation goal
 
 A user is ready when all of the following are true:

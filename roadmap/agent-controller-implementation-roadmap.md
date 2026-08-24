@@ -8,25 +8,27 @@
 >
 > For that work see
 > [open-input-media-voice-environments-roadmap.md](open-input-media-voice-environments-roadmap.md).
-> Where the two disagree, the newer document wins.
+> Current delivery state is maintained in
+> [IMPLEMENTATION-STATUS.md](IMPLEMENTATION-STATUS.md). Where these documents disagree, the newer
+> roadmap and its status ledger win.
 
 ## Current Status
 
-Every phase reached the limit of what its original scope required. Phases 6 and 8 shipped the
-plumbing but not a usable product surface, and are reopened in the newer roadmap. What otherwise
-remains is physical and commercial execution, listed explicitly at the end.
+Every phase reached the limit of what its original scope required. Phases 3, 6, and 8 shipped
+important plumbing but not the complete product experience and are reopened in the active roadmap.
+As of 2026-08-24, active-roadmap Milestone 0.5 is complete; Milestones 0–5 remain open.
 
 | Phase | Status | Notes |
 |---|---|---|
 | 0 Product scope | Done | All three v1 workflows; deferred items still deferred |
 | 1 Cloud foundation | Done | Convex/file/memory stores; S3-compatible media via `src/s3.mjs` |
 | 2 T3 integration | Done | HTTP orchestration **and** the WebSocket RPC API (`src/t3Ws.mjs`); background snapshot poller |
-| 3 Environment pairing | Transport done, UX reopened | Token exchange, encrypted storage, expiry handling, 4 connection modes. First-run pairing still requires running `setup:t3` on the host and pasting a token; failures collapse to one generic message |
+| 3 Environment pairing | Transport done, UX reopened | Token exchange, encrypted storage, expiry handling, 4 connection modes, eight typed failure reasons, targeted recovery, and dependency-aware removal. First-run pairing still requires host-side setup and manual token transfer; discovery/handoff are missing |
 | 4 Device provisioning | Code done | QR claim labels; `REQUIRE_TLS` enforcement. **eFuse ceremony outstanding** |
-| 5 Firmware MVP | Code done | Compiles on 4 environments incl. audio/camera capture. **Unvalidated on hardware** |
-| 6 Text / audio / camera | **Reopened** | Attachments, transcription, and OCR/vision exist as endpoints, but: transcription is synchronous with no real provider (`disabled`/`mock`/`openai` only), the composer holds one attachment, capture is MediaPage-only, first-turn launch hardcodes `attachments: []`, and device audio never auto-transcribes. See Categories 1–3 of the newer roadmap |
+| 5 Firmware MVP | Code done, hardware partial | All 11 environments across four board folders compile. Hosyond provisioning, audio, display, and orb UI have been exercised on silicon; CrowPanel, Waveshare, and T190 still lack current hardware validation |
+| 6 Text / audio / camera | **Reopened; transport repairs done** | Ordered multi-attachment and first-turn attachment transport are complete. Transcription remains synchronous (`disabled`/`mock`/`openai`), capture is MediaPage-only, there is no unified picker/request state machine, and device audio does not auto-transcribe. See Categories 1–3 of the newer roadmap |
 | 7 Policy engine | Done | All 8 dimensions; credential/deletion/install screening; custom profiles |
-| 8 Phone and web apps | **Partially reopened** | PWA, mobile Quick page, profile editor, billing all exist, but the Quick/Dashboard page has no composer at all — approvals and saved actions only. See Category 1 |
+| 8 Phone and web apps | **Partially reopened** | PWA, mobile Quick page, profile editor, and billing exist, but Quick/Dashboard has no composer and Operate cannot show the complete live T3 response, provider interactions, subagents, or parallel work. See Categories 1 and 6 |
 | 9 Shell input | Done | Stages 1–4; `terminal:operate` opt-in, confirm-always, dispatched over WS |
 | 10 Observability | Done | Metrics plus alerts at the Phase 11 budgets |
 | 11 Beta launch | Measurable | `/v1/observability/beta-readiness`. **Needs real users** |
@@ -38,7 +40,8 @@ remains is physical and commercial execution, listed explicitly at the end.
    ceremony is a human decision. See `docs/production-security.md`.
 2. **OTA rollback test** — four-step procedure documented; needs one board and a deliberately
    broken image. Keep `ENABLE_OTA_APPLY=0` on shipping units until it passes.
-3. **Hardware capture validation** — I2S audio and camera compile but have never run on a board.
+3. **Remaining hardware validation** — Hosyond I2S audio and display now run on a board. CrowPanel
+   capture, Waveshare audio/pins, T190 pins/protocol, and OTA rollback still need silicon evidence.
 4. **Beta** — 10–20 users and 50+ paired device-days is real adoption over real time.
 
 The usability gaps in Phases 3, 6, and 8 are *not* on this list. They are ordinary software work and
@@ -46,6 +49,12 @@ are scheduled in
 [open-input-media-voice-environments-roadmap.md](open-input-media-voice-environments-roadmap.md).
 
 ### Verified during implementation
+
+- Current verification gate: production frontend build/typecheck, 166 frontend tests, 341 passing
+  server tests with 3 S3 integration skips, and all 11 PlatformIO environments passing.
+- Hosyond ES3C28P: 8 MB PSRAM, 16 MB flash, battery telemetry, ES8311 codec/microphone, SoftAP
+  provisioning, ILI9341 display, panel polarity, and the orb UI exercised on silicon; orb rendering
+  quality/buffer tuning remains active.
 
 - T3's WebSocket RPC protocol reverse-engineered and confirmed live against T3 Code 0.0.28.
 - Provider catalogue read live from `server.getConfig`.

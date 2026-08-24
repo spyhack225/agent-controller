@@ -19,11 +19,26 @@ The current implementation is the first vertical slice:
 - Redacted support diagnostics export.
 - Device media upload storage for audio/image captures, transcription state, audio transcripts, retention settings, and purge.
 - Simulated device registration script.
-- ESP32 firmware scaffold for the hardware controller.
+- Four ESP32-S3 firmware targets with 11 compiling PlatformIO environments; CrowPanel has the most
+  complete gateway client and Hosyond has verified microphone/display hardware bring-up.
 - Factory batch provisioning and signed firmware update metadata.
 - Per-user, per-device, and factory rate limits.
 - Clerk auth and Convex storage integration.
 - React, Vite, and Tailwind operations console with route-level workspaces for control, fleet, environments, media, activity, and settings.
+
+## Roadmap status
+
+As of 2026-08-24, active-roadmap **Milestone 0.5 is complete**: dependency-aware environment
+removal, reason-specific T3 recovery, first-turn attachments, and ordered multi-attachment dispatch
+have landed. Milestones 0–5 remain open. In particular, Agent Controller still does not show the
+complete live T3 response or let the user handle T3-native approvals/questions, subagents, and
+parallel tasks. The unified composer, QuickPage input, automatic CPU-hosted Parakeet pipeline, and
+controller upload/dispatch path are also unfinished.
+
+See the active
+[open-input/media/voice/environment roadmap](roadmap/open-input-media-voice-environments-roadmap.md)
+and its [canonical implementation ledger](roadmap/IMPLEMENTATION-STATUS.md) for verified progress,
+tests, firmware evidence, and next dependencies.
 
 ## Run
 
@@ -83,7 +98,7 @@ node scripts/simulate-device.mjs
 
 ## ESP32 Firmware
 
-The first hardware scaffold is in:
+The primary gateway-connected firmware is in:
 
 ```text
 firmware/CrowPanel-ESP32-2.13-E-paper
@@ -293,7 +308,7 @@ The built-in dashboard supports:
 
 - Creating a local platform token.
 - Registering development devices, claiming factory devices, updating profiles, rotating secrets, transfer-resetting devices, and revoking devices.
-- Pairing, updating, unpairing, reachability-checking, and browsing T3 Code sessions.
+- Pairing, updating, dependency-previewing/removing, reachability-checking, and browsing T3 Code sessions.
 - Selecting any T3 project/provider instance/model and launching its first thread.
 - Uploading, deleting, and retention-managing image/audio media from phone or laptop.
 - Sending text, media, shell, status, and stop intents.
@@ -344,4 +359,7 @@ For local development without a real T3 Code instance:
 node scripts/mock-t3.mjs
 ```
 
-See [docs/api.md](docs/api.md) for endpoint examples and the local end-to-end flow.
+See [docs/api.md](docs/api.md) for endpoint examples and the local end-to-end flow. Product work in
+progress is tracked in
+[roadmap/open-input-media-voice-environments-roadmap.md](roadmap/open-input-media-voice-environments-roadmap.md),
+with current verified state in [roadmap/IMPLEMENTATION-STATUS.md](roadmap/IMPLEMENTATION-STATUS.md).

@@ -2,6 +2,11 @@
 
 This project scaffolds a PlatformIO firmware target for the Heltec Vision Master T190 (ESP32-S3R8, 170x320 color TFT).
 
+**Status: bring-up only.** Its single PlatformIO environment compiles, but the pins and hardware
+remain unverified and its `/health` POST is not protocol-v2 heartbeat parity. The shared gateway
+client planned in [the implementation ledger](../../roadmap/IMPLEMENTATION-STATUS.md) has not
+landed.
+
 ## Quick start
 
 ```bash

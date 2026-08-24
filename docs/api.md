@@ -1158,7 +1158,13 @@ The React/Vite application is the primary UI and is served from:
 http://127.0.0.1:3996/
 ```
 
-The React application can register or claim devices, rotate device secrets, revoke devices, pair T3 environments, upload media, send prompts, approve or reject high-risk commands, request status, stop sessions, and review audit activity.
+The React application can register or claim devices, rotate device secrets, revoke devices, pair or
+dependency-preview/remove T3 environments, upload media, send prompts with ordered stored-media
+attachments, approve or reject high-risk Agent Controller commands, request status, stop sessions,
+and review audit activity. Dispatch is not yet a complete live T3 conversation: provider approvals,
+structured questions, streamed tool activity, subagents, and parallel tasks are not exposed through
+the current API/UI. That work is tracked in
+[roadmap/IMPLEMENTATION-STATUS.md](../roadmap/IMPLEMENTATION-STATUS.md).
 
 ## Display State And Events
 

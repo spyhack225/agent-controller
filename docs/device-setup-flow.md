@@ -9,9 +9,14 @@ Two decisions frame it:
 
 - **Wi-Fi provisioning is SoftAP first, BLE later**, both behind one on-device provisioning state
   machine so the second transport is a driver, not a rewrite.
-- **Both boards share one client layer.** `firmware/CrowPanel-ESP32-2.13-E-paper` and
-  `firmware/vision-master-t190` get a common `GatewayClient` and a thin per-board display adapter,
-  instead of the two divergent trees that exist today.
+- **All board targets share one client layer.** The original scope named CrowPanel and T190;
+  Hosyond and Waveshare have since joined the tree. `DeviceStore`, `Provisioning`, and
+  `ThinkingOrb` are shared, but the common `GatewayClient` and thin display-adapter boundary are
+  still Phase 3 work.
+
+Current delivery status is tracked in
+[roadmap/IMPLEMENTATION-STATUS.md](../roadmap/IMPLEMENTATION-STATUS.md). This document retains the
+original design rationale and phase details; it is not a second progress ledger.
 
 Target hardware:
 
@@ -295,7 +300,7 @@ live and `201` only on a real rotation; expiry enforced in `claimDevice`;
 reading `location.search` before the hash router and holding the link across a Clerk round trip in
 sessionStorage; `presence.latestActivityAt` required by `buildOnboardingReadiness`.
 
-**Phase 2 — device storage and provisioning. Done (unvalidated on hardware).** `firmware/shared`
+**Phase 2 — device storage and provisioning. Done; partially validated on hardware.** `firmware/shared`
 with `DeviceStore` + `Provisioning` + SoftAP portal, NVS identity, boot state machine, connect
 timeouts, long-press reset. Factory flashing station writes identity to NVS instead of baking it
 into the image. Fixes breaks 1, 2, and 10.
@@ -309,9 +314,9 @@ EXIT held for 10 s wipes Wi-Fi and re-enters provisioning; a `401` becomes a `re
 that recovery. `buildNvsSeedCsv()` emits the per-device `nvs_partition_gen.py` CSV, and
 `buildFlashConfig()` no longer emits `WIFI_SSID`/`WIFI_PASSWORD`.
 
-Compiles on all three `CrowPanel-ESP32-2.13-E-paper` environments. **Not yet run on a board** —
-the SoftAP portal, the join timeout path, and the long-press reset are all unexercised on real
-silicon.
+The current tree compiles all four CrowPanel environments and all 11 environments across four board
+folders. Hosyond has exercised NVS-backed provisioning, its SoftAP portal, and BOOT recovery on
+silicon. CrowPanel EXIT recovery, T190, and Waveshare remain unvalidated on hardware.
 
 **Phase 3 — shared client and both boards.** `GatewayClient` + `DisplayAdapter`; e213 refactored onto
 it with no behaviour change, T190 brought up to full protocol parity. Display payload gains its

@@ -28,15 +28,36 @@ enum class OrbMode : uint8_t {
 };
 
 struct OrbDot {
-  int16_t x;      // screen space, relative to the centre passed to render()
-  int16_t y;
-  uint8_t radius; // in pixels, already floored at the mode's rMin
-  uint8_t ink;    // 0..255 grey; the adapter maps this to its own colour space
+  // Position and radius in SIXTEENTHS of a pixel, relative to the centre passed to render().
+  //
+  // Whole-pixel coordinates are what made the animation jitter: the sphere turns slowly, so a dot
+  // spends many frames drifting within one pixel and then jumps to the next. Rounding at emit time
+  // throws away exactly the information the painter needs to anti-alias, and no amount of frame
+  // pacing recovers it. Sixteenths are plenty — a dot moves far less than 1/16 px per frame — and
+  // keep the struct integer-sized for a paint path that runs a few hundred times a frame.
+  int16_t x16;
+  int16_t y16;
+  uint8_t r16;    // radius; the mode's rMin and the sanity cap are already applied
+  uint8_t ink;    // 0..255 grey, already mirrored for a dark ground
+  uint8_t alpha;  // 0..255 coverage multiplier; modes use it to fade whole layers
+};
+
+// A stroked edge between two projected points. The "connecting" mode is mostly edges — a
+// constellation without its lines is just scattered dots — so they are part of the frame rather
+// than something the board is left to infer.
+struct OrbLine {
+  int16_t x16a, y16a;
+  int16_t x16b, y16b;
+  uint8_t ink;
+  uint8_t alpha;
+  uint8_t w16;    // stroke width in sixteenths of a pixel
 };
 
 struct OrbFrame {
   const OrbDot* dots;
   uint16_t count;
+  const OrbLine* lines;   // drawn first, so nodes sit on top of their edges
+  uint16_t lineCount;
 };
 
 class ThinkingOrb {
@@ -59,20 +80,29 @@ class ThinkingOrb {
 
   uint16_t diameter() const { return diameter_; }
 
+  // Edge budget for the constellation mode. 30 nodes can wire up densely for a moment.
+  static constexpr uint16_t kMaxLines = 160;
+
  private:
   void buildGeometry();
+  float radiusScale() const;
+  void pushDot(float px, float py, float z01, float radiusPx, float white, float alpha,
+               uint16_t& n);
   uint16_t emitGlobe(float t);
   uint16_t emitOrbits(float t);
   uint16_t emitWave(float t);
   uint16_t emitRing(float t);
   uint16_t emitWeb(float t);
 
-  // Projects a unit-sphere point through the current rotation and writes it as a dot.
-  // `depth01` out-parameter is the normalised nearness used for sorting and ink.
-  void project(float x, float y, float z, float cosA, float sinA, float cosB, float sinB,
-               float rBase, float rDepth, float inkFar, float inkSpan, uint16_t& n);
+  // Shared spin + tilt + orthographic projection, matching the reference engine's makeProj.
+  void setProjection(float yaw, float tilt, float scale);
+  bool projectPoint(float x, float y, float z, float& px, float& py, float& depth) const;
+
 
   OrbDot* dots_ = nullptr;
+  OrbLine* lines_ = nullptr;
+  uint16_t lineCount_ = 0;
+  float cosYaw_ = 1.0f, sinYaw_ = 0.0f, cosTilt_ = 1.0f, sinTilt_ = 0.0f, scale_ = 1.0f;
   uint16_t capacity_ = 0;
   uint16_t diameter_ = 0;
   float radiusPx_ = 0.0f;

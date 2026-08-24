@@ -2,6 +2,10 @@
 
 #include <esp_heap_caps.h>
 
+#ifndef DISPLAY_FRAME_PROBE
+#define DISPLAY_FRAME_PROBE 0
+#endif
+
 #if __has_include("controller_config.h")
 #include "controller_config.h"
 #else
@@ -62,10 +66,11 @@ bool displayBegin() {
   // an animated orb, so the bus is the budget. 40 MHz is the compromise: a real speed-up, with
   // margin against the ribbon and the breadboard-grade routing on a module like this.
   SPI.begin(LCD_SCLK, LCD_MISO, LCD_MOSI, LCD_CS);
-  // The vendor drives this panel at 80 MHz (docs/.../Example_01/spi_dev.h). Adafruit defaults to
-  // 24 MHz, which leaves the frame time dominated by the blit. 40 MHz roughly halves it while
-  // keeping margin against the ribbon on a module like this.
-  panelFreq = 40000000;
+  // 80 MHz, which is what the vendor's own driver uses (docs/.../Example_01/spi_dev.h) — so it is
+  // a rate this board's routing is known to carry, not an optimistic guess. Adafruit's 24 MHz
+  // default left the frame time dominated by the blit: a 148x148 push is ~9 ms at 40 MHz against a
+  // 33 ms budget that the orb maths had already mostly spent.
+  panelFreq = 80000000;
 
   // Built here, after Arduino's init and after SPI is known to exist.
   if (!panel) panel = new Adafruit_ILI9341(LCD_CS, LCD_DC, LCD_RST);
@@ -98,6 +103,30 @@ bool displayBegin() {
 
 namespace {
 
+// A GFXcanvas16 whose pixels live in INTERNAL RAM.
+//
+// The stock class allocates with plain malloc, which on this board lands in PSRAM, and the buffer
+// then intermittently reads back as zeros. That was measured, not guessed: probing the buffer just
+// before pushing it caught a frame where every sampled pixel was 0x0000 instead of the 0xFFFF the
+// canvas had been filled with, while the surrounding frames were correct. Zeros on this inverted
+// panel are white, which is the flickering box.
+//
+// Staging rows through DMA-capable RAM was necessary but not sufficient: the corruption is on the
+// read side, before the copy. The fix is for the pixels never to be in PSRAM at all. 54 KB out of
+// ~250 KB of free internal heap.
+class InternalCanvas16 : public GFXcanvas16 {
+ public:
+  InternalCanvas16(uint16_t w, uint16_t h) : GFXcanvas16(w, h, false) {
+    buffer = (uint16_t*)heap_caps_malloc((size_t)w * h * sizeof(uint16_t),
+                                         MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+    buffer_owned = false;   // freed here, not by the base destructor
+  }
+  ~InternalCanvas16() {
+    heap_caps_free(buffer);
+    buffer = nullptr;
+  }
+};
+
 // Off-screen canvases, blitted in one transaction each.
 //
 // The first version drew every dot straight to the panel and erased the previous frame dot by dot.
@@ -107,8 +136,12 @@ namespace {
 // scaling with dot count, and the panel never shows a half-built frame.
 //
 // A 148x148 canvas is 43 KB and the label strip is 11 KB, against ~300 KB of free internal heap.
-GFXcanvas16* orbCanvas = nullptr;
-GFXcanvas16* labelCanvas = nullptr;
+// The orb composites as 8-bit coverage, not colour: it is greyscale by nature, this halves the
+// buffer, and anti-aliasing wants to blend coverage rather than packed RGB565.
+uint8_t* orbGrey = nullptr;
+int16_t orbDim = 0;
+
+InternalCanvas16* labelCanvas = nullptr;
 
 constexpr int16_t kLabelH = 22;
 
@@ -137,16 +170,20 @@ void pushRow(Adafruit_ILI9341& g, const uint16_t* src, int16_t len) {
 bool displayBeginCanvases(uint16_t orbSize) {
   const uint32_t heapBefore = ESP.getFreeHeap();
 
-  if (!orbCanvas) orbCanvas = new GFXcanvas16(orbSize, orbSize);
-  if (!labelCanvas) labelCanvas = new GFXcanvas16(240, kLabelH);
+  if (!orbGrey) {
+    orbDim = (int16_t)orbSize;
+    orbGrey = (uint8_t*)heap_caps_malloc((size_t)orbSize * orbSize,
+                                         MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+  }
+  if (!labelCanvas) labelCanvas = new InternalCanvas16(240, kLabelH);
 
-  const uint16_t* orbBuf = orbCanvas ? orbCanvas->getBuffer() : nullptr;
+  const uint8_t* orbBuf = orbGrey;
   const uint16_t* labelBuf = labelCanvas ? labelCanvas->getBuffer() : nullptr;
 
   Serial.printf(
-    "[display] canvases: orb %ux%u buf=%p (%u B), label 240x%d buf=%p (%u B), heap %u -> %u\n",
+    "[display] buffers: orb %ux%u grey=%p (%u B), label 240x%d buf=%p (%u B), heap %u -> %u\n",
     (unsigned)orbSize, (unsigned)orbSize, (const void*)orbBuf,
-    (unsigned)(orbSize * orbSize * 2), (int)kLabelH, (const void*)labelBuf,
+    (unsigned)(orbSize * orbSize), (int)kLabelH, (const void*)labelBuf,
     (unsigned)(240 * kLabelH * 2), (unsigned)heapBefore, (unsigned)ESP.getFreeHeap()
   );
 
@@ -158,58 +195,124 @@ bool displayBeginCanvases(uint16_t orbSize) {
                 dmaRow ? "internal/DMA" : "FAILED");
 
   if (!orbBuf || !labelBuf || !dmaRow) {
-    Serial.println("[display] CANVAS ALLOCATION FAILED — the orb cannot be composited.");
+    Serial.println("[display] BUFFER ALLOCATION FAILED — the orb cannot be composited.");
     return false;
   }
   return true;
 }
 
 void displayDrawOrb(ThinkingOrb& orb, int16_t cx, int16_t cy, uint32_t elapsedMs) {
-  // The buffer, not just the object: a GFXcanvas16 whose malloc failed is a live object wrapping a
-  // null pointer, and pushing from it sends whatever happens to be in RAM — which is exactly what a
-  // flickering white rectangle looks like.
-  if (!displayReady() || !orbCanvas || !orbCanvas->getBuffer()) return;
+  if (!displayReady() || !orbGrey || !dmaRow) return;
 
   const OrbFrame frame = orb.render(elapsedMs);
 
-  // One line, once, so a frame that draws nothing is distinguishable from a frame that draws and
-  // fails to reach the glass.
-  static bool reported = false;
-  if (!reported) {
-    reported = true;
-    Serial.printf("[display] first orb frame: %u dots, canvas %dx%d\n",
-                  (unsigned)frame.count, orbCanvas->width(), orbCanvas->height());
-  }
-
-  const int16_t w = orbCanvas->width();
-  const int16_t h = orbCanvas->height();
+  const int16_t w = orbDim;
+  const int16_t h = orbDim;
   const int16_t mid = w / 2;
 
-  orbCanvas->fillScreen(panelGrey(0));
-  for (uint16_t i = 0; i < frame.count; ++i) {
-    const OrbDot& d = frame.dots[i];
-    const uint16_t colour = panelGrey(d.ink);
-    const int16_t x = mid + d.x;
-    const int16_t y = mid + d.y;
-    // A 1 px dot as a filled circle costs a bounding-box walk for one pixel, and most of the
-    // sphere is 1 px dots.
-    if (d.radius <= 1) orbCanvas->drawPixel(x, y, colour);
-    else orbCanvas->fillCircle(x, y, d.radius, colour);
+  memset(orbGrey, 0, (size_t)w * h);
+
+  // Edges first, so nodes sit on top of their own links.
+  //
+  // Walked along the segment rather than rasterised over its bounding box. A near-diagonal edge
+  // fills a box that is almost entirely empty, and at 30 nodes the constellation can have a hundred
+  // of them — that approach measured 41 ms a frame against a 33 ms budget. Walking makes the cost
+  // proportional to length instead of area.
+  for (uint16_t i = 0; i < frame.lineCount; ++i) {
+    const OrbLine& L = frame.lines[i];
+    const float ax = mid + L.x16a / 16.0f, ay = mid + L.y16a / 16.0f;
+    const float bx = mid + L.x16b / 16.0f, by = mid + L.y16b / 16.0f;
+    const float ink = L.ink * (L.alpha / 255.0f);
+    if (ink < 1.0f) continue;
+
+    const float ex = bx - ax, ey = by - ay;
+    const float len = sqrtf(ex * ex + ey * ey);
+    if (len < 0.5f) continue;
+
+    const int steps = (int)ceilf(len);
+    const float sx = ex / steps, sy = ey / steps;
+
+    for (int st = 0; st <= steps; ++st) {
+      const float cxp = ax + sx * st;
+      const float cyp = ay + sy * st;
+      const int16_t bx0 = (int16_t)floorf(cxp - 1.0f);
+      const int16_t by0 = (int16_t)floorf(cyp - 1.0f);
+
+      // A 3x3 neighbourhood is enough for a hairline: anything wider is a stroke width this design
+      // never uses.
+      for (int16_t py = by0; py <= by0 + 2; ++py) {
+        if (py < 0 || py >= h) continue;
+        uint8_t* row = orbGrey + (size_t)py * w;
+        for (int16_t px = bx0; px <= bx0 + 2; ++px) {
+          if (px < 0 || px >= w) continue;
+          const float dx = (px + 0.5f) - cxp, dy = (py + 0.5f) - cyp;
+          float cov = 1.0f - sqrtf(dx * dx + dy * dy);
+          if (cov <= 0.0f) continue;
+          if (cov > 1.0f) cov = 1.0f;
+          const uint8_t v = (uint8_t)(ink * cov);
+          if (v > row[px]) row[px] = v;
+        }
+      }
+    }
   }
 
-  // Pushed with setAddrWindow + writePixels rather than drawRGBBitmap.
+  // Anti-aliased splat, in 8-bit coverage rather than colour.
   //
-  // The two are not equivalent here: with an identical canvas fill, drawRGBBitmap rendered the orb
-  // box as a white rectangle while the label strip — same buffer type, same fill value, pushed this
-  // way — came out correctly black. Whatever drawRGBBitmap does to the pixel data on this
-  // core/library combination, it does not round-trip. This path is the one with evidence behind it,
-  // and it is also the one the label already uses, so there is a single blit idiom in the file.
+  // Each dot contributes brightness proportional to how much of the pixel it actually covers, so a
+  // dot drifting across a pixel boundary fades over rather than jumping. That is the whole
+  // difference between "rotating sphere" and "twitching dots", and it is only possible because the
+  // renderer now hands over sixteenths of a pixel instead of rounded integers.
+  //
+  // Overlap takes the maximum, not a sum: the dots are one colour on one ground, so adding would
+  // blow out crossings into blobs, and the painter's far-to-near order already decides what should
+  // read as being in front.
+  for (uint16_t i = 0; i < frame.count; ++i) {
+    const OrbDot& d = frame.dots[i];
+
+    const float fx = mid + d.x16 / 16.0f;
+    const float fy = mid + d.y16 / 16.0f;
+    const float r = d.r16 / 16.0f;
+    // Alpha folds into coverage: the ground is uniform, so a half-transparent dot and a
+    // half-covered pixel are indistinguishable here, and one multiply is cheaper than a blend.
+    const float ink = d.ink * (d.alpha / 255.0f);
+
+    // Coverage falls off over one pixel at the rim. Wider looks blurred; narrower reintroduces the
+    // hard edge that was aliasing in the first place.
+    const float outer = r + 0.5f;
+    const int16_t x0 = (int16_t)floorf(fx - outer);
+    const int16_t x1 = (int16_t)ceilf(fx + outer);
+    const int16_t y0 = (int16_t)floorf(fy - outer);
+    const int16_t y1 = (int16_t)ceilf(fy + outer);
+
+    for (int16_t py = y0; py <= y1; ++py) {
+      if (py < 0 || py >= h) continue;
+      const float dy = (py + 0.5f) - fy;
+      uint8_t* row = orbGrey + (size_t)py * w;
+      for (int16_t px = x0; px <= x1; ++px) {
+        if (px < 0 || px >= w) continue;
+        const float dx = (px + 0.5f) - fx;
+        const float dist = sqrtf(dx * dx + dy * dy);
+
+        float cov = (r + 0.5f) - dist;      // 1 well inside, 0 well outside
+        if (cov <= 0.0f) continue;
+        if (cov > 1.0f) cov = 1.0f;
+
+        const uint8_t v = (uint8_t)(ink * cov);
+        if (v > row[px]) row[px] = v;
+      }
+    }
+  }
+
+  // Convert a row at a time straight into the DMA staging buffer. The 8-bit coverage buffer is half
+  // the RAM of the RGB565 canvas it replaces, and the colour conversion has to happen on the way
+  // out regardless.
   Adafruit_ILI9341& g = displayPanel();
-  const uint16_t* buf = orbCanvas->getBuffer();
   g.startWrite();
   g.setAddrWindow(cx - mid, cy - mid, w, h);
   for (int16_t row = 0; row < h; ++row) {
-    pushRow(g, buf + (size_t)row * w, w);
+    const uint8_t* src = orbGrey + (size_t)row * w;
+    for (int16_t col = 0; col < w; ++col) dmaRow[col] = panelGrey(src[col]);
+    g.writePixels(dmaRow, w);
   }
   g.endWrite();
 }

@@ -482,6 +482,10 @@ constexpr int16_t kOrbCy = 118;
 constexpr int16_t kLabelY = 208;
 constexpr int16_t kContextY = 244;
 
+// ~30 fps. The orb maths and the panel blit together measure ~27 ms on this board, so this is the
+// cadence the hardware can actually hold rather than an aspiration.
+constexpr uint32_t kFrameMs = 33;
+
 // Greys, resolved through panelGrey() so the panel's polarity is applied in one place.
 constexpr uint8_t kBgGrey = 0;      // #000, the ground the web component sits on
 constexpr uint8_t kDimGrey = 56;    // hairlines
@@ -538,14 +542,36 @@ void setOrbState(OrbMode mode, const String& label, const String& context) {
 void tickScreen() {
   if (!displayReady()) return;
 
-  static uint32_t lastFrame = 0;
+  // Paced against a running deadline rather than "33 ms since the last frame finished". The latter
+  // adds the draw time to every interval, so a 27 ms draw yields 37 ms frames — 27 fps that also
+  // wanders as the draw cost changes. A deadline keeps the cadence even, which the eye notices more
+  // than the rate.
+  static uint32_t nextFrameAt = 0;
   const uint32_t now = millis();
-  if (now - lastFrame < 33) return;   // ~30 fps; the blit is the floor, not the maths
-  lastFrame = now;
+  if (nextFrameAt == 0) nextFrameAt = now;
+  if ((int32_t)(now - nextFrameAt) < 0) return;
+  nextFrameAt += kFrameMs;
+  // If a frame ran long, do not try to catch up by drawing several back to back — that reads as a
+  // stutter followed by a sprint. Drop the missed slots and resync.
+  if ((int32_t)(now - nextFrameAt) > (int32_t)kFrameMs) nextFrameAt = now + kFrameMs;
 
   const uint32_t elapsed = now - orbStartedAt;
+  const uint32_t drawStart = millis();
   displayDrawOrb(orb, kOrbCx, kOrbCy, elapsed);
   displayDrawStatus(statusLabel.c_str(), kLabelY, elapsed);
+
+  // Frame pacing is the other half of smoothness: an animation that renders beautifully but
+  // arrives at uneven intervals still reads as stutter. Reported rarely, and only worst-case,
+  // because the average hides exactly the frames that are visible.
+  static uint32_t worstDraw = 0, frames = 0, lastReport = 0;
+  const uint32_t drawMs = millis() - drawStart;
+  if (drawMs > worstDraw) worstDraw = drawMs;
+  frames++;
+  if (now - lastReport > 10000) {
+    Serial.printf("[display] %u frames/10s (%.1f fps), worst draw %u ms, budget %u ms\n",
+                  (unsigned)frames, frames / 10.0f, (unsigned)worstDraw, (unsigned)kFrameMs);
+    frames = 0; worstDraw = 0; lastReport = now;
+  }
 }
 
 }  // namespace
@@ -647,5 +673,5 @@ void loop() {
   tickScreen();
 
   pollBootButton();
-  delay(5);
+  delay(1);
 }

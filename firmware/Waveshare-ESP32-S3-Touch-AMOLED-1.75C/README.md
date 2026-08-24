@@ -64,8 +64,8 @@ Buy one and make it the voice prototype. Keep the CrowPanel e-ink board as the l
 status controller; they are complements, not competitors, and the shared core already exists to
 support both.
 
-Do not block the software voice work on this hardware arriving. The roadmap's Milestone 2 (the
-Parakeet pipeline) and Milestone 3's PWA companion path are both independent of it, and the phone
+Do not block the software voice work on this hardware arriving. The roadmap's Milestone 3 (the
+Parakeet pipeline) and Milestone 4 PWA companion path are both independent of it, and the phone
 companion remains the fastest route to voice for real users.
 
 ## Hardware
@@ -118,8 +118,8 @@ The order matters: the PMIC gates the rails everything else needs.
 3. **AXP2101 over I2C.** Rails first. Battery telemetry feeds the existing heartbeat fields.
 4. **Extract the gateway client into `firmware/shared`.** This is the real work, and it is not
    board-specific. Today the heartbeat, display-state fetch, intent submission, OTA, and media
-   upload all live inside the CrowPanel's 3652-line `src/main.cpp`; only `DeviceStore` and
-   `Provisioning` are shared. A third board makes that duplication untenable — port the client once,
+   upload all live inside the CrowPanel's 3652-line `src/main.cpp`; `DeviceStore`, `Provisioning`,
+   and `ThinkingOrb` are shared. A third board makes that duplication untenable — port the client once,
    into `AgentControllerCore`, and let each board supply a display adapter.
 5. **CO5300 panel over QSPI**, framebuffer in PSRAM. Waveshare's engineering-sample sources
    (<https://github.com/waveshareteam/ESP32-S3-Touch-AMOLED-1.75>) or an LVGL port are the

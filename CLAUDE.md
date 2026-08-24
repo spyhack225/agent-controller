@@ -322,30 +322,34 @@ deliberately not scripted.
 
 [docs/api.md](docs/api.md) (endpoints + local e2e flow), [docs/auth-storage.md](docs/auth-storage.md) (Clerk/Convex
 deployment validation), [docs/hardware-protocol.md](docs/hardware-protocol.md) (device provisioning/display/intent wire
-format), [roadmap/](roadmap/).
+format), [roadmap/open-input-media-voice-environments-roadmap.md](roadmap/open-input-media-voice-environments-roadmap.md)
+(active product roadmap), and [roadmap/IMPLEMENTATION-STATUS.md](roadmap/IMPLEMENTATION-STATUS.md)
+(canonical verified progress). Milestone 0.5 is complete; Milestones 0–5 remain open.
 
 Firmware is PlatformIO C++ under four board folders; copy `include/controller_config.example.h` to
 `controller_config.h`, then `pio run`.
 
 | Folder | Board | State |
 |---|---|---|
-| `CrowPanel-ESP32-2.13-E-paper` | 2.13" e-ink, five active-low keys | The only complete implementation |
+| `CrowPanel-ESP32-2.13-E-paper` | 2.13" e-ink, five active-low keys | Most complete gateway-connected implementation; 4 build environments; current silicon validation not recorded |
 | `vision-master-t190` | 1.9" TFT | Bring-up sketch |
 | `Waveshare-ESP32-S3-Touch-AMOLED-1.75C` | 466x466 round AMOLED touch, dual-mic array | Scaffold; pin map unverified |
-| `Hosyond-ESP32-S3-2.8-Touchscreen` | 2.8" IPS 240x320 touch, on-board mic + speaker (ES8311) | Scaffold with a working capture path; pin map vendor-verified |
+| `Hosyond-ESP32-S3-2.8-Touchscreen` | 2.8" IPS 240x320 touch, on-board mic + speaker (ES8311) | Hardware-proven capture/display/orb/provisioning prototype; no shared gateway client or touch path |
 
 Every board is pinned to **ESP-IDF 5.5 / Arduino core 3.3** via the pioarduino platform fork. The official
 `platformio/platform-espressif32` is unmaintained at Arduino 2.0.17 / ESP-IDF 4.4, which lacks `driver/i2s_std.h`
-and cannot build the audio boards. Changing the pin means re-verifying all nine environments.
+and cannot build the audio boards. Changing the pin means re-verifying all 11 environments.
 
 **Every ESP32-S3 board is BLE-only** — no Bluetooth Classic, so no HFP headset microphone, and no LE Audio.
 Bluetooth earbuds cannot be a microphone source on any current or planned board. On-board mics or a phone
 companion are the two real paths.
 
-`firmware/shared/AgentControllerCore` (via `lib_extra_dirs`) owns the writable device state both boards need:
+`firmware/shared/AgentControllerCore` (via `lib_extra_dirs`) owns the writable device state and orb
+renderer the boards share:
 `DeviceStore` wraps NVS (namespace `agentctl`) for identity, gateway URL, Wi-Fi credentials, the cached claim code, and
 the config cache; `Provisioning` is the boot state machine plus a SoftAP captive portal. **`controller_config.h` is a
 bench seed, not a source of truth** — `DeviceStore` copies it into NVS only on a unit that has none, and a factory unit
 gets its identity from the `nvsSeed` CSV that `POST /v1/factory/batches` returns. There is no `WIFI_SSID` macro any more;
-the factory cannot know the customer's network. Holding EXIT for 10 s wipes Wi-Fi and re-enters provisioning, which is
-the recovery for a revoked device, a house move, or a resale. See `firmware/shared/README.md`.
+the factory cannot know the customer's network. CrowPanel uses EXIT hold for Wi-Fi reset; Hosyond
+uses BOOT hold, while a short BOOT tap reopens its configuration portal. See
+`firmware/shared/README.md` and the board READMEs.

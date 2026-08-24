@@ -7,22 +7,31 @@
 //   https://orbs.jakubantalik.com  ·  https://github.com/Jakubantalik/Libraries
 //   MIT License, Copyright (c) 2026 Jakub Antalik.
 //
-// The numbers below are that library's own machine-readable spec (spec/orbs-spec.json), not values
-// eyeballed from the demo. Its paint model is deliberately plain — source-over fills, no blur, no
-// blend modes, painter-sorted far to near — which is exactly why it survives the trip to a panel
-// that has none of those.
+// Ported from the engine sources (src/engine/{core,lattice,web}.ts), not from the spec JSON alone.
+// The spec gives the tuning constants; the engine gives what they mean, and an earlier pass here
+// guessed wrong about three of them:
 //
-// Divergences from the web original, and why:
-//   * Density is scaled to a dot budget as well as to size. A browser can afford 750 dots per
-//     frame at 60 fps; a 240 MHz Xtensa pushing SPI cannot, and a half-drawn frame looks worse
-//     than a sparser complete one.
-//   * No device-pixel-ratio handling. There is exactly one pixel ratio here.
-//   * Integer output. The adapter draws whole pixels, so rounding happens once, here, rather than
-//     separately in every board's paint path.
+//   * rsPow is the exponent of radiusScale(size) = (size/300)^pow — a sub-linear correction so a
+//     small orb keeps legible dots — NOT an exponent applied to depth.
+//   * radius is LINEAR in depth: (rBase + rDepth * depth) * radiusScale.
+//   * ink is `white = inkFar - inkSpan * depth`, where `white` is ink-on-paper and a dark ground
+//     mirrors it to (1 - white). Near dots end bright, far dots genuinely dim.
+//
+// The motion detail matters as much as the geometry. Globe's tilt breathes rather than sitting
+// still, and a scan meridian sweeps the sphere swelling dots as it passes. Web's nodes wander under
+// value noise instead of sitting on a fixed lattice. Those are what make it read as alive rather
+// than as a spinning model, and they are cheap.
+//
+// Divergences from the web original, all forced by the target:
+//   * Density scales to a dot budget as well as size: a browser affords 750 dots at 60fps, a
+//     240 MHz Xtensa pushing SPI does not.
+//   * Output is fixed-point (sixteenths of a pixel) rather than float, so the painter can
+//     anti-alias without the geometry step rounding first.
+//   * No per-dot alpha blending against arbitrary content — the ground is uniform, so alpha folds
+//     into coverage in the painter.
 
 namespace {
 
-// Per-mode geometry, from baseProfiles in the spec.
 struct Profile {
   uint8_t latRings;
   uint8_t lonDensity;
@@ -30,28 +39,27 @@ struct Profile {
   float rDepth;
   float inkFar;
   float inkSpan;
-  float speed;      // the 64px preset speed
-  float count;      // the 64px preset density multiplier
-  float size;       // the 64px preset radius multiplier
+  float speed;     // multiplies elapsed seconds before any mode maths
+  float count;     // density multiplier
+  float rsPow;     // exponent of radiusScale
+  float dimBase;   // layers below the highlight fade to this
 };
 
-// rsPow and rMin are 0.6 and 0.3 for every mode in the spec, so they are constants rather than
-// nine copies of the same number.
-constexpr float kRsPow = 0.6f;
 constexpr float kRMin = 0.3f;
-constexpr float kCullInk = 0.02f;
+constexpr float kCullAlpha = 0.02f;
+constexpr float kPi = 3.14159265358979f;
 
 const Profile kProfiles[] = {
-  // Orbits — working. Particles riding inclined rings.
-  { 0,  0,   1.2f, 1.6f, 0.55f, 0.45f, 1.885f, 1.00f, 1.00f },
-  // Globe — searching. The flagship lat/lon dot sphere.
-  { 17, 44,  0.6f, 1.7f, 0.62f, 0.54f, 2.015f, 1.00f, 1.15f },
-  // Wave — listening. Sphere whose rings breathe with amplitude.
-  { 15, 40,  0.6f, 1.7f, 0.62f, 0.54f, 4.388f, 0.90f, 1.00f },
-  // Ring — breathing. Face-on lanes; the calm state.
-  { 5,  88,  1.1f, 1.7f, 0.60f, 0.50f, 1.200f, 0.85f, 1.00f },
-  // Web — connecting. Sparse nodes, sparser than a globe on purpose.
-  { 9,  22,  0.9f, 1.5f, 0.55f, 0.50f, 2.400f, 1.00f, 1.20f },
+  // Orbits — working
+  { 0,  0,   1.20f, 1.60f, 0.55f, 0.45f, 1.885f, 1.00f, 0.6f, 1.00f },
+  // Globe — searching/thinking
+  { 17, 44,  0.60f, 1.70f, 0.62f, 0.54f, 2.015f, 1.00f, 0.6f, 0.45f },
+  // Wave — listening
+  { 15, 40,  0.60f, 1.70f, 0.62f, 0.54f, 4.388f, 0.90f, 0.6f, 1.00f },
+  // Ring — breathing/idle
+  { 5,  88,  1.10f, 1.70f, 0.60f, 0.50f, 1.200f, 0.85f, 0.6f, 1.00f },
+  // Web — connecting
+  { 0,  0,   1.40f, 1.80f, 0.55f, 0.45f, 2.400f, 1.00f, 0.6f, 1.00f },
 };
 
 const Profile& profileFor(OrbMode m) { return kProfiles[static_cast<uint8_t>(m)]; }
@@ -63,16 +71,60 @@ struct Scratch {
 
 Scratch* scratch = nullptr;
 
-inline uint8_t inkToGrey(float ink) {
-  if (ink < 0.0f) ink = 0.0f;
-  if (ink > 1.0f) ink = 1.0f;
-  return (uint8_t)lroundf(ink * 255.0f);
+// Deterministic hash in [0,1), and smooth value noise on a 2D lattice. Web's nodes drift under
+// this rather than sitting on their lattice positions, which is the difference between a
+// constellation that is alive and one that is merely rotating.
+float hashD(float a, float b) {
+  const float h = sinf(a * 12.9898f + b * 78.233f) * 43758.5453f;
+  return h - floorf(h);
+}
+
+float vnoise(float x, float y) {
+  const float xi = floorf(x), yi = floorf(y);
+  float fx = x - xi, fy = y - yi;
+  fx = fx * fx * (3.0f - 2.0f * fx);
+  fy = fy * fy * (3.0f - 2.0f * fy);
+  const float a = hashD(xi, yi);
+  const float b = hashD(xi + 1, yi);
+  const float c = hashD(xi, yi + 1);
+  const float d = hashD(xi + 1, yi + 1);
+  return a + (b - a) * fx + (c - a) * fy + (a - b - c + d) * fx * fy;
+}
+
+// Shortest signed angular distance, wrapped to (-pi, pi].
+float angleDelta(float a, float b) { return atan2f(sinf(a - b), cosf(a - b)); }
+
+void fibDir(int i, int n, float& x, float& y, float& z) {
+  const float golden = kPi * (3.0f - sqrtf(5.0f));
+  y = 1.0f - (2.0f * (i + 0.5f)) / n;
+  const float rad = sqrtf(fmaxf(0.0f, 1.0f - y * y));
+  const float a = i * golden;
+  x = rad * cosf(a);
+  z = rad * sinf(a);
+}
+
+inline uint8_t clamp8(float v) {
+  if (v <= 0.0f) return 0;
+  if (v >= 255.0f) return 255;
+  return (uint8_t)lroundf(v);
+}
+
+// `white` is ink-on-paper, 0 = darkest. The ground here is dark, so it mirrors.
+inline uint8_t inkFromWhite(float white) {
+  if (white < 0.0f) white = 0.0f;
+  if (white > 1.0f) white = 1.0f;
+  return clamp8((1.0f - white) * 255.0f);
+}
+
+inline int16_t toFixed(float px) {
+  const float v = px * 16.0f;
+  if (v < -32000.0f) return -32000;
+  if (v > 32000.0f) return 32000;
+  return (int16_t)lroundf(v);
 }
 
 }  // namespace
 
-// The dot budget is generous now that dots composite into a RAM canvas rather than costing an SPI
-// transaction each. Density is what makes the sphere read as solid.
 bool ThinkingOrb::begin(uint16_t diameter, uint16_t capacity) {
   end();
   if (diameter < 8 || capacity < 16) return false;
@@ -83,7 +135,8 @@ bool ThinkingOrb::begin(uint16_t diameter, uint16_t capacity) {
 
   dots_ = (OrbDot*)malloc(sizeof(OrbDot) * capacity_);
   scratch = (Scratch*)malloc(sizeof(Scratch) * capacity_);
-  if (!dots_ || !scratch) {
+  lines_ = (OrbLine*)malloc(sizeof(OrbLine) * kMaxLines);
+  if (!dots_ || !scratch || !lines_) {
     end();
     return false;
   }
@@ -93,11 +146,11 @@ bool ThinkingOrb::begin(uint16_t diameter, uint16_t capacity) {
 }
 
 void ThinkingOrb::end() {
-  free(dots_);
-  dots_ = nullptr;
-  free(scratch);
-  scratch = nullptr;
+  free(dots_);   dots_ = nullptr;
+  free(scratch); scratch = nullptr;
+  free(lines_);  lines_ = nullptr;
   capacity_ = 0;
+  lineCount_ = 0;
 }
 
 void ThinkingOrb::setMode(OrbMode mode) {
@@ -106,13 +159,11 @@ void ThinkingOrb::setMode(OrbMode mode) {
   buildGeometry();
 }
 
-// The spec scales a lat/lon pair by sqrt(count): halving the density multiplier takes roughly a
-// third off each axis rather than off the product, which keeps the sphere looking like a sphere
-// instead of a set of stripes. The dot budget is then applied the same way, so a tight capacity
-// thins both axes evenly.
+// The reference scales a lat/lon pair by sqrt(count) so both axes thin evenly and the sphere stays
+// a sphere. The dot budget is applied the same way.
 void ThinkingOrb::buildGeometry() {
   const Profile& p = profileFor(mode_);
-  if (p.latRings == 0) {  // Orbits builds its points procedurally.
+  if (p.latRings == 0) {
     latRings_ = 0;
     lonDensity_ = 0;
     return;
@@ -132,161 +183,258 @@ void ThinkingOrb::buildGeometry() {
   lonDensity_ = (uint8_t)lon;
 }
 
-void ThinkingOrb::project(float x, float y, float z, float cosA, float sinA, float cosB,
-                          float sinB, float rBase, float rDepth, float inkFar, float inkSpan,
+void ThinkingOrb::setProjection(float yaw, float tilt, float scale) {
+  cosYaw_ = cosf(yaw);   sinYaw_ = sinf(yaw);
+  cosTilt_ = cosf(tilt); sinTilt_ = sinf(tilt);
+  scale_ = scale;
+}
+
+// Returns screen offset from the centre, plus depth in 0..1. The clamp is load-bearing: modes that
+// breathe push points slightly off the unit sphere, and a fractionally negative depth used to reach
+// powf() as a NaN and come back as a dot the width of the canvas.
+bool ThinkingOrb::projectPoint(float x, float y, float z, float& px, float& py, float& depth) const {
+  const float x1 = x * cosYaw_ + z * sinYaw_;
+  const float z1 = -x * sinYaw_ + z * cosYaw_;
+  const float y1 = y * cosTilt_ - z1 * sinTilt_;
+  const float z2 = y * sinTilt_ + z1 * cosTilt_;
+
+  px = x1 * scale_;
+  py = -y1 * scale_;          // screen Y grows downward
+  depth = (z2 + 1.0f) * 0.5f;
+  if (depth < 0.0f) depth = 0.0f;
+  if (depth > 1.0f) depth = 1.0f;
+  return true;
+}
+
+float ThinkingOrb::radiusScale() const {
+  // Radii were tuned for a 300 pt frame; sub-linear scaling keeps a small orb legible.
+  const Profile& p = profileFor(mode_);
+  return powf(diameter_ / 300.0f, p.rsPow);
+}
+
+void ThinkingOrb::pushDot(float px, float py, float z01, float radiusPx, float white, float alpha,
                           uint16_t& n) {
   if (n >= capacity_) return;
+  if (alpha < kCullAlpha) return;
 
-  // Yaw then pitch. Two axes is enough to read as a rotating solid; a third only adds cost.
-  const float x1 = x * cosA + z * sinA;
-  const float z1 = -x * sinA + z * cosA;
-  const float y2 = y * cosB - z1 * sinB;
-  const float z2 = y * sinB + z1 * cosB;
-
-  // Nearness in 0..1. Everything visual keys off this: dots grow and brighten as they come round.
-  const float depth = (z2 + 1.0f) * 0.5f;
-  const float shaped = powf(depth, kRsPow);
-
-  // inkFar is the ink of the FURTHEST dot, not a coefficient on depth. Multiplying by depth drove
-  // the back hemisphere to zero, where the cull below deleted it — which is why the sphere looked
-  // like a sparse scatter instead of a solid: half of it was never drawn.
-  float ink = inkFar + inkSpan * shaped;
-  if (ink > 1.0f) ink = 1.0f;
-  if (ink < kCullInk) return;
-
-  // The spec's radii are in the reference canvas's own pixels, and that canvas is rendered at
-  // device-pixel-ratio 2 — so a 64 px orb is a 128 px canvas. Dividing by 64 reproduces the
-  // reference dot size; dividing by 32 (the CSS size) doubles every dot, which is what turned the
-  // sphere into overlapping blobs.
-  float r = (rBase + rDepth * shaped) * (radiusPx_ / 64.0f);
-  if (r < kRMin) r = kRMin;
+  float r = radiusPx < kRMin ? kRMin : radiusPx;
+  const long r16 = lroundf(r * 16.0f);
+  const long bounded = r16 < 5L ? 5L : (r16 > 160L ? 160L : r16);
 
   Scratch& s = scratch[n++];
-  s.z = z2;
-  s.dot.x = (int16_t)lroundf(x1 * radiusPx_ * 0.86f);
-  s.dot.y = (int16_t)lroundf(y2 * radiusPx_ * 0.86f);
-  s.dot.radius = (uint8_t)std::min(255L, lroundf(r) < 1 ? 1L : lroundf(r));
-  s.dot.ink = inkToGrey(ink);
+  s.z = z01;
+  s.dot.x16 = toFixed(px);
+  s.dot.y16 = toFixed(py);
+  s.dot.r16 = (uint8_t)bounded;
+  s.dot.ink = inkFromWhite(white);
+  s.dot.alpha = clamp8(alpha * 255.0f);
 }
 
+// --- Globe: a lat/long field with a scan meridian sweeping it ---------------------------------
 uint16_t ThinkingOrb::emitGlobe(float t) {
   const Profile& p = profileFor(mode_);
-  const float cosA = cosf(t), sinA = sinf(t);
-  const float cosB = cosf(0.42f), sinB = sinf(0.42f);   // fixed tilt, so the poles never face us
+  const float spin = 0.5f;
+  // The tilt breathes. A fixed tilt reads as a model on a turntable; this reads as something alive.
+  const float tilt = 0.4f + 0.06f * sinf(t * 0.35f);
+  setProjection(t * spin, tilt, radiusPx_ * 0.82f);
+
+  const float scan = t * (spin + (1.7f - spin) * 4.08f);
+  const float rs = radiusScale();
 
   uint16_t n = 0;
-  for (uint8_t i = 0; i < latRings_; ++i) {
-    // Offset by half a step so no ring sits exactly on the equator, which would read as a seam.
-    const float phi = ((i + 0.5f) / latRings_) * (float)M_PI;
-    const float sinPhi = sinf(phi), cosPhi = cosf(phi);
-    // Fewer points near the poles, in proportion to the ring's circumference. Without this the
-    // poles turn into bright clots.
-    const uint8_t ringPoints = (uint8_t)fmaxf(3.0f, roundf(lonDensity_ * sinPhi));
-    for (uint8_t j = 0; j < ringPoints; ++j) {
-      const float theta = (j / (float)ringPoints) * 2.0f * (float)M_PI;
-      project(sinPhi * cosf(theta), cosPhi, sinPhi * sinf(theta),
-              cosA, sinA, cosB, sinB, p.rBase * p.size, p.rDepth * p.size, p.inkFar, p.inkSpan, n);
+  for (uint8_t li = 0; li <= latRings_; ++li) {
+    const float lat = -kPi / 2.0f + ((float)li / latRings_) * kPi;
+    const float cosLat = cosf(lat), sinLat = sinf(lat);
+    const uint16_t lonCount = (uint16_t)fmaxf(1.0f, roundf(fabsf(cosLat) * lonDensity_));
+    for (uint16_t lj = 0; lj < lonCount; ++lj) {
+      const float lon = ((float)lj / lonCount) * 2.0f * kPi;
+      float px, py, depth;
+      projectPoint(cosLat * cosf(lon), sinLat, cosLat * sinf(lon), px, py, depth);
+
+      // The scan reads as a size ripple rather than a shine, so it survives a panel with no
+      // gradients at all.
+      const float d = angleDelta(lon + t * spin, scan);
+      const float zSigned = depth * 2.0f - 1.0f;
+      const float boost = expf(-(d * d) / 0.18f) * fmaxf(0.0f, zSigned);
+
+      pushDot(px, py, depth,
+              (p.rBase + p.rDepth * depth + boost) * rs,
+              p.inkFar - p.inkSpan * depth,
+              p.dimBase + (1.0f - p.dimBase) * fminf(1.0f, boost),
+              n);
     }
   }
   return n;
 }
 
+// --- Wave: the same field, rings breathing with amplitude ------------------------------------
 uint16_t ThinkingOrb::emitWave(float t) {
   const Profile& p = profileFor(mode_);
-  const float cosA = cosf(t * 0.5f), sinA = sinf(t * 0.5f);
-  const float cosB = cosf(0.36f), sinB = sinf(0.36f);
+  setProjection(t * 0.4f, 0.36f + 0.05f * sinf(t * 0.3f), radiusPx_ * 0.82f);
+  const float rs = radiusScale();
 
   uint16_t n = 0;
-  for (uint8_t i = 0; i < latRings_; ++i) {
-    const float u = (i + 0.5f) / latRings_;
-    const float phi = u * (float)M_PI;
-    // The listening state: each ring swells on its own phase, so the sphere looks like it is
-    // reacting to something rather than simply spinning.
-    const float swell = 1.0f + 0.10f * sinf(t * 2.2f - u * 6.0f);
-    const float sinPhi = sinf(phi) * swell, cosPhi = cosf(phi) * swell;
-    const uint8_t ringPoints = (uint8_t)fmaxf(3.0f, roundf(lonDensity_ * sinf(phi)));
-    for (uint8_t j = 0; j < ringPoints; ++j) {
-      const float theta = (j / (float)ringPoints) * 2.0f * (float)M_PI;
-      project(sinPhi * cosf(theta), cosPhi, sinPhi * sinf(theta),
-              cosA, sinA, cosB, sinB, p.rBase * p.size, p.rDepth * p.size, p.inkFar, p.inkSpan, n);
+  for (uint8_t li = 0; li <= latRings_; ++li) {
+    const float u = (float)li / latRings_;
+    const float lat = -kPi / 2.0f + u * kPi;
+    const float cosLat = cosf(lat), sinLat = sinf(lat);
+    const uint16_t lonCount = (uint16_t)fmaxf(1.0f, roundf(fabsf(cosLat) * lonDensity_));
+
+    // The swell rides the RADIUS, not the position. Displacing points off the unit sphere is what
+    // produced out-of-range depths; amplitude belongs in how big a dot is, not where it is.
+    const float swell = 1.0f + 0.35f * sinf(t * 2.2f - u * 6.0f);
+
+    for (uint16_t lj = 0; lj < lonCount; ++lj) {
+      const float lon = ((float)lj / lonCount) * 2.0f * kPi;
+      float px, py, depth;
+      projectPoint(cosLat * cosf(lon), sinLat, cosLat * sinf(lon), px, py, depth);
+      pushDot(px, py, depth,
+              (p.rBase + p.rDepth * depth) * swell * rs,
+              p.inkFar - p.inkSpan * depth,
+              1.0f, n);
     }
   }
   return n;
 }
 
+// --- Ring: face-on concentric lanes, the calm state -------------------------------------------
 uint16_t ThinkingOrb::emitRing(float t) {
   const Profile& p = profileFor(mode_);
-  // Face-on: no yaw, so the lanes read as concentric rather than as a tilted sphere. This is the
-  // idle state and should look like it is waiting, not working.
-  const float cosA = 1.0f, sinA = 0.0f;
-  const float cosB = 1.0f, sinB = 0.0f;
+  setProjection(0.0f, 0.0f, radiusPx_ * 0.82f);
+  const float rs = radiusScale();
 
   uint16_t n = 0;
   const uint8_t lanes = latRings_;
   for (uint8_t i = 0; i < lanes; ++i) {
-    const float laneR = 0.35f + 0.62f * ((i + 1) / (float)lanes);
-    const float breathe = 1.0f + 0.045f * sinf(t * 1.1f - i * 0.55f);
-    const uint8_t segs = lonDensity_;
-    for (uint8_t j = 0; j < segs; ++j) {
-      const float theta = (j / (float)segs) * 2.0f * (float)M_PI + t * (0.18f + i * 0.05f);
-      project(cosf(theta) * laneR * breathe, sinf(theta) * laneR * breathe, 0.15f * sinf(theta * 2.0f),
-              cosA, sinA, cosB, sinB, p.rBase * p.size, p.rDepth * p.size, p.inkFar, p.inkSpan, n);
+    const float laneR = 0.34f + 0.60f * ((i + 1) / (float)lanes);
+    const float breathe = 1.0f + 0.04f * sinf(t * 0.9f - i * 0.55f);
+    const uint16_t segs = lonDensity_;
+    for (uint16_t j = 0; j < segs; ++j) {
+      const float theta = ((float)j / segs) * 2.0f * kPi + t * (0.14f + i * 0.035f);
+      const float rr = laneR * breathe;
+      float px, py, depth;
+      projectPoint(cosf(theta) * rr, sinf(theta) * rr, 0.0f, px, py, depth);
+      // Face-on has no real depth, so brightness travels around each lane instead.
+      const float phase = 0.5f + 0.5f * sinf(theta * 2.0f - t * 1.1f);
+      pushDot(px, py, depth,
+              (p.rBase + p.rDepth * 0.45f) * rs,
+              p.inkFar - p.inkSpan * phase,
+              0.55f + 0.45f * phase, n);
     }
   }
   return n;
 }
 
+// --- Orbits: particles riding inclined rings ---------------------------------------------------
 uint16_t ThinkingOrb::emitOrbits(float t) {
   const Profile& p = profileFor(mode_);
-  const float cosB = cosf(0.5f), sinB = sinf(0.5f);
+  setProjection(t * 0.25f, 0.5f, radiusPx_ * 0.82f);
+  const float rs = radiusScale();
 
   uint16_t n = 0;
   const uint8_t orbits = 7;
-  const uint8_t perOrbit = (uint8_t)std::max(6, std::min(40, capacity_ / (orbits + 1)));
+  const uint16_t perOrbit = (uint16_t)std::max(8, std::min(44, capacity_ / (orbits + 1)));
   for (uint8_t o = 0; o < orbits; ++o) {
-    const float incl = (o / (float)orbits) * (float)M_PI;
+    const float incl = ((float)o / orbits) * kPi;
     const float cosI = cosf(incl), sinI = sinf(incl);
-    for (uint8_t j = 0; j < perOrbit; ++j) {
-      const float a = (j / (float)perOrbit) * 2.0f * (float)M_PI + t * (0.6f + o * 0.09f);
-      // A circle in the XZ plane, tipped by the orbit's inclination.
-      const float x = cosf(a);
-      const float z = sinf(a) * cosI;
-      const float y = sinf(a) * sinI;
-      project(x, y, z, cosf(t * 0.25f), sinf(t * 0.25f), cosB, sinB,
-              p.rBase * p.size, p.rDepth * p.size, p.inkFar, p.inkSpan, n);
+    for (uint16_t j = 0; j < perOrbit; ++j) {
+      const float a = ((float)j / perOrbit) * 2.0f * kPi + t * (0.55f + o * 0.08f);
+      float px, py, depth;
+      projectPoint(cosf(a), sinf(a) * sinI, sinf(a) * cosI, px, py, depth);
+      pushDot(px, py, depth,
+              (p.rBase + p.rDepth * depth) * rs,
+              p.inkFar - p.inkSpan * depth,
+              0.35f + 0.65f * depth, n);
     }
   }
   return n;
 }
 
+// --- Web: a constellation wiring itself --------------------------------------------------------
 uint16_t ThinkingOrb::emitWeb(float t) {
   const Profile& p = profileFor(mode_);
-  const float cosA = cosf(t * 0.7f), sinA = sinf(t * 0.7f);
-  const float cosB = cosf(0.4f), sinB = sinf(0.4f);
+  // Barely turning. "Connecting" is about the links forming, not about rotation.
+  setProjection(t * 0.12f, 0.32f, radiusPx_ * 0.80f);
+  const float rs = radiusScale();
+
+  constexpr int kNodes = 30;
+  constexpr float kThr = 0.72f;
+  float nx[kNodes], ny[kNodes], nz[kNodes];
+
+  for (int i = 0; i < kNodes; ++i) {
+    float dx, dy, dz;
+    fibDir(i, kNodes, dx, dy, dz);
+    // Slow noise wander, renormalised back onto the surface. This is the organic part: the lattice
+    // gives an even spread, the noise stops it looking manufactured.
+    float x = dx + 0.3f * (vnoise(i * 0.31f + 9.0f, t * 0.24f) - 0.5f) * 2.0f;
+    float y = dy + 0.3f * (vnoise(i * 0.53f + 27.0f, t * 0.21f) - 0.5f) * 2.0f;
+    float z = dz + 0.3f * (vnoise(i * 0.77f + 55.0f, t * 0.27f) - 0.5f) * 2.0f;
+    const float l = fmaxf(1e-6f, sqrtf(x * x + y * y + z * z));
+    nx[i] = x / l; ny[i] = y / l; nz[i] = z / l;
+  }
+
+  // Edges between close neighbours, faded by proximity and depth.
+  lineCount_ = 0;
+  for (int i = 0; i < kNodes && lineCount_ < kMaxLines; ++i) {
+    for (int j = i + 1; j < kNodes && lineCount_ < kMaxLines; ++j) {
+      const float dx = nx[i] - nx[j], dy = ny[i] - ny[j], dz = nz[i] - nz[j];
+      const float dist = sqrtf(dx * dx + dy * dy + dz * dz);
+      if (dist >= kThr) continue;
+
+      float ax, ay, ad, bx, by, bd;
+      projectPoint(nx[i], ny[i], nz[i], ax, ay, ad);
+      projectPoint(nx[j], ny[j], nz[j], bx, by, bd);
+      const float depth = (ad + bd) * 0.5f;
+      const float alpha = (1.0f - dist / kThr) * (0.3f + 0.55f * depth);
+      if (alpha < kCullAlpha) continue;
+
+      OrbLine& L = lines_[lineCount_++];
+      L.x16a = toFixed(ax); L.y16a = toFixed(ay);
+      L.x16b = toFixed(bx); L.y16b = toFixed(by);
+      L.ink = inkFromWhite(0.42f);
+      L.alpha = clamp8(alpha * 255.0f);
+      L.w16 = (uint8_t)std::max(10L, lroundf(0.8f * rs * 16.0f));
+    }
+  }
 
   uint16_t n = 0;
-  // A Fibonacci sphere rather than a lat/lon grid: connecting should look like scattered nodes,
-  // and an even grid reads as structure the state does not have.
-  const uint16_t nodes = (uint16_t)std::min<uint16_t>(capacity_, 120);
-  const float golden = (float)M_PI * (3.0f - sqrtf(5.0f));
-  for (uint16_t i = 0; i < nodes; ++i) {
-    const float y = 1.0f - (i / (float)(nodes - 1)) * 2.0f;
-    const float r = sqrtf(fmaxf(0.0f, 1.0f - y * y));
-    const float theta = golden * i;
-    // Nodes pulse in and out so the constellation looks like it is establishing links.
-    const float pulse = 0.92f + 0.12f * sinf(t * 2.6f + i * 0.7f);
-    project(cosf(theta) * r * pulse, y * pulse, sinf(theta) * r * pulse,
-            cosA, sinA, cosB, sinB, p.rBase * p.size, p.rDepth * p.size, p.inkFar, p.inkSpan, n);
+  for (int i = 0; i < kNodes; ++i) {
+    float px, py, depth;
+    projectPoint(nx[i], ny[i], nz[i], px, py, depth);
+    // Pulse on the radius, never on the position.
+    const float pulse = 1.0f + 0.25f * sinf(t * 1.4f + i * 2.7f);
+    pushDot(px, py, depth, (p.rBase + p.rDepth * depth) * pulse * rs,
+            0.55f - 0.45f * depth, 1.0f, n);
+  }
+
+  // Signals: bright packets running between re-picked pairs. Small, but they are what make the
+  // constellation look like it is doing something rather than merely existing.
+  constexpr int kSignals = 5;
+  for (int s = 0; s < kSignals; ++s) {
+    const float seg = floorf(t * 0.55f + s * 7.31f);
+    const int a = (int)(hashD(seg, s * 3.1f + 1.7f) * kNodes) % kNodes;
+    const int b = (int)(hashD(seg, s * 5.7f + 4.2f) * kNodes) % kNodes;
+    if (a == b) continue;
+    const float f = (t * 0.55f + s * 7.31f) - seg;
+    float x = nx[a] + (nx[b] - nx[a]) * f;
+    float y = ny[a] + (ny[b] - ny[a]) * f;
+    float z = nz[a] + (nz[b] - nz[a]) * f;
+    const float l = fmaxf(1e-6f, sqrtf(x * x + y * y + z * z));
+    float px, py, depth;
+    projectPoint(x / l, y / l, z / l, px, py, depth);
+    pushDot(px, py, depth, (p.rBase * 1.5f + p.rDepth * depth) * rs,
+            0.05f, 0.5f + 0.5f * depth, n);
   }
   return n;
 }
 
 OrbFrame ThinkingOrb::render(uint32_t elapsedMs) {
-  if (!dots_ || !scratch) return {nullptr, 0};
+  if (!dots_ || !scratch) return {nullptr, 0, nullptr, 0};
 
   const Profile& p = profileFor(mode_);
   const float t = (elapsedMs / 1000.0f) * p.speed * speed_;
 
+  lineCount_ = 0;
   uint16_t n = 0;
   switch (mode_) {
     case OrbMode::Globe:  n = emitGlobe(t);  break;
@@ -296,12 +444,11 @@ OrbFrame ThinkingOrb::render(uint32_t elapsedMs) {
     case OrbMode::Web:    n = emitWeb(t);    break;
   }
 
-  // Painter's order: far to near, so a near dot overwrites the one behind it. Without this the
-  // sphere loses its solidity and reads as a flat cloud.
+  // Painter's order: far to near, so a near dot overwrites the one behind it.
   std::sort(scratch, scratch + n, [](const Scratch& a, const Scratch& b) { return a.z < b.z; });
   for (uint16_t i = 0; i < n; ++i) dots_[i] = scratch[i].dot;
 
-  return {dots_, n};
+  return {dots_, n, lines_, lineCount_};
 }
 
 OrbMode orbModeForAgentState(const String& state) {
