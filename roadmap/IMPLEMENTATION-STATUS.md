@@ -5,19 +5,29 @@ Canonical progress ledger for
 This file records what the repository can do now; the roadmap records the target and sequence.
 Anything not marked **done** is not complete.
 
-Last verified: **2026-08-24**, at commit `ba35cbc` plus any later documentation-only changes.
+Last verified: **2026-08-24**, at commit `c8e1c90`.
 
 ## Verified baseline
 
-- **Delivery:** Milestone 0.5 is complete. None of Milestones 0–5 is complete.
-- **Web/server gate:** production frontend build and typecheck pass; 166 frontend tests pass;
-  341 server tests pass and 3 S3 integration tests are intentionally skipped when no S3 service is
+- **Delivery:** Milestones 0.5 and 1 are complete. Milestone 2 (voice pipeline) and the firmware
+  operate flow are in progress. Milestones 0, 3–5 are not started.
+- **Web/server gate:** production frontend build and typecheck pass; 188 frontend tests pass;
+  363 server tests pass and 3 S3 integration tests are intentionally skipped when no S3 service is
   configured.
 - **Firmware gate:** all 11 PlatformIO environments across four board folders compile: CrowPanel
   4, Hosyond 4, Waveshare 2, and Vision Master T190 1.
 - **Hardware evidence:** Hosyond ES3C28P has been flashed. Its 8 MB PSRAM, 16 MB flash, battery
   reading, ES8311 codec, microphone samples, SoftAP provisioning, ILI9341 display, panel polarity,
   and orb UI have been exercised on silicon. Other boards remain unvalidated on hardware.
+- **Onboarding proven end to end, without user-side flashing:** a factory NVS seed was written
+  once, after which the owner entered Wi-Fi through the SoftAP portal, the device discovered the
+  gateway over LAN broadcast, reported itself unclaimed, displayed its claim code, and was claimed
+  from the console. The device logged `link: claimed` and cleared the spent code.
+- **Reboot loop diagnosed and fixed:** both HTTP call sites declared `HTTPClient` before the
+  `WiFiClient` handed to `begin()`. C++ destroys locals in reverse order, so `~HTTPClient()` ran
+  `stop()` on freed memory — crashing as `InstrFetchProhibited` at PC `0xfffffffd` and corrupting
+  the lwIP heap, which panicked the tcpip thread separately. Two symptoms, one bug. The fix is
+  committed but **not yet flashed**: the board is wedged and needs a physical power cycle.
 - **Critical product gap:** a request can be dispatched to T3 Code, but Agent Controller still
   cannot show and interact with the complete live response, provider approvals/questions,
   subagents, or parallel work.
