@@ -5,7 +5,7 @@ Canonical progress ledger for
 This file records what the repository can do now; the roadmap records the target and sequence.
 Anything not marked **done** is not complete.
 
-Last verified: **2026-08-24**, at commit `da62ef0`.
+Last verified: **2026-08-24**, at commit `1d7ad51`.
 
 ## Verified baseline
 
@@ -38,11 +38,26 @@ Last verified: **2026-08-24**, at commit `da62ef0`.
   **150 s soak after the fix: 0 resets, 0 panics** (previously 18 resets in 120 s). This also
   explains the "device only ever shows Ready" symptom: the device reached `link: claimed` and then
   crashed during the config burst before it could paint the operate screens. One bug, two symptoms.
-- **Known non-blocking issue:** the render loop makes blocking HTTP calls, so frames still hitch
-  (worst gap ~1.0-1.7 s). Moving the cycle to a second core was tried and withdrawn — `ui.cpp`
-  reads gateway state in 68 places across its render path, so a task mutating those Strings
-  faults. The correct fix is for the client to do its request unlocked and publish a finished
-  snapshot under a short lock; not yet done.
+- **Render stall resolved.** The gateway cycle now runs on core 0 while the renderer keeps core 1.
+  Measured on hardware: **worst frame gap 2332 ms -> 68 ms**, sustained 30.3 fps, typical draw
+  9-20 ms of a 33 ms budget, 170 s soak with 0 resets and 0 panics.
+
+  The first attempt at this crashed within seconds and was withdrawn. The second core was never the
+  problem; sharing mutable Arduino Strings across it was. Three things make it correct:
+  `request()` hands the state lock back for the duration of every socket wait (tracking recursion
+  depth explicitly, since a recursive mutex only releases when given back as many times as taken);
+  all 14 touch-driven entry points take the lock themselves; and the renderer holds it across the
+  whole frame — affordable only because of the first point — skipping a frame rather than painting
+  from state being rewritten underneath it.
+- **The device UI is a real operate surface**, not a status screen: contextual action bar,
+  pull-down status drawer, and environment -> folder -> thread browsing. Orb state selection is a
+  total table over the vocabulary the gateway actually sends; it previously matched only one of
+  those words and rendered failed turns identically to idle ones. Four of the nine animations
+  (searching, solving, weaving, shaping) have no honest trigger yet and are deliberately unused
+  outside the `-orbbench` environment.
+- **Speaker and notification LED** are implemented behind compile flags. The LED pin (GPIO42) is
+  documented from four vendor sources; no LED has been lit and no sound has been heard, so both
+  remain hardware-unverified.
 - **Critical product gap:** a request can be dispatched to T3 Code, but Agent Controller still
   cannot show and interact with the complete live response, provider approvals/questions,
   subagents, or parallel work. This is Milestone 1 and it is not started.
@@ -167,7 +182,7 @@ live threads and voice.
 | Board / component | State | Current evidence |
 |---|---|---|
 | CrowPanel 2.13-inch e-paper | partial | Most complete gateway-connected firmware; four environments compile; no current silicon validation recorded |
-| Hosyond ES3C28P | partial | Only board validated end to end on silicon: provisioning, LAN discovery, claim, flash/PSRAM, battery, codec, microphone, ILI9341 display, polarity, touch, orb rendering, BOOT recovery, and a clean 150 s soak after the orb scratch-buffer fix. Operate screens exist but are not yet confirmed on glass; render loop still hitches on blocking HTTP |
+| Hosyond ES3C28P | done (hardware) | Only board validated end to end on silicon: provisioning, LAN discovery, claim, flash/PSRAM, battery, codec, microphone, ILI9341 display, polarity, touch, orb rendering, BOOT recovery. Operate UI confirmed on glass from photographs. 170 s soak: 0 resets, 0 panics, 30.3 fps, worst frame gap 68 ms. Speaker and LED compile but are unheard and unlit |
 | Waveshare AMOLED 1.75C | partial | Two scaffold environments compile; board and pin map remain unverified on silicon |
 | Vision Master T190 | partial | One bring-up environment compiles; placeholder pins and incomplete protocol client remain |
 | Shared `AgentControllerCore` | done | `DeviceStore`, `Provisioning`, `ThinkingOrb`, `OrbPainter`, `GatewayClient`, `GatewayDiscovery`, `GatewayOperate`, `MediaUpload` and `OperateModel` are all shared and consumed by three boards |
