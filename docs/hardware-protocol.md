@@ -1158,7 +1158,7 @@ permission, so the gateway continues returning `manual_or_notify`/false to those
 The scaffold lives in:
 
 ```text
-firmware/esp32-controller
+firmware/CrowPanel-ESP32-2.13-E-paper
 ```
 
 ### Target board
@@ -1186,7 +1186,8 @@ separate driver for each. **The units we have are JD79661**, confirmed on hardwa
 both vendor drivers verbatim: the SSD1680 one hangs on the first busy-wait, the JD79661 one drives
 the panel. GxEPD2 speaks only SSD1680 and assumes BUSY is active high, whereas this controller
 idles BUSY high — so GxEPD2 blocks forever and the display never comes up. The firmware therefore
-vendors Elecrow's driver at `firmware/esp32-controller/lib/ElecrowEPD/` instead of using GxEPD2.
+vendors Elecrow's driver at `firmware/CrowPanel-ESP32-2.13-E-paper/lib/ElecrowEPD/` instead of
+using GxEPD2.
 
 Two traps in that library, both of which cost real bring-up time:
 
@@ -1202,7 +1203,7 @@ release channel.
 Bring-up flow:
 
 ```bash
-cd firmware/esp32-controller
+cd firmware/CrowPanel-ESP32-2.13-E-paper
 cp include/controller_config.example.h include/controller_config.h
 ```
 

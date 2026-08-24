@@ -86,14 +86,14 @@ node scripts/simulate-device.mjs
 The first hardware scaffold is in:
 
 ```text
-firmware/esp32-controller
+firmware/CrowPanel-ESP32-2.13-E-paper
 ```
 
 It connects over WiFi, authenticates with the device ID/secret, polls compact display state, renders to a 2.13 inch e-ink display, reads an EC11 rotary encoder, and sends menu intents.
 Runtime defaults for the T3 environment, thread, prompt, and menu can be managed from the gateway after the device is claimed.
 
 ```bash
-cd firmware/esp32-controller
+cd firmware/CrowPanel-ESP32-2.13-E-paper
 cp include/controller_config.example.h include/controller_config.h
 pio run
 ```

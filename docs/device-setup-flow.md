@@ -9,13 +9,13 @@ Two decisions frame it:
 
 - **Wi-Fi provisioning is SoftAP first, BLE later**, both behind one on-device provisioning state
   machine so the second transport is a driver, not a rewrite.
-- **Both boards share one client layer.** `firmware/esp32-controller` and
+- **Both boards share one client layer.** `firmware/CrowPanel-ESP32-2.13-E-paper` and
   `firmware/vision-master-t190` get a common `GatewayClient` and a thin per-board display adapter,
   instead of the two divergent trees that exist today.
 
 Target hardware:
 
-| | `esp32-controller` | `vision-master-t190` |
+| | `CrowPanel-ESP32-2.13-E-paper` | `vision-master-t190` |
 |---|---|---|
 | Board | CrowPanel ESP32 2.13" E-Paper HMI | Heltec Vision Master T190 |
 | MCU | ESP32-S3-WROOM-1 N8R8 (8 MB flash, 8 MB octal PSRAM) | ESP32-S3 |
@@ -25,24 +25,27 @@ Target hardware:
 
 The CrowPanel pin map and its consequences are documented in
 [hardware-protocol.md](hardware-protocol.md#target-board) and
-[firmware/esp32-controller/include/README.md](../firmware/esp32-controller/include/README.md).
+the CrowPanel board's
+[include/README.md](../firmware/CrowPanel-ESP32-2.13-E-paper/include/README.md).
 
 ## 1. What is broken today
 
-Traced through the current code, not hypothetical.
+Traced through the code, not hypothetical. Phases 1 and 2 (§7) have since landed, so several
+of these are fixed — each link points at where that break's code lives now, or at the code that
+replaced it.
 
 | # | Break | Where |
 |---|---|---|
 | 1 | Wi-Fi SSID/password are compile-time `#define`s written by the factory station from its own env. The factory cannot know the customer's network, so no shipped unit can connect. | `buildFlashConfig()` [manufacturing.mjs:31](../src/manufacturing.mjs#L31), `scripts/manufacture-batch.mjs` |
-| 2 | `connectWiFi()` loops forever with no timeout and no fallback. A wrong password bricks the unit until reflash. | [esp32-controller/src/main.cpp:261](../firmware/esp32-controller/src/main.cpp#L261) |
-| 3 | The printed claim label is invalidated by powering the device on. `rotateUnclaimedDeviceClaimCode` regenerates unconditionally, and firmware calls it on the first 403 — seconds after boot — then again every 10 minutes, so the code can change while the user is typing it. | [store.mjs:371](../src/store.mjs#L371), [main.cpp:285](../firmware/esp32-controller/src/main.cpp#L285) |
+| 2 | `connectWiFi()` loops forever with no timeout and no fallback. A wrong password bricks the unit until reflash. | replaced by the join timeout in [Provisioning.cpp:127](../firmware/shared/AgentControllerCore/src/Provisioning.cpp#L127) |
+| 3 | The printed claim label is invalidated by powering the device on. `rotateUnclaimedDeviceClaimCode` regenerates unconditionally, and firmware calls it on the first 403 — seconds after boot — then again every 10 minutes, so the code can change while the user is typing it. | [store.mjs:371](../src/store.mjs#L371), [main.cpp:1162](../firmware/CrowPanel-ESP32-2.13-E-paper/src/main.cpp#L1162) |
 | 4 | The QR code dead-ends. The server falls `/claim` back to `index.html`, but the SPA routes on `location.hash` and never reads `location.search`, so `?device=&code=` is silently discarded. | [app.mjs:2092](../src/app.mjs#L2092) vs [App.tsx:139](../frontend/src/App.tsx#L139) |
 | 5 | Rotated secrets can never reach the device. `rotateDeviceSecret` and `resetDeviceForTransfer` mint a new secret; the device's is a `#define`. Revoke-and-recover, resale, and compromise response all require USB reflashing. | [store.mjs:303](../src/store.mjs#L303), [store.mjs:335](../src/store.mjs#L335) |
 | 6 | Onboarding marks a device "ready" with zero evidence it ever powered on — no `lastSeenAt` or heartbeat check, contradicting the operational-evidence rule every other check honours. | `buildOnboardingReadiness` [onboarding.mjs:176](../src/onboarding.mjs#L176) |
 | 7 | The wizard assumes the user already holds a claim code. There is no "power on / join setup network / read the code" beat anywhere in it. | [OnboardingPage.tsx:931](../frontend/src/features/OnboardingPage.tsx#L931) |
 | 8 | Factory-manufactured firmware ships with TLS verification disabled — not just the example header, the generated config. The device carries a long-lived bearer secret. | [manufacturing.mjs:55](../src/manufacturing.mjs#L55) |
 | 9 | The T190 tree is a bring-up sketch: it POSTs device headers at `/health`, which ignores them. No config, display, intent, or OTA loop. | [vision-master-t190/src/main.cpp:71](../firmware/vision-master-t190/src/main.cpp#L71) |
-| 10 | A revoked device shows `Display poll failed / HTTP 401` forever with no on-device reset. | [main.cpp:388](../firmware/esp32-controller/src/main.cpp#L388) |
+| 10 | A revoked device shows `Display poll failed / HTTP 401` forever with no on-device reset. | now handled at [main.cpp:427](../firmware/CrowPanel-ESP32-2.13-E-paper/src/main.cpp#L427) |
 
 Breaks 1, 2, 5, and 10 all have the same root cause: **the device has no writable state and no
 first-boot user interaction model.** Everything it needs to know is frozen at flash time.
@@ -247,7 +250,7 @@ firmware/
     Provisioning.{h,cpp}       state machine + SoftAP transport (BLE later)
     DisplayAdapter.h           abstract: renderStatus, renderClaim, renderMenu, renderProgress
     Protocol.h                 DisplayModel, RuntimeConfig, HeartbeatPayload structs
-  esp32-controller/
+  CrowPanel-ESP32-2.13-E-paper/
     lib/ElecrowEPD/            vendored JD79661 driver (Elecrow arduino-v1.2)
     src/EinkDisplay.cpp        122x250 implementation of DisplayAdapter
     src/main.cpp               wiring + five-key input only
@@ -306,8 +309,9 @@ EXIT held for 10 s wipes Wi-Fi and re-enters provisioning; a `401` becomes a `re
 that recovery. `buildNvsSeedCsv()` emits the per-device `nvs_partition_gen.py` CSV, and
 `buildFlashConfig()` no longer emits `WIFI_SSID`/`WIFI_PASSWORD`.
 
-Compiles on all three `esp32-controller` environments. **Not yet run on a board** — the SoftAP
-portal, the join timeout path, and the long-press reset are all unexercised on real silicon.
+Compiles on all three `CrowPanel-ESP32-2.13-E-paper` environments. **Not yet run on a board** —
+the SoftAP portal, the join timeout path, and the long-press reset are all unexercised on real
+silicon.
 
 **Phase 3 — shared client and both boards.** `GatewayClient` + `DisplayAdapter`; e213 refactored onto
 it with no behaviour change, T190 brought up to full protocol parity. Display payload gains its
