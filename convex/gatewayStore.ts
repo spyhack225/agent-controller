@@ -2545,6 +2545,83 @@ export const listAuditLogs = gatewayQuery({
   },
 });
 
+/**
+ * Mirrors getDisplaySummary() in src/store.mjs — the fixed-size answer behind the display poll.
+ *
+ * Deliberately one query rather than a count/latest function per collection: the adapter turns each
+ * store method into its own HTTP call, and this route is polled every five seconds by hardware that
+ * was already timing out. One call, one constant-size response.
+ *
+ * Every read below is an index range over this user's rows — never a table scan — and the rows stay
+ * inside the deployment: only the numbers cross to the gateway, which is the transfer that grew
+ * without bound before. The Convex base API has no count aggregate, so `commands` and `auditLogs`
+ * still read the user's own rows here to size them. A maintained counter would remove that read,
+ * but it would have to be patched by every audit write on the account, which turns one document
+ * into an OCC contention point for every mutation the account makes; the read is the cheaper
+ * trade until this needs @convex-dev/aggregate.
+ */
+export const getDisplaySummary = gatewayQuery({
+  args: {
+    userId: v.string(),
+  },
+  handler: async (ctx, args) => {
+    const byUser = (table: string) =>
+      ctx.db
+        .query(table as any)
+        .withIndex("byUserExternalId", (q: any) => q.eq("userExternalId", args.userId));
+
+    const [devices, environments, media, macros, commands, auditLogs, latestCommand, latestAudit] =
+      await Promise.all([
+        byUser("devices").collect(),
+        byUser("environments").collect(),
+        byUser("mediaUploads").collect(),
+        byUser("macros").collect(),
+        byUser("commands").collect(),
+        byUser("auditLogs").collect(),
+        byUser("commands").order("desc").first(),
+        byUser("auditLogs").order("desc").first(),
+      ]);
+
+    let onlineDevices = 0;
+    for (const device of devices) {
+      if (buildDevicePresence(device).online) onlineDevices += 1;
+    }
+
+    // listEnvironments() collapses duplicate baseUrls, so a raw row count would report a number
+    // the environments list never shows.
+    const environmentUrls = new Set<string>();
+    for (const environment of environments) environmentUrls.add(environment.baseUrl);
+
+    return {
+      counts: {
+        environments: environmentUrls.size,
+        devices: devices.length,
+        media: media.length,
+        macros: macros.length,
+        commands: commands.length,
+        audit: auditLogs.length,
+        onlineDevices,
+        offlineDevices: Math.max(0, devices.length - onlineDevices),
+      },
+      latestCommand: latestCommand
+        ? {
+          id: latestCommand._id,
+          status: latestCommand.status,
+          intentType: latestCommand.intent?.type ?? null,
+          createdAt: latestCommand.createdAt ?? null,
+        }
+        : null,
+      latestAudit: latestAudit
+        ? {
+          id: latestAudit._id,
+          action: latestAudit.action,
+          createdAt: latestAudit.createdAt ?? null,
+        }
+        : null,
+    };
+  },
+});
+
 async function ensureUserRecord(ctx: any, userId: string, email?: string, name?: string) {
   const existing = await findUser(ctx, userId);
   if (existing) {

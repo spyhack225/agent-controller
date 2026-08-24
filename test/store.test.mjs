@@ -557,3 +557,295 @@ test("deleting an environment repairs every record that pointed at it", () => {
   // Removal is idempotent: the second call has nothing left to repair.
   assert.equal(store.deleteEnvironment({ userId: "user_1", environmentId: environment.id }), null);
 });
+
+// getDisplaySummary() exists so the five-second display poll stops fetching whole collections.
+// These tests pin it to the list methods it replaced: if the two ever disagree, the console and
+// the controller are showing different numbers for the same account.
+
+/** A populated two-user account. `now` keeps the online/offline split deterministic. */
+function displayFixtureStore(now = Date.now()) {
+  const fresh = new Date(now - 1_000).toISOString();
+  const stale = new Date(now - 10 * 60_000).toISOString();
+  return createMemoryStore({
+    devices: [
+      {
+        id: "dev_online",
+        userId: "user_1",
+        label: "Desk controller",
+        profile: "agent-controller",
+        claimedAt: stale,
+        lastSeenAt: fresh,
+        status: { lastHeartbeatAt: fresh },
+        config: {},
+        createdAt: stale,
+      },
+      {
+        id: "dev_offline",
+        userId: "user_1",
+        label: "Shelf controller",
+        profile: "read-only",
+        claimedAt: stale,
+        lastSeenAt: stale,
+        status: { lastHeartbeatAt: stale },
+        config: {},
+        createdAt: stale,
+      },
+      {
+        id: "dev_other_user",
+        userId: "user_2",
+        label: "Someone else's controller",
+        profile: "agent-controller",
+        claimedAt: stale,
+        lastSeenAt: fresh,
+        status: { lastHeartbeatAt: fresh },
+        config: {},
+        createdAt: stale,
+      },
+    ],
+    environments: [
+      {
+        id: "env_a",
+        userId: "user_1",
+        label: "Studio",
+        baseUrl: "http://127.0.0.1:3773",
+        createdAt: "2026-08-01T00:00:00.000Z",
+        updatedAt: "2026-08-01T00:00:00.000Z",
+      },
+      // Same baseUrl: listEnvironments() collapses these into one, so the count has to as well.
+      {
+        id: "env_a_duplicate",
+        userId: "user_1",
+        label: "Studio (legacy)",
+        baseUrl: "http://127.0.0.1:3773",
+        createdAt: "2026-08-02T00:00:00.000Z",
+        updatedAt: "2026-08-02T00:00:00.000Z",
+      },
+      {
+        id: "env_b",
+        userId: "user_1",
+        label: "Laptop",
+        baseUrl: "http://127.0.0.1:3774",
+        createdAt: "2026-08-03T00:00:00.000Z",
+        updatedAt: "2026-08-03T00:00:00.000Z",
+      },
+      {
+        id: "env_other_user",
+        userId: "user_2",
+        label: "Not mine",
+        baseUrl: "http://127.0.0.1:3775",
+        createdAt: "2026-08-03T00:00:00.000Z",
+        updatedAt: "2026-08-03T00:00:00.000Z",
+      },
+    ],
+    mediaUploads: [
+      { id: "media_1", userId: "user_1", kind: "audio", createdAt: "2026-08-04T00:00:00.000Z" },
+      { id: "media_2", userId: "user_1", kind: "image", createdAt: "2026-08-05T00:00:00.000Z" },
+      { id: "media_other", userId: "user_2", kind: "audio", createdAt: "2026-08-05T00:00:00.000Z" },
+    ],
+    macros: [
+      { id: "macro_1", userId: "user_1", label: "Ship it", steps: [], createdAt: "2026-08-04T00:00:00.000Z" },
+      { id: "macro_other", userId: "user_2", label: "Not mine", steps: [], createdAt: "2026-08-04T00:00:00.000Z" },
+    ],
+    commands: [
+      {
+        id: "cmd_old",
+        userId: "user_1",
+        environmentId: "env_a",
+        intent: { type: "agent_prompt" },
+        status: "completed",
+        risk: "low",
+        createdAt: "2026-08-06T00:00:00.000Z",
+        updatedAt: "2026-08-06T00:00:00.000Z",
+      },
+      {
+        id: "cmd_other_user",
+        userId: "user_2",
+        environmentId: "env_other_user",
+        intent: { type: "shell_input" },
+        status: "failed",
+        risk: "high",
+        createdAt: "2026-08-07T00:00:00.000Z",
+        updatedAt: "2026-08-07T00:00:00.000Z",
+      },
+      {
+        id: "cmd_newest",
+        userId: "user_1",
+        environmentId: "env_b",
+        intent: { type: "session_control" },
+        status: "dispatched",
+        risk: "low",
+        createdAt: "2026-08-08T00:00:00.000Z",
+        updatedAt: "2026-08-08T00:00:00.000Z",
+      },
+    ],
+    auditLogs: [
+      { id: "audit_old", userId: "user_1", actorType: "user", action: "device.claimed", metadata: {}, createdAt: "2026-08-06T00:00:00.000Z" },
+      { id: "audit_other", userId: "user_2", actorType: "user", action: "environment.paired", metadata: {}, createdAt: "2026-08-07T00:00:00.000Z" },
+      { id: "audit_newest", userId: "user_1", actorType: "device", action: "command.dispatched", metadata: {}, createdAt: "2026-08-08T00:00:00.000Z" },
+    ],
+  });
+}
+
+test("getDisplaySummary counts match what the list methods would have returned", () => {
+  const store = displayFixtureStore();
+
+  // The comparison is the point: these are the exact expressions buildUserDisplayState() used to
+  // evaluate, so a divergence here is a number the device would now render wrongly.
+  const devices = store.listDevices("user_1");
+  const expected = {
+    environments: store.listEnvironments("user_1").length,
+    devices: devices.length,
+    media: store.listMediaUploads("user_1").length,
+    macros: store.listMacros("user_1").length,
+    commands: store.listCommands("user_1").length,
+    audit: store.listAuditLogs("user_1").length,
+    onlineDevices: devices.filter((device) => device.presence?.online).length,
+    offlineDevices: devices.length - devices.filter((device) => device.presence?.online).length,
+  };
+
+  const summary = store.getDisplaySummary("user_1");
+  assert.deepEqual(summary.counts, expected);
+  // Pinned literally as well, so a bug that breaks both the list methods and the counts in the
+  // same direction still fails.
+  assert.deepEqual(summary.counts, {
+    environments: 2,
+    devices: 2,
+    media: 2,
+    macros: 1,
+    commands: 2,
+    audit: 2,
+    onlineDevices: 1,
+    offlineDevices: 1,
+  });
+});
+
+test("getDisplaySummary reports zero for an account that has nothing", () => {
+  const store = createMemoryStore();
+
+  const summary = store.getDisplaySummary("user_nobody");
+  assert.deepEqual(summary.counts, {
+    environments: 0,
+    devices: 0,
+    media: 0,
+    macros: 0,
+    commands: 0,
+    audit: 0,
+    onlineDevices: 0,
+    offlineDevices: 0,
+  });
+  assert.equal(summary.latestCommand, null);
+  assert.equal(summary.latestAudit, null);
+});
+
+test("getDisplaySummary returns the newest command and audit entry, not the first", () => {
+  const store = displayFixtureStore();
+
+  const commands = store.listCommands("user_1");
+  const audit = store.listAuditLogs("user_1");
+  assert.equal(summaryLatestId(store, "latestCommand"), commands.at(-1).id);
+  assert.equal(summaryLatestId(store, "latestAudit"), audit.at(-1).id);
+
+  const summary = store.getDisplaySummary("user_1");
+  assert.deepEqual(summary.latestCommand, {
+    id: "cmd_newest",
+    status: "dispatched",
+    intentType: "session_control",
+    createdAt: "2026-08-08T00:00:00.000Z",
+  });
+  assert.deepEqual(summary.latestAudit, {
+    id: "audit_newest",
+    action: "command.dispatched",
+    createdAt: "2026-08-08T00:00:00.000Z",
+  });
+
+  // A command written after the summary was taken becomes the new latest.
+  const later = store.createCommand({
+    userId: "user_1",
+    environmentId: "env_b",
+    intent: { type: "status" },
+    normalized: { type: "status" },
+    status: "queued",
+    risk: "low",
+  });
+  assert.equal(store.getDisplaySummary("user_1").latestCommand.id, later.id);
+  assert.equal(store.getDisplaySummary("user_1").counts.commands, 3);
+});
+
+function summaryLatestId(store, key) {
+  return store.getDisplaySummary("user_1")[key].id;
+}
+
+test("getDisplaySummary never leaks one account's rows into another's counts", () => {
+  const store = displayFixtureStore();
+
+  const second = store.getDisplaySummary("user_2");
+  assert.deepEqual(second.counts, {
+    environments: 1,
+    devices: 1,
+    media: 1,
+    macros: 1,
+    commands: 1,
+    audit: 1,
+    onlineDevices: 1,
+    offlineDevices: 0,
+  });
+  assert.equal(second.latestCommand.id, "cmd_other_user");
+  assert.equal(second.latestAudit.id, "audit_other");
+
+  // And an id that owns nothing sees nothing, even though the store is full.
+  assert.equal(store.getDisplaySummary("user_3").counts.commands, 0);
+  assert.equal(store.getDisplaySummary("user_3").latestAudit, null);
+});
+
+test("the display payload keeps the exact shape firmware parses", async () => {
+  const store = displayFixtureStore();
+
+  const display = await buildUserDisplayState(store, "user_1");
+
+  // applyDisplayJson() in the firmware reads these names positionally out of the JSON, so key
+  // order and spelling are the contract, not an implementation detail.
+  assert.deepEqual(Object.keys(display), [
+    "title",
+    "state",
+    "line1",
+    "line2",
+    "counts",
+    "latestAction",
+    "menu",
+  ]);
+  assert.deepEqual(Object.keys(display.counts), [
+    "environments",
+    "devices",
+    "media",
+    "macros",
+    "commands",
+    "audit",
+    "onlineDevices",
+    "offlineDevices",
+  ]);
+  assert.deepEqual(display, {
+    title: "Agent Controller",
+    state: "ready",
+    line1: "2 env / 2 devices",
+    line2: "dispatched: session_control",
+    counts: {
+      environments: 2,
+      devices: 2,
+      media: 2,
+      macros: 1,
+      commands: 2,
+      audit: 2,
+      onlineDevices: 1,
+      offlineDevices: 1,
+    },
+    latestAction: "command.dispatched",
+    menu: ["status", "prompt", "shell", "macro", "media", "stop"],
+  });
+
+  // The two states the line1/state pair can take, both preserved from the old implementation.
+  const empty = await buildUserDisplayState(createMemoryStore(), "user_nobody");
+  assert.equal(empty.state, "setup");
+  assert.equal(empty.line1, "0 env / 0 devices");
+  assert.equal(empty.line2, "No commands yet");
+  assert.equal(empty.latestAction, null);
+});

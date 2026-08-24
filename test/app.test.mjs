@@ -3793,6 +3793,113 @@ test("one owner cannot delete another owner's revoked device", async (t) => {
   assert.equal(stillThere.devices.length, 1, "the owner's device survives a stranger's delete");
 });
 
+test("the display route answers from bounded reads and one owner never sees another's counts", async (t) => {
+  // The display route is what a controller polls every five seconds. It used to fetch the whole
+  // command list and the whole audit log to read `.length` and `.at(-1)` off them, which grew
+  // without bound and timed out on the firmware side; it now goes through getDisplaySummary().
+  // This drives the real write path rather than a seeded store, so the projection is exercised
+  // against rows the gateway actually produced.
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = async (url, init = {}) => {
+    const parsed = new URL(String(url));
+    if (parsed.pathname === "/api/orchestration/dispatch") return jsonResponse({ status: "accepted" }, 200);
+    if (parsed.pathname === "/api/orchestration/snapshot") {
+      return jsonResponse({ projects: [{ id: "p1" }], threads: [{ id: "t1" }] }, 200);
+    }
+    return jsonResponse({ error: "not found" }, 404);
+  };
+  t.after(() => {
+    globalThis.fetch = originalFetch;
+  });
+
+  const { server, store } = createApp();
+  await listen(server);
+  t.after(() => server.close());
+  const baseUrl = `http://127.0.0.1:${server.address().port}`;
+
+  const tokenFor = async (userId) => {
+    const created = await requestJson(originalFetch, baseUrl, "/v1/users/dev", {
+      method: "POST",
+      headers: {},
+      body: { userId, email: `${userId}@example.local` },
+    });
+    return { authorization: `Bearer ${created.apiToken.secret}` };
+  };
+  const owner = await tokenFor("user_display_owner");
+  const stranger = await tokenFor("user_display_stranger");
+
+  const device = await requestJson(originalFetch, baseUrl, "/v1/devices", {
+    method: "POST",
+    headers: owner,
+    body: { label: "Polling controller", profile: "agent-controller" },
+  });
+  const environment = await requestJson(originalFetch, baseUrl, "/v1/t3/environments", {
+    method: "POST",
+    headers: owner,
+    body: { label: "Mock T3", baseUrl: "https://mock-t3.example", accessToken: "mock-token" },
+  });
+  await requestJson(originalFetch, baseUrl, "/v1/device/intents", {
+    method: "POST",
+    headers: { "x-device-id": device.device.id, "x-device-secret": device.secret },
+    body: {
+      environmentId: environment.environment.id,
+      threadId: "thread_1",
+      intent: { type: "agent_prompt", text: "Run the tests." },
+    },
+  });
+
+  const display = await requestJson(originalFetch, baseUrl, "/v1/display", {
+    method: "GET",
+    headers: owner,
+  });
+  assert.deepEqual(Object.keys(display.display.counts), [
+    "environments",
+    "devices",
+    "media",
+    "macros",
+    "commands",
+    "audit",
+    "onlineDevices",
+    "offlineDevices",
+  ]);
+  assert.equal(display.display.counts.environments, 1);
+  assert.equal(display.display.counts.devices, 1);
+  assert.equal(display.display.counts.commands, 1);
+  assert.equal(display.display.line1, "1 env / 1 devices");
+  assert.equal(display.display.line2, "dispatched: agent_prompt");
+  assert.ok(display.display.counts.audit > 0, "the intent left an audit trail");
+
+  // The summary agrees with the collections it replaced, on data the gateway wrote itself.
+  const summary = store.getDisplaySummary("user_display_owner");
+  assert.equal(summary.counts.commands, store.listCommands("user_display_owner").length);
+  assert.equal(summary.counts.audit, store.listAuditLogs("user_display_owner").length);
+  assert.equal(summary.latestCommand.id, store.listCommands("user_display_owner").at(-1).id);
+  assert.equal(summary.latestAudit.action, store.listAuditLogs("user_display_owner").at(-1).action);
+
+  // A second account on the same gateway sees none of it.
+  const other = await requestJson(originalFetch, baseUrl, "/v1/display", {
+    method: "GET",
+    headers: stranger,
+  });
+  assert.equal(other.display.counts.commands, 0);
+  assert.equal(other.display.counts.devices, 0);
+  assert.equal(other.display.counts.environments, 0);
+  assert.equal(other.display.state, "setup");
+  assert.equal(other.display.line2, "No commands yet");
+  // Their own account creation is the only thing they have ever done, so that is the latest
+  // action they see — not the owner's dispatch, which is newer.
+  assert.equal(other.display.latestAction, "user_token.created");
+
+  // The device-realm payload is the same base plus the device block firmware expects.
+  const deviceDisplay = await requestJson(originalFetch, baseUrl, "/v1/device/display", {
+    method: "GET",
+    headers: { "x-device-id": device.device.id, "x-device-secret": device.secret },
+  });
+  assert.deepEqual(deviceDisplay.display.counts, display.display.counts);
+  assert.equal(deviceDisplay.display.title, "Polling controller");
+  assert.equal(deviceDisplay.display.device.id, device.device.id);
+});
+
 test("the discovery endpoint identifies the gateway without authentication", async (t) => {
   // A controller has no credentials at the moment it needs this: it is deciding whether a
   // candidate address, from a UDP reply or a typed URL, is a gateway at all.

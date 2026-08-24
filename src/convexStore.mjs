@@ -96,6 +96,7 @@ const DEFAULT_FUNCTIONS = {
   listCommands: { type: "query", name: "gatewayStore:listCommands" },
   listCommandEvents: { type: "query", name: "gatewayStore:listCommandEvents" },
   listAuditLogs: { type: "query", name: "gatewayStore:listAuditLogs" },
+  getDisplaySummary: { type: "query", name: "gatewayStore:getDisplaySummary" },
 };
 
 export async function createConvexStore(config = {}, options = {}) {
@@ -362,6 +363,10 @@ export function createConvexStoreAdapter({
     listCommands: (userId) => call("listCommands", { userId }),
     listCommandEvents: (args) => call("listCommandEvents", args),
     listAuditLogs: (userId) => call("listAuditLogs", { userId }),
+    // The display poll's whole surface, in one round trip. Splitting this into per-collection
+    // count/latest methods would cost one HTTP call to Convex each, on the route a controller
+    // hits every five seconds.
+    getDisplaySummary: (userId) => call("getDisplaySummary", { userId }),
   };
 }
 

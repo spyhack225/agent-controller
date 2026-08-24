@@ -1896,6 +1896,98 @@ export function createStore(seed = {}, options = {}) {
     return auditLogs.filter((event) => event.userId === userId);
   }
 
+  /**
+   * The fixed-size answer behind the display poll (`GET /v1/device/display`, every five seconds).
+   *
+   * One method instead of a family of `countX()` / `latestX()` calls, for two reasons. The caller
+   * always wants the whole set at once, so splitting it only creates ways to fetch a partial one;
+   * and under the Convex store every store method is a network round trip, so eight small methods
+   * would put eight round trips on the path a controller hits every five seconds — the same shape
+   * that was already producing `HTTPClient error(-11)` on the firmware side. This is one call and
+   * one response whose size does not depend on how much history the account has.
+   *
+   * The two latest rows come back as projections, not records. A command carries its intent
+   * payload and its translated T3 command and an audit entry carries arbitrary metadata; the
+   * display renders a status, an intent type and an action name, and shipping the rest would put
+   * user content on a device-realm response that has no use for it.
+   *
+   * Counts are computed by iteration rather than by building and measuring arrays, so nothing here
+   * materialises a collection. `environments` deliberately counts distinct base URLs, because
+   * `listEnvironments()` collapses duplicates and a raw row count would disagree with the list the
+   * console shows.
+   */
+  function getDisplaySummary(userId) {
+    let deviceCount = 0;
+    let onlineDevices = 0;
+    for (const device of devices.values()) {
+      if (device.userId !== userId) continue;
+      deviceCount += 1;
+      if (buildDevicePresence(device).online) onlineDevices += 1;
+    }
+
+    const environmentUrls = new Set();
+    for (const environment of environments.values()) {
+      if (environment.userId === userId) environmentUrls.add(environment.baseUrl);
+    }
+
+    let mediaCount = 0;
+    for (const media of mediaUploads.values()) {
+      if (media.userId === userId) mediaCount += 1;
+    }
+
+    let macroCount = 0;
+    for (const macro of macros.values()) {
+      if (macro.userId === userId) macroCount += 1;
+    }
+
+    // Insertion order is creation order for both of these — commands are keyed by id and an update
+    // re-sets an existing key, which does not move it — so the last match is the newest, exactly
+    // what `listCommands(userId).at(-1)` used to return.
+    let commandCount = 0;
+    let latestCommand = null;
+    for (const command of commands.values()) {
+      if (command.userId !== userId) continue;
+      commandCount += 1;
+      latestCommand = command;
+    }
+
+    let auditCount = 0;
+    let latestAudit = null;
+    for (const event of auditLogs) {
+      if (event.userId !== userId) continue;
+      auditCount += 1;
+      latestAudit = event;
+    }
+
+    return {
+      counts: {
+        environments: environmentUrls.size,
+        devices: deviceCount,
+        media: mediaCount,
+        macros: macroCount,
+        commands: commandCount,
+        audit: auditCount,
+        onlineDevices,
+        offlineDevices: Math.max(0, deviceCount - onlineDevices),
+      },
+      latestCommand: latestCommand
+        ? {
+          id: latestCommand.id,
+          status: latestCommand.status,
+          intentType: latestCommand.intent?.type ?? null,
+          createdAt: latestCommand.createdAt ?? null,
+        }
+        : null,
+      latestAudit: latestAudit
+        ? {
+          id: latestAudit.id,
+          action: latestAudit.action,
+          createdAt: latestAudit.createdAt ?? null,
+        }
+        : null,
+    };
+  }
+
   return {
     subscribe,
     exportState,
@@ -1991,6 +2083,7 @@ export function createStore(seed = {}, options = {}) {
     listCommands,
     listCommandEvents,
     listAuditLogs,
+    getDisplaySummary,
   };
 }
 

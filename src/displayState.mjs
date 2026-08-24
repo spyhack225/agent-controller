@@ -1,38 +1,25 @@
 export async function buildUserDisplayState(store, userId) {
-  // Awaited together, not in sequence. None of these six depends on another, and under the Convex
-  // store each one is its own network round trip — so serialising them made the device's five-second
-  // display poll six round trips deep and it began timing out on the firmware side
-  // (HTTPClient error -11) once the account had enough history. Batching turns that back into one
-  // slowest-call wait.
-  const [environments, devices, media, macros, commands, audit] = await Promise.all([
-    store.listEnvironments(userId),
-    store.listDevices(userId),
-    store.listMediaUploads(userId),
-    store.listMacros(userId),
-    store.listCommands(userId),
-    store.listAuditLogs(userId),
-  ]);
-  const lastCommand = commands.at(-1) ?? null;
-  const lastAudit = audit.at(-1) ?? null;
-  const onlineDevices = devices.filter((device) => device.presence?.online).length;
-  const offlineDevices = Math.max(0, devices.length - onlineDevices);
+  // One bounded store call, not six unbounded ones.
+  //
+  // This used to fetch every environment, device, media upload, macro, command and audit entry the
+  // account had ever produced, and then read `.length` and `.at(-1)` off them. Batching the six
+  // with Promise.all fixed the round-trip count but not the payload: the audit log grows on every
+  // write, so a device polling this route every five seconds was dragging a monotonically larger
+  // history across the wire forever, and the firmware logged `HTTPClient error(-11): read Timeout`
+  // on roughly every poll. `getDisplaySummary()` answers with counts and two small projections, so
+  // the work and the response are the same size on an account's first day and its thousandth.
+  const { counts, latestCommand, latestAudit } = await store.getDisplaySummary(userId);
 
+  // `counts` is passed through verbatim and its keys are fixed by the store, because firmware
+  // parses these field names (applyDisplayJson in GatewayOperate.cpp) and a renamed or reordered
+  // key is a silent regression on hardware nothing here can test.
   return {
     title: "Agent Controller",
-    state: environments.length > 0 ? "ready" : "setup",
-    line1: `${environments.length} env / ${devices.length} devices`,
-    line2: lastCommand ? `${lastCommand.status}: ${lastCommand.intent.type}` : "No commands yet",
-    counts: {
-      environments: environments.length,
-      devices: devices.length,
-      media: media.length,
-      macros: macros.length,
-      commands: commands.length,
-      audit: audit.length,
-      onlineDevices,
-      offlineDevices,
-    },
-    latestAction: lastAudit?.action ?? null,
+    state: counts.environments > 0 ? "ready" : "setup",
+    line1: `${counts.environments} env / ${counts.devices} devices`,
+    line2: latestCommand ? `${latestCommand.status}: ${latestCommand.intentType}` : "No commands yet",
+    counts,
+    latestAction: latestAudit?.action ?? null,
     menu: ["status", "prompt", "shell", "macro", "media", "stop"],
   };
 }
