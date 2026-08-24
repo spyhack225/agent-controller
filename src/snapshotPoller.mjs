@@ -1,6 +1,7 @@
 import { createHash } from "node:crypto";
 
 import { compressSnapshot, fetchT3Snapshot, isEnvironmentTokenExpired } from "./t3Client.mjs";
+import { rememberSnapshotThreadTitles } from "./mediaNaming.mjs";
 import { classifyEnvironmentFailure } from "./environmentFailure.mjs";
 import { extractThreadOutcomes, reconcileCommandStatus } from "./t3Harness.mjs";
 
@@ -104,6 +105,9 @@ export function createSnapshotPoller({
 
     try {
       const snapshot = await fetchSnapshot(environment);
+      // The one place that reads every environment on a timer, so it is also the cheapest place to
+      // keep thread titles current for media naming. See src/mediaNaming.mjs.
+      rememberSnapshotThreadTitles(environment.id, snapshot);
       await updateHealth(userId, environment, "reachable", { checkedAt, lastError: null, failureReason: null });
       const changed = publishScreen(userId, environment, compressSnapshot(snapshot));
       const reconciled = await reconcileCommands(userId, environmentId, snapshot);

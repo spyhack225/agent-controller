@@ -206,6 +206,31 @@ not. Images carry `visionStatus`/`descriptionSource`; audio carries
 `transcriptionStatus`/`transcriptSource`. A vision description is user content — it is redacted from
 support bundles alongside every transcript version.
 
+### Media names are derived, never stored
+
+Firmware calls every recording `controller.wav`, so a library of controller captures was a column of
+identical rows. `src/mediaNaming.mjs` builds a `displayName` on read instead —
+`Hosyond Touch screen · Verify Workspace · 24 Aug 19:32` — from the device label, the thread the
+capture was pinned to, and its creation time, plus a structured `origin`. `nameMediaRecords()` in
+`app.mjs` attaches both to every owner-facing media response.
+
+**Derived, not stored, for the same reason the transcript diff is** (`withTranscriptChange`): a
+stored name goes stale the moment a device is relabelled or a thread retitled, and it would need a
+migration to reach clips a user already has. `originalName` is never overwritten — it is what the
+client uploaded and what the agent still sees as the attachment filename.
+
+The destination comes from the media **job** (`job.threadId`, pinned at enqueue), falling back to
+`device.config.threadId`; the current binding is where the device points *now*, not where the
+capture was going. Thread titles exist only in T3, so they are remembered from snapshots the gateway
+already fetches (`readT3Snapshot()`, the poller) rather than fetched per listing, with one
+short-timeout refresh for a stale environment and failures cached like successes. Every segment is
+optional and every degenerate case has a defined answer: no label gives `Controller 7d2c9f`, no
+thread drops the segment, an unresolvable title gives `Thread 4f2a1c`, a console upload gives
+`Console · diagram.png · ...`. The frontend never composes its own name — `mediaLabel()` in
+`features/MediaCapture.tsx` is the single reader, so the library, the composer picker and an
+attachment chip cannot disagree. Support diagnostics deliberately keep the **undecorated** records: a
+thread title would be new user content in the bundle.
+
 ### Transcription is a durable job
 
 A 30-second ASR call held a connection open and died with the process, leaving the media stuck at

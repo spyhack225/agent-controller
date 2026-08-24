@@ -48,6 +48,13 @@ import {
   storeUploadedMedia,
 } from "./mediaStore.mjs";
 import { createMediaJobRunner } from "./mediaJobs.mjs";
+import {
+  buildMediaName,
+  lookupThreadTitle,
+  markThreadTitlesUnavailable,
+  rememberSnapshotThreadTitles,
+  threadTitlesAreStale,
+} from "./mediaNaming.mjs";
 import { deviceJobStatus, mediaJobEvent, voiceAutoSendEnabled } from "./deviceAudio.mjs";
 import { describeTranscriptChange, isTranscriptionProviderEnabled } from "./transcription.mjs";
 import { buildUserObservabilitySummary } from "./observability.mjs";
@@ -1115,7 +1122,7 @@ export function createApp({
         if (!environment) throw new HttpError(404, "Environment not found.");
         try {
           assertEnvironmentTokenActive(environment);
-          const snapshot = await fetchT3Snapshot({ ...environment, timeoutMs: 5000 });
+          const snapshot = await readT3Snapshot({ ...environment, timeoutMs: 5000 });
           const screen = compressSnapshot(snapshot);
           const checkedAt = new Date().toISOString();
           const updated = await store.updateEnvironmentHealth({
@@ -1209,7 +1216,7 @@ export function createApp({
         assertEnvironmentTokenActive(environment);
         let snapshot;
         try {
-          snapshot = await fetchT3Snapshot({ ...environment, timeoutMs: 5000 });
+          snapshot = await readT3Snapshot({ ...environment, timeoutMs: 5000 });
         } catch (error) {
           throw new HttpError(502, "T3 snapshot is unavailable.", { cause: errorMessage(error) });
         }
@@ -1233,7 +1240,7 @@ export function createApp({
         const body = await readJson(req);
         const projectId = requireString(body.projectId, "projectId");
         const text = optionalString(body.text) ?? "Open this project and report that the session is ready.";
-        const snapshot = await fetchT3Snapshot({ ...environment, timeoutMs: 5000 });
+        const snapshot = await readT3Snapshot({ ...environment, timeoutMs: 5000 });
         const project = snapshot.projects?.find((candidate) => candidate.id === projectId);
         if (!project) throw new HttpError(404, "T3 project not found.");
         const requestedModelSelection = normalizeT3ModelSelection(body.modelSelection);
@@ -1774,7 +1781,10 @@ export function createApp({
       if (req.method === "GET" && url.pathname === "/v1/media") {
         const user = await authenticateUser(req, store, config, null, clerkAuth);
         await enforceUserRead(req, res, rateLimiter, config, user);
-        return sendJson(res, 200, { media: await store.listMediaUploads(user.id) });
+        // Named on the way out, never in storage: see nameMediaRecords().
+        return sendJson(res, 200, {
+          media: await nameMediaRecords(store, user.id, await store.listMediaUploads(user.id), config),
+        });
       }
 
       if (req.method === "POST" && url.pathname === "/v1/media") {
@@ -1787,7 +1797,7 @@ export function createApp({
           actor: { type: "user", id: user.id, userId: user.id },
           payload: body,
         });
-        return sendJson(res, 201, { media });
+        return sendJson(res, 201, { media: await nameMediaRecord(store, user.id, media, config) });
       }
 
       // Signed, short-lived, single-media access so a paired T3 environment can fetch
@@ -1828,7 +1838,7 @@ export function createApp({
           transcript: requireString(body.transcript, "transcript"),
         });
         if (!media) throw new HttpError(404, "Audio media upload not found.");
-        return sendJson(res, 200, { media });
+        return sendJson(res, 200, { media: await nameMediaRecord(store, user.id, media, config) });
       }
 
       // Roadmap Phase 6's camera flow: upload -> OCR/vision -> prompt -> dispatch.
@@ -1929,7 +1939,7 @@ export function createApp({
         if (!media) throw new HttpError(404, "Media upload not found.");
         await deleteStoredMedia(media, config);
         const deleted = await store.deleteMediaUpload({ userId: user.id, mediaId: media.id });
-        return sendJson(res, 200, { media: deleted });
+        return sendJson(res, 200, { media: await nameMediaRecord(store, user.id, deleted, config) });
       }
 
       if (req.method === "POST" && url.pathname === "/v1/device/heartbeat") {
@@ -2641,7 +2651,7 @@ export function createApp({
         const environment = await store.getEnvironmentForUser(device.userId, environmentId);
         if (!environment) throw new HttpError(404, "Environment not found.");
         assertEnvironmentTokenActive(environment);
-        const snapshot = await fetchT3Snapshot(environment);
+        const snapshot = await readT3Snapshot(environment);
         return sendJson(res, 200, { device, environmentId, screen: compressSnapshot(snapshot) });
       }
 
@@ -3300,7 +3310,7 @@ async function submitIntent({
     const dispatchStartedAt = Date.now();
     let snapshot;
     try {
-      snapshot = await fetchT3Snapshot(environment);
+      snapshot = await readT3Snapshot(environment);
     } catch (error) {
       const command = await store.createCommand({
         userId: actor.userId,
@@ -3669,7 +3679,7 @@ async function checkEnvironmentHealth({ store, userId, environment }) {
   }
   let snapshot;
   try {
-    snapshot = await fetchT3Snapshot({ ...environment, timeoutMs: 5000 });
+    snapshot = await readT3Snapshot({ ...environment, timeoutMs: 5000 });
   } catch (error) {
     const reason = classifyEnvironmentFailure(error);
     return recordEnvironmentFailure({
@@ -3802,7 +3812,10 @@ async function enqueueTranscription({ store, config, userId, mediaId, res }) {
     },
   });
 
-  return sendJson(res, 202, { job, media: withProcessing ?? publicMediaRecord(media) });
+  return sendJson(res, 202, {
+    job,
+    media: await nameMediaRecord(store, userId, withProcessing ?? publicMediaRecord(media), config),
+  });
 }
 
 /**
@@ -3959,6 +3972,106 @@ function withTranscriptChange(job) {
     ...job,
     transcriptChange: describeTranscriptChange(job.rawTranscript, job.normalizedTranscript),
   };
+}
+
+/**
+ * Attaches the derived `displayName` and `origin` to media records on their way out.
+ *
+ * Derived here rather than stored (see src/mediaNaming.mjs): the device label and the thread title
+ * a name is built from both live somewhere else and both change, so a persisted name would be a
+ * copy that quietly stops being true — and clips already in a user's library would need a migration
+ * to get one at all.
+ *
+ * Batched, because a listing is the hot caller: one device read and one job read for the whole
+ * page, never one per row.
+ */
+async function nameMediaRecords(store, userId, records, config = null) {
+  const list = (records ?? []).filter(Boolean);
+  if (list.length === 0) return [];
+
+  // A console-only library touches neither table: there is no device to label and no pinned thread.
+  const fromDevice = list.some((media) => media.deviceId);
+  const [devices, jobs] = fromDevice
+    ? await Promise.all([store.listDevices(userId), store.listMediaJobs({ userId })])
+    : [[], []];
+  const deviceById = new Map((devices ?? []).map((device) => [device.id, device]));
+
+  // The job holds the target the controller was pointed at when it recorded, which is the thread
+  // the owner was talking to; the device's own config is only where it happens to point *now*, so
+  // it is the fallback for a capture that never produced a job (an image, or audio with no
+  // transcription provider configured).
+  const jobByMedia = new Map();
+  for (const job of jobs ?? []) {
+    if (!job?.mediaId) continue;
+    const previous = jobByMedia.get(job.mediaId);
+    if (previous && String(previous.createdAt ?? "") > String(job.createdAt ?? "")) continue;
+    jobByMedia.set(job.mediaId, job);
+  }
+
+  const targets = list.map((media) => {
+    const device = media.deviceId ? deviceById.get(media.deviceId) ?? null : null;
+    const job = jobByMedia.get(media.id) ?? null;
+    return {
+      media,
+      device,
+      environmentId: optionalString(job?.environmentId) ?? optionalString(device?.config?.environmentId),
+      threadId: optionalString(job?.threadId) ?? optionalString(device?.config?.threadId),
+    };
+  });
+
+  await warmThreadTitles(store, userId, targets, config);
+
+  const now = new Date();
+  return targets.map(({ media, device, environmentId, threadId }) => ({
+    ...media,
+    ...buildMediaName({
+      media,
+      device,
+      environmentId,
+      threadId,
+      threadTitle: lookupThreadTitle(environmentId, threadId),
+      now,
+    }),
+  }));
+}
+
+/** The single-record form, for the routes that answer with one upload. */
+async function nameMediaRecord(store, userId, media, config = null) {
+  if (!media) return media;
+  const [named] = await nameMediaRecords(store, userId, [media], config);
+  return named ?? media;
+}
+
+/**
+ * Fills the thread-title cache for the environments this page actually needs.
+ *
+ * Titles normally arrive for free from the snapshots the gateway already fetches, but the first
+ * listing after a restart would otherwise show `Thread 4f2a1c` where a real title exists. So a
+ * stale environment gets one short-timeout read — and a failure is remembered exactly like a
+ * success, so an unreachable T3 costs one attempt per window rather than one per page load.
+ * Nothing here can fail the listing: a name is decoration.
+ */
+async function warmThreadTitles(store, userId, targets, config) {
+  const environmentIds = [...new Set(targets
+    .filter((target) => target.threadId && target.environmentId)
+    .map((target) => target.environmentId))]
+    .filter((environmentId) => threadTitlesAreStale(environmentId));
+
+  for (const environmentId of environmentIds) {
+    try {
+      const environment = await store.getEnvironmentForUser(userId, environmentId);
+      if (!environment || isEnvironmentTokenExpired(environment)) {
+        markThreadTitlesUnavailable(environmentId);
+        continue;
+      }
+      await readT3Snapshot({
+        ...environment,
+        timeoutMs: config?.mediaNameSnapshotTimeoutMs ?? 1500,
+      });
+    } catch {
+      markThreadTitlesUnavailable(environmentId);
+    }
+  }
 }
 
 /** getMediaForUser hands back the raw record; storagePath must never leave the gateway. */
@@ -4796,11 +4909,25 @@ function snapshotThreadProjectId(snapshot, threadId) {
   return thread ? optionalString(thread?.projectId) : null;
 }
 
+/**
+ * `fetchT3Snapshot`, plus the thread titles it happened to carry.
+ *
+ * Every snapshot the gateway already fetches names every thread in the environment, and media
+ * naming needs exactly those names. Remembering them here means a media listing can put a real
+ * thread title on a row without adding a T3 round trip of its own — see `src/mediaNaming.mjs`.
+ * Purely a side effect: a caller that only wants the snapshot is unaffected.
+ */
+async function readT3Snapshot(environment, options = {}) {
+  const snapshot = await fetchT3Snapshot(environment, options);
+  rememberSnapshotThreadTitles(environment?.id, snapshot);
+  return snapshot;
+}
+
 // Every device route that reads T3 reports an unreachable host the same way, so the
 // firmware has one error contract to branch on instead of four.
 async function fetchDeviceSnapshot(environment) {
   try {
-    return await fetchT3Snapshot(environment);
+    return await readT3Snapshot(environment);
   } catch (error) {
     throw new HttpError(502, "T3 environment is unavailable.", {
       code: "t3_unreachable",

@@ -311,3 +311,53 @@ test("shell stays a deliberate mode: it cannot carry attachments and dispatches 
     },
   }));
 });
+
+/*
+ * One file, one name.
+ *
+ * The gateway derives a media name from the device that recorded it, the thread it was headed for
+ * and when it was taken, and every surface renders that same string. A picker that said
+ * "controller.wav" while the library said "Hosyond Touch screen · Verify Workspace · 24 Aug 19:32"
+ * would be two names for one clip, which is worse than one bad name.
+ */
+test("the picker and the attachment chip both show the gateway's derived name", () => {
+  const recording: MediaItem = {
+    id: "media_voice",
+    kind: "audio",
+    contentType: "audio/wav",
+    originalName: "controller.wav",
+    displayName: "Hosyond Touch screen · Verify Workspace · 24 Aug 19:32",
+    origin: {
+      source: "device",
+      deviceLabel: "Hosyond Touch screen",
+      threadId: "thread_voice",
+      threadTitle: "Verify Workspace",
+    },
+    processing: { transcriptionStatus: "ready" },
+  };
+  const c = controller({ media: [recording] });
+  renderOperate(c);
+
+  openSourceMenu();
+  fireEvent.click(screen.getByRole("menuitem", { name: "Choose from media library" }));
+
+  const attach = screen.getByRole("button", {
+    name: "Attach Hosyond Touch screen · Verify Workspace · 24 Aug 19:32",
+  });
+  expect(within(attach).getByText("Hosyond Touch screen · Verify Workspace · 24 Aug 19:32")).toBeVisible();
+  expect(screen.queryByRole("button", { name: "Attach controller.wav" })).toBeNull();
+
+  fireEvent.click(attach);
+  expect(chipNames()).toEqual(["Hosyond Touch screen · Verify Workspace · 24 Aug 19:32"]);
+});
+
+test("a record served without a derived name still falls back to what was uploaded", () => {
+  const c = controller({ media: [{ ...IMAGE, displayName: null }] });
+  renderOperate(c);
+
+  openSourceMenu();
+  fireEvent.click(screen.getByRole("menuitem", { name: "Choose from media library" }));
+  fireEvent.click(screen.getByRole("button", { name: "Attach diagram.png" }));
+
+  expect(chipNames()).toEqual(["diagram.png"]);
+});

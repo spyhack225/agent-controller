@@ -220,3 +220,53 @@ test("an untouched transcript carries no diff notice", () => {
 
   expect(screen.queryByText("Cleanup changed the wording")).toBeNull();
 });
+
+/*
+ * The reported bug: two recordings from two moments, both listed as `controller.wav`, separable
+ * only by byte count and a raw id. The gateway now derives a name from the device, the destination
+ * thread and the minute — and the row leads with that, while still recording what was uploaded.
+ */
+test("a controller recording is listed under its derived name, not controller.wav", () => {
+  renderMedia({
+    media: [
+      {
+        ...AUDIO,
+        id: "media_1",
+        originalName: "controller.wav",
+        displayName: "Hosyond Touch screen · Verify Workspace · 24 Aug 19:32",
+      },
+      {
+        ...AUDIO,
+        id: "media_2",
+        originalName: "controller.wav",
+        displayName: "Hosyond Touch screen · Verify Workspace · 24 Aug 19:48",
+      },
+    ],
+  });
+
+  expect(screen.getByText("Hosyond Touch screen · Verify Workspace · 24 Aug 19:32")).toBeVisible();
+  expect(screen.getByText("Hosyond Touch screen · Verify Workspace · 24 Aug 19:48")).toBeVisible();
+
+  // originalName is not destroyed: it stays on the row beside the id, as the record of the upload.
+  expect(screen.getByText("controller.wav · media_1")).toBeVisible();
+  expect(screen.getByText("controller.wav · media_2")).toBeVisible();
+});
+
+test("the delete confirmation names the capture the way the row does", async () => {
+  renderMedia({
+    media: [{ ...AUDIO, displayName: "Hosyond Touch screen · Verify Workspace · 24 Aug 19:32" }],
+  });
+
+  fireEvent.click(screen.getByRole("button", { name: /Delete/ }));
+
+  expect(
+    await screen.findByText("Delete Hosyond Touch screen · Verify Workspace · 24 Aug 19:32?"),
+  ).toBeVisible();
+});
+
+test("a record with no derived name falls back to what was uploaded", () => {
+  renderMedia({ media: [{ ...AUDIO, displayName: null }] });
+
+  expect(screen.getByText("clip.webm")).toBeVisible();
+  expect(screen.getByText("clip.webm · media_1")).toBeVisible();
+});

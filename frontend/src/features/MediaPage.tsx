@@ -16,7 +16,6 @@ import {
   formatMediaExpiry,
   formatMediaJob,
   formatMediaProcessing,
-  formatRelativeTime,
   mediaJobTone,
 } from "../format";
 import { ActivityOrb } from "../motion";
@@ -29,7 +28,7 @@ import {
   StatusBadge,
   useConfirm,
 } from "../ui";
-import { MediaCaptureDialog } from "./MediaCapture";
+import { MediaCaptureDialog, mediaLabel } from "./MediaCapture";
 
 export function MediaPage({ controller: c }: { controller: Controller }) {
   const confirm = useConfirm();
@@ -103,7 +102,7 @@ export function MediaPage({ controller: c }: { controller: Controller }) {
 
   const deleteMedia = async (item: MediaItem) => {
     const accepted = await confirm({
-      title: `Delete ${item.originalName ?? item.id}?`,
+      title: `Delete ${mediaLabel(item)}?`,
       description: "The stored capture and its transcript will be permanently removed.",
       confirmLabel: "Delete media",
     });
@@ -152,7 +151,7 @@ export function MediaPage({ controller: c }: { controller: Controller }) {
                 </div>
                 <div className="min-w-0">
                   <div className="flex flex-wrap items-center gap-2">
-                    <p className="truncate text-sm font-semibold">{item.originalName ?? item.id}</p>
+                    <p className="truncate text-sm font-semibold">{mediaLabel(item)}</p>
                     <StatusBadge
                       tone={item.processing?.lastError ? "danger" : item.processing?.transcriptionStatus === "processing" ? "warning" : "success"}
                       label={formatMediaProcessing(item)}
@@ -160,9 +159,21 @@ export function MediaPage({ controller: c }: { controller: Controller }) {
                     {job ? <StatusBadge tone={mediaJobTone(job)} label={formatMediaJob(job)} /> : null}
                     <ActivityOrb activity={job ? mediaJobActivity(job.stage) : null} />
                   </div>
-                  <p className="mt-1 truncate font-mono text-[11px] text-ink-faint">{item.id}</p>
+                  {/*
+                    The derived name is the heading; what the client actually uploaded is still
+                    here, next to the id, because it is the record of the file and a name that is
+                    derived must never be mistaken for the one that was given.
+                  */}
+                  <p className="mt-1 truncate font-mono text-[11px] text-ink-faint">
+                    {item.originalName ? `${item.originalName} · ${item.id}` : item.id}
+                  </p>
+                  {/*
+                    No relative time here any more: the derived name already carries the moment the
+                    capture was taken, and "24 Aug 19:32" plus "16m ago" is one fact printed twice.
+                    What is left is what the name cannot say — the container and how big it is.
+                  */}
                   <p className="mt-1 text-xs text-ink-muted">
-                    {item.contentType} · {item.sizeBytes ?? 0} B · {formatRelativeTime(item.createdAt)}
+                    {item.contentType} · {item.sizeBytes ?? 0} B
                   </p>
                   <p className="mt-1 text-xs text-ink-muted">
                     {formatMediaExpiry(item.expiresAt)}

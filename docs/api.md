@@ -518,6 +518,36 @@ unavailable
 not_applicable
 ```
 
+### Media names
+
+Owner-facing media reads (`GET /v1/media`, and the single record returned by `POST /v1/media`,
+`PUT /v1/media/:id/transcript`, `POST /v1/media/:id/transcribe`, `DELETE /v1/media/:id`) carry a
+derived `displayName` and a structured `origin` alongside the `originalName` the client uploaded:
+
+```json
+{
+  "id": "media_...",
+  "originalName": "controller.wav",
+  "displayName": "Hosyond Touch screen · Verify Workspace · 24 Aug 19:32",
+  "origin": {
+    "source": "device",
+    "deviceId": "dev_...",
+    "deviceLabel": "Hosyond Touch screen",
+    "environmentId": "env_...",
+    "threadId": "thread_voice",
+    "threadTitle": "Verify Workspace",
+    "capturedAt": "2026-08-24T19:32:05.104Z"
+  }
+}
+```
+
+Both fields are computed on read and never stored, so a renamed device or a retitled thread is
+reflected immediately and clips uploaded before this existed are named too. `originalName` is never
+overwritten, and it remains the filename the agent sees on an attachment. Segments are dropped when
+unknown: a console upload has no device (`Console · diagram.png · 24 Aug 19:32`), a device with
+no bound thread has no destination, and a thread whose title T3 cannot supply is named by a short
+form of its id (`Thread 4f2a1c`). See `src/mediaNaming.mjs`.
+
 The signed-in owner can update an audio transcript later:
 
 ```http

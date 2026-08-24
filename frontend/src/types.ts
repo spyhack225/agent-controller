@@ -550,11 +550,34 @@ export interface DeviceFirmwarePolicy {
   releaseNotes?: string | null;
 }
 
+/**
+ * Where a capture came from and where it was headed, derived by the gateway on read.
+ *
+ * Not stored anywhere: a device gets relabelled and a thread gets retitled, so the server rebuilds
+ * this from the live records every time it hands a media row out.
+ */
+export interface MediaOrigin {
+  source: "device" | "console" | string;
+  deviceId?: string | null;
+  deviceLabel?: string | null;
+  environmentId?: string | null;
+  threadId?: string | null;
+  threadTitle?: string | null;
+  capturedAt?: string | null;
+}
+
 export interface MediaItem {
   id: string;
   kind: "audio" | "image" | string;
   contentType: string;
   sizeBytes?: number;
+  /**
+   * The name every surface shows: "Hosyond Touch screen · Verify workspace · 24 Aug 19:32".
+   * Server-derived, so the library, the composer's picker and an attachment chip cannot disagree.
+   */
+  displayName?: string | null;
+  origin?: MediaOrigin;
+  /** Exactly what the client uploaded. Kept, never overwritten by the derived name. */
   originalName?: string | null;
   transcript?: string | null;
   description?: string | null;

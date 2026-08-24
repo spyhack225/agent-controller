@@ -20,6 +20,7 @@ import { useMemo, useState } from "react";
 import type { Controller } from "../controller";
 import type { JsonRecord, SavedAction, SavedActionStep, SavedActionType } from "../types";
 import { Button, EmptyState, Field, StatusBadge, cn, useConfirm } from "../ui";
+import { mediaLabel } from "./MediaCapture";
 
 const actionKinds: Array<{
   value: SavedActionType;
@@ -248,7 +249,7 @@ export function ActionsPage({ controller: c }: { controller: Controller }) {
                     >
                       <option value="">Choose {requiredMediaKind}</option>
                       {compatibleMedia.map((item) => (
-                        <option key={item.id} value={item.id}>{item.originalName ?? item.id}</option>
+                        <option key={item.id} value={item.id}>{mediaLabel(item)}</option>
                       ))}
                     </select>
                     {!compatibleMedia.length ? <small>Upload a compatible {requiredMediaKind} to test this action.</small> : null}

@@ -40,8 +40,16 @@ export function isAttachableFile(file: { type?: string }): boolean {
   return type.startsWith("image/") || type.startsWith("audio/");
 }
 
+/**
+ * The one name a capture goes by, everywhere.
+ *
+ * The gateway derives it (device, destination thread, time) because it is the only side that knows
+ * all three; the client never composes its own, so what the library shows and what an attachment
+ * chip shows cannot drift apart. `originalName` is the fallback for a record served by an older
+ * gateway, and the id is the last resort.
+ */
 export function mediaLabel(item: MediaItem): string {
-  return item.originalName ?? item.id;
+  return item.displayName ?? item.originalName ?? item.id;
 }
 
 export function mediaState(item: MediaItem): string {
