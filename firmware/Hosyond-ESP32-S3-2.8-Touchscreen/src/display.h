@@ -111,3 +111,15 @@ void displaySoftSegment(float x0, float y0, float x1, float y1, float thickness,
 // separator is a curve that stops rather than a rule that hits the bezel.
 void displaySoftArcDivider(int16_t x, int16_t y, int16_t w, float sag, float thickness,
                            uint8_t bgGrey, uint8_t inkGrey);
+
+// A large flat surface with rounded ends: the status drawer and the action tray.
+//
+// displaySoftRoundRect() evaluates a distance field for every pixel it covers, which is right for a
+// button and wrong for a panel — a full-page drawer is 63 000 pixels and only the ~26 rows at each
+// rounded end have any curvature in them. This splits the shape: the caps go through the field, the
+// middle goes through the panel's own accelerated fill. Same picture, a fraction of the arithmetic.
+//
+// `roundTop` / `roundBottom` say which ends are actually on screen. A tray that slides up from
+// below the bezel has no bottom corners to draw.
+void displaySoftPanel(int16_t x, int16_t y, int16_t w, int16_t h, float radius, uint8_t bgGrey,
+                      uint8_t fillGrey, bool roundTop, bool roundBottom);

@@ -255,10 +255,25 @@ void loop() {
     gatewayProbeNow();
   }
 
-  const TouchEvent touch = touchPoll();
-  if (touch.gesture != TouchGesture::None) uiHandleTouch(touch);
+  // The whole frame runs under the gateway's state lock, touch handling included.
+  //
+  // The paint path reads gateway Strings — thread titles, statuses, response lines — in dozens of
+  // places, and the cycle that reassigns those Strings now runs on the other core. Reading one
+  // while it is being reassigned is a use-after-free, and it is the exact fault that crashed this
+  // board before: panics inside the WiFi driver with none of our code on the stack.
+  //
+  // Holding the lock across a whole frame is only affordable because request() hands it back for
+  // the duration of every socket wait. The task therefore holds it just for the microseconds of
+  // parsing on either side of a fetch, so this almost never waits. When it genuinely cannot get
+  // the lock in time, the frame is skipped rather than painted from state that is being rewritten
+  // underneath it — one dropped frame at 30 fps is invisible, and a torn String is not.
+  if (gateway.tryLockState(50)) {
+    const TouchEvent touch = touchPoll();
+    if (touch.gesture != TouchGesture::None) uiHandleTouch(touch);
+    uiTick();
+    gateway.unlockState();
+  }
 
-  uiTick();
   pollBootButton();
   uiSleepUntilNextFrame();
 }

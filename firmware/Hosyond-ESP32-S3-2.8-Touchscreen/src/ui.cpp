@@ -76,7 +76,11 @@ constexpr uint32_t kFrameMs = 33;
 // Slide durations. Both are deliberately shorter than a beat and longer than a frame: under about
 // 120 ms an eased slide is indistinguishable from a jump, and over about 300 ms the device feels
 // like it is thinking about it.
-constexpr uint32_t kDrawerSlideMs = 220;
+constexpr uint32_t kDrawerOpenMs = 220;
+// Shorter on the way out, and eased at both ends. The drawer covers the whole page, so the strip it
+// vacates is the bare ground until the screen underneath is repainted at the end of the slide;
+// getting out of the way quickly is what stops that reading as a blank frame.
+constexpr uint32_t kDrawerCloseMs = 150;
 constexpr uint32_t kBarSlideMs = 170;
 
 // The home orb, and the one that keeps a list screen from looking frozen. 148 px is the measured
@@ -126,7 +130,9 @@ constexpr uint8_t kMaxActions = 3;
 enum class Row : uint8_t { Device, Gateway, Thread, Activity };
 
 constexpr uint8_t kMaxDrawerRows = 4;
-constexpr int16_t kDrawerRowH = 46;
+// Taller than a list row, because the drawer covers the whole page and four rows in a 264 px column
+// with 46 px each left most of the panel empty for no reason.
+constexpr int16_t kDrawerRowH = 58;
 
 GatewayClient* gw = nullptr;
 Provisioning* prov = nullptr;
@@ -142,6 +148,10 @@ bool orbReady = false;
 bool miniReady = false;
 uint32_t orbStartedAt = 0;
 OrbMode currentMode = OrbMode::Ring;
+// The word under the orb, chosen alongside the mode rather than derived from it. Ring is five
+// different facts — idle, done, revoked, failed, waiting on a person — and orbLabelForMode() calls
+// all of them "Thinking".
+const char* currentLabel = "Starting";
 
 Screen screen = Screen::Status;
 Modal modal = Modal::None;
@@ -196,6 +206,12 @@ int16_t drawerShownPx = 0;
 bool drawerDirty = false;
 uint8_t drawerRowCount = 0;
 Row drawerRows[kMaxDrawerRows];
+// How much of each row is already correct on the glass. Repainting a row whose text has not
+// changed is what drew text over text: the surface is not cleared between redraws, so a shorter
+// new value left the tail of the old one standing beside it. A row is now repainted only when its
+// own string moved, and its band is cleared first.
+String drawerPainted[kMaxDrawerRows];
+bool drawerRowOnGlass[kMaxDrawerRows] = {false, false, false, false};
 
 // The action bar. `barT` eases; `barReserved` is whether the content region currently stops short
 // of the bottom, and only that second flag costs a content repaint.
@@ -257,6 +273,14 @@ int16_t contentBottom() { return barReserved ? (int16_t)(kH - kBarH) : kH; }
 // list changed underneath it.
 void clearContent() {
   g().fillRect(0, kContentTop, kW, (int16_t)(contentBottom() - kContentTop), panelGrey(kBg));
+}
+
+// Clears only the scrolling part of a list screen. The band above it belongs to that screen's own
+// chrome, which clears it again when it repaints on top of the rows — clearing it twice was 13 000
+// to 29 000 wasted pixels on every list repaint, which at 80 MHz is real milliseconds.
+void clearListRegion(int16_t top) {
+  const int16_t bottom = contentBottom();
+  if (bottom > top) g().fillRect(0, top, kW, (int16_t)(bottom - top), panelGrey(kBg));
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -391,9 +415,11 @@ void rebuildDrawerRows() {
   }
 }
 
-int16_t drawerHeight() {
-  return (int16_t)(12 + (int16_t)drawerRowCount * kDrawerRowH + 14);
-}
+// The drawer covers the whole page. It used to open as a band sized to its rows, which left the
+// screen underneath showing below it and read as a popup rather than as a surface being pulled
+// down over the device.
+constexpr int16_t kDrawerFullH = kH - kContentTop;
+int16_t drawerHeight() { return kDrawerFullH; }
 
 // ---------------------------------------------------------------------------------------------
 // Header
@@ -456,36 +482,128 @@ void drawChrome() {
 // ---------------------------------------------------------------------------------------------
 // Orb mode
 // ---------------------------------------------------------------------------------------------
-
-// What the agent is doing, from the best evidence the device protocol actually carries.
 //
-// The display payload's `state` is an account-level word ("ready" / "setup"), not an agent state,
-// so on its own it would leave the orb permanently calm. The signals that do move are, in order of
-// authority: a recording in progress, a response still arriving, and the selected thread's status
-// from the thread list. Each is mapped through the shared orbModeForAgentState() so every board
-// shows the same animation for the same state.
-OrbMode modeForState() {
-  if (audio::recording()) return orbModeForAgentState("recording");
-  if (!gw) return OrbMode::Ring;
-  if (!operable()) return OrbMode::Web;
-  if (gw->responseOpen() && gw->responseInFlight()) return orbModeForAgentState("running");
+// The orb is this device's primary status indicator, which makes a wrong mode a lie about what the
+// agent is doing. So this is a TOTAL decision table over the states the device can actually be in,
+// and every arm names both the animation and the word under it — the two are returned together
+// precisely so they cannot drift apart. Deriving the label from the mode, as this used to, meant
+// every calm state said "Thinking", including a revoked credential and a failed turn.
+//
+// The vocabulary is the one the gateway really speaks, checked against the server rather than
+// assumed:
+//
+//   threads[].status   running | starting | streaming | completed | error | stopped | idle
+//                      (app.mjs deviceThreadStatus(): active work wins over a stale session, and
+//                      anything else is T3's own latestTurn.state or session.status verbatim)
+//   response.state     waiting | streaming | complete | empty | error  (deviceThreadOutput.mjs)
+//   display.state      ready | setup   (displayState.mjs), plus boot/unknown/error set locally
+//
+// orbModeForAgentState() in the shared ThinkingOrb also matches searching / solving / planning /
+// weaving / composing / writing / shaping / pairing / listening. None of those strings exist
+// anywhere in src/ — that mapper is written against a vocabulary this gateway does not have. It is
+// still consulted, last, for a status word this table does not recognise, so that a gateway which
+// one day publishes a real agent verb lights the matching animation with no firmware change.
 
+struct OrbPresentation {
+  OrbMode mode;
+  const char* label;
+};
+
+// Case-insensitive compare with no allocation. The client upper-cases a thread status for display
+// and Arduino's String::equalsIgnoreCase only takes a String, so the obvious spelling would build
+// and destroy a temporary for every arm of the table below.
+bool stateIs(const String& value, const char* word) {
+  return strcasecmp(value.c_str(), word) == 0;
+}
+
+OrbPresentation presentationForState() {
+  // 1. The microphone, above everything. "Listening" means the ADC is open and a clip is growing —
+  //    not that a screen with a microphone on it happens to be showing, and not that a finished
+  //    clip is waiting to be sent. It is the one state the person is directly causing.
+  if (audio::recording()) return {OrbMode::Wave, "Listening"};
+
+  if (!gw || !prov) return {OrbMode::Ring, "Starting"};
+
+  // 2. Getting onto a network and onto an account. Only one of these is genuinely "connecting":
+  //    a device sitting on a revoked credential or an unreachable gateway is not establishing
+  //    anything, and wiring a constellation together while it is stuck was the previous
+  //    behaviour's plainest lie.
+  switch (prov->status().state) {
+    case ProvisioningState::Provisioning:  return {OrbMode::Ring, "Set up"};
+    case ProvisioningState::Failed:        return {OrbMode::Ring, "Wi-Fi failed"};
+    case ProvisioningState::Unprovisioned: return {OrbMode::Ring, "Not set up"};
+    case ProvisioningState::Connecting:    return {OrbMode::Web, "Joining"};
+    case ProvisioningState::Online:        break;
+  }
+
+  switch (gw->link()) {
+    case GatewayLink::NoIdentity:  return {OrbMode::Ring, "Not set up"};
+    case GatewayLink::Revoked:     return {OrbMode::Ring, "Revoked"};
+    case GatewayLink::Unreachable: return {OrbMode::Ring, "No gateway"};
+    case GatewayLink::Unclaimed:   return {OrbMode::Ring, "Claim me"};
+    // Online, and the first cycle has not come back yet. This is the real one.
+    case GatewayLink::Idle:
+    case GatewayLink::Connecting:  return {OrbMode::Web, "Connecting"};
+    case GatewayLink::Claimed:     break;
+  }
+
+  // 3. A command parked by policy outranks any amount of agent activity, because it is the only
+  //    thing on this device that cannot proceed without a person. The action bar says REVIEW at
+  //    the same moment for the same reason.
+  if (gw->approvalCount() > 0) return {OrbMode::Ring, "Needs you"};
+
+  // 4. The turn in front of us. `waiting` and `streaming` were previously both "working"; they are
+  //    different facts. Waiting is the agent thinking with nothing to show. Streaming is text
+  //    arriving right now, which is what "composing" means.
+  if (gw->responseOpen()) {
+    const ThreadResponse& r = gw->response();
+    if (stateIs(r.state, "streaming")) return {OrbMode::Ribbon, "Composing"};
+    if (stateIs(r.state, "error"))     return {OrbMode::Ring, "Failed"};
+    if (gw->responseInFlight())        return {OrbMode::Orbits, "Working"};
+  }
+
+  // 5. The selected thread's own status.
   const int index = gw->selectedThreadIndex();
   const ThreadOption* selected = gw->thread((size_t)(index < 0 ? 0 : index));
-  if (selected && selected->selected) {
-    // The client upper-cases the status for display; the mapper wants the wire value.
-    String state = selected->status;
-    state.toLowerCase();
-    const OrbMode mapped = orbModeForAgentState(state);
-    if (mapped != OrbMode::Ring) return mapped;
+  if (selected && selected->selected && selected->status.length() > 0) {
+    const String& st = selected->status;
+    if (stateIs(st, "running") || stateIs(st, "working"))     return {OrbMode::Orbits, "Working"};
+    if (stateIs(st, "streaming"))                             return {OrbMode::Ribbon, "Composing"};
+    // A session coming up is establishing something, which is the honest reading of the
+    // constellation. The word says which kind of coming-up it is.
+    if (stateIs(st, "starting"))                              return {OrbMode::Web, "Starting"};
+    if (stateIs(st, "error") || stateIs(st, "failed"))        return {OrbMode::Ring, "Failed"};
+    if (stateIs(st, "completed") || stateIs(st, "complete"))  return {OrbMode::Ring, "Done"};
+    if (stateIs(st, "stopped") || stateIs(st, "idle")
+        || stateIs(st, "empty"))                              return {OrbMode::Ring, "Idle"};
+    // Unrecognised. Ask the shared mapper in case the gateway has grown a verb since this table
+    // was written; if it has nothing either, say so rather than picking a busy animation.
+    const OrbMode mapped = orbModeForAgentState(st);
+    if (mapped != OrbMode::Ring) return {mapped, orbLabelForMode(mapped)};
+    return {OrbMode::Ring, "Ready"};
   }
-  return orbModeForAgentState(gw->display().state);
+
+  // 6. No thread selected: the account's own state, which is all the display payload carries.
+  const String& shown = gw->display().state;
+  if (stateIs(shown, "setup")) return {OrbMode::Ring, "Set up"};
+  if (stateIs(shown, "boot"))  return {OrbMode::Ring, "Starting"};
+  if (stateIs(shown, "error")) return {OrbMode::Ring, "Failed"};
+  if (!gw->hasThread())        return {OrbMode::Ring, "No thread"};
+  return {OrbMode::Ring, "Ready"};
 }
 
 void setMode(OrbMode mode) {
   currentMode = mode;
   orb.setMode(mode);
   miniOrb.setMode(mode);
+}
+
+// Applies both halves at once. The label is a `const char*` and is assigned into `statusLabel`
+// without a String temporary, which is what keeps this off the per-frame allocation path.
+void applyPresentation() {
+  const OrbPresentation next = presentationForState();
+  currentLabel = next.label;
+  if (next.mode != currentMode) setMode(next.mode);
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -507,9 +625,9 @@ String gatewayLine() {
 void paintHome() {
   clearContent();
   const String thread = gw ? gw->selectedThreadLabel() : String("No gateway");
-  uip::textCentered(kHomeThreadY, 1, kText, uip::fit(thread, kCols1));
+  uip::textCentered(kHomeThreadY, 1, kText, uip::fitWords(thread, kCols1));
   const String detail = message.length() > 0 ? message : gatewayLine();
-  uip::textCentered(kHomeDetailY, 1, kMuted, uip::fit(detail, kCols1));
+  uip::textCentered(kHomeDetailY, 1, kMuted, uip::fitWords(detail, kCols1));
 }
 
 // The claim screen. A brand-new controller has one job: tell its owner how to take possession of
@@ -572,17 +690,39 @@ constexpr int16_t kThreadRowH = 48;
 // because it is a control: it says where the work is going AND opens the list of somewhere else.
 void paintBreadcrumb() {
   uip::capsule(kBreadcrumb, (int16_t)kSurface, (int16_t)kHair, 1.2f);
+  // A name, or an admission that we do not have one yet. This used to fall back to
+  // context().environmentId, which put `jn72kshfoxn642tdlhsjspv1e58o34` across the top of the
+  // thread list — thirty characters that identify the environment to the gateway and to nobody
+  // standing in front of the device. The list is fetched on the way into this screen, so the gap
+  // lasts one request rather than forever.
   String where = browse.environmentLabel();
   if (where.length() == 0) {
-    const String& env = gw->context().environmentId;
-    where = env.length() > 0 ? env : String("No environment");
+    where = gw->context().environmentId.length() > 0 ? String("Environment")
+                                                     : String("No environment");
   }
   const String project = browse.projectLabel();
   if (project.length() > 0) where += String("  /  ") + project;
-  uip::text(kBreadcrumb.x + 14, (int16_t)(kBreadcrumb.y + 11), 1, kText, uip::fit(where, 32));
+  uip::text(kBreadcrumb.x + 14, (int16_t)(kBreadcrumb.y + 11), 1, kText, uip::fitWords(where, 32));
   uip::chevron((int16_t)(kBreadcrumb.x + kBreadcrumb.w - 16),
                (int16_t)(kBreadcrumb.y + kBreadcrumb.h / 2), 5.0f, 1, kMuted, 2.0f, kSurface);
 }
+
+// A scrolling list has no clipping, so it has to be given one.
+//
+// Adafruit_GFX draws wherever it is told; there is no scissor rectangle. A row scrolled half out of
+// the top of the viewport therefore drew its title and its status line straight over the section
+// heading and the breadcrumb above it — on glass, a thread title landing on the breadcrumb capsule
+// and a "STOPPED" landing on "5 THREADS". Two rules fix it, and both are needed:
+//
+//   TOP     rows are painted FIRST and the fixed chrome above them is repainted on top afterwards,
+//           so anything that overran is covered. Pixel-accurate scrolling survives; the header
+//           always wins.
+//   BOTTOM  a row is skipped once its own INK would cross the viewport floor — the floor is the
+//           action tray, and a row half under it cannot be covered by anything.
+//
+// kRowInk is how far down a row its last pixel of text reaches, and it is the measurement the
+// bottom rule is made against rather than the row pitch, which includes the gap below it.
+constexpr int16_t kRowInk = 34;
 
 // One row of any of the three lists. They are the same shape on purpose: an environment, a folder
 // and a thread are the same kind of choice at three depths, and a person should not have to relearn
@@ -597,20 +737,27 @@ void paintChoiceRow(int16_t y, int16_t rowH, const String& title, const String& 
     // look worse than a hard one.
     uip::marker(14, (int16_t)(y + 10), (int16_t)(rowH - 26), kBright, kSurface);
   }
-  uip::text(26, (int16_t)(y + 9), 1, selected ? kBright : kText, uip::fit(title, 33));
+  uip::text(26, (int16_t)(y + 9), 1, selected ? kBright : kText, uip::fitWords(title, 33));
   uip::text(26, (int16_t)(y + 25), 1, selected ? kMuted : kHair, uip::fit(meta, 33));
   if (!last && !selected) uip::divider(20, (int16_t)(y + rowH - 5), (int16_t)(kW - 40));
 }
 
-void paintThreads() {
-  clearContent();
+// The band above a list: everything that does not scroll. Repainted after the rows, so a row that
+// scrolled up into it is covered rather than left showing through.
+void paintThreadsChrome() {
+  g().fillRect(0, kContentTop, kW, (int16_t)(kThreadListTop - kContentTop), panelGrey(kBg));
   paintBreadcrumb();
-
   const size_t count = gw->threadCount();
   uip::text(14, kContentTop + 42, 1, kMuted,
             count > 0 ? String(count) + " THREADS" : String("THREADS"));
+}
 
+void paintThreads() {
+  clearListRegion(kThreadListTop);
+
+  const size_t count = gw->threadCount();
   if (count == 0) {
+    paintThreadsChrome();
     const String detail = gw->threadsDetail().length() > 0 ? gw->threadsDetail() : message;
     uip::textCentered(kContentTop + 100, 1, kMuted,
                       uip::fit(detail.length() > 0 ? detail : String("Nothing here yet"), kCols1));
@@ -620,22 +767,32 @@ void paintThreads() {
   const int16_t bottom = contentBottom();
   for (size_t i = 0; i < count; ++i) {
     const int16_t y = (int16_t)(kThreadListTop + (int16_t)i * kThreadRowH - threadScroll);
-    if (y + kThreadRowH <= kThreadListTop || y >= bottom) continue;
+    if (y + kRowInk > bottom) break;
+    if (y + kThreadRowH <= kContentTop) continue;
     const ThreadOption* row = gw->thread(i);
     if (!row) continue;
     const String meta = row->selected ? String("ACTIVE  ") + row->status : row->status;
     paintChoiceRow(y, kThreadRowH, row->title, meta, row->selected, i + 1 == count);
   }
+  paintThreadsChrome();
 }
 
 constexpr int16_t kBrowseListTop = kContentTop + 34;
 constexpr int16_t kBrowseRowH = 48;
 
+// The heading band of a browse list. Cleared whole and repainted on top of the rows, for the same
+// reason the thread list does it: a row scrolled halfway out of the viewport has already drawn its
+// title up here, and there is no clipping to stop it.
+void paintBrowseChrome(const char* label) {
+  g().fillRect(0, kContentTop, kW, (int16_t)(kBrowseListTop - kContentTop), panelGrey(kBg));
+  uip::text(14, kContentTop + 8, 1, kMuted, label);
+}
+
 void paintEnvironments() {
-  clearContent();
-  uip::text(14, kContentTop + 8, 1, kMuted, "ENVIRONMENT");
+  clearListRegion(kBrowseListTop);
   const size_t count = browse.environmentCount();
   if (count == 0) {
+    paintBrowseChrome("ENVIRONMENT");
     const String detail = browse.environmentsDetail();
     uip::textCentered(kContentTop + 100, 1, kMuted,
                       uip::fit(detail.length() > 0 ? detail : String("Tap RELOAD"), kCols1));
@@ -644,7 +801,8 @@ void paintEnvironments() {
   const int16_t bottom = contentBottom();
   for (size_t i = 0; i < count; ++i) {
     const int16_t y = (int16_t)(kBrowseListTop + (int16_t)i * kBrowseRowH - envScroll);
-    if (y + kBrowseRowH <= kBrowseListTop || y >= bottom) continue;
+    if (y + kRowInk > bottom) break;
+    if (y + kBrowseRowH <= kContentTop) continue;
     const BrowseEnvironment* row = browse.environment(i);
     if (!row) continue;
     // An expired access token is a dead end the owner has to fix at the host, and the listing
@@ -652,16 +810,17 @@ void paintEnvironments() {
     const String meta = row->tokenExpired ? String("TOKEN EXPIRED") : row->status;
     paintChoiceRow(y, kBrowseRowH, row->label, meta, row->selected, i + 1 == count);
   }
+  paintBrowseChrome("ENVIRONMENT");
 }
 
 void paintProjects() {
-  clearContent();
+  clearListRegion(kBrowseListTop);
   // There is no "all folders" row, and it is not an omission: POST /v1/device/config/project reads
   // `projectId` as a required string, so the device protocol offers no way to clear a folder once
   // one is bound. Widening the scope again is a console operation.
-  uip::text(14, kContentTop + 8, 1, kMuted, "FOLDER");
   const size_t count = browse.projectCount();
   if (count == 0) {
+    paintBrowseChrome("FOLDER");
     const String detail = browse.projectsDetail();
     uip::textCentered(kContentTop + 100, 1, kMuted,
                       uip::fit(detail.length() > 0 ? detail : String("Tap RELOAD"), kCols1));
@@ -670,7 +829,8 @@ void paintProjects() {
   const int16_t bottom = contentBottom();
   for (size_t i = 0; i < count; ++i) {
     const int16_t y = (int16_t)(kBrowseListTop + (int16_t)i * kBrowseRowH - projectScroll);
-    if (y + kBrowseRowH <= kBrowseListTop || y >= bottom) continue;
+    if (y + kRowInk > bottom) break;
+    if (y + kBrowseRowH <= kContentTop) continue;
     const BrowseProject* row = browse.project(i);
     if (!row) continue;
     // The count is what makes this list usable at arm's length: it says which folder has anything
@@ -679,6 +839,7 @@ void paintProjects() {
                                               : String(row->threadCount) + " threads";
     paintChoiceRow(y, kBrowseRowH, row->title, meta, row->selected, i + 1 == count);
   }
+  paintBrowseChrome("FOLDER");
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -686,7 +847,11 @@ void paintProjects() {
 // ---------------------------------------------------------------------------------------------
 
 constexpr Rect kMicButton = {14, kContentTop + 6, kW - 28, 86};
-constexpr int16_t kActionListTop = kContentTop + 116;
+// Measured off the element above it, not guessed. The heading sits in the gap between the capsule
+// and the list, and the list starts below the heading — so growing the capsule moves both instead
+// of quietly overlapping them.
+constexpr int16_t kSendHeadingY = kMicButton.y + kMicButton.h + 10;
+constexpr int16_t kActionListTop = kSendHeadingY + 18;
 constexpr int16_t kActionRowH = 42;
 
 void paintMicButton() {
@@ -725,13 +890,19 @@ void paintMicButton() {
   uip::textCentered(kMicButton.y + 56, 1, kMuted, "voice note to the selected thread");
 }
 
-void paintSend() {
-  clearContent();
+// Everything on SEND that does not scroll: the microphone and the heading over the list.
+void paintSendChrome() {
+  g().fillRect(0, kContentTop, kW, (int16_t)(kActionListTop - kContentTop), panelGrey(kBg));
   paintMicButton();
+  uip::text(14, kSendHeadingY, 1, kMuted, "SAVED ACTIONS");
+}
 
-  uip::text(14, kActionListTop - 18, 1, kMuted, "SAVED ACTIONS");
+void paintSend() {
+  clearListRegion(kActionListTop);
+
   const size_t count = gw->controlCount();
   if (count == 0) {
+    paintSendChrome();
     uip::textCentered(kActionListTop + 20, 1, kHair, "None assigned - add them in the console");
     return;
   }
@@ -739,11 +910,13 @@ void paintSend() {
   const int16_t bottom = contentBottom();
   for (size_t i = 0; i < count; ++i) {
     const int16_t y = (int16_t)(kActionListTop + (int16_t)i * kActionRowH - actionScroll);
-    if (y + kActionRowH <= kActionListTop || y >= bottom) continue;
+    // The saved-action row's ink stops at y+28: a label, and a reason under it when it is blocked.
+    if (y + 28 > bottom) break;
+    if (y + kActionRowH <= kContentTop) continue;
     const DeviceControl* c = gw->control(i);
     if (!c) continue;
     const bool blocked = !c->enabled || (c->requiresThread && !gw->hasThread());
-    uip::text(14, (int16_t)(y + 6), 1, blocked ? kHair : kText, uip::fit(c->label, 28));
+    uip::text(14, (int16_t)(y + 6), 1, blocked ? kHair : kText, uip::fitWords(c->label, 28));
     // The right-hand word is why the row will or will not do anything, which is the only thing a
     // person needs to read before pressing it.
     String meta = "RUN";
@@ -754,9 +927,10 @@ void paintSend() {
     else if (c->requiresConfirmation || c->kind == "stop" || c->kind == "reset") meta = "CONFIRM";
     uip::textRight((int16_t)(kW - 14), (int16_t)(y + 6), 1, kHair, meta);
     const String sub = blocked && c->reason.length() > 0 ? c->reason : String();
-    if (sub.length() > 0) uip::text(14, (int16_t)(y + 20), 1, kHair, uip::fit(sub, 34));
+    if (sub.length() > 0) uip::text(14, (int16_t)(y + 20), 1, kHair, uip::fitWords(sub, 34));
     if (i + 1 < count) uip::divider(20, (int16_t)(y + kActionRowH - 6), (int16_t)(kW - 40));
   }
+  paintSendChrome();
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -977,62 +1151,101 @@ Rect drawerRowRect(uint8_t index) {
   return {0, (int16_t)(kContentTop + 12 + (int16_t)index * kDrawerRowH), kW, kDrawerRowH};
 }
 
-// Paints the drawer at its current extension, repainting only the band that changed.
+// Paints one row of the drawer onto the surface, clearing its band first.
+void paintDrawerRow(uint8_t index) {
+  const Rect r = drawerRowRect(index);
+  const Row row = drawerRows[index];
+  const String value = uip::fitWords(rowValue(row), 27);
+
+  // Cleared to the whole row, never to the ink. A band sized to the new string leaves the tail of
+  // a longer old one beside it, which is the defect that produced "C.Weaving g" in this project
+  // once already.
+  g().fillRect(0, r.y, kW, r.h, panelGrey(kSurfaceHi));
+
+  uip::dot(26, (int16_t)(r.y + 26), 4.0f, rowTone(row), kSurfaceHi);
+  uip::text(44, (int16_t)(r.y + 12), 1, kMuted, rowTitle(row));
+  uip::text(44, (int16_t)(r.y + 30), 1, kText, value);
+  uip::chevron((int16_t)(kW - 24), (int16_t)(r.y + 26), 5.0f, 1, kMuted, 2.0f, kSurfaceHi);
+  displaySoftArcDivider(44, (int16_t)(r.y + r.h - 4), (int16_t)(kW - 88), 2.0f, 1.2f,
+                        kSurfaceHi, kHair);
+
+  drawerPainted[index] = value;
+  drawerRowOnGlass[index] = true;
+}
+
+// Advances the drawer by exactly the strip that changed, and nothing else.
 //
-// The whole panel is NOT redrawn per frame: `drawerShownPx` remembers how much is already on the
-// glass, and each frame paints from the smaller of the two positions to the larger. A full 210 px
-// panel is 50 000 pixels, which is most of a frame budget on its own — paying that ten times for
-// one slide is how an animation becomes a stutter.
+// The previous version redrew the entire surface, every row and every string on every frame of the
+// slide. Repainting a region that is already correct is what made it read as the screen reloading
+// rather than as a panel moving: the text flickered as it was laid over itself, and the whole panel
+// flashed as the fill swept back across it. Now a frame touches three things — the strip the lip
+// vacated or exposed, the lip itself, and any row that has just become fully visible.
 void paintDrawerFrame() {
-  const int16_t revealed = (int16_t)(uip::easeOutCubic(drawerT) * drawerHeight());
-  const int16_t from = revealed < drawerShownPx ? revealed : drawerShownPx;
-  const int16_t to = revealed > drawerShownPx ? revealed : drawerShownPx;
+  const float eased = drawerOpen ? uip::easeOutCubic(drawerT) : uip::easeInOutCubic(drawerT);
+  const int16_t revealed = (int16_t)(eased * drawerHeight());
+  const int16_t was = drawerShownPx;
   drawerShownPx = revealed;
 
-  // The band that changed, plus the lip's own thickness at each end.
-  int16_t bandTop = (int16_t)(kContentTop + from - 10);
-  int16_t bandBottom = (int16_t)(kContentTop + to + 10);
-  if (bandTop < kContentTop) bandTop = kContentTop;
-  if (bandBottom > kH) bandBottom = kH;
-  if (bandBottom > bandTop) {
-    g().fillRect(0, bandTop, kW, (int16_t)(bandBottom - bandTop), panelGrey(kBg));
+  // The lip is a curve a few pixels tall; the strip has to include where it WAS or its old copy is
+  // left behind on the surface.
+  constexpr int16_t kLip = 12;
+
+  if (revealed > was) {
+    // Opening: new surface appears below the old edge.
+    int16_t top = (int16_t)(kContentTop + was - kLip);
+    if (top < kContentTop) top = kContentTop;
+    int16_t bottom = (int16_t)(kContentTop + revealed);
+    if (bottom > kH) bottom = kH;
+    if (bottom > top) g().fillRect(0, top, kW, (int16_t)(bottom - top), panelGrey(kSurfaceHi));
+  } else if (revealed < was) {
+    // Closing: the vacated strip goes back to the ground. The content underneath is repainted once,
+    // when the panel is fully away — the drawer covers the whole page, so there is nothing to
+    // reveal progressively without re-rendering the screen beneath it on every frame, which is the
+    // cost this rewrite exists to remove.
+    int16_t top = (int16_t)(kContentTop + revealed - kLip);
+    if (top < kContentTop) top = kContentTop;
+    int16_t bottom = (int16_t)(kContentTop + was + kLip);
+    if (bottom > kH) bottom = kH;
+    if (bottom > top) g().fillRect(0, top, kW, (int16_t)(bottom - top), panelGrey(kBg));
+    // Rows inside the vacated strip are gone from the glass and must be repainted if it comes back.
+    for (uint8_t i = 0; i < kMaxDrawerRows; ++i) {
+      const Rect r = drawerRowRect(i);
+      if (r.y + r.h > kContentTop + revealed) drawerRowOnGlass[i] = false;
+    }
   }
+
   if (revealed <= 2) return;
 
-  // The surface starts above the header so its top corners are never seen: the drawer reads as
-  // something pulled OUT of the header rather than a card that appeared under it.
-  displaySoftRoundRect(-8, (int16_t)(kContentTop - 30), (int16_t)(kW + 16),
-                       (int16_t)(revealed + 30), 26.0f, kBg, (int16_t)kSurfaceHi, -1, 0.0f, 2.2f);
+  // No rounded top. The panel emerges from under the header's own curved divider, so its top edge
+  // is never on screen — drawing corners there would paint over the header instead of tucking
+  // beneath it. The end that IS visible is the leading edge below, and that one is a curve.
 
   for (uint8_t i = 0; i < drawerRowCount; ++i) {
     const Rect r = drawerRowRect(i);
     // A row appears only once there is room for the whole of it. Half a row sliding past the lip
     // is the thing that makes a reveal look like a repaint.
-    if (r.y + r.h > kContentTop + revealed - 10) break;
-    const Row row = drawerRows[i];
-    uip::dot(24, (int16_t)(r.y + 20), 4.0f, rowTone(row), kSurfaceHi);
-    uip::text(40, (int16_t)(r.y + 6), 1, kMuted, rowTitle(row));
-    uip::text(40, (int16_t)(r.y + 22), 1, kText, uip::fit(rowValue(row), 29));
-    uip::chevron((int16_t)(kW - 22), (int16_t)(r.y + 20), 5.0f, 1, kMuted, 2.0f, kSurfaceHi);
-    if (i + 1 < drawerRowCount && r.y + r.h + kDrawerRowH <= kContentTop + revealed - 10) {
-      displaySoftArcDivider(36, (int16_t)(r.y + r.h - 3), (int16_t)(kW - 72), 2.0f, 1.2f,
-                            kSurfaceHi, kHair);
+    if (r.y + r.h > kContentTop + revealed - kLip) break;
+    if (drawerRowOnGlass[i] && drawerPainted[i] == uip::fitWords(rowValue(drawerRows[i]), 27)) {
+      continue;
     }
+    paintDrawerRow(i);
   }
 
   // The leading edge: a brighter curve at the bottom of the panel, which is the thing the eye
-  // follows down and back up again.
-  displaySoftArcDivider(18, (int16_t)(kContentTop + revealed - 8), (int16_t)(kW - 36), 3.0f, 1.8f,
-                        kSurfaceHi, kMuted);
+  // follows down and back up again. Skipped once the panel is fully out — at full extension the
+  // edge is the bottom of the screen and there is nothing for it to lead.
+  if (revealed < drawerHeight()) {
+    displaySoftArcDivider(18, (int16_t)(kContentTop + revealed - 8), (int16_t)(kW - 36), 3.0f, 1.8f,
+                          kSurfaceHi, kMuted);
+  }
 }
 
 void openDrawer() {
   if (drawerOpen) return;
   drawerOpen = true;
   drawerDirty = true;
-  // The drawer covers the content, and a drawer shorter than the content leaves whatever was under
-  // it frozen on screen — including a big orb that has stopped being drawn. Clear once, here.
-  clearContent();
+  // Every row has to be painted afresh: the surface it sits on is about to be laid down again.
+  for (uint8_t i = 0; i < kMaxDrawerRows; ++i) drawerRowOnGlass[i] = false;
 }
 
 void closeDrawer() {
@@ -1047,6 +1260,7 @@ void closeDrawerNow() {
   drawerT = 0.0f;
   drawerShownPx = 0;
   drawerDirty = false;
+  for (uint8_t i = 0; i < kMaxDrawerRows; ++i) drawerRowOnGlass[i] = false;
   contentDirty = true;
 }
 
@@ -1191,9 +1405,11 @@ void paintActionBar() {
   if (offset >= kBarH || actionCount == 0) return;
 
   // The tray is drawn wider and taller than the screen so only its top corners are ever visible:
-  // the bar reads as a surface rising out of the bottom edge, not as a card floating on it.
-  displaySoftRoundRect(-10, top, (int16_t)(kW + 20), (int16_t)(kBarH + 40), 26.0f, kBg,
-                       (int16_t)kSurfaceHi, -1, 0.0f, 2.2f);
+  // the bar reads as a surface rising out of the bottom edge, not as a card floating on it. Only
+  // those corners go through the distance field — the other 24 000 pixels are a flat fill, and
+  // paying field arithmetic for them was a measurable slice of every frame the bar animated.
+  displaySoftPanel(-10, top, (int16_t)(kW + 20), (int16_t)(kBarH + 40), 26.0f, kBg, kSurfaceHi,
+                   true, false);
   for (uint8_t i = 0; i < actionCount; ++i) {
     uip::button(actionRect(i, top), actions[i].label, actions[i].primary, actions[i].enabled,
                 kSurfaceHi);
@@ -1211,8 +1427,8 @@ void showBusy(const String& title, const String& detail) {
   closeDrawerNow();
   drawHeader();
   clearContent();
-  uip::textCentered(kContentTop + 70, 2, kBright, uip::fit(title, kCols2));
-  uip::textCentered(kContentTop + 102, 1, kMuted, uip::fit(detail, kCols1));
+  uip::textCentered(kContentTop + 70, 2, kBright, uip::fitWords(title, kCols2));
+  uip::textCentered(kContentTop + 102, 1, kMuted, uip::fitWords(detail, kCols1));
   contentDirty = true;
 }
 
@@ -1411,7 +1627,7 @@ void startRecording() {
   clipHeldMs = 0;
   recordArmed = true;
   audio::startRecording();
-  setMode(modeForState());
+  applyPresentation();
   recordPaintedAt = 0;
   paintMicButton();
 }
@@ -1424,10 +1640,20 @@ void refreshThreads() {
   contentDirty = true;
 }
 
+void goToThreads() {
+  goTo(Screen::Threads);
+  if (browse.environmentLabel().length() == 0) {
+    showBusy("Threads", "Finding the environment");
+    browse.refreshEnvironments();
+  }
+  if (gw->threadCount() == 0) refreshThreads();
+  contentDirty = true;
+}
+
 void selectThreadRow(size_t index) {
   const ThreadOption* row = gw->thread(index);
   if (!row) return;
-  showBusy("Selecting", uip::fit(row->title, kCols1));
+  showBusy("Selecting", uip::fitWords(row->title, kCols1));
   if (gw->selectThread(index)) {
     message = "Thread selected";
     goTo(Screen::Send);
@@ -1436,6 +1662,14 @@ void selectThreadRow(size_t index) {
   }
   contentDirty = true;
 }
+
+// The single door into THREADS.
+//
+// Three call sites used to open it and each remembered a different subset of what has to be true
+// when it does: a thread list, and an environment NAME for the breadcrumb. The environment listing
+// is a per-user store read on the gateway — no T3 round trip — so fetching it here costs one fast
+// request and is what stops the breadcrumb showing a raw id.
+void goToThreads();
 
 void refreshEnvironments() {
   showBusy("Environments", "Asking the gateway");
@@ -1454,7 +1688,7 @@ void refreshProjects() {
 void selectEnvironmentRow(size_t index) {
   const BrowseEnvironment* row = browse.environment(index);
   if (!row) return;
-  showBusy("Binding", uip::fit(row->label, kCols1));
+  showBusy("Binding", uip::fitWords(row->label, kCols1));
   if (!browse.selectEnvironment(index)) {
     message = browse.environmentsDetail();
     contentDirty = true;
@@ -1471,7 +1705,7 @@ void selectEnvironmentRow(size_t index) {
 void selectProjectRow(size_t index) {
   const BrowseProject* row = browse.project(index);
   if (!row) return;
-  showBusy("Folder", uip::fit(row->title, kCols1));
+  showBusy("Folder", uip::fitWords(row->title, kCols1));
   if (!browse.selectProject(index)) {
     message = browse.projectsDetail();
     contentDirty = true;
@@ -1503,8 +1737,7 @@ void openCategory(Row row) {
       goTo(Screen::Gateway);
       return;
     case Row::Thread:
-      goTo(Screen::Threads);
-      if (gw->threadCount() == 0) refreshThreads();
+      goToThreads();
       return;
     default:
       // An approval queue is the thing that most needs a person; a reply is what they came for
@@ -1534,8 +1767,7 @@ void runAction(Act id) {
       goTo(Screen::Send);
       return;
     case Act::PickThread:
-      goTo(Screen::Threads);
-      if (gw->threadCount() == 0) refreshThreads();
+      goToThreads();
       return;
     case Act::OpenReply:
       goTo(Screen::Response);
@@ -1672,7 +1904,7 @@ void handleDrawerTap(int16_t x, int16_t y) {
   if (y < kContentTop) { closeDrawer(); return; }
   for (uint8_t i = 0; i < drawerRowCount; ++i) {
     const Rect r = drawerRowRect(i);
-    if (r.y + r.h > kContentTop + drawerShownPx - 10) break;
+    if (r.y + r.h > kContentTop + drawerShownPx - 12) break;
     if (uip::hit(r, x, y)) {
       const Row row = drawerRows[i];
       closeDrawerNow();
@@ -2020,6 +2252,9 @@ void uiTick() {
   if (gw->approvalCount() != lastApprovalCount) {
     lastApprovalCount = gw->approvalCount();
     drawerDirty = true;
+    // A parked command outranks agent activity in presentationForState(), so its edge has to
+    // recompute the orb as well as the drawer row.
+    modeDirty = true;
   }
   if (screen != lastScreen || modal != lastModal) {
     lastScreen = screen;
@@ -2042,25 +2277,14 @@ void uiTick() {
     contentDirty = true;
   }
 #else
-  if (modeDirty) {
-    const OrbMode wanted = modeForState();
-    if (wanted != currentMode) setMode(wanted);
-  }
+  // One call decides the animation AND the word, on the edges that can change either: the
+  // microphone opening or closing, the link or provisioning state moving, the client's revision
+  // bumping (which covers the response state and the thread list), and the approval queue.
+  if (modeDirty) applyPresentation();
   // Assigned from const char*, never through a String temporary: Arduino's String reuses its own
-  // buffer for an assignment that fits, so this costs nothing, while wrapping either arm in
-  // String(...) would allocate and free once a frame.
-  statusLabel = recordingNow ? "Listening" : orbLabelForMode(currentMode);
-  if (!operable()) {
-    switch (link) {
-      case GatewayLink::Unclaimed:   statusLabel = "Claim me"; break;
-      case GatewayLink::Revoked:     statusLabel = "Revoked"; break;
-      case GatewayLink::NoIdentity:  statusLabel = "Not set up"; break;
-      case GatewayLink::Unreachable: statusLabel = "No gateway"; break;
-      default:
-        statusLabel = provState == ProvisioningState::Provisioning ? "Set up" : "Connecting";
-        break;
-    }
-  }
+  // buffer for an assignment that fits, so this costs nothing, while wrapping it in String(...)
+  // would allocate and free once a frame.
+  statusLabel = currentLabel;
 #endif
 
   const uint32_t drawStart = millis();
@@ -2068,7 +2292,8 @@ void uiTick() {
   // The drawer eases open and shut. While it is moving nothing else in the content region is
   // painted: it covers all of it, and repainting underneath would be work nobody can see.
   const float drawerTarget = drawerOpen ? 1.0f : 0.0f;
-  const float nextDrawerT = uip::approach(drawerT, drawerTarget, kFrameMs, kDrawerSlideMs);
+  const float nextDrawerT = uip::approach(drawerT, drawerTarget, kFrameMs,
+                                          drawerOpen ? kDrawerOpenMs : kDrawerCloseMs);
   const bool drawerMoved = nextDrawerT != drawerT;
   drawerT = nextDrawerT;
 
@@ -2100,10 +2325,11 @@ void uiTick() {
   // Painting the bar afterwards would have it wipe the content it had just been given room beside.
   //
   // The DRAWER goes second because on the frames where both move — the bar retracting as the drawer
-  // opens — the drawer is the one arriving and the two overlap by four pixels at full extension.
+  // slides down — the drawer is the one arriving, and it ends up covering the tray's band along
+  // with everything else.
   //
-  // The CONTENT goes last and only when the drawer is fully away, because the drawer covers all of
-  // it and repainting underneath is work nobody can see.
+  // The CONTENT goes last and only when the drawer is fully away, because the drawer covers the
+  // whole page and repainting underneath it is work nobody can see.
   if (barMoved || barDirty) paintActionBar();
 
   const bool drawerActive = drawerMoved || drawerT > 0.0f || drawerShownPx > 0;
@@ -2114,7 +2340,8 @@ void uiTick() {
   }
   drawerDirty = false;
 
-  if (contentDirty && drawerT <= 0.001f) paintContent();
+  const bool repaintedContent = contentDirty && drawerT <= 0.001f;
+  if (repaintedContent) paintContent();
 
   // Only the orb and its label animate. Everything else is repainted on change, which is what keeps
   // a list screen inside the frame budget: a full list redraw costs several frames' worth of SPI
@@ -2122,7 +2349,20 @@ void uiTick() {
   const uint32_t elapsed = now - orbStartedAt;
   const bool bigOrb = (screen == Screen::Home || screen == Screen::Status)
     && modal == Modal::None && drawerT <= 0.001f;
-  if (bigOrb && orbReady) {
+
+  // The orb and a full content repaint do not share a frame.
+  //
+  // Measured on the board, the orb alone is about 24 ms of a 33 ms budget — its geometry, its
+  // rasterisation and its blit. A content repaint clears and redraws the whole region and costs
+  // another ten or more. Together they were the 75 ms frames. Dropping ONE orb frame when the
+  // screen underneath changes is invisible at 30 fps; a frame that runs to twice the budget is
+  // not, and it is what "sluggish" looked like.
+  //
+  // The drawer and the action tray are cheap enough to coexist with it now that neither pays
+  // distance-field arithmetic for its flat middle, so only the content repaint is excluded.
+  if (repaintedContent) {
+    // Nothing: the orb resumes on the next frame, 33 ms later.
+  } else if (bigOrb && orbReady) {
     displayDrawOrb(orb, kOrbCx, kOrbCy, elapsed);
     // The claim block starts where the label would be, and the label's strip is full width: drawing
     // both means the code is repainted over four times a second by a word.

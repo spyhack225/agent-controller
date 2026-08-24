@@ -202,15 +202,20 @@ bool GatewayBrowse::selectEnvironment(size_t index) {
   return true;
 }
 
+// A NAME or nothing. Never the id.
+//
+// This used to fall back to a shortened id on the theory that it was still a stable handle somebody
+// could match in the console. On glass that meant `jn72kshfoxn642tdlhsjspv1e58o34` across the top
+// of the thread list, which identifies the environment to the gateway and to nobody standing in
+// front of the device. An empty string lets the caller say "Environment" and go and fetch the list,
+// which is the answer a person can act on.
 String GatewayBrowse::environmentLabel() const {
   for (size_t i = 0; i < environmentCount_; i += 1) {
     if (environments_[i].id == boundEnvironmentId_ && environments_[i].label.length() > 0) {
       return environments_[i].label;
     }
   }
-  if (boundEnvironmentId_.length() == 0) return String();
-  if (boundEnvironmentId_.length() <= 10) return boundEnvironmentId_;
-  return String("~") + boundEnvironmentId_.substring(boundEnvironmentId_.length() - 9);
+  return String();
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -318,6 +323,7 @@ String GatewayBrowse::projectLabel() const {
   if (boundProjectId_.length() == 0) {
     return projectCount_ > 0 ? String("All folders") : String();
   }
-  if (boundProjectId_.length() <= 10) return boundProjectId_;
-  return String("~") + boundProjectId_.substring(boundProjectId_.length() - 9);
+  // Same rule as environmentLabel(): a folder the fetched list does not name is not worth naming
+  // with its id.
+  return String();
 }

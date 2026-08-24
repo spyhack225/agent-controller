@@ -56,6 +56,31 @@ String fit(const String& value, size_t cols) {
   return value.substring(0, cols - 1) + "~";
 }
 
+String fitWords(const String& value, size_t cols) {
+  const size_t len = value.length();
+  if (len <= cols) return value;
+  if (cols <= 4) return value.substring(0, cols);
+
+  const size_t budget = cols - 3;          // room for the three dots
+  size_t brk = budget;
+  while (brk > 0 && value[brk] != ' ') brk -= 1;
+  // A word boundary that throws away more than a third of the budget is not a better answer than
+  // cutting mid-word — one long token would otherwise reduce the whole line to an ellipsis.
+  if (brk == 0 || brk * 3 < budget * 2) brk = budget;
+
+  while (brk > 0) {
+    const char c = value[brk - 1];
+    if (c == ' ' || c == ',' || c == '.' || c == ';' || c == ':' || c == '-'
+        || c == '"' || c == '\'' || c == '(' || c == '[' || c == '/') {
+      brk -= 1;
+      continue;
+    }
+    break;
+  }
+  if (brk == 0) return value.substring(0, budget) + "...";
+  return value.substring(0, brk) + "...";
+}
+
 void text(int16_t x, int16_t y, uint8_t size, uint8_t grey, const String& value) {
   if (value.length() == 0) return;
   g().setTextWrap(false);

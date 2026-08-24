@@ -113,11 +113,22 @@ screen geometry — a taller screen walks pages), 2 follow-ups, 4 pending approv
 8 KB ceiling on any response body. `setLimits()` declares the first two to the gateway in the
 heartbeat; wrong numbers there come back as clipped text rather than as an error.
 
-There is no device-facing list of environments or projects, by design: the owner binds one
-environment and the hardware works inside it. Projects surface only as a count in the display
-payload, and `context().environmentId` is read-only from here. A board that wants an
-"environments -> projects -> threads" picker cannot have one: the thread list is the whole picker
-the protocol offers.
+`GatewayClient` itself only picks a thread. The two levels above it — which paired T3 host, and
+which folder inside it — live in `GatewayBrowse.{h,cpp}`, against
+`GET/POST /v1/device/environments` and `/v1/device/projects`
+(`docs/hardware-protocol.md`, "Environment, project, and thread API").
+
+It is a separate class with its own state and its own copy of the request helper, not new members
+on `GatewayClient`, so a board that does not browse pays nothing and the class every board already
+depends on did not have to grow a surface. Caps are 8 environments and 12 projects, truncation
+reported rather than silently clipped. Two behaviours are load-bearing: changing environment clears
+the project and thread server-side, so both local lists are dropped rather than kept; and
+`POST /v1/device/config/project` reads `projectId` as a **required** string, so a device can narrow
+to a folder but cannot widen back to "all folders" — that stays a console operation.
+
+Earlier revisions of this file said such a picker was impossible because the thread list was the
+whole picker the protocol offered. That was true, and stopped being true when the gateway grew
+those routes.
 
 ### Media upload
 

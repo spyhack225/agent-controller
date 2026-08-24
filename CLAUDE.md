@@ -163,11 +163,99 @@ argument — omit it and they always hit local disk, which is a silent bug under
 mean it: unset auto-detects (MinIO/R2 need path style, AWS does not), and coercing it to `false`
 breaks non-AWS endpoints.
 
-Two pluggable media processors, same shape (`disabled` | `mock` | real provider):
-`transcribeStoredAudio` (`src/mediaStore.mjs`) and `describeStoredImage` (`src/vision.mjs`). Both
-write processing state before calling out. Images carry `visionStatus`/`descriptionSource`; audio
-carries `transcriptionStatus`/`transcriptSource`. A vision description is user content — it is
-redacted from support bundles alongside transcripts.
+Two pluggable media processors, both `disabled` | `mock` | real provider, but no longer the same
+shape. `describeStoredImage` (`src/vision.mjs`) still runs inside the request; transcription does
+not. Images carry `visionStatus`/`descriptionSource`; audio carries
+`transcriptionStatus`/`transcriptSource`. A vision description is user content — it is redacted from
+support bundles alongside every transcript version.
+
+### Transcription is a durable job
+
+A 30-second ASR call held a connection open and died with the process, leaving the media stuck at
+`processing` forever. So `POST /v1/media/:id/transcribe` now answers **202 with a job row** and
+`src/mediaJobs.mjs` drives it — the same shape as the snapshot poller: constructed in `createApp()`,
+**started only from `server.mjs`**, with a `runOnce()` tests call directly.
+
+`src/transcription.mjs` is the provider interface (`transcribe()` → raw text plus metadata, or a
+`TranscriptionError`). Its `retryable` flag is the whole point: a 429 or a timeout goes back to
+`queued` and costs one attempt, while a missing API key fails terminally instead of burning three
+identical attempts.
+
+Stages: `queued → transcribing → normalizing → review_required|ready → dispatching → dispatched`,
+with `failed` terminal. `dispatched` and `failed` are never re-claimed — that is what stops a
+restart from dispatching the same transcript twice.
+
+Two subtleties worth keeping:
+
+- **`claimMediaJobs` recomputes the stage from stored evidence** (`resumeStageFor`), not from where
+  the job crashed. A worker that died after recording the raw transcript does not pay for the ASR
+  call again. A job whose `attempts` are spent is failed *inside the claim* rather than handed out,
+  or it would be rediscovered on every tick forever.
+- **The transcript is versions, not a field.** `rawTranscript` (verbatim ASR, whitespace included)
+  and `normalizedTranscript` are write-once — `updateMediaJob` silently ignores a second write.
+  Only `userEditedTranscript` stays writable, and the last version present wins. `review_required`
+  is not runnable: it waits on a person and must not hold a lease.
+
+The audio is never consumed. A transcript is derived; the upload has to stay playable.
+
+**Normalisation may move spacing, punctuation and case — never letters.** `describeTranscriptChange()`
+enforces that by comparing the two versions with everything but letters and digits stripped out; if
+they differ, the job parks at `review_required` whatever `TRANSCRIPTION_REVIEW_REQUIRED` says. A
+"correction" that changes someone's command has to be shown as a diff, not dispatched on their
+behalf. The diff is computed on read (`withTranscriptChange` in `app.mjs`) rather than stored, so it
+cannot go stale against the versions it describes.
+
+### The device voice loop
+
+`POST /v1/device/media` **enqueues transcription itself** — a controller records, uploads, and is
+done, so nothing else was ever going to ask. Before this, device audio was stored and never
+transcribed; the only caller of the transcriber was the owner-facing endpoint.
+
+The device gets back one id and polls one device-realm route, `GET /v1/device/media/jobs/:id`, which
+returns the projection in `src/deviceAudio.mjs` — six milestones (`recorded`, `uploading`,
+`transcribing`, `review`, `ready`, `sent`, `failed`) plus `done`/`ok`/`transcript`/`error` and
+nothing else. Stages, leases, attempt counts, provider names and timings are worker bookkeeping a
+few square centimetres of screen cannot render, and they stay on `/v1/media/jobs/:id`. The route is
+scoped to `job.deviceId`, not merely to the owner: two controllers on one account are two
+microphones in two rooms, and the transcript is in the response. The same projection builds the
+`media.job` SSE payload, so a console that listens and a device that polls cannot disagree.
+
+**A finished transcript waits.** Auto-send is a per-device grant (`PUT
+/v1/devices/:id/voice-auto-send`, owner realm) recording `enabledBy`/`enabledAt`. There is no
+account-wide switch on purpose — auto-send is a trust decision about one microphone, and a device
+claimed later must not inherit it.
+
+**The grant, the device and the policy are read at dispatch, never at enqueue.** A capture can sit
+through a retry budget while the owner tightens a profile or revokes the grant, and the newer rule
+has to win; `dispatchVoiceTranscript()` in `app.mjs` re-reads all three and then goes through the
+ordinary `submitIntent()` path. The worker itself knows nothing about policy — the hook is injected
+into `createMediaJobRunner()`.
+
+Transcription succeeding and the send being refused are independent, which is why the outcome lives
+on its own fields (`dispatchStatus`, `dispatchError`, `commandId`, `autoSend`) instead of
+`lastError`/`failureKind`. A blocked send still reaches stage `dispatched`, because the transcript
+is on the media record and the owner has something to look at; reporting it as `ready` would claim
+the words are waiting when the gateway has already declined to act on them.
+
+### The parakeet adapter
+
+`TRANSCRIPTION_PROVIDER=parakeet` is its own adapter in `src/transcription.mjs`, not the OpenAI
+branch with a different URL. It talks HTTP to a local sidecar running `nvidia/parakeet-tdt-0.6b-v2`:
+the gateway never imports Python and never blocks its event loop on inference. CPU is the supported
+default, which is why `PARAKEET_TIMEOUT_MS` is minutes and `PARAKEET_CONCURRENCY` is 1 — the gate in
+`createConcurrencyGate()` hands a released slot straight to the next waiter, because decrementing and
+re-acquiring would let a fresh caller overtake the queue.
+
+Three things it refuses before spending an inference, all terminal because no retry changes them:
+a container outside `PARAKEET_ACCEPTED_CONTENT_TYPES` (browser WebM/Opus and MP4/AAC and controller
+WAV are in; anything else fails naming the list, rather than becoming an opaque 4xx from a Python
+traceback); a WAV whose own header says it is longer than `PARAKEET_MAX_CLIP_SECONDS`; and a
+language the configured checkpoint cannot speak — v2 is English, and pointing it at French produces
+confident nonsense rather than French, so that is a configuration error and is reported as one.
+
+`timings` on a finished job carries `queueWaitMs`, `gateWaitMs`, `decodeMs`, `inferenceMs`,
+`providerMs`, `normalizeMs` and `totalMs`, plus `realtimeFactor` (compute seconds per audio second)
+when the sidecar reports the clip length — the number that decides whether a GPU is worth adding.
 
 ### Device profiles
 
@@ -202,7 +290,9 @@ without losing data.
   (see `DEFAULT_FUNCTIONS` at the top of that file), authenticating each call with `GATEWAY_CONVEX_SECRET`.
 
 **Adding a store method means touching all three**, plus `convex/gatewayStore.ts` and `convex/schema.ts`. The store API
-surface is listed as the return object at the bottom of `src/store.mjs` (~line 833).
+surface is listed as the return object at the bottom of `src/store.mjs`. `test/storeParity.test.mjs` guards the parts
+that have to exist twice, including a check that every `gatewayStore:*` name the adapter maps is actually exported —
+`updateMediaDescription` was mapped to a function that had never been written.
 
 Secrets are never stored in plaintext: device secrets and API tokens are stored as SHA-256 hashes and compared with
 `timingSafeEqual`; T3 access tokens are AES-256-GCM sealed by `src/secretBox.mjs` (`v1:iv:tag:ciphertext`, key derived
@@ -334,11 +424,23 @@ Firmware is PlatformIO C++ under four board folders; copy `include/controller_co
 | `CrowPanel-ESP32-2.13-E-paper` | 2.13" e-ink, five active-low keys | Most complete gateway-connected implementation; 4 build environments; current silicon validation not recorded |
 | `vision-master-t190` | 1.9" TFT | Bring-up sketch |
 | `Waveshare-ESP32-S3-Touch-AMOLED-1.75C` | 466x466 round AMOLED touch, dual-mic array | Scaffold; pin map unverified |
-| `Hosyond-ESP32-S3-2.8-Touchscreen` | 2.8" IPS 240x320 touch, on-board mic + speaker (ES8311) | Hardware-proven capture/display/orb/provisioning prototype; no shared gateway client or touch path |
+| `Hosyond-ESP32-S3-2.8-Touchscreen` | 2.8" IPS 240x320 touch, on-board mic + speaker (ES8311) | Five-screen touch UI over the shared gateway client (home/threads/send/reply/approvals) with hold-to-talk upload; 5 environments, `-controller` is the product build. Capture/display/orb/provisioning proven on silicon, the UI and every gateway call are not |
 
 Every board is pinned to **ESP-IDF 5.5 / Arduino core 3.3** via the pioarduino platform fork. The official
 `platformio/platform-espressif32` is unmaintained at Arduino 2.0.17 / ESP-IDF 4.4, which lacks `driver/i2s_std.h`
 and cannot build the audio boards. Changing the pin means re-verifying all 11 environments.
+
+A board **can** browse environments → projects → threads. That was untrue for most of this
+project's life — `GET /v1/device/threads` was the only list the device protocol offered — and the
+claim outlived the gateway change that fixed it. The routes are
+`GET/POST /v1/device/environments` and `/v1/device/projects` alongside the thread pair
+(`docs/hardware-protocol.md`, "Environment, project, and thread API"); each level is scoped by the
+one above and every id is checked server-side, so the owner still keeps the boundary. The firmware
+client is `firmware/shared/AgentControllerCore/src/GatewayBrowse.cpp`, in its own translation unit
+with its own state rather than as members on `GatewayClient`, and the Hosyond board drives it.
+Two limits are real: changing environment clears the project and thread server-side, and
+`POST /v1/device/config/project` reads `projectId` as a **required** string — so a device can narrow
+to a folder but cannot widen back out to "all folders" without the console.
 
 **Every ESP32-S3 board is BLE-only** — no Bluetooth Classic, so no HFP headset microphone, and no LE Audio.
 Bluetooth earbuds cannot be a microphone source on any current or planned board. On-board mics or a phone

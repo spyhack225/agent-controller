@@ -62,6 +62,16 @@ float approach(float value, float target, uint32_t frameMs, uint32_t durationMs)
 // ---------------------------------------------------------------------------------------------
 
 String fit(const String& value, size_t cols);
+
+// Truncation for anything a person reads as language: a thread title, a summary, a folder name.
+//
+// fit() cuts at the column and appends a tilde, which is right for an id and wrong for a sentence —
+// on glass it produced `Open this project and report tha"`, half a word plus whatever punctuation
+// the cut happened to land on. This backs up to a word boundary, drops the trailing punctuation the
+// break exposed, and ends in three dots, which the 5x7 font actually has (U+2026 is not in it).
+//
+// A single token longer than the budget is still hard-cut: backing up would leave nothing.
+String fitWords(const String& value, size_t cols);
 void text(int16_t x, int16_t y, uint8_t size, uint8_t grey, const String& value);
 void textCentered(int16_t y, uint8_t size, uint8_t grey, const String& value);
 void textCenteredIn(const Rect& r, int16_t y, uint8_t size, uint8_t grey, const String& value);

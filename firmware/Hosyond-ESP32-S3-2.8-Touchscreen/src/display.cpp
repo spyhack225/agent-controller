@@ -231,16 +231,42 @@ void blitOrb(ThinkingOrb& orb, int16_t cx, int16_t cy, uint32_t elapsedMs, uint8
   // not be if each grows its own rasteriser.
   paintOrbCoverage(frame, grey, dim);
 
-  // Convert a row at a time straight into the DMA staging buffer. The 8-bit coverage buffer is half
-  // the RAM of the RGB565 canvas it replaces, and the colour conversion has to happen on the way
-  // out regardless.
+  // Pushed as a DISC, one span per row, not as a square.
+  //
+  // The square was visible on glass: a circular object sitting in a box, because the corners of the
+  // blit are written with the coverage buffer's zero — which is only the same colour as the page
+  // when the page happens to be the ground. It is not, on a card or under the action tray, and the
+  // box showed. Clipping to the inscribed circle means those pixels are never written at all, so
+  // whatever is behind the orb stays behind it.
+  //
+  // It is also 21% fewer pixels — pi/4 of the box — which on the frame that costs the most is the
+  // cheapest 21% available. The extra cost is one setAddrWindow per row instead of one per frame:
+  // about eleven bytes of command at 80 MHz, against the ~150 pixels each row saves.
+  //
+  // No anti-aliasing at the rim, deliberately. The geometry never reaches the inscribed circle —
+  // the widest mode projects to roughly 0.9 of it — so this cuts through pixels that are already
+  // zero, and feathering an edge the drawing never touches would only cost time.
+  const float r = (float)mid;
+  const float r2 = r * r;
+
   Adafruit_ILI9341& g = displayPanel();
   g.startWrite();
-  g.setAddrWindow(cx - mid, cy - mid, dim, dim);
   for (int16_t row = 0; row < dim; ++row) {
-    const uint8_t* src = grey + (size_t)row * dim;
-    for (int16_t col = 0; col < dim; ++col) dmaRow[col] = panelGrey(src[col]);
-    g.writePixels(dmaRow, dim);
+    const float dy = (row - r) + 0.5f;
+    const float inside = r2 - dy * dy;
+    if (inside <= 0.0f) continue;
+    const int16_t half = (int16_t)sqrtf(inside);
+    int16_t from = (int16_t)(mid - half);
+    int16_t to = (int16_t)(mid + half);
+    if (from < 0) from = 0;
+    if (to > dim) to = dim;
+    const int16_t span = (int16_t)(to - from);
+    if (span <= 0) continue;
+
+    const uint8_t* src = grey + (size_t)row * dim + from;
+    for (int16_t col = 0; col < span; ++col) dmaRow[col] = panelGrey(src[col]);
+    g.setAddrWindow((int16_t)(cx - mid + from), (int16_t)(cy - mid + row), span, 1);
+    g.writePixels(dmaRow, span);
   }
   g.endWrite();
 }
@@ -341,13 +367,21 @@ inline float roundBoxSdf(float px, float py, float halfW, float halfH, float r) 
 
 }  // namespace
 
-void displaySoftRoundRect(int16_t x, int16_t y, int16_t w, int16_t h, float radius,
-                          uint8_t bgGrey, int16_t fillGrey, int16_t strokeGrey,
-                          float strokeWidth, float feather) {
+// The rounded rectangle, restricted to the rows in [bandTop, bandBottom).
+//
+// The shape is still evaluated in its own full coordinates — the corner arc is the arc the whole
+// rectangle would have had — so a caller can draw one end of a very tall panel without the curve
+// changing to suit the stub it asked for. displaySoftPanel() is the reason this exists.
+void displaySoftRoundRectBand(int16_t x, int16_t y, int16_t w, int16_t h, float radius,
+                              uint8_t bgGrey, int16_t fillGrey, int16_t strokeGrey,
+                              float strokeWidth, float feather, int16_t bandTop,
+                              int16_t bandBottom) {
   if (!displayReady() || !dmaRow || w <= 0 || h <= 0) return;
 
   int16_t x0 = x, y0 = y;
   int16_t x1 = (int16_t)(x + w), y1 = (int16_t)(y + h);
+  if (y0 < bandTop) y0 = bandTop;
+  if (y1 > bandBottom) y1 = bandBottom;
   if (x0 < 0) x0 = 0;
   if (y0 < 0) y0 = 0;
   if (x1 > kPanelW) x1 = kPanelW;
@@ -388,6 +422,13 @@ void displaySoftRoundRect(int16_t x, int16_t y, int16_t w, int16_t h, float radi
     g.writePixels(dmaRow, vw);
   }
   g.endWrite();
+}
+
+void displaySoftRoundRect(int16_t x, int16_t y, int16_t w, int16_t h, float radius,
+                          uint8_t bgGrey, int16_t fillGrey, int16_t strokeGrey,
+                          float strokeWidth, float feather) {
+  displaySoftRoundRectBand(x, y, w, h, radius, bgGrey, fillGrey, strokeGrey, strokeWidth, feather,
+                           0, kPanelH);
 }
 
 void displaySoftSegment(float x0f, float y0f, float x1f, float y1f, float thickness,
@@ -477,4 +518,33 @@ void displaySoftArcDivider(int16_t x, int16_t y, int16_t w, float sag, float thi
     g.writePixels(dmaRow, vw);
   }
   g.endWrite();
+}
+
+void displaySoftPanel(int16_t x, int16_t y, int16_t w, int16_t h, float radius, uint8_t bgGrey,
+                      uint8_t fillGrey, bool roundTop, bool roundBottom) {
+  if (!displayReady() || w <= 0 || h <= 0) return;
+
+  // The cap is the band a corner of this radius can reach into, plus a row for the feathered edge.
+  int16_t cap = (int16_t)(radius + 1.5f);
+  if (cap < 0) cap = 0;
+  if (cap * 2 > h) cap = (int16_t)(h / 2);
+
+  const int16_t topCap = roundTop ? cap : 0;
+  const int16_t bottomCap = roundBottom ? cap : 0;
+  const int16_t middle = (int16_t)(h - topCap - bottomCap);
+
+  // Each cap is drawn as the full rounded rectangle clipped to its own band, so the corner arc is
+  // the same curve the one-shot version would have produced rather than an arc fitted to a stub.
+  if (topCap > 0) {
+    displaySoftRoundRectBand(x, y, w, h, radius, bgGrey, (int16_t)fillGrey, -1, 0.0f, 1.4f,
+                             y, (int16_t)(y + topCap));
+  }
+  if (middle > 0) {
+    displayPanel().fillRect(x < 0 ? 0 : x, (int16_t)(y + topCap),
+                            (int16_t)(x < 0 ? w + x : w), middle, panelGrey(fillGrey));
+  }
+  if (bottomCap > 0) {
+    displaySoftRoundRectBand(x, y, w, h, radius, bgGrey, (int16_t)fillGrey, -1, 0.0f, 1.4f,
+                             (int16_t)(y + h - bottomCap), (int16_t)(y + h));
+  }
 }
