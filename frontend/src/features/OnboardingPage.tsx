@@ -24,6 +24,7 @@ import {
 import { useEffect, useMemo, useRef, useState, type ReactNode } from "react";
 
 import type { Controller } from "../controller";
+import { buildGatewayTunnelSetupCommand, type RemoteAccessMode } from "../remoteAccess";
 import {
   buildT3SetupCommand,
   firstIncompleteStep,
@@ -49,6 +50,10 @@ import {
   StatusBadge,
   cn,
 } from "../ui";
+import {
+  RemoteAccessReadiness,
+  remoteAccessReady,
+} from "./RemoteAccessReadiness";
 
 interface OnboardingPageProps {
   controller: Controller;
@@ -153,6 +158,9 @@ export function OnboardingPage({ controller: c, onNavigate }: OnboardingPageProp
     && c.deviceSecret?.id === registeredDeviceId
     && c.deviceSecret.secret,
   );
+  const gatewayRemoteMode: RemoteAccessMode = c.remoteAccess?.tailscale.mode ?? "serve";
+  const gatewayRemoteReady = remoteAccessReady(c.remoteAccess, gatewayRemoteMode);
+  const gatewayTunnelCommand = buildGatewayTunnelSetupCommand(gatewayRemoteMode);
   const setupCommand = useMemo(() => {
     if (!workspacePath.trim()) return "";
     return buildT3SetupCommand({
@@ -679,6 +687,36 @@ export function OnboardingPage({ controller: c, onNavigate }: OnboardingPageProp
                     />
                   </Field>
                 ) : null}
+                {networkMode === "tailscale" ? (
+                  <div className="space-y-3 rounded-lg border border-success/20 bg-success/7 p-4">
+                    <div className="flex items-start gap-3">
+                      <ShieldCheck className="mt-0.5 size-4 shrink-0 text-success" aria-hidden="true" />
+                      <div className="space-y-1 text-xs leading-relaxed text-ink-muted">
+                        <p className="font-semibold text-ink">Private HTTPS through Tailscale Serve</p>
+                        <p>
+                          Install Tailscale and sign in on the T3 host. The generated setup command starts T3 Code with <code className="font-mono text-[11px] text-ink">--tailscale-serve</code> and prints its stable MagicDNS URL and one-time pairing credential.
+                        </p>
+                        <p>
+                          If T3 Code is already running, use <code className="font-mono text-[11px] text-ink">npx t3 pair --tailscale</code> instead, then paste the resulting HTTPS URL and token on the next step.
+                        </p>
+                        <p>
+                          The machine check below applies when T3 Code and Agent Controller run on this same host. If T3 runs elsewhere, install and sign in to Tailscale on that host too.
+                        </p>
+                      </div>
+                    </div>
+                    <RemoteAccessReadiness
+                      status={c.remoteAccess}
+                      mode="serve"
+                      compact
+                      refreshing={c.busyAction === "refresh-remote-access"}
+                      onRefresh={() => void c.run(
+                        "refresh-remote-access",
+                        "Remote access status refreshed.",
+                        () => c.loadRemoteAccess(true),
+                      )}
+                    />
+                  </div>
+                ) : null}
               </div>
 
               <div className="onboarding-section">
@@ -1138,6 +1176,61 @@ export function OnboardingPage({ controller: c, onNavigate }: OnboardingPageProp
                 <ReadinessRow label="Provider and model" ready={Boolean(c.onboardingReadiness?.checks.providerConfigured)} detail={[c.onboarding?.provider.instanceId, c.onboarding?.provider.model].filter(Boolean).join(" · ") || "Not configured"} />
                 <ReadinessRow label="First thread" ready={Boolean(c.onboardingReadiness?.checks.firstRunDispatched)} detail={c.onboarding?.firstThreadId ?? "Not dispatched"} mono />
                 <ReadinessRow label="Operating mode" ready={Boolean(c.onboardingReadiness?.checks.deviceReady)} detail={c.onboarding?.device.mode === "browser_only" ? "Browser only" : c.onboardingReadiness?.device?.label ?? "No controller"} />
+              </div>
+
+              <div className="onboarding-section space-y-3">
+                <div className="flex flex-wrap items-start justify-between gap-3">
+                  <div>
+                    <p className="eyebrow">Optional remote console</p>
+                    <h2 className="mt-1 font-display text-base font-semibold text-ink">
+                      {gatewayRemoteReady ? "Remote access is ready" : "Finish tunnel setup on this machine"}
+                    </h2>
+                    <p className="mt-1 text-xs leading-relaxed text-ink-muted">
+                      This is separate from the T3 environment connection. It controls whether you can open Agent Controller from another phone or computer.
+                    </p>
+                  </div>
+                  <StatusBadge
+                    tone={gatewayRemoteReady ? "success" : "warning"}
+                    label={gatewayRemoteReady ? "Configured" : "Optional setup"}
+                  />
+                </div>
+                <RemoteAccessReadiness
+                  status={c.remoteAccess}
+                  mode={gatewayRemoteMode}
+                  compact
+                  refreshing={c.busyAction === "refresh-remote-access"}
+                  onRefresh={() => void c.run(
+                    "refresh-remote-access",
+                    "Remote access status refreshed.",
+                    () => c.loadRemoteAccess(true),
+                  )}
+                />
+                {gatewayRemoteReady && c.remoteAccess?.tailscale.httpsUrl ? (
+                  <a
+                    className="inline-flex min-h-9 items-center justify-center gap-2 self-start rounded-md border border-success/25 bg-success/10 px-3 text-xs font-semibold text-success outline-none hover:bg-success/15 focus-visible:ring-2 focus-visible:ring-focus"
+                    href={c.remoteAccess.tailscale.httpsUrl}
+                    target="_blank"
+                    rel="noreferrer"
+                  >
+                    Open remote console <ArrowRight className="size-3.5" />
+                  </a>
+                ) : (
+                  <div className="onboarding-command">
+                    <div>
+                      <p className="eyebrow">Run on the Agent Controller host</p>
+                      <code>{gatewayTunnelCommand}</code>
+                    </div>
+                    <Button
+                      size="sm"
+                      onClick={() => {
+                        void navigator.clipboard.writeText(gatewayTunnelCommand);
+                        c.setNotice({ tone: "success", message: "Tunnel setup command copied." });
+                      }}
+                    >
+                      <Clipboard className="size-3.5" /> Copy
+                    </Button>
+                  </div>
+                )}
               </div>
 
               {c.onboardingReadiness?.ready ? (

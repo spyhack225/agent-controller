@@ -18,6 +18,51 @@ test("platform tokens authenticate users without exposing token hashes", () => {
   assert.equal(store.authenticateUserToken("wrong"), null);
 });
 
+test("pairing an existing T3 URL updates the original environment and hides legacy duplicates", () => {
+  const store = createMemoryStore({
+    environments: [
+      {
+        id: "env_original",
+        userId: "user_1",
+        label: "Original T3",
+        baseUrl: "http://127.0.0.1:3773",
+        accessToken: "old-token",
+        scopes: ["orchestration:read"],
+        status: "reachable",
+        health: { lastReachableAt: "2026-08-08T12:00:00.000Z" },
+        createdAt: "2026-07-24T12:00:00.000Z",
+        updatedAt: "2026-07-24T12:00:00.000Z",
+      },
+      {
+        id: "env_duplicate",
+        userId: "user_1",
+        label: "Duplicate T3",
+        baseUrl: "http://127.0.0.1:3773",
+        accessToken: "duplicate-token",
+        scopes: ["orchestration:read"],
+        status: "paired",
+        createdAt: "2026-08-08T12:00:00.000Z",
+        updatedAt: "2026-08-08T12:00:00.000Z",
+      },
+    ],
+  });
+
+  assert.deepEqual(store.listEnvironments("user_1").map((environment) => environment.id), ["env_original"]);
+
+  const repaired = store.upsertEnvironment({
+    userId: "user_1",
+    label: "Macbook Air T3 Code",
+    baseUrl: "http://127.0.0.1:3773/",
+    accessToken: "fresh-token",
+    scopes: ["orchestration:read", "orchestration:operate"],
+    status: "paired",
+  });
+
+  assert.equal(repaired.id, "env_original");
+  assert.equal(store.getEnvironmentForUser("user_1", "env_original").accessToken, "fresh-token");
+  assert.equal(store.listEnvironments("user_1").length, 1);
+});
+
 test("device presence is computed from recent activity", async () => {
   const recent = new Date().toISOString();
   const store = createMemoryStore({
@@ -57,6 +102,31 @@ test("device presence is computed from recent activity", async () => {
   const display = await buildUserDisplayState(store, "user_1");
   assert.equal(display.counts.onlineDevices, 1);
   assert.equal(display.counts.offlineDevices, 1);
+});
+
+test("device inventory exposes the confirmed gateway profile selection", () => {
+  const store = createMemoryStore({
+    devices: [{
+      id: "dev_gateway",
+      userId: "user_1",
+      label: "Desk controller",
+      profile: "agent-controller",
+      claimedAt: "2026-08-08T12:00:00.000Z",
+      config: { environmentId: "env_studio" },
+      gatewaySelection: {
+        revision: 4,
+        state: "stable",
+        activeProfileId: "gateway_tailnet",
+        appliedAt: "2026-08-08T12:05:00.000Z",
+      },
+      createdAt: "2026-08-08T12:00:00.000Z",
+    }],
+  });
+
+  const [device] = store.listDevices("user_1");
+  assert.equal(device.gatewaySelection.activeProfileId, "gateway_tailnet");
+  assert.equal(device.gatewaySelection.state, "stable");
+  assert.equal(device.gatewaySelection.revision, 4);
 });
 
 test("observability summary rolls up reliability signals", async () => {

@@ -521,6 +521,78 @@ test("T3 environment snapshot exposes projects and threads for session selection
   assert.equal(snapshots[0].authorization, "Bearer snapshot-token");
 });
 
+test("T3 compatibility checks detect version changes and persist breaking-risk alerts", async (t) => {
+  const originalFetch = globalThis.fetch;
+  let serverVersion = "0.0.33";
+  globalThis.fetch = async (url) => {
+    const parsed = new URL(String(url));
+    if (parsed.hostname === "registry.npmjs.org") {
+      return jsonResponse({ version: "0.0.33" }, 200);
+    }
+    if (parsed.pathname === "/.well-known/t3/environment") {
+      return jsonResponse({ serverVersion }, 200);
+    }
+    if (parsed.pathname === "/api/orchestration/snapshot") {
+      return jsonResponse({ projects: [], threads: [] }, 200);
+    }
+    return jsonResponse({ error: "not found" }, 404);
+  };
+  t.after(() => {
+    globalThis.fetch = originalFetch;
+  });
+
+  const { server } = createApp({
+    config: { demoMode: false },
+    t3CompatibilityRpc: async () => ({ providers: [] }),
+  });
+  await listen(server);
+  t.after(() => server.close());
+  const baseUrl = `http://127.0.0.1:${server.address().port}`;
+  const authHeaders = await createAuthHeaders(originalFetch, baseUrl);
+  await requestJson(originalFetch, baseUrl, "/v1/t3/environments", {
+    method: "POST",
+    headers: authHeaders,
+    body: {
+      label: "Compatibility T3",
+      baseUrl: "https://compatibility-t3.example",
+      accessToken: "compatibility-token",
+    },
+  });
+
+  const first = await requestJson(originalFetch, baseUrl, "/v1/settings/t3-compatibility", {
+    method: "POST",
+    headers: authHeaders,
+    body: {},
+  });
+  assert.equal(first.release.latestVersion, "0.0.33");
+  assert.equal(first.release.status, "review_required");
+  assert.equal(first.results[0].installedVersion, "0.0.33");
+  assert.equal(first.results[0].versionChanged, false);
+
+  serverVersion = "0.0.34";
+  const changed = await requestJson(originalFetch, baseUrl, "/v1/settings/t3-compatibility", {
+    method: "POST",
+    headers: authHeaders,
+    body: {},
+  });
+  assert.equal(changed.results[0].previousVersion, "0.0.33");
+  assert.equal(changed.results[0].versionChanged, true);
+  assert.equal(changed.results[0].breakingRisk, true);
+
+  const saved = await requestJson(originalFetch, baseUrl, "/v1/settings/t3-compatibility", {
+    method: "GET",
+    headers: authHeaders,
+  });
+  assert.equal(saved.results[0].installedVersion, "0.0.34");
+  assert.equal(saved.summary.breakingRisks, 1);
+
+  const alerts = await requestJson(originalFetch, baseUrl, "/v1/observability/alerts", {
+    method: "GET",
+    headers: authHeaders,
+  });
+  assert.equal(alerts.alerts.some((alert) => alert.id === "environment.t3_compatibility_breaking"), true);
+});
+
 test("web users can launch the first T3 thread with any provider instance", async (t) => {
   const originalFetch = globalThis.fetch;
   const dispatches = [];
@@ -1130,6 +1202,34 @@ test("privacy settings apply media retention and purge expired stored bytes", as
   assert.equal(freshAfterPurge.status, 200);
 });
 
+test("remote access settings report machine readiness without exposing command output", async (t) => {
+  const { server } = createApp({
+    config: {
+      host: "0.0.0.0",
+      port: 3996,
+      publicBaseUrl: "https://gateway.example.test",
+      demoMode: false,
+    },
+  });
+  await listen(server);
+  t.after(() => server.close());
+  const baseUrl = `http://127.0.0.1:${server.address().port}`;
+  const authHeaders = await createAuthHeaders(fetch, baseUrl);
+
+  const result = await requestJson(fetch, baseUrl, "/v1/settings/remote-access?refresh=1", {
+    method: "GET",
+    headers: authHeaders,
+  });
+
+  assert.equal(result.remoteAccess.gateway.host, "0.0.0.0");
+  assert.equal(result.remoteAccess.gateway.port, 3996);
+  assert.equal(result.remoteAccess.gateway.publicBaseUrl, "https://gateway.example.test");
+  assert.equal(typeof result.remoteAccess.tailscale.installed, "boolean");
+  assert.equal(typeof result.remoteAccess.tailscale.connected, "boolean");
+  assert.match(result.remoteAccess.checkedAt, /^\d{4}-\d{2}-\d{2}T/u);
+  assert.equal(Object.hasOwn(result.remoteAccess.tailscale, "rawStatus"), false);
+});
+
 test("support diagnostics bundle redacts prompts, shell commands, and secrets", async (t) => {
   const mediaDir = await mkdtemp(join(tmpdir(), "agent-controller-diagnostics-media-"));
   t.after(() => rm(mediaDir, { recursive: true, force: true }));
@@ -1635,21 +1735,40 @@ test("device config is user-managed and used as device intent defaults", async (
   });
   assert.equal(invalidConfig.status, 404);
 
+  const insecureRemoteConfig = await originalFetch(new URL(`/v1/devices/${created.device.id}/config`, baseUrl), {
+    method: "PUT",
+    headers: { "content-type": "application/json", ...authHeaders },
+    body: JSON.stringify({ gatewayAccessMode: "online", gatewayUrl: "http://gateway.example.com" }),
+  });
+  assert.equal(insecureRemoteConfig.status, 400);
+
   const saved = await requestJson(originalFetch, baseUrl, `/v1/devices/${created.device.id}/config`, {
     method: "PUT",
     headers: authHeaders,
     body: {
+      label: "Editing bay controller",
       environmentId: environment.environment.id,
       threadId: "thread_configured",
+      gatewayAccessMode: "online",
+      gatewayUrl: "https://gateway.example.com/",
       defaultPrompt: "Configured prompt from gateway.",
       shellCommand: "npm test -- --watch=false",
       menu: ["status", "prompt", "shell"],
     },
   });
   assert.equal(saved.config.environmentId, environment.environment.id);
+  assert.equal(saved.device.label, "Editing bay controller");
   assert.equal(saved.config.threadId, "thread_configured");
+  assert.equal(saved.config.gatewayAccessMode, "online");
+  assert.equal(saved.config.gatewayUrl, "https://gateway.example.com");
   assert.equal(saved.config.shellCommand, "npm test -- --watch=false");
   assert.deepEqual(saved.config.menu, ["status", "prompt", "shell"]);
+
+  const listed = await requestJson(originalFetch, baseUrl, "/v1/devices", {
+    method: "GET",
+    headers: authHeaders,
+  });
+  assert.equal(listed.devices[0].label, "Editing bay controller");
 
   const deviceConfig = await requestJson(originalFetch, baseUrl, "/v1/device/config", {
     method: "GET",
@@ -1660,6 +1779,8 @@ test("device config is user-managed and used as device intent defaults", async (
   });
   assert.equal(deviceConfig.config.defaultPrompt, "Configured prompt from gateway.");
   assert.equal(deviceConfig.config.shellCommand, "npm test -- --watch=false");
+  assert.equal(deviceConfig.config.gatewayAccessMode, "online");
+  assert.equal(deviceConfig.config.gatewayUrl, "https://gateway.example.com");
 
   const dispatched = await requestJson(originalFetch, baseUrl, "/v1/device/intents", {
     method: "POST",
@@ -2131,7 +2252,29 @@ test("factory batch provisioning returns flash configs and firmware manifests ar
 
   assert.equal(release.release.version, "0.2.0");
   assert.equal(release.manifest.version, "0.2.0");
+  assert.equal(release.manifest.channel, "stable");
   assert.match(release.manifest.signature, /^[a-f0-9]{64}$/u);
+
+  await requestJson(fetch, baseUrl, "/v1/factory/firmware/releases", {
+    method: "POST",
+    headers: { authorization: "Bearer factory-secret" },
+    body: {
+      version: "0.3.0-beta.1",
+      channel: "beta",
+      hardwareModel: "e213-esp32-s3r8",
+      url: "https://cdn.example.com/firmware/agent-controller-0.3.0-beta.1.bin",
+      sha256: "b".repeat(64),
+      sizeBytes: 905000,
+      mandatory: false,
+      releaseNotes: "Beta controls firmware.",
+    },
+  });
+
+  await requestJson(fetch, baseUrl, `/v1/devices/${batch.devices[0].device.id}/firmware-policy`, {
+    method: "PUT",
+    headers: authHeaders,
+    body: { updateMode: "automatic" },
+  });
 
   const update = await requestJson(fetch, baseUrl, "/v1/device/firmware?version=0.1.0&hardware=e213-esp32-s3r8", {
     method: "GET",
@@ -2141,6 +2284,7 @@ test("factory batch provisioning returns flash configs and firmware manifests ar
     },
   });
   assert.equal(update.updateAvailable, true);
+  assert.equal(update.installation, "automatic");
   assert.equal(update.manifest.version, "0.2.0");
   assert.equal(update.manifest.sha256, "a".repeat(64));
 
@@ -2153,6 +2297,66 @@ test("factory batch provisioning returns flash configs and firmware manifests ar
   });
   assert.equal(current.updateAvailable, false);
   assert.equal(current.reason, "current");
+
+  const manualBetaPolicy = await requestJson(fetch, baseUrl, `/v1/devices/${batch.devices[0].device.id}/firmware-policy`, {
+    method: "PUT",
+    headers: authHeaders,
+    body: { channel: "beta", updateMode: "manual" },
+  });
+  assert.equal(manualBetaPolicy.latestVersion, "0.3.0-beta.1");
+  assert.deepEqual(manualBetaPolicy.availableVersions, ["0.3.0-beta.1"]);
+
+  const legacyManualBeta = await requestJson(fetch, baseUrl, "/v1/device/firmware?version=0.1.0&hardware=e213-esp32-s3r8", {
+    method: "GET",
+    headers: {
+      "x-device-id": batch.devices[0].device.id,
+      "x-device-secret": batch.devices[0].secret,
+    },
+  });
+  assert.equal(legacyManualBeta.updateAvailable, false);
+  assert.equal(legacyManualBeta.reason, "manual_or_notify");
+
+  await requestJson(fetch, baseUrl, "/v1/device/heartbeat", {
+    method: "POST",
+    headers: {
+      "x-device-id": batch.devices[0].device.id,
+      "x-device-secret": batch.devices[0].secret,
+    },
+    body: {
+      protocolVersion: 2,
+      firmwareVersion: "0.1.0",
+      hardwareModel: "e213-esp32-s3r8",
+      features: ["ota", "ota_confirm"],
+    },
+  });
+
+  const manualBeta = await requestJson(fetch, baseUrl, "/v1/device/firmware?version=0.1.0&hardware=e213-esp32-s3r8", {
+    method: "GET",
+    headers: {
+      "x-device-id": batch.devices[0].device.id,
+      "x-device-secret": batch.devices[0].secret,
+    },
+  });
+  assert.equal(manualBeta.updateAvailable, true);
+  assert.equal(manualBeta.installation, "confirm");
+  assert.equal(manualBeta.manifest.version, "0.3.0-beta.1");
+
+  await requestJson(fetch, baseUrl, `/v1/devices/${batch.devices[0].device.id}/firmware-policy`, {
+    method: "PUT",
+    headers: authHeaders,
+    body: { desiredVersion: "0.3.0-beta.1" },
+  });
+  const requestedBeta = await requestJson(fetch, baseUrl, "/v1/device/firmware?version=0.1.0&hardware=e213-esp32-s3r8", {
+    method: "GET",
+    headers: {
+      "x-device-id": batch.devices[0].device.id,
+      "x-device-secret": batch.devices[0].secret,
+    },
+  });
+  assert.equal(requestedBeta.updateAvailable, true);
+  assert.equal(requestedBeta.installation, "automatic");
+  assert.equal(requestedBeta.manifest.version, "0.3.0-beta.1");
+  assert.equal(requestedBeta.manifest.channel, "beta");
 });
 
 test("rate limits protect user and device write paths", async (t) => {
@@ -2428,16 +2632,22 @@ function includesCompletedEvent(output, pattern) {
 // owner bound. The owner keeps the boundary that matters; the hardware gets the
 // autonomy that is actually useful at a five-key bezel.
 
-async function threadSelectionFixture(t, { threads } = {}) {
+async function threadSelectionFixture(t, { threads, snapshotError = null } = {}) {
   const originalFetch = globalThis.fetch;
   globalThis.fetch = async (url) => {
     const parsed = new URL(String(url));
     if (parsed.pathname === "/api/orchestration/snapshot") {
+      if (snapshotError) throw snapshotError;
       return jsonResponse({
         projects: [{ id: "p1" }],
         threads: threads ?? [
-          { id: "thread_a", title: "Alpha" },
-          { id: "thread_b", title: "Beta" },
+          { id: "thread_a", title: "Alpha", session: { status: "stopped" } },
+          {
+            id: "thread_b",
+            title: "Beta",
+            session: { status: "stopped" },
+            latestTurn: { state: "running" },
+          },
         ],
       }, 200);
     }
@@ -2472,8 +2682,33 @@ async function threadSelectionFixture(t, { threads } = {}) {
   return { originalFetch, baseUrl, authHeaders, created, deviceHeaders, environment };
 }
 
-test("a device lists selectable threads from the environment its owner bound", async (t) => {
+test("a device lists titled thread status and the current selection from its bound environment", async (t) => {
   const f = await threadSelectionFixture(t);
+  await requestJson(f.originalFetch, f.baseUrl, `/v1/devices/${f.created.device.id}/config`, {
+    method: "PUT",
+    headers: f.authHeaders,
+    body: { environmentId: f.environment.environment.id, threadId: "thread_a" },
+  });
+
+  const listed = await requestJson(f.originalFetch, f.baseUrl, "/v1/device/threads", {
+    headers: f.deviceHeaders,
+  });
+  assert.equal(listed.environmentId, f.environment.environment.id);
+  assert.deepEqual(listed.threads, [
+    { id: "thread_a", title: "Alpha", status: "stopped", selected: true },
+    { id: "thread_b", title: "Beta", status: "running", selected: false },
+  ]);
+  assert.equal(listed.threadId, "thread_a");
+});
+
+test("device thread listing supplies safe title and status fallbacks", async (t) => {
+  const f = await threadSelectionFixture(t, {
+    threads: [
+      { id: "thread_named", name: "Named by provider" },
+      { id: "thread_untitled" },
+      { title: "Missing identity", session: { status: "running" } },
+    ],
+  });
   await requestJson(f.originalFetch, f.baseUrl, `/v1/devices/${f.created.device.id}/config`, {
     method: "PUT",
     headers: f.authHeaders,
@@ -2483,12 +2718,70 @@ test("a device lists selectable threads from the environment its owner bound", a
   const listed = await requestJson(f.originalFetch, f.baseUrl, "/v1/device/threads", {
     headers: f.deviceHeaders,
   });
-  assert.equal(listed.environmentId, f.environment.environment.id);
   assert.deepEqual(listed.threads, [
-    { id: "thread_a", title: "Alpha" },
-    { id: "thread_b", title: "Beta" },
+    { id: "thread_named", title: "Named by provider", status: "idle", selected: false },
+    { id: "thread_untitled", title: "Untitled thread", status: "idle", selected: false },
   ]);
-  assert.equal(listed.threadId, null, "no thread is selected yet");
+});
+
+test("a device reads only its selected thread response through bounded pages", async (t) => {
+  const f = await threadSelectionFixture(t, {
+    threads: [{
+      id: "thread_output",
+      title: "Response task",
+      session: { status: "stopped" },
+      messages: [{
+        id: "message_output",
+        role: "assistant",
+        createdAt: "2026-08-08T20:00:00.000Z",
+        text: "Implemented the hardware response display with paging and safe action validation. <!--AC_FOLLOWUPS:[\"invented_action\"]-->",
+      }],
+    }],
+  });
+  await requestJson(f.originalFetch, f.baseUrl, `/v1/devices/${f.created.device.id}/config`, {
+    method: "PUT",
+    headers: f.authHeaders,
+    body: { environmentId: f.environment.environment.id, threadId: "thread_output" },
+  });
+
+  const output = await requestJson(f.originalFetch, f.baseUrl, "/v1/device/thread-output?page=0", {
+    headers: f.deviceHeaders,
+  });
+  assert.equal(output.thread.id, "thread_output");
+  assert.equal(output.response.messageId, "message_output");
+  assert.equal(output.response.state, "complete");
+  assert.ok(output.response.lines.every((line) => line.length <= 31));
+  assert.doesNotMatch(output.response.lines.join(" "), /AC_FOLLOWUPS/u);
+  assert.deepEqual(output.suggestions, [], "unassigned model output never becomes a device action");
+
+  const waiting = await requestJson(f.originalFetch, f.baseUrl, "/v1/device/thread-output?page=0&after=2026-08-08T21%3A00%3A00.000Z", {
+    headers: f.deviceHeaders,
+  });
+  assert.equal(waiting.response.state, "waiting");
+  assert.equal(waiting.response.messageId, null);
+
+  const invalid = await f.originalFetch(new URL("/v1/device/thread-output?page=-1", f.baseUrl), {
+    headers: f.deviceHeaders,
+  });
+  assert.equal(invalid.status, 400);
+});
+
+test("device thread listing reports a bound T3 host outage as an actionable gateway error", async (t) => {
+  const f = await threadSelectionFixture(t, { snapshotError: new Error("connect ECONNREFUSED") });
+  await requestJson(f.originalFetch, f.baseUrl, `/v1/devices/${f.created.device.id}/config`, {
+    method: "PUT",
+    headers: f.authHeaders,
+    body: { environmentId: f.environment.environment.id },
+  });
+
+  const response = await f.originalFetch(new URL("/v1/device/threads", f.baseUrl), {
+    headers: f.deviceHeaders,
+  });
+  assert.equal(response.status, 502);
+  const body = await response.json();
+  assert.equal(body.error.message, "T3 environment is unavailable.");
+  assert.equal(body.error.details.code, "t3_unreachable");
+  assert.equal(body.error.details.environmentId, f.environment.environment.id);
 });
 
 test("a device can select a thread inside its bound environment", async (t) => {
@@ -2512,6 +2805,20 @@ test("a device can select a thread inside its bound environment", async (t) => {
     headers: f.deviceHeaders,
   });
   assert.equal(reread.config.threadId, "thread_b", "the choice is durable");
+
+  const relisted = await requestJson(f.originalFetch, f.baseUrl, "/v1/device/threads", {
+    headers: f.deviceHeaders,
+  });
+  assert.equal(relisted.threadId, "thread_b");
+  assert.equal(relisted.threads.find((thread) => thread.id === "thread_b")?.selected, true);
+
+  const audit = await requestJson(f.originalFetch, f.baseUrl, "/v1/audit", { headers: f.authHeaders });
+  const event = audit.events.findLast((entry) => (
+    entry.action === "device.config_updated" && entry.metadata?.threadId === "thread_b"
+  ));
+  assert.equal(event?.actorType, "device");
+  assert.equal(event?.actorId, f.created.device.id);
+  assert.equal(event?.targetId, f.created.device.id);
 });
 
 test("a device cannot select a thread that is not in its bound environment", async (t) => {
@@ -2533,6 +2840,24 @@ test("a device cannot select a thread that is not in its bound environment", asy
     headers: f.deviceHeaders,
   });
   assert.equal(reread.config.threadId, "thread_a", "the rejected write changed nothing");
+});
+
+test("device thread selection rejects missing or blank thread ids", async (t) => {
+  const f = await threadSelectionFixture(t);
+  await requestJson(f.originalFetch, f.baseUrl, `/v1/devices/${f.created.device.id}/config`, {
+    method: "PUT",
+    headers: f.authHeaders,
+    body: { environmentId: f.environment.environment.id },
+  });
+
+  for (const body of [{}, { threadId: "   " }]) {
+    const response = await f.originalFetch(new URL("/v1/device/config/thread", f.baseUrl), {
+      method: "POST",
+      headers: { ...f.deviceHeaders, "content-type": "application/json" },
+      body: JSON.stringify(body),
+    });
+    assert.equal(response.status, 400);
+  }
 });
 
 test("thread selection is refused when the owner bound no environment", async (t) => {
@@ -2605,6 +2930,23 @@ test("an unclaimed device cannot list or select threads", async (t) => {
     body: JSON.stringify({ threadId: "thread_a" }),
   });
   assert.equal(wrote.status, 403);
+});
+
+test("invalid device credentials cannot read or change thread selection", async (t) => {
+  const f = await threadSelectionFixture(t);
+  const badHeaders = {
+    "x-device-id": f.created.device.id,
+    "x-device-secret": "wrong-secret",
+  };
+
+  const listed = await f.originalFetch(new URL("/v1/device/threads", f.baseUrl), { headers: badHeaders });
+  assert.equal(listed.status, 401);
+  const wrote = await f.originalFetch(new URL("/v1/device/config/thread", f.baseUrl), {
+    method: "POST",
+    headers: { ...badHeaders, "content-type": "application/json" },
+    body: JSON.stringify({ threadId: "thread_a" }),
+  });
+  assert.equal(wrote.status, 401);
 });
 
 test("the device display payload carries the owner's configured menu, not a generic one", async (t) => {

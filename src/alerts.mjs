@@ -69,6 +69,38 @@ export function evaluateAlerts(summary, thresholds = DEFAULT_ALERT_THRESHOLDS) {
       threshold: 0,
     });
   }
+  if (environments.compatibilityBreakingRisks > 0) {
+    add({
+      id: "environment.t3_compatibility_breaking",
+      severity: "critical",
+      title: "T3 Code compatibility change detected",
+      detail: `${environments.compatibilityBreakingRisks} environment(s) changed in a way that could break Agent Controller.`,
+      metric: "environments.compatibilityBreakingRisks",
+      value: environments.compatibilityBreakingRisks,
+      threshold: 0,
+    });
+  } else if (environments.compatibilityReviewRequired > 0) {
+    add({
+      id: "environment.t3_compatibility_review",
+      severity: "warning",
+      title: "T3 Code version needs compatibility review",
+      detail: `${environments.compatibilityReviewRequired} environment(s) run a version newer than Agent Controller has certified.`,
+      metric: "environments.compatibilityReviewRequired",
+      value: environments.compatibilityReviewRequired,
+      threshold: 0,
+    });
+  }
+  if (environments.compatibilityUpdatesRecommended > 0) {
+    add({
+      id: "environment.t3_update_recommended",
+      severity: "info",
+      title: "T3 Code update recommended",
+      detail: `${environments.compatibilityUpdatesRecommended} environment(s) can update to the recommended supported version.`,
+      metric: "environments.compatibilityUpdatesRecommended",
+      value: environments.compatibilityUpdatesRecommended,
+      threshold: 0,
+    });
+  }
 
   const devices = summary?.devices ?? {};
   if (devices.total > 0 && devices.offline > 0) {

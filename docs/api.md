@@ -4,6 +4,36 @@ This is the initial platform API for device management and T3 Code orchestration
 
 For the ESP32 firmware-facing flow, see [hardware-protocol.md](hardware-protocol.md).
 
+## Gateway Profiles
+
+Owners manage reusable device origins with `GET/POST /v1/gateway-profiles` and
+`GET/PUT/DELETE /v1/gateway-profiles/:id`. A profile is
+`{id,label,mode:"lan"|"tailnet"|"custom",url}`. URLs are origins only: Tailnet profiles require
+HTTPS `.ts.net`, custom profiles require HTTPS, and plaintext LAN profiles require a private,
+link-local, localhost, or `.local` host.
+
+`PUT /v1/devices/:id/gateway` with `{profileId}` stages a revisioned switch. The controller reads
+`GET /v1/device/gateway`, probes the candidate with its existing device credential, and reports
+`POST /v1/device/gateway/switch` with `{revision,profileId,status:"requested"|"applied"|"failed",detail?}`.
+Only an exact revision and owned profile can be promoted. Failure retains the active profile;
+`POST /v1/devices/:id/gateway/rollback` cancels a pending switch.
+
+Authenticated owners can enable or disable private Tailnet-only Serve with
+`POST /v1/settings/remote-access/serve` and `{enabled:boolean}`. Enabling first disables Funnel on
+the same port and verifies Tailscale reports `tailnet only`.
+
+Factory operators can upload an immutable binary with
+`POST /v1/factory/firmware/releases/upload?version=...&channel=stable&hardwareModel=...` using
+`application/octet-stream`. The gateway computes SHA-256 and size, stores the artifact on disk or
+private S3/R2, and emits an authenticated device-download URL. Bucket credentials and object keys
+are not exposed.
+
+Managed artifact URLs in a device firmware manifest carry short-lived `expires` and `token`
+parameters. The HMAC capability is scoped to the artifact SHA-256 and hardware model, allowing
+legacy firmware that cannot attach device headers to complete one OTA hop. New firmware should
+continue sending device headers. Capabilities are rejected after expiry and cannot be reused for a
+different artifact or hardware model.
+
 ## Device Profiles
 
 Discover supported device profiles:
@@ -588,6 +618,37 @@ Use `null` for manual deletion only:
 }
 ```
 
+## T3 Code Compatibility
+
+Read the current supported-release policy and the latest saved compatibility result for every
+paired T3 environment:
+
+```http
+GET /v1/settings/t3-compatibility
+authorization: Bearer PLATFORM_TOKEN
+```
+
+Run a fresh, read-only check against every paired environment:
+
+```http
+POST /v1/settings/t3-compatibility
+authorization: Bearer PLATFORM_TOKEN
+content-type: application/json
+
+{}
+```
+
+Pass `environmentId` to check one environment. The gateway reads
+`/.well-known/t3/environment`, validates the orchestration snapshot contract, compares the
+reported server version with the latest `t3` package release, and persists the result in
+environment health. A later check records `versionChanged` and raises `breakingRisk` when a
+changed version is outside the certified range or a required read-only contract fails.
+
+The response includes the installed, latest, minimum-supported, maximum-tested, and recommended
+versions; individual contract checks; compatibility findings; and a fleet summary. Compatibility
+results also feed `/v1/observability/alerts` so potentially breaking T3 changes appear as critical
+environment alerts.
+
 Purge expired media bytes and metadata:
 
 ```http
@@ -763,6 +824,13 @@ List firmware releases:
 
 ```http
 GET /v1/factory/firmware/releases?hardwareModel=e213-esp32-s3r8
+authorization: Bearer FACTORY_TOKEN
+```
+
+Remove a withdrawn or temporary release so devices cannot keep retrying an unavailable artifact:
+
+```http
+DELETE /v1/factory/firmware/releases/fw_...
 authorization: Bearer FACTORY_TOKEN
 ```
 

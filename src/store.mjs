@@ -44,8 +44,17 @@ export function createStore(seed = {}, options = {}) {
   const devices = new Map((seed.devices ?? []).map((device) => [device.id, device]));
   const environments = new Map((seed.environments ?? []).map((environment) => [environment.id, environment]));
   const firmwareReleases = new Map((seed.firmwareReleases ?? []).map((release) => [release.id, release]));
+  const gatewayProfiles = new Map((seed.gatewayProfiles ?? []).map((profile) => [profile.id, profile]));
   const mediaUploads = new Map((seed.mediaUploads ?? []).map((media) => [media.id, media]));
   const macros = new Map((seed.macros ?? []).map((macro) => [macro.id, macro]));
+  const actions = new Map((seed.actions ?? []).map((action) => [action.id, action]));
+  const deviceControls = new Map(
+    (seed.deviceControls ?? []).map((controls) => [
+      controls.deviceId,
+      { ...controls, explicit: controls.explicit !== false },
+    ]),
+  );
+  const macroRuns = new Map((seed.macroRuns ?? []).map((run) => [run.id, run]));
   // Keyed by user + slug: a profile id is unique per user, not globally.
   const deviceProfiles = new Map(
     (seed.deviceProfiles ?? []).map((profile) => [`${profile.userId}:${profile.profileId}`, profile]),
@@ -72,8 +81,12 @@ export function createStore(seed = {}, options = {}) {
       devices: [...devices.values()],
       environments: [...environments.values()],
       firmwareReleases: [...firmwareReleases.values()],
+      gatewayProfiles: [...gatewayProfiles.values()],
       mediaUploads: [...mediaUploads.values()],
       macros: [...macros.values()],
+      actions: [...actions.values()],
+      deviceControls: [...deviceControls.values()],
+      macroRuns: [...macroRuns.values()],
       deviceProfiles: [...deviceProfiles.values()],
       commands: [...commands.values()],
       commandEvents: [...commandEvents.values()],
@@ -240,6 +253,7 @@ export function createStore(seed = {}, options = {}) {
       lastSeenAt: null,
       status: createDefaultDeviceStatus(),
       config: createDefaultDeviceConfig(),
+      firmwarePolicy: createDefaultFirmwarePolicy(),
       createdAt: nowIso(),
     };
     devices.set(device.id, device);
@@ -270,6 +284,7 @@ export function createStore(seed = {}, options = {}) {
       lastSeenAt: null,
       status: createDefaultDeviceStatus(),
       config: createDefaultDeviceConfig(),
+      firmwarePolicy: createDefaultFirmwarePolicy(),
       createdAt: nowIso(),
     };
     devices.set(device.id, device);
@@ -341,6 +356,7 @@ export function createStore(seed = {}, options = {}) {
     if (!device.revokedAt) return { device: null, reason: "not_revoked" };
     const removed = publicDevice(device);
     devices.delete(deviceId);
+    deviceControls.delete(deviceId);
     audit({
       userId,
       actorType: "user",
@@ -399,6 +415,8 @@ export function createStore(seed = {}, options = {}) {
     device.lastSeenAt = null;
     device.status = createDefaultDeviceStatus();
     device.config = createDefaultDeviceConfig();
+    device.firmwarePolicy = createDefaultFirmwarePolicy();
+    deviceControls.delete(device.id);
     audit({
       userId,
       actorType: "user",
@@ -512,6 +530,10 @@ export function createStore(seed = {}, options = {}) {
   function updateDeviceConfig({ userId, deviceId, config, actorType = "user", actorId }) {
     const device = devices.get(deviceId);
     if (!device || device.userId !== userId || device.revokedAt) return null;
+    const previousLabel = device.label;
+    if (Object.hasOwn(config, "label")) {
+      device.label = normalizeNullableString(config.label) ?? device.label;
+    }
     device.config = normalizeDeviceConfig(config, device.config);
     audit({
       userId,
@@ -520,8 +542,12 @@ export function createStore(seed = {}, options = {}) {
       action: "device.config_updated",
       targetId: device.id,
       metadata: {
+        label: device.label,
+        previousLabel,
         environmentId: device.config.environmentId,
         threadId: device.config.threadId,
+        gatewayAccessMode: device.config.gatewayAccessMode,
+        gatewayUrl: device.config.gatewayUrl,
         menu: device.config.menu,
       },
     });
@@ -529,15 +555,385 @@ export function createStore(seed = {}, options = {}) {
     return publicDevice(device);
   }
 
+  function createGatewayProfile({ userId, label, mode, url }) {
+    const profile = { id: createId("gateway"), userId, label, mode, url, createdAt: nowIso(), updatedAt: nowIso() };
+    gatewayProfiles.set(profile.id, profile);
+    audit({ userId, actorType: "user", action: "gateway_profile.created", targetId: profile.id,
+      metadata: { label, mode, origin: url } });
+    notifyChanged();
+    return { ...profile };
+  }
+
+  function listGatewayProfiles(userId) {
+    return [...gatewayProfiles.values()].filter((profile) => profile.userId === userId)
+      .sort((left, right) => left.createdAt.localeCompare(right.createdAt)).map((profile) => ({ ...profile }));
+  }
+
+  function getGatewayProfileForUser(userId, profileId) {
+    const profile = gatewayProfiles.get(profileId);
+    return profile?.userId === userId ? { ...profile } : null;
+  }
+
+  function updateGatewayProfile({ userId, profileId, label, mode, url }) {
+    const profile = gatewayProfiles.get(profileId);
+    if (!profile || profile.userId !== userId) return null;
+    const deviceIds = [...devices.values()].filter((device) => device.userId === userId
+      && [device.gatewaySelection?.activeProfileId, device.gatewaySelection?.pendingProfileId].includes(profileId))
+      .map((device) => device.id);
+    if (deviceIds.length && (profile.url !== url || profile.mode !== mode)) return { conflict: true, deviceIds };
+    Object.assign(profile, { label, mode, url, updatedAt: nowIso() });
+    audit({ userId, actorType: "user", action: "gateway_profile.updated", targetId: profile.id,
+      metadata: { label, mode, origin: url } });
+    notifyChanged();
+    return { ...profile, conflict: false };
+  }
+
+  function deleteGatewayProfile({ userId, profileId }) {
+    const profile = gatewayProfiles.get(profileId);
+    if (!profile || profile.userId !== userId) return null;
+    const deviceIds = [...devices.values()].filter((device) => device.userId === userId
+      && [device.gatewaySelection?.activeProfileId, device.gatewaySelection?.pendingProfileId].includes(profileId))
+      .map((device) => device.id);
+    if (deviceIds.length) return { conflict: true, deviceIds };
+    gatewayProfiles.delete(profileId);
+    audit({ userId, actorType: "user", action: "gateway_profile.deleted", targetId: profileId,
+      metadata: { label: profile.label, mode: profile.mode } });
+    notifyChanged();
+    return { profile: { ...profile }, conflict: false };
+  }
+
+  function getDeviceGatewaySelection({ userId, deviceId }) {
+    const device = devices.get(deviceId);
+    if (!device || device.userId !== userId) return null;
+    return normalizeGatewaySelection(device.gatewaySelection);
+  }
+
+  function stageDeviceGatewaySwitch({ userId, deviceId, profileId, actorType = "user", actorId = null }) {
+    const device = devices.get(deviceId);
+    const profile = gatewayProfiles.get(profileId);
+    if (!device || device.userId !== userId || device.revokedAt || !profile || profile.userId !== userId) return null;
+    const previous = normalizeGatewaySelection(device.gatewaySelection);
+    device.gatewaySelection = {
+      ...previous,
+      revision: previous.revision + 1,
+      state: "pending",
+      previousProfileId: previous.activeProfileId,
+      pendingProfileId: profileId,
+      requestedAt: nowIso(),
+      lastError: null,
+    };
+    audit({ userId, actorType, ...(actorId ? { actorId } : {}), action: "device.gateway_switch_requested",
+      targetId: deviceId, metadata: { revision: device.gatewaySelection.revision, profileId } });
+    notifyChanged();
+    return structuredClone(device.gatewaySelection);
+  }
+
+  function reportDeviceGatewaySwitch({ userId, deviceId, revision, profileId, status, detail = null }) {
+    const device = devices.get(deviceId);
+    const profile = gatewayProfiles.get(profileId);
+    if (!device || device.userId !== userId || device.revokedAt || !profile || profile.userId !== userId) return null;
+    const previous = normalizeGatewaySelection(device.gatewaySelection);
+    if (revision !== previous.revision) return { conflict: true, selection: previous };
+    if (status === "requested") {
+      const selection = stageDeviceGatewaySwitch({ userId, deviceId, profileId, actorType: "device", actorId: deviceId });
+      return { conflict: false, selection };
+    }
+    if (status === "applied") {
+      if (previous.pendingProfileId && previous.pendingProfileId !== profileId) return { conflict: true, selection: previous };
+      device.gatewaySelection = {
+        ...previous,
+        revision: previous.pendingProfileId ? previous.revision : previous.revision + 1,
+        state: "stable",
+        previousProfileId: previous.activeProfileId,
+        activeProfileId: profileId,
+        pendingProfileId: null,
+        appliedAt: nowIso(),
+        lastError: null,
+      };
+    } else {
+      if (previous.pendingProfileId && previous.pendingProfileId !== profileId) return { conflict: true, selection: previous };
+      device.gatewaySelection = { ...previous, state: "failed", pendingProfileId: null,
+        lastError: detail ?? "Gateway probe failed." };
+    }
+    audit({ userId, actorType: "device", actorId: deviceId,
+      action: status === "applied" ? "device.gateway_switch_applied" : "device.gateway_switch_failed",
+      targetId: deviceId, metadata: { revision: device.gatewaySelection.revision, profileId, detail } });
+    notifyChanged();
+    return { conflict: false, selection: structuredClone(device.gatewaySelection) };
+  }
+
+  function rollbackDeviceGatewaySwitch({ userId, deviceId }) {
+    const device = devices.get(deviceId);
+    if (!device || device.userId !== userId || device.revokedAt) return null;
+    const previous = normalizeGatewaySelection(device.gatewaySelection);
+    device.gatewaySelection = { ...previous, revision: previous.revision + 1, state: "stable",
+      pendingProfileId: null, lastError: null };
+    audit({ userId, actorType: "user", action: "device.gateway_switch_rolled_back", targetId: deviceId,
+      metadata: { revision: device.gatewaySelection.revision, activeProfileId: device.gatewaySelection.activeProfileId } });
+    notifyChanged();
+    return structuredClone(device.gatewaySelection);
+  }
+
+  function createAction(input) {
+    const action = {
+      id: createId("action"),
+      userId: input.userId,
+      type: input.type,
+      label: input.label,
+      payload: structuredClone(input.payload ?? {}),
+      targetMode: input.targetMode ?? "device-current",
+      environmentId: input.environmentId ?? null,
+      threadId: input.threadId ?? null,
+      steps: structuredClone(input.steps ?? []),
+      createdAt: nowIso(),
+      updatedAt: nowIso(),
+    };
+    actions.set(action.id, action);
+    audit({
+      userId: input.userId,
+      actorType: "user",
+      action: "action.created",
+      targetId: action.id,
+      metadata: { label: action.label, type: action.type, stepCount: action.steps.length },
+    });
+    notifyChanged();
+    return publicAction(action);
+  }
+
+  function getActionForUser(userId, actionId) {
+    const action = actions.get(actionId);
+    return action?.userId === userId ? publicAction(action) : null;
+  }
+
+  function listActions(userId) {
+    return [...actions.values()]
+      .filter((action) => action.userId === userId)
+      .map(publicAction);
+  }
+
+  function updateAction({ userId, actionId, ...input }) {
+    const action = actions.get(actionId);
+    if (!action || action.userId !== userId) return null;
+    for (const key of ["type", "label", "targetMode", "environmentId", "threadId"]) {
+      if (input[key] !== undefined) action[key] = input[key];
+    }
+    if (input.payload !== undefined) action.payload = structuredClone(input.payload);
+    if (input.steps !== undefined) action.steps = structuredClone(input.steps);
+    action.updatedAt = nowIso();
+    audit({
+      userId,
+      actorType: "user",
+      action: "action.updated",
+      targetId: action.id,
+      metadata: { label: action.label, type: action.type, stepCount: action.steps.length },
+    });
+    notifyChanged();
+    return publicAction(action);
+  }
+
+  function deleteAction({ userId, actionId }) {
+    const action = actions.get(actionId);
+    if (!action || action.userId !== userId) return null;
+    actions.delete(actionId);
+    const unassignedDeviceIds = [];
+    for (const controls of deviceControls.values()) {
+      if (controls.userId !== userId) continue;
+      const items = controls.items.filter((item) => item.actionId !== actionId);
+      if (items.length === controls.items.length) continue;
+      controls.items = items;
+      controls.revision += 1;
+      controls.updatedAt = nowIso();
+      unassignedDeviceIds.push(controls.deviceId);
+    }
+    audit({
+      userId,
+      actorType: "user",
+      action: "action.deleted",
+      targetId: action.id,
+      metadata: { label: action.label, type: action.type, unassignedDeviceIds },
+    });
+    notifyChanged();
+    return { action: publicAction(action), unassignedDeviceIds };
+  }
+
+  function recordActionRun({ userId, actionId, actorType, actorId, status, intentType = null, commandIds = [] }) {
+    audit({
+      userId,
+      actorType,
+      actorId,
+      action: `action.run_${status}`,
+      targetId: actionId,
+      metadata: { intentType, commandIds: [...commandIds] },
+    });
+    notifyChanged();
+    return true;
+  }
+
+  function createMacroRun(input) {
+    const run = {
+      id: createId("macrorun"),
+      userId: input.userId,
+      actionId: input.actionId,
+      approvalCommandId: input.approvalCommandId,
+      nextStepIndex: input.nextStepIndex,
+      runtime: structuredClone(input.runtime),
+      actor: structuredClone(input.actor),
+      policyContext: structuredClone(input.policyContext ?? {}),
+      baseUrl: input.baseUrl ?? null,
+      executions: structuredClone(input.executions ?? []),
+      status: "waiting_approval",
+      resumeAttempts: 0,
+      resumeClaimedAt: null,
+      result: null,
+      createdAt: nowIso(),
+      updatedAt: nowIso(),
+    };
+    macroRuns.set(run.id, run);
+    notifyChanged();
+    return structuredClone(run);
+  }
+
+  function getMacroRunForApproval({ userId, commandId }) {
+    const run = [...macroRuns.values()].find((candidate) => candidate.userId === userId
+      && candidate.approvalCommandId === commandId);
+    return run ? structuredClone(run) : null;
+  }
+
+  function claimMacroRunForResume({ userId, runId, leaseMs = 30_000 }) {
+    const run = macroRuns.get(runId);
+    if (!run || run.userId !== userId) return null;
+    const claimedAt = Date.parse(run.resumeClaimedAt ?? "");
+    if (run.status === "resuming" && Number.isFinite(claimedAt) && Date.now() - claimedAt < leaseMs) return null;
+    if (!["waiting_approval", "resuming"].includes(run.status)) return null;
+    run.status = "resuming";
+    run.resumeAttempts += 1;
+    run.resumeClaimedAt = nowIso();
+    run.updatedAt = nowIso();
+    notifyChanged();
+    return structuredClone(run);
+  }
+
+  function updateMacroRun({ userId, runId, ...input }) {
+    const run = macroRuns.get(runId);
+    if (!run || run.userId !== userId) return null;
+    for (const key of ["approvalCommandId", "nextStepIndex", "status", "result"]) {
+      if (input[key] !== undefined) run[key] = structuredClone(input[key]);
+    }
+    if (input.executions !== undefined) run.executions = structuredClone(input.executions);
+    run.resumeClaimedAt = input.status === "waiting_approval" ? null : run.resumeClaimedAt;
+    run.updatedAt = nowIso();
+    notifyChanged();
+    return structuredClone(run);
+  }
+
+  function getDeviceControls({ userId, deviceId }) {
+    const device = devices.get(deviceId);
+    if (!device || device.userId !== userId) return null;
+    return publicDeviceControls(deviceControls.get(deviceId) ?? createDefaultDeviceControls(device));
+  }
+
+  function updateDeviceControls({ userId, deviceId, items }) {
+    const device = devices.get(deviceId);
+    if (!device || device.userId !== userId || device.revokedAt) return null;
+    const existing = deviceControls.get(deviceId) ?? createDefaultDeviceControls(device);
+    const controls = {
+      ...existing,
+      explicit: true,
+      userId,
+      deviceId,
+      revision: existing.revision + 1,
+      items: structuredClone(items),
+      updatedAt: nowIso(),
+    };
+    deviceControls.set(deviceId, controls);
+    audit({
+      userId,
+      actorType: "user",
+      action: "device.controls_updated",
+      targetId: deviceId,
+      metadata: { revision: controls.revision, itemCount: controls.items.length },
+    });
+    notifyChanged();
+    return publicDeviceControls(controls);
+  }
+
+  function acknowledgeDeviceControls({
+    userId,
+    deviceId,
+    revision,
+    status = "applied",
+    error = null,
+    appliedCount = null,
+    expectedCount = null,
+  }) {
+    const device = devices.get(deviceId);
+    if (!device || device.userId !== userId || device.revokedAt) return null;
+    const controls = deviceControls.get(deviceId) ?? createDefaultDeviceControls(device);
+    if (!controls.explicit) return { controls: publicDeviceControls(controls), reason: "no_explicit_layout" };
+    let reason = null;
+    if (revision > controls.revision) reason = "future_revision";
+    else if (revision < controls.revision) reason = "stale_revision";
+    else if (appliedCount !== null && expectedCount !== null && appliedCount !== expectedCount) reason = "count_mismatch";
+    if (reason) {
+      controls.lastAckStatus = "rejected";
+      controls.lastAckError = reason === "count_mismatch"
+        ? `Device applied ${appliedCount} controls; gateway resolved ${expectedCount}.`
+        : `Device acknowledged revision ${revision}; current revision is ${controls.revision}.`;
+    } else {
+      controls.appliedRevision = Math.max(controls.appliedRevision ?? 0, revision);
+      controls.appliedAt = nowIso();
+      controls.lastAckStatus = status;
+      controls.lastAckError = error;
+    }
+    deviceControls.set(deviceId, controls);
+    audit({
+      userId,
+      actorType: "device",
+      actorId: deviceId,
+      action: "device.controls_acknowledged",
+      targetId: deviceId,
+      metadata: { revision, status: controls.lastAckStatus, error: controls.lastAckError, appliedCount, expectedCount },
+    });
+    notifyChanged();
+    return { controls: publicDeviceControls(controls), reason };
+  }
+
+  function getDeviceFirmwarePolicy({ userId, deviceId }) {
+    const device = devices.get(deviceId);
+    if (!device || device.userId !== userId) return null;
+    return normalizeFirmwarePolicy({}, device.firmwarePolicy);
+  }
+
+  function updateDeviceFirmwarePolicy({ userId, deviceId, policy, actorType = "user", actorId }) {
+    const device = devices.get(deviceId);
+    if (!device || device.userId !== userId || device.revokedAt) return null;
+    device.firmwarePolicy = normalizeFirmwarePolicy(policy, device.firmwarePolicy);
+    audit({
+      userId,
+      actorType,
+      ...(actorId ? { actorId } : {}),
+      action: actorType === "device" ? "device.firmware_reported" : "device.firmware_policy_updated",
+      targetId: deviceId,
+      metadata: device.firmwarePolicy,
+    });
+    notifyChanged();
+    return { ...device.firmwarePolicy };
+  }
+
   function upsertEnvironment(input) {
     const user = ensureUser({ userId: input.userId });
-    const existing = input.id ? environments.get(input.id) : null;
+    const normalizedBaseUrl = input.baseUrl.replace(/\/+$/u, "");
+    const existing = input.id
+      ? environments.get(input.id)
+      : [...environments.values()]
+        .filter((environment) => environment.userId === user.id && environment.baseUrl === normalizedBaseUrl)
+        .sort((left, right) => Date.parse(left.createdAt) - Date.parse(right.createdAt))[0] ?? null;
     if (input.id && (!existing || existing.userId !== user.id)) return null;
     const environment = {
-      id: input.id ?? createId("env"),
+      id: existing?.id ?? createId("env"),
       userId: user.id,
       label: input.label,
-      baseUrl: input.baseUrl.replace(/\/+$/u, ""),
+      baseUrl: normalizedBaseUrl,
       ...(t3TokenBox.enabled
         ? { accessTokenCiphertext: t3TokenBox.seal(input.accessToken) }
         : { accessToken: input.accessToken }),
@@ -630,21 +1026,28 @@ export function createStore(seed = {}, options = {}) {
   }
 
   function listEnvironments(userId) {
-    return [...environments.values()]
-      .filter((environment) => environment.userId === userId)
-      .map(publicEnvironment);
+    const uniqueByUrl = new Map();
+    for (const environment of [...environments.values()]
+      .filter((item) => item.userId === userId)
+      .sort((left, right) => Date.parse(left.createdAt) - Date.parse(right.createdAt))) {
+      if (!uniqueByUrl.has(environment.baseUrl)) uniqueByUrl.set(environment.baseUrl, environment);
+    }
+    return [...uniqueByUrl.values()].map(publicEnvironment);
   }
 
   function createFirmwareRelease(input) {
     const release = {
       id: createId("fw"),
       version: input.version,
+      channel: input.channel ?? "stable",
       hardwareModel: input.hardwareModel,
       url: input.url,
       sha256: input.sha256,
       sizeBytes: input.sizeBytes,
       mandatory: input.mandatory,
       releaseNotes: input.releaseNotes ?? "",
+      artifactKey: input.artifactKey ?? null,
+      artifactProvider: input.artifactProvider ?? null,
       createdAt: nowIso(),
     };
     firmwareReleases.set(release.id, release);
@@ -655,6 +1058,7 @@ export function createStore(seed = {}, options = {}) {
       targetId: release.id,
       metadata: {
         version: release.version,
+        channel: release.channel,
         hardwareModel: release.hardwareModel,
         mandatory: release.mandatory,
       },
@@ -663,14 +1067,37 @@ export function createStore(seed = {}, options = {}) {
     return release;
   }
 
-  function listFirmwareReleases({ hardwareModel } = {}) {
+  function listFirmwareReleases({ hardwareModel, channel } = {}) {
     return [...firmwareReleases.values()]
-      .filter((release) => !hardwareModel || release.hardwareModel === hardwareModel)
+      .filter((release) => (!hardwareModel || release.hardwareModel === hardwareModel)
+        && (!channel || (release.channel ?? "stable") === channel))
+      .map(publicFirmwareRelease)
       .sort((left, right) => left.createdAt.localeCompare(right.createdAt));
   }
 
-  function getLatestFirmwareRelease({ hardwareModel }) {
-    return listFirmwareReleases({ hardwareModel }).at(-1) ?? null;
+  function deleteFirmwareRelease(releaseId) {
+    const release = firmwareReleases.get(releaseId);
+    if (!release) return null;
+    firmwareReleases.delete(releaseId);
+    audit({
+      userId: "system",
+      actorType: "system",
+      action: "firmware.release_deleted",
+      targetId: releaseId,
+      metadata: { version: release.version, channel: release.channel, hardwareModel: release.hardwareModel },
+    });
+    notifyChanged();
+    return { ...release };
+  }
+
+  function getLatestFirmwareRelease({ hardwareModel, channel }) {
+    return listFirmwareReleases({ hardwareModel, channel }).at(-1) ?? null;
+  }
+
+  function getFirmwareArtifact({ sha256, hardwareModel = null }) {
+    const release = [...firmwareReleases.values()].find((candidate) => candidate.sha256 === sha256
+      && candidate.artifactKey && (!hardwareModel || candidate.hardwareModel === hardwareModel));
+    return release ? { ...release } : null;
   }
 
   function createMediaUpload(input) {
@@ -987,6 +1414,15 @@ export function createStore(seed = {}, options = {}) {
     return command;
   }
 
+  function claimCommandApproval({ userId, commandId, leaseMs = 30_000 }) {
+    const command = commands.get(commandId);
+    if (!command || command.userId !== userId || command.status !== "approval_required") return null;
+    const claimedAt = Date.parse(command.approvalClaimedAt ?? "");
+    if (Number.isFinite(claimedAt) && Date.now() - claimedAt < leaseMs) return null;
+    command.approvalClaimedAt = nowIso();
+    return command;
+  }
+
   function updateCommand({ userId, commandId, status, normalized, result, risk, metrics }) {
     const command = commands.get(commandId);
     if (!command || command.userId !== userId) return null;
@@ -1102,9 +1538,20 @@ export function createStore(seed = {}, options = {}) {
     updateEnvironmentCatalogue,
     getEnvironmentForUser,
     listEnvironments,
+    createGatewayProfile,
+    listGatewayProfiles,
+    getGatewayProfileForUser,
+    updateGatewayProfile,
+    deleteGatewayProfile,
+    getDeviceGatewaySelection,
+    stageDeviceGatewaySwitch,
+    reportDeviceGatewaySwitch,
+    rollbackDeviceGatewaySwitch,
     createFirmwareRelease,
+    deleteFirmwareRelease,
     listFirmwareReleases,
     getLatestFirmwareRelease,
+    getFirmwareArtifact,
     createMediaUpload,
     getMediaForUser,
     createDeviceProfile,
@@ -1118,12 +1565,28 @@ export function createStore(seed = {}, options = {}) {
     listMediaUploads,
     listExpiredMediaUploads,
     deleteMediaUpload,
+    createAction,
+    getActionForUser,
+    listActions,
+    updateAction,
+    deleteAction,
+    recordActionRun,
+    createMacroRun,
+    getMacroRunForApproval,
+    claimMacroRunForResume,
+    updateMacroRun,
+    getDeviceControls,
+    updateDeviceControls,
+    acknowledgeDeviceControls,
+    getDeviceFirmwarePolicy,
+    updateDeviceFirmwarePolicy,
     createMacro,
     getMacroForUser,
     listMacros,
     deleteMacro,
     createCommand,
     getCommandForUser,
+    claimCommandApproval,
     updateCommand,
     listCommands,
     listCommandEvents,
@@ -1150,6 +1613,8 @@ function createDefaultDeviceConfig() {
   return {
     environmentId: null,
     threadId: null,
+    gatewayAccessMode: "local",
+    gatewayUrl: null,
     defaultPrompt: "Continue the current task, inspect progress, and run relevant tests.",
     shellCommand: "npm test",
     menu: ["status", "prompt", "shell", "macro", "thread", "media", "stop"],
@@ -1167,6 +1632,40 @@ function createDefaultDeviceStatus() {
     uptimeMs: null,
     batteryMv: null,
     batteryPercent: null,
+    protocolVersion: 1,
+    features: [],
+    limits: {},
+  };
+}
+
+function createDefaultFirmwarePolicy() {
+  return {
+    channel: "stable",
+    updateMode: "manual",
+    desiredVersion: null,
+    lastUpdateStatus: null,
+    lastUpdateAt: null,
+    lastUpdateError: null,
+    updateProgress: null,
+    targetVersion: null,
+  };
+}
+
+function createDefaultDeviceControls(device) {
+  return {
+    userId: device.userId,
+    deviceId: device.id,
+    revision: 1,
+    explicit: false,
+    items: [
+      { id: "system_status", kind: "status", label: "Status" },
+      { id: "system_stop", kind: "stop", label: "Stop run" },
+    ],
+    appliedRevision: null,
+    appliedAt: null,
+    lastAckStatus: null,
+    lastAckError: null,
+    updatedAt: device.createdAt ?? nowIso(),
   };
 }
 
@@ -1188,7 +1687,57 @@ function normalizeDeviceStatus(input = {}, existing = null, heartbeatAt = nowIso
   if (Object.hasOwn(input, "uptimeMs")) next.uptimeMs = normalizeOptionalNumber(input.uptimeMs);
   if (Object.hasOwn(input, "batteryMv")) next.batteryMv = normalizeOptionalNumber(input.batteryMv);
   if (Object.hasOwn(input, "batteryPercent")) next.batteryPercent = normalizeOptionalNumber(input.batteryPercent);
+  if (Object.hasOwn(input, "protocolVersion")) {
+    const protocolVersion = Number(input.protocolVersion);
+    if (Number.isInteger(protocolVersion) && protocolVersion >= 1) next.protocolVersion = protocolVersion;
+  }
+  if (Object.hasOwn(input, "features")) {
+    next.features = Array.isArray(input.features)
+      ? [...new Set(input.features.filter((feature) => typeof feature === "string" && feature.trim()).map((feature) => feature.trim()))].slice(0, 32)
+      : [];
+  }
+  if (Object.hasOwn(input, "limits")) {
+    next.limits = input.limits && typeof input.limits === "object" && !Array.isArray(input.limits)
+      ? Object.fromEntries(Object.entries(input.limits).filter(([, value]) => Number.isFinite(Number(value))))
+      : {};
+  }
+  if (Object.hasOwn(input, "gateway") && input.gateway && typeof input.gateway === "object" && !Array.isArray(input.gateway)) {
+    next.gateway = normalizeGatewayTelemetry(input.gateway);
+  }
 
+  return next;
+}
+
+function normalizeGatewayTelemetry(input) {
+  const reportedStatus = input.switchStatus ?? input.state;
+  const status = reportedStatus === "stable" ? "active"
+    : reportedStatus === "pending" ? "probing"
+      : ["active", "probing", "failed"].includes(reportedStatus) ? reportedStatus : "active";
+  return {
+    activeProfileId: normalizeNullableString(input.activeProfileId),
+    activeUrl: normalizeNullableString(input.activeUrl),
+    pendingProfileId: normalizeNullableString(input.pendingProfileId),
+    pendingUrl: normalizeNullableString(input.pendingUrl),
+    switchStatus: status,
+    detail: normalizeNullableString(input.detail),
+  };
+}
+
+function normalizeFirmwarePolicy(input = {}, existing = null) {
+  const next = { ...createDefaultFirmwarePolicy(), ...(existing ?? {}) };
+  if (Object.hasOwn(input, "channel") && ["stable", "beta"].includes(input.channel)) {
+    next.channel = input.channel;
+  }
+  if (Object.hasOwn(input, "updateMode") && ["manual", "notify", "automatic"].includes(input.updateMode)) {
+    next.updateMode = input.updateMode;
+  }
+  for (const key of ["desiredVersion", "lastUpdateStatus", "lastUpdateAt", "lastUpdateError", "targetVersion"]) {
+    if (Object.hasOwn(input, key)) next[key] = normalizeNullableString(input[key]);
+  }
+  if (Object.hasOwn(input, "updateProgress")) {
+    const progress = Number(input.updateProgress);
+    next.updateProgress = Number.isFinite(progress) ? Math.max(0, Math.min(100, progress)) : null;
+  }
   return next;
 }
 
@@ -1204,6 +1753,12 @@ function normalizeDeviceConfig(input = {}, existing = null) {
   }
   if (Object.hasOwn(input, "threadId")) {
     next.threadId = normalizeNullableString(input.threadId);
+  }
+  if (Object.hasOwn(input, "gatewayAccessMode") && ["local", "tailscale", "online"].includes(input.gatewayAccessMode)) {
+    next.gatewayAccessMode = input.gatewayAccessMode;
+  }
+  if (Object.hasOwn(input, "gatewayUrl")) {
+    next.gatewayUrl = normalizeNullableString(input.gatewayUrl)?.replace(/\/+$/u, "") ?? null;
   }
   if (Object.hasOwn(input, "defaultPrompt")) {
     const value = normalizeNullableString(input.defaultPrompt);
@@ -1247,6 +1802,7 @@ function normalizeEnvironmentHealth(input = {}, existing = null) {
     lastReachableAt: null,
     lastError: null,
     snapshot: null,
+    compatibility: null,
     ...(existing ?? {}),
   };
   return {
@@ -1255,6 +1811,7 @@ function normalizeEnvironmentHealth(input = {}, existing = null) {
     ...(Object.hasOwn(input, "lastReachableAt") ? { lastReachableAt: normalizeNullableString(input.lastReachableAt) } : {}),
     ...(Object.hasOwn(input, "lastError") ? { lastError: normalizeNullableString(input.lastError) } : {}),
     ...(Object.hasOwn(input, "snapshot") ? { snapshot: input.snapshot ?? null } : {}),
+    ...(Object.hasOwn(input, "compatibility") ? { compatibility: input.compatibility ?? null } : {}),
   };
 }
 
@@ -1352,11 +1909,32 @@ function publicDevice(device) {
   const { secretHash, claimCodeHash, pendingSecretHash, ...publicFields } = device;
   return {
     ...publicFields,
+    gatewaySelection: normalizeGatewaySelection(device.gatewaySelection),
     config: normalizeDeviceConfig({}, device.config),
     status: normalizeDeviceStatus({}, device.status, device.status?.lastHeartbeatAt ?? null),
+    firmwarePolicy: normalizeFirmwarePolicy({}, device.firmwarePolicy),
     presence: buildDevicePresence(device),
     actions: deviceActions(device),
     claimed: Boolean(device.claimedAt),
+  };
+}
+
+function publicFirmwareRelease(release) {
+  if (!release) return null;
+  const { artifactKey, artifactProvider, ...output } = release;
+  return { ...output, channel: release.channel ?? "stable" };
+}
+
+function normalizeGatewaySelection(input = null) {
+  return {
+    revision: Number.isInteger(input?.revision) && input.revision >= 0 ? input.revision : 0,
+    state: ["stable", "pending", "failed"].includes(input?.state) ? input.state : "stable",
+    activeProfileId: input?.activeProfileId ?? null,
+    pendingProfileId: input?.pendingProfileId ?? null,
+    previousProfileId: input?.previousProfileId ?? null,
+    requestedAt: input?.requestedAt ?? null,
+    appliedAt: input?.appliedAt ?? null,
+    lastError: input?.lastError ?? null,
   };
 }
 
@@ -1440,6 +2018,36 @@ function publicMacro(macro) {
     intent: macro.intent,
     createdAt: macro.createdAt,
     updatedAt: macro.updatedAt,
+  };
+}
+
+function publicAction(action) {
+  return {
+    id: action.id,
+    userId: action.userId,
+    type: action.type,
+    label: action.label,
+    payload: structuredClone(action.payload ?? {}),
+    targetMode: action.targetMode ?? "device-current",
+    environmentId: action.environmentId ?? null,
+    threadId: action.threadId ?? null,
+    steps: structuredClone(action.steps ?? []),
+    createdAt: action.createdAt,
+    updatedAt: action.updatedAt,
+  };
+}
+
+function publicDeviceControls(controls) {
+  return {
+    deviceId: controls.deviceId,
+    revision: controls.revision,
+    explicit: controls.explicit === true,
+    items: structuredClone(controls.items ?? []),
+    appliedRevision: controls.appliedRevision ?? null,
+    appliedAt: controls.appliedAt ?? null,
+    lastAckStatus: controls.lastAckStatus ?? null,
+    lastAckError: controls.lastAckError ?? null,
+    updatedAt: controls.updatedAt,
   };
 }
 

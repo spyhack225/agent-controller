@@ -344,9 +344,10 @@ prototype shared-key HMAC); on-device claim QR rendering.
   "flash one image + write an NVS partition". That is faster and lets us ship a single signed binary,
   but it needs `nvs_partition_gen.py` in the manufacturing script and a decision about flash
   encryption keys at the station.
-- **Gateway URL migration.** The heartbeat can carry a new `gatewayUrl`, but a device that follows a
-  bad one is unrecoverable without a physical reset. Probably worth gating behind a signed value, or
-  dropping until there is a concrete migration need.
+- **Gateway URL migration rollout.** The configuration endpoint can carry a new `gatewayUrl`, and
+  current firmware probes that candidate with the device credential before committing it to NVS.
+  Failed probes keep the known-good endpoint. Signed OTA makes this safe migration behavior
+  deployable to existing controllers before an owner enables Tailscale-routed or Online access.
 - **Claim code TTL.** 30 days is a guess. It should outlive warehouse-to-customer transit; if units
   sit in retail inventory longer, the code has to be refreshable from the device menu without the
   owner having claimed it first — which the phase 1 `rotate: true` path already allows.

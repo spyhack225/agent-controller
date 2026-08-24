@@ -41,8 +41,10 @@ export function commandSummary(command: Command): string {
   if (typeof summary === "string" && summary.trim()) return summary;
   if (typeof command.result === "string") return command.result;
   if (command.result && typeof command.result === "object") {
-    const reason = (command.result as JsonRecord).reason;
-    if (typeof reason === "string") return reason;
+    const result = command.result as JsonRecord;
+    const detail = [result.response, result.reason, result.message]
+      .find((candidate) => typeof candidate === "string");
+    if (typeof detail === "string") return detail;
   }
   return "No command detail";
 }
@@ -57,10 +59,24 @@ export function renderEventResult(result: unknown): string {
   if (typeof result === "string") return result;
   if (typeof result === "object") {
     const record = result as JsonRecord;
+    const detail = [record.response, record.reason, record.message, record.output]
+      .find((candidate) => typeof candidate === "string");
+    if (typeof detail === "string" && detail.trim()) return detail;
+    if (isT3DispatchReceipt(record)) return "Sent to T3 Code";
     if (typeof record.status === "string") return record.status;
-    if (typeof record.reason === "string") return record.reason;
   }
-  return JSON.stringify(result);
+  return "Result received";
+}
+
+function isT3DispatchReceipt(record: JsonRecord): boolean {
+  const isSequenceReceipt = (value: unknown) => Boolean(
+    value
+    && typeof value === "object"
+    && typeof (value as JsonRecord).sequence === "number",
+  );
+  return isSequenceReceipt(record)
+    || isSequenceReceipt(record.createThread)
+    || isSequenceReceipt(record.startTurn);
 }
 
 export function formatMediaProcessing(media: MediaItem): string {

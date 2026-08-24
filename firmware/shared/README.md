@@ -9,7 +9,7 @@ stops `esp32-controller` and `vision-master-t190` from drifting into two unrelat
 
 | Unit | What it owns |
 |---|---|
-| `DeviceStore` | Writable device state in NVS (namespace `agentctl`): identity, gateway URL, Wi-Fi credentials, the cached claim code, and the last-known runtime config. |
+| `DeviceStore` | Writable device state in NVS (namespace `agentctl`): identity, gateway profiles and switch journal, Wi-Fi credentials, the cached claim code, and the last-known runtime config. |
 | `Provisioning` | The boot state machine and its first transport, a SoftAP captive portal. |
 
 ### Why this exists
@@ -45,6 +45,8 @@ must change the other, or factory-flashed units authenticate against nothing.
 |---|---|
 | `dev_id`, `dev_secret` | factory flashing station (or a bench seed from `controller_config.h`) |
 | `gw_url` | factory default; the owner can override it in the portal |
+| `gw_profiles`, `gw_rev`, `gw_active` | device-synced gateway profile cache, revision, and active profile; `gw_url` remains the active URL for compatibility |
+| `gw_pending`, `gw_purl`, `gw_prev`, `gw_state`, `gw_error` | two-phase gateway switch journal; an interrupted or failed probe retains the prior working URL |
 | `wifi_ssid`, `wifi_pass` | the owner, through the portal |
 | `claim_code`, `claim_exp` | the device, from the one time `/v1/device/setup-code` returns plaintext |
 | `cfg_cache` | the device, from `/v1/device/config` |

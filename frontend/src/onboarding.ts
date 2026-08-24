@@ -82,8 +82,8 @@ export const networkOptions: Array<{
   },
   {
     id: "tailscale",
-    label: "Tailscale",
-    description: "Private HTTPS access across your Tailnet.",
+    label: "Tailscale Serve",
+    description: "Recommended private HTTPS access across your Tailnet.",
   },
   {
     id: "custom",

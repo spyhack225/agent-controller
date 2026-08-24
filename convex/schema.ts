@@ -92,10 +92,18 @@ export default defineSchema({
       uptimeMs: v.union(v.number(), v.null()),
       batteryMv: v.union(v.number(), v.null()),
       batteryPercent: v.union(v.number(), v.null()),
+      protocolVersion: v.optional(v.number()),
+      features: v.optional(v.array(v.string())),
+      limits: v.optional(v.any()),
+      gateway: v.optional(v.any()),
     })),
+    firmwarePolicy: v.optional(v.any()),
+    gatewaySelection: v.optional(v.any()),
     config: v.object({
       environmentId: v.optional(v.string()),
       threadId: v.optional(v.string()),
+      gatewayAccessMode: v.optional(v.union(v.literal("local"), v.literal("tailscale"), v.literal("online"))),
+      gatewayUrl: v.optional(v.union(v.string(), v.null())),
       defaultPrompt: v.string(),
       shellCommand: v.optional(v.string()),
       menu: v.array(v.string()),
@@ -119,6 +127,7 @@ export default defineSchema({
       lastReachableAt: v.union(v.string(), v.null()),
       lastError: v.union(v.string(), v.null()),
       snapshot: v.any(),
+      compatibility: v.optional(v.any()),
     })),
     providerCatalogue: v.optional(providerCatalogueValidator),
     createdAt: v.string(),
@@ -150,6 +159,57 @@ export default defineSchema({
     updatedAt: v.string(),
   }).index("byUserExternalId", ["userExternalId"]),
 
+  actions: defineTable({
+    userExternalId: v.string(),
+    type: v.string(),
+    label: v.string(),
+    payload: v.any(),
+    targetMode: v.string(),
+    environmentId: v.optional(v.id("environments")),
+    threadId: v.optional(v.string()),
+    steps: v.array(v.object({
+      actionId: v.id("actions"),
+      continueOnFailure: v.boolean(),
+    })),
+    createdAt: v.string(),
+    updatedAt: v.string(),
+  }).index("byUserExternalId", ["userExternalId"]),
+
+  deviceControls: defineTable({
+    userExternalId: v.string(),
+    deviceId: v.id("devices"),
+    revision: v.number(),
+    items: v.any(),
+    appliedRevision: v.optional(v.union(v.number(), v.null())),
+    appliedAt: v.optional(v.union(v.string(), v.null())),
+    lastAckStatus: v.optional(v.union(v.string(), v.null())),
+    lastAckError: v.optional(v.union(v.string(), v.null())),
+    createdAt: v.string(),
+    updatedAt: v.string(),
+  })
+    .index("byUserExternalId", ["userExternalId"])
+    .index("byDeviceId", ["deviceId"]),
+
+  macroRuns: defineTable({
+    userExternalId: v.string(),
+    actionId: v.id("actions"),
+    approvalCommandId: v.id("commands"),
+    nextStepIndex: v.number(),
+    runtime: v.any(),
+    actor: v.any(),
+    policyContext: v.any(),
+    baseUrl: v.optional(v.union(v.string(), v.null())),
+    executions: v.any(),
+    status: v.string(),
+    resumeAttempts: v.number(),
+    resumeClaimedAt: v.optional(v.union(v.string(), v.null())),
+    result: v.any(),
+    createdAt: v.string(),
+    updatedAt: v.string(),
+  })
+    .index("byApprovalCommandId", ["approvalCommandId"])
+    .index("byUserExternalId", ["userExternalId"]),
+
   // User-defined device profiles (roadmap Phase 8 profile editor). The three built-in profiles
   // in src/profiles.mjs stay in code and are never stored here — this table only holds custom
   // ones. Capability *values* are validated in Node against DEVICE_CAPABILITIES; storing a
@@ -164,6 +224,15 @@ export default defineSchema({
     updatedAt: v.string(),
   }).index("byUserExternalIdAndProfileId", ["userExternalId", "profileId"]),
 
+  gatewayProfiles: defineTable({
+    userExternalId: v.string(),
+    label: v.string(),
+    mode: v.string(),
+    url: v.string(),
+    createdAt: v.string(),
+    updatedAt: v.string(),
+  }).index("byUserExternalId", ["userExternalId"]),
+
   commands: defineTable({
     userExternalId: v.string(),
     deviceId: v.optional(v.id("devices")),
@@ -175,6 +244,7 @@ export default defineSchema({
     risk: v.string(),
     result: v.any(),
     metrics: v.optional(v.any()),
+    approvalClaimedAt: v.optional(v.string()),
     createdAt: v.string(),
     updatedAt: v.string(),
   }).index("byUserExternalId", ["userExternalId"]),
@@ -197,12 +267,15 @@ export default defineSchema({
 
   firmwareReleases: defineTable({
     version: v.string(),
+    channel: v.optional(v.string()),
     hardwareModel: v.string(),
     url: v.string(),
     sha256: v.string(),
     sizeBytes: v.number(),
     mandatory: v.boolean(),
     releaseNotes: v.string(),
+    artifactKey: v.optional(v.string()),
+    artifactProvider: v.optional(v.string()),
     createdAt: v.string(),
   }).index("byHardwareModel", ["hardwareModel"]),
 

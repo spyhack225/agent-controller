@@ -21,6 +21,10 @@ import {
 } from "./http.mjs";
 import { normalizeIntent } from "./intent.mjs";
 import {
+  buildDeviceFollowUpInstruction,
+  buildDeviceThreadOutput,
+} from "./deviceThreadOutput.mjs";
+import {
   buildDeviceClaimUrl,
   buildDeviceLabelSvg,
   buildFirmwareManifest,
@@ -31,6 +35,8 @@ import {
   normalizeFirmwareRelease,
 } from "./manufacturing.mjs";
 import { verifyMediaAccessToken } from "./mediaLinks.mjs";
+import { deleteFirmwareArtifact, readFirmwareArtifact, storeFirmwareArtifact } from "./firmwareArtifacts.mjs";
+import { buildFirmwareArtifactUrl, verifyFirmwareArtifactCapability } from "./firmwareLinks.mjs";
 import {
   buildMediaAttachments,
   deleteStoredMedia,
@@ -48,6 +54,14 @@ import {
 } from "./billing.mjs";
 import { evaluateAlerts, summarizeAlerts } from "./alerts.mjs";
 import { buildBetaReadiness } from "./betaReadiness.mjs";
+import {
+  actionControlKind,
+  actionIntent,
+  hardwareSupportsAction,
+  normalizeActionInput,
+  normalizeDeviceControlItems,
+  SYSTEM_CONTROL_IDS,
+} from "./actions.mjs";
 import { describeStoredImage } from "./vision.mjs";
 import { classifyNetworkLocation } from "./networkTrust.mjs";
 import { buildOnboardingReadiness, normalizeOnboarding } from "./onboarding.mjs";
@@ -59,6 +73,8 @@ import {
   validateCustomProfile,
 } from "./profiles.mjs";
 import { createRateLimiter } from "./rateLimit.mjs";
+import { configurePrivateTailscaleServe, inspectRemoteAccess } from "./remoteAccess.mjs";
+import { normalizeGatewayProfileInput, publicGatewayProfile } from "./gatewayProfiles.mjs";
 import { createSnapshotPoller } from "./snapshotPoller.mjs";
 import { createStore } from "./store.mjs";
 import { assertSecureTransport } from "./transport.mjs";
@@ -85,17 +101,42 @@ import {
   fetchT3Snapshot,
   isEnvironmentTokenExpired,
 } from "./t3Client.mjs";
+import {
+  buildT3ReleaseStatus,
+  fetchLatestT3Release,
+  runT3CompatibilityCheck,
+  summarizeT3Compatibility,
+} from "./t3Compatibility.mjs";
 
 const STANDARD_T3_SCOPES = ["orchestration:read", "orchestration:operate"];
 const BILLING_WEBHOOK_TOLERANCE_MS = 5 * 60 * 1000;
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const WEB_DIST_DIR = join(__dirname, "..", "dist", "web");
 
+async function resolveEnvironmentHarnesses(environment, snapshot) {
+  let catalogue = environment.providerCatalogue ?? null;
+  let catalogueSource = catalogue ? "registered" : "snapshot-only";
+  try {
+    const providers = await fetchProviderCatalogue(environment, { timeoutMs: 8000 });
+    catalogue = buildProviderCatalogue(providers, { source: "t3-websocket" });
+    catalogueSource = "live";
+  } catch {
+    // A registered catalogue is still authoritative when the live socket is unavailable. Without
+    // either source, snapshot-derived harnesses remain permissive so custom models keep working.
+  }
+  return {
+    harnesses: extractHarnesses(snapshot, { catalogue }),
+    catalogueSource,
+  };
+}
+
 export function createApp({
   store = null,
   config = loadConfig(),
   rateLimiter = createRateLimiter(),
   clerkAuth = createClerkAuthenticator(config),
+  t3CompatibilityRpc = undefined,
+  remoteAccessControl = configurePrivateTailscaleServe,
 } = {}) {
   store ??= createStore({}, { t3TokenEncryptionKey: config.t3TokenEncryptionKey });
   const events = createEventBroker();
@@ -113,6 +154,21 @@ export function createApp({
     events,
     ...(config.snapshotPollIntervalMs ? { intervalMs: config.snapshotPollIntervalMs } : {}),
   });
+  let remoteAccessCache = null;
+  let remoteAccessCacheExpiresAt = 0;
+
+  async function remoteAccessStatus(force = false) {
+    if (!force && remoteAccessCache && remoteAccessCacheExpiresAt > Date.now()) {
+      return remoteAccessCache;
+    }
+    remoteAccessCache = await inspectRemoteAccess({
+      host: config.host,
+      port: config.port,
+      publicBaseUrl: config.publicBaseUrl,
+    });
+    remoteAccessCacheExpiresAt = Date.now() + 15_000;
+    return remoteAccessCache;
+  }
 
   async function handle(req, res) {
     try {
@@ -277,6 +333,52 @@ export function createApp({
         });
       }
 
+      if (url.pathname === "/v1/gateway-profiles" && req.method === "GET") {
+        const user = await authenticateUser(req, store, config, null, clerkAuth);
+        await enforceUserRead(req, res, rateLimiter, config, user);
+        return sendJson(res, 200, { profiles: (await store.listGatewayProfiles(user.id)).map(publicGatewayProfile) });
+      }
+
+      if (url.pathname === "/v1/gateway-profiles" && req.method === "POST") {
+        const user = await authenticateUser(req, store, config, null, clerkAuth);
+        await enforceUserWrite(req, res, rateLimiter, config, user);
+        if ((await store.listGatewayProfiles(user.id)).length >= 5) {
+          throw new HttpError(409, "A maximum of five gateway profiles is supported per owner.");
+        }
+        const input = normalizeGatewayProfileInput(await readJson(req));
+        const profile = await store.createGatewayProfile({ userId: user.id, ...input });
+        return sendJson(res, 201, { profile: publicGatewayProfile(profile) });
+      }
+
+      const gatewayProfileMatch = url.pathname.match(/^\/v1\/gateway-profiles\/([^/]+)$/u);
+      if (gatewayProfileMatch && req.method === "GET") {
+        const user = await authenticateUser(req, store, config, null, clerkAuth);
+        await enforceUserRead(req, res, rateLimiter, config, user);
+        const profile = await store.getGatewayProfileForUser(user.id, gatewayProfileMatch[1]);
+        if (!profile) throw new HttpError(404, "Gateway profile not found.");
+        return sendJson(res, 200, { profile: publicGatewayProfile(profile) });
+      }
+      if (gatewayProfileMatch && req.method === "PUT") {
+        const user = await authenticateUser(req, store, config, null, clerkAuth);
+        await enforceUserWrite(req, res, rateLimiter, config, user);
+        const existing = await store.getGatewayProfileForUser(user.id, gatewayProfileMatch[1]);
+        if (!existing) throw new HttpError(404, "Gateway profile not found.");
+        const input = normalizeGatewayProfileInput(await readJson(req), existing);
+        const profile = await store.updateGatewayProfile({ userId: user.id, profileId: existing.id, ...input });
+        if (profile?.conflict) throw new HttpError(409, "Create and stage a new profile before changing an assigned gateway URL.", {
+          deviceIds: profile.deviceIds,
+        });
+        return sendJson(res, 200, { profile: publicGatewayProfile(profile) });
+      }
+      if (gatewayProfileMatch && req.method === "DELETE") {
+        const user = await authenticateUser(req, store, config, null, clerkAuth);
+        await enforceUserWrite(req, res, rateLimiter, config, user);
+        const result = await store.deleteGatewayProfile({ userId: user.id, profileId: gatewayProfileMatch[1] });
+        if (!result) throw new HttpError(404, "Gateway profile not found.");
+        if (result.conflict) throw new HttpError(409, "Gateway profile is assigned to a device.", { deviceIds: result.deviceIds });
+        return sendJson(res, 200, { profile: publicGatewayProfile(result.profile), deleted: true });
+      }
+
       if (req.method === "POST" && url.pathname === "/v1/factory/batches") {
         authenticateFactory(req, config);
         await enforceFactoryWrite(req, res, rateLimiter, config);
@@ -346,18 +448,63 @@ export function createApp({
         const input = parseFirmwareRelease(body);
         const release = await store.createFirmwareRelease(input);
         return sendJson(res, 201, {
-          release,
+          release: sanitizeFirmwareRelease(release),
           manifest: buildFirmwareManifest(release, signingKey),
         });
+      }
+
+      if (req.method === "POST" && url.pathname === "/v1/factory/firmware/releases/upload") {
+        authenticateFactory(req, config);
+        await enforceFactoryWrite(req, res, rateLimiter, config);
+        const signingKey = requireOtaSigningKey(config);
+        if (String(req.headers["content-type"] ?? "").split(";", 1)[0].trim().toLowerCase() !== "application/octet-stream") {
+          throw new HttpError(415, "Firmware upload must use application/octet-stream.");
+        }
+        const contentLength = Number(req.headers["content-length"]);
+        if (Number.isFinite(contentLength) && contentLength > config.maxFirmwareBytes) {
+          throw new HttpError(413, `Firmware artifact exceeds ${config.maxFirmwareBytes} bytes.`);
+        }
+        const version = requireString(url.searchParams.get("version"), "version");
+        const channel = optionalString(url.searchParams.get("channel")) ?? "stable";
+        const hardwareModel = optionalString(url.searchParams.get("hardwareModel")) ?? config.defaultHardwareModel;
+        const releaseNotes = optionalString(url.searchParams.get("releaseNotes")) ?? "";
+        const mandatory = url.searchParams.get("mandatory") === "1";
+        const buffer = await readRawBody(req, config.maxFirmwareBytes);
+        const artifact = await storeFirmwareArtifact({ config, buffer, hardwareModel, channel, version });
+        let release;
+        try {
+          const input = parseFirmwareRelease({ version, channel, hardwareModel,
+            url: `/v1/device/firmware/artifacts/${artifact.sha256}`, sha256: artifact.sha256,
+            sizeBytes: artifact.sizeBytes, mandatory, releaseNotes });
+          release = await store.createFirmwareRelease({ ...input, artifactKey: artifact.artifactKey,
+            artifactProvider: artifact.artifactProvider });
+        } catch (error) {
+          await deleteFirmwareArtifact(artifact, config).catch(() => {});
+          throw error;
+        }
+        const publicRelease = sanitizeFirmwareRelease(release);
+        const manifestRelease = { ...publicRelease, url: new URL(publicRelease.url, requestBaseUrl(req)).toString() };
+        return sendJson(res, 201, { release: publicRelease, manifest: buildFirmwareManifest(manifestRelease, signingKey), managedArtifact: true });
       }
 
       if (req.method === "GET" && url.pathname === "/v1/factory/firmware/releases") {
         authenticateFactory(req, config);
         await enforceFactoryWrite(req, res, rateLimiter, config);
         const hardwareModel = optionalString(url.searchParams.get("hardwareModel"));
+        const channel = optionalString(url.searchParams.get("channel"));
         return sendJson(res, 200, {
-          releases: await store.listFirmwareReleases({ hardwareModel }),
+          releases: await store.listFirmwareReleases({ hardwareModel, channel }),
         });
+      }
+
+      const factoryFirmwareReleaseMatch = url.pathname.match(/^\/v1\/factory\/firmware\/releases\/([^/]+)$/u);
+      if (req.method === "DELETE" && factoryFirmwareReleaseMatch) {
+        authenticateFactory(req, config);
+        await enforceFactoryWrite(req, res, rateLimiter, config);
+        const release = await store.deleteFirmwareRelease(factoryFirmwareReleaseMatch[1]);
+        if (!release) throw new HttpError(404, "Firmware release not found.");
+        await deleteFirmwareArtifact(release, config);
+        return sendJson(res, 200, { release: sanitizeFirmwareRelease(release), deleted: true });
       }
 
       if (req.method === "POST" && url.pathname === "/v1/devices") {
@@ -445,6 +592,25 @@ export function createApp({
         const user = await authenticateUser(req, store, config, null, clerkAuth);
         await enforceUserWrite(req, res, rateLimiter, config, user);
         const body = await readJson(req);
+        if (Object.hasOwn(body, "label")) body.label = requireString(body.label, "label");
+        if (Object.hasOwn(body, "gatewayAccessMode") && !["local", "tailscale", "online"].includes(body.gatewayAccessMode)) {
+          throw new HttpError(400, "gatewayAccessMode must be local, tailscale, or online.");
+        }
+        if (Object.hasOwn(body, "gatewayUrl") && body.gatewayUrl !== null && body.gatewayUrl !== "") {
+          const gatewayUrl = requireString(body.gatewayUrl, "gatewayUrl");
+          let parsedGatewayUrl;
+          try {
+            parsedGatewayUrl = new URL(gatewayUrl);
+          } catch {
+            throw new HttpError(400, "gatewayUrl must be a valid HTTP or HTTPS URL.");
+          }
+          if (!["http:", "https:"].includes(parsedGatewayUrl.protocol)) {
+            throw new HttpError(400, "gatewayUrl must be a valid HTTP or HTTPS URL.");
+          }
+          if (body.gatewayAccessMode && body.gatewayAccessMode !== "local" && parsedGatewayUrl.protocol !== "https:") {
+            throw new HttpError(400, "Remote gateway URLs must use HTTPS.");
+          }
+        }
         const environmentId = optionalString(body.environmentId);
         if (environmentId && !(await store.getEnvironmentForUser(user.id, environmentId))) {
           throw new HttpError(404, "Environment not found.");
@@ -456,6 +622,114 @@ export function createApp({
         });
         if (!device) throw new HttpError(404, "Device not found.");
         return sendJson(res, 200, { deviceId: device.id, config: device.config, device });
+      }
+
+      const ownerDeviceGatewayMatch = url.pathname.match(/^\/v1\/devices\/([^/]+)\/gateway$/u);
+      if (ownerDeviceGatewayMatch && req.method === "GET") {
+        const user = await authenticateUser(req, store, config, null, clerkAuth);
+        await enforceUserRead(req, res, rateLimiter, config, user);
+        const device = await store.getDeviceForUser(user.id, ownerDeviceGatewayMatch[1]);
+        if (!device) throw new HttpError(404, "Device not found.");
+        return sendJson(res, 200, await deviceGatewayResponse(store, device));
+      }
+      if (ownerDeviceGatewayMatch && req.method === "PUT") {
+        const user = await authenticateUser(req, store, config, null, clerkAuth);
+        await enforceUserWrite(req, res, rateLimiter, config, user);
+        const device = await store.getDeviceForUser(user.id, ownerDeviceGatewayMatch[1]);
+        if (!device) throw new HttpError(404, "Device not found.");
+        const body = await readJson(req);
+        const profileId = requireString(body.profileId, "profileId");
+        if (!(await store.getGatewayProfileForUser(user.id, profileId))) throw new HttpError(404, "Gateway profile not found.");
+        const selection = await store.stageDeviceGatewaySwitch({ userId: user.id, deviceId: device.id, profileId });
+        if (!selection) throw new HttpError(409, "Gateway switch could not be staged.");
+        return sendJson(res, 200, await deviceGatewayResponse(store, device, selection));
+      }
+
+      const ownerGatewayRollbackMatch = url.pathname.match(/^\/v1\/devices\/([^/]+)\/gateway\/rollback$/u);
+      if (ownerGatewayRollbackMatch && req.method === "POST") {
+        const user = await authenticateUser(req, store, config, null, clerkAuth);
+        await enforceUserWrite(req, res, rateLimiter, config, user);
+        const device = await store.getDeviceForUser(user.id, ownerGatewayRollbackMatch[1]);
+        if (!device) throw new HttpError(404, "Device not found.");
+        const selection = await store.rollbackDeviceGatewaySwitch({ userId: user.id, deviceId: device.id });
+        return sendJson(res, 200, await deviceGatewayResponse(store, device, selection));
+      }
+
+      const deviceControlsMatch = url.pathname.match(/^\/v1\/devices\/([^/]+)\/controls$/u);
+      if (deviceControlsMatch && req.method === "GET") {
+        const user = await authenticateUser(req, store, config, null, clerkAuth);
+        await enforceUserRead(req, res, rateLimiter, config, user);
+        const device = await store.getDeviceForUser(user.id, deviceControlsMatch[1]);
+        if (!device) throw new HttpError(404, "Device not found.");
+        const stored = await store.getDeviceControls({ userId: user.id, deviceId: device.id });
+        return sendJson(res, 200, {
+          deviceId: device.id,
+          controls: await resolveDeviceControls({ store, device, stored, config }),
+          layout: stored,
+        });
+      }
+
+      if (deviceControlsMatch && req.method === "PUT") {
+        const user = await authenticateUser(req, store, config, null, clerkAuth);
+        await enforceUserWrite(req, res, rateLimiter, config, user);
+        const device = await store.getDeviceForUser(user.id, deviceControlsMatch[1]);
+        if (!device) throw new HttpError(404, "Device not found.");
+        const body = await readJson(req);
+        const menuItems = Number(device.status?.limits?.menuItems) || 8;
+        const items = normalizeDeviceControlItems(body.controls ?? body.items, { menuItems });
+        await validateDeviceControlAssignments({ store, device, items, config });
+        const layout = await store.updateDeviceControls({ userId: user.id, deviceId: device.id, items });
+        if (!layout) throw new HttpError(404, "Device not found or revoked.");
+        return sendJson(res, 200, {
+          deviceId: device.id,
+          controls: await resolveDeviceControls({ store, device, stored: layout, config }),
+          layout,
+        });
+      }
+
+      const deviceFirmwarePolicyMatch = url.pathname.match(/^\/v1\/devices\/([^/]+)\/firmware-policy$/u);
+      if (deviceFirmwarePolicyMatch && req.method === "GET") {
+        const user = await authenticateUser(req, store, config, null, clerkAuth);
+        await enforceUserRead(req, res, rateLimiter, config, user);
+        const device = await store.getDeviceForUser(user.id, deviceFirmwarePolicyMatch[1]);
+        if (!device) throw new HttpError(404, "Device not found.");
+        const policy = await store.getDeviceFirmwarePolicy({
+          userId: user.id,
+          deviceId: device.id,
+        });
+        return sendJson(res, 200, await firmwarePolicyResponse({ store, device, policy, config }));
+      }
+
+      if (deviceFirmwarePolicyMatch && req.method === "PUT") {
+        const user = await authenticateUser(req, store, config, null, clerkAuth);
+        await enforceUserWrite(req, res, rateLimiter, config, user);
+        const body = await readJson(req);
+        validateFirmwarePolicyInput(body);
+        const device = await store.getDeviceForUser(user.id, deviceFirmwarePolicyMatch[1]);
+        if (!device) throw new HttpError(404, "Device not found.");
+        const currentPolicy = await store.getDeviceFirmwarePolicy({ userId: user.id, deviceId: device.id });
+        const policyInput = {
+          ...body,
+          ...(body.channel && body.channel !== currentPolicy.channel && !Object.hasOwn(body, "desiredVersion")
+            ? { desiredVersion: null }
+            : {}),
+        };
+        if (policyInput.desiredVersion) {
+          const releases = await compatibleFirmwareReleases(store, device, {
+            ...currentPolicy,
+            ...policyInput,
+          }, config);
+          if (!releases.some((release) => release.version === policyInput.desiredVersion)) {
+            throw new HttpError(404, "The desired firmware version is not available for this hardware and channel.");
+          }
+        }
+        const policy = await store.updateDeviceFirmwarePolicy({
+          userId: user.id,
+          deviceId: device.id,
+          policy: policyInput,
+        });
+        if (!policy) throw new HttpError(404, "Device not found or revoked.");
+        return sendJson(res, 200, await firmwarePolicyResponse({ store, device, policy, config }));
       }
 
       const deviceProfileMatch = url.pathname.match(/^\/v1\/devices\/([^/]+)\/profile$/u);
@@ -515,6 +789,26 @@ export function createApp({
         const user = await authenticateUser(req, store, config, null, clerkAuth);
         await enforceUserRead(req, res, rateLimiter, config, user);
         return sendJson(res, 200, { environments: await store.listEnvironments(user.id) });
+      }
+
+      const environmentCapabilitiesMatch = url.pathname.match(/^\/v1\/t3\/environments\/([^/]+)\/capabilities$/u);
+      if (req.method === "GET" && environmentCapabilitiesMatch) {
+        const user = await authenticateUser(req, store, config, null, clerkAuth);
+        await enforceUserRead(req, res, rateLimiter, config, user);
+        const environment = await store.getEnvironmentForUser(user.id, environmentCapabilitiesMatch[1]);
+        if (!environment) throw new HttpError(404, "Environment not found.");
+        const scopes = new Set(environment.scopes ?? []);
+        return sendJson(res, 200, {
+          environmentId: environment.id,
+          capabilities: {
+            orchestrationRead: scopes.has("orchestration:read"),
+            orchestrationOperate: scopes.has("orchestration:operate"),
+            terminalDirect: scopes.has(TERMINAL_SCOPE),
+            attachments: scopes.has("orchestration:operate"),
+            savedActions: "gateway",
+            macros: "gateway",
+          },
+        });
       }
 
       const environmentMatch = url.pathname.match(/^\/v1\/t3\/environments\/([^/]+)$/u);
@@ -675,18 +969,7 @@ export function createApp({
         } catch (error) {
           throw new HttpError(502, "T3 snapshot is unavailable.", { cause: errorMessage(error) });
         }
-        // Prefer the catalogue read live from T3 over the socket; fall back to one registered by
-        // the setup script, then to whatever the snapshot revealed.
-        let catalogue = null;
-        let catalogueSource = environment.providerCatalogue ? "registered" : "snapshot-only";
-        try {
-          const providers = await fetchProviderCatalogue(environment, { timeoutMs: 8000 });
-          catalogue = buildProviderCatalogue(providers, { source: "t3-websocket" });
-          catalogueSource = "live";
-        } catch {
-          catalogue = environment.providerCatalogue ?? null;
-        }
-        const harnesses = extractHarnesses(snapshot, { catalogue });
+        const { harnesses, catalogueSource } = await resolveEnvironmentHarnesses(environment, snapshot);
         return sendJson(res, 200, {
           harnesses,
           usable: usableHarnesses(harnesses).map((harness) => harness.instanceId),
@@ -709,20 +992,36 @@ export function createApp({
         const snapshot = await fetchT3Snapshot({ ...environment, timeoutMs: 5000 });
         const project = snapshot.projects?.find((candidate) => candidate.id === projectId);
         if (!project) throw new HttpError(404, "T3 project not found.");
-        const modelSelection = normalizeT3ModelSelection(body.modelSelection)
-          ?? normalizeT3ModelSelection(project.defaultModelSelection);
-        if (!modelSelection) {
-          throw new HttpError(409, "Select a provider instance and model before launching this project.");
-        }
-        // T3 accepts the dispatch and only then has the provider reject an unknown model, which
-        // leaves the command stuck looking successful. Refuse the bad pair before it is sent.
-        const harnesses = extractHarnesses(snapshot, { catalogue: environment.providerCatalogue });
-        const invalid = validateModelSelection(modelSelection, harnesses);
+        const requestedModelSelection = normalizeT3ModelSelection(body.modelSelection);
+        const projectDefaultModelSelection = normalizeT3ModelSelection(project.defaultModelSelection);
+        const { harnesses, catalogueSource } = await resolveEnvironmentHarnesses(environment, snapshot);
+        const invalid = requestedModelSelection
+          ? validateModelSelection(requestedModelSelection, harnesses)
+          : null;
+        let modelSelection = resolveModelSelection({
+          harnesses,
+          requested: requestedModelSelection,
+          projectDefault: projectDefaultModelSelection,
+        });
+        let modelRecovery = null;
         if (invalid) {
-          throw new HttpError(422, invalid.reason, {
-            modelSelection,
-            ...(invalid.known ? { known: invalid.known } : {}),
-            catalogueSource: environment.providerCatalogue ? "registered" : "snapshot-only",
+          if (!modelSelection) {
+            throw new HttpError(422, invalid.reason, {
+              modelSelection: requestedModelSelection,
+              ...(invalid.known ? { known: invalid.known } : {}),
+              catalogueSource,
+            });
+          }
+          modelRecovery = {
+            requested: requestedModelSelection,
+            selected: modelSelection,
+            reason: invalid.reason,
+            catalogueSource,
+          };
+        }
+        if (!modelSelection) {
+          throw new HttpError(409, "T3 did not report an available provider model.", {
+            catalogueSource,
           });
         }
         const startedAt = Date.now();
@@ -746,10 +1045,17 @@ export function createApp({
             environmentId: environment.id,
             threadId: launch.threadId,
             intent: { type: "agent_prompt", text },
-            normalized: { type: "thread.launch", ...launch },
+            normalized: {
+              type: "thread.launch",
+              ...launch,
+              ...(modelRecovery ? { modelRecovery } : {}),
+            },
             status: "failed",
             risk: "medium",
-            result: t3FailureResult(error),
+            result: {
+              ...t3FailureResult(error),
+              ...(modelRecovery ? { modelRecovery } : {}),
+            },
             metrics: commandMetrics({ startedAt, dispatchStartedAt, failure: true }),
           });
           throw new HttpError(502, "T3 project launch failed.", {
@@ -763,16 +1069,24 @@ export function createApp({
           environmentId: environment.id,
           threadId: launch.threadId,
           intent: { type: "agent_prompt", text },
-          normalized: { type: "thread.launch", ...launch },
+          normalized: {
+            type: "thread.launch",
+            ...launch,
+            ...(modelRecovery ? { modelRecovery } : {}),
+          },
           status: "dispatched",
           risk: "medium",
-          result,
+          result: {
+            ...result,
+            ...(modelRecovery ? { modelRecovery } : {}),
+          },
           metrics: commandMetrics({ startedAt, dispatchStartedAt, completed: true }),
         });
         return sendJson(res, 202, {
           project,
           threadId: launch.threadId,
           modelSelection,
+          modelRecovery,
           command,
         });
       }
@@ -806,6 +1120,37 @@ export function createApp({
         const user = await authenticateUser(req, store, config, null, clerkAuth);
         await enforceUserRead(req, res, rateLimiter, config, user);
         return sendJson(res, 200, { macros: await store.listMacros(user.id) });
+      }
+
+      if (req.method === "GET" && url.pathname === "/v1/actions") {
+        const user = await authenticateUser(req, store, config, null, clerkAuth);
+        await enforceUserRead(req, res, rateLimiter, config, user);
+        const [actions, devices] = await Promise.all([store.listActions(user.id), store.listDevices(user.id)]);
+        const deviceIdsByAction = new Map(actions.map((action) => [action.id, []]));
+        for (const device of devices) {
+          const layout = await store.getDeviceControls({ userId: user.id, deviceId: device.id });
+          if (!layout?.explicit) continue;
+          for (const item of layout.items) {
+            if (item.actionId && deviceIdsByAction.has(item.actionId)) {
+              deviceIdsByAction.get(item.actionId).push(device.id);
+            }
+          }
+        }
+        return sendJson(res, 200, {
+          actions: actions.map((action) => ({
+            ...action,
+            deviceIds: [...new Set(deviceIdsByAction.get(action.id) ?? [])],
+          })),
+        });
+      }
+
+      if (req.method === "POST" && url.pathname === "/v1/actions") {
+        const user = await authenticateUser(req, store, config, null, clerkAuth);
+        await enforceUserWrite(req, res, rateLimiter, config, user);
+        const input = normalizeActionInput(await readJson(req));
+        await validateSavedActionInput(store, user.id, input);
+        const action = await store.createAction({ userId: user.id, ...input });
+        return sendJson(res, 201, { action });
       }
 
       if (req.method === "POST" && url.pathname === "/v1/macros") {
@@ -896,6 +1241,93 @@ export function createApp({
         return sendJson(res, 200, { privacy: await store.getUserPrivacySettings(user.id) });
       }
 
+      if (req.method === "GET" && url.pathname === "/v1/settings/remote-access") {
+        const user = await authenticateUser(req, store, config, null, clerkAuth);
+        await enforceUserRead(req, res, rateLimiter, config, user);
+        return sendJson(res, 200, {
+          remoteAccess: await remoteAccessStatus(url.searchParams.get("refresh") === "1"),
+        });
+      }
+
+      if (req.method === "POST" && url.pathname === "/v1/settings/remote-access/serve") {
+        const user = await authenticateUser(req, store, config, null, clerkAuth);
+        await enforceUserWrite(req, res, rateLimiter, config, user);
+        const body = await readJson(req);
+        if (typeof body.enabled !== "boolean") throw new HttpError(400, "enabled must be a boolean.");
+        try {
+          await remoteAccessControl({ enabled: body.enabled, gatewayPort: config.port, httpsPort: 443 });
+        } catch (error) {
+          throw new HttpError(409, errorMessage(error));
+        }
+        remoteAccessCache = null;
+        remoteAccessCacheExpiresAt = 0;
+        return sendJson(res, 200, { remoteAccess: await remoteAccessStatus(true) });
+      }
+
+      if (req.method === "GET" && url.pathname === "/v1/settings/t3-compatibility") {
+        const user = await authenticateUser(req, store, config, null, clerkAuth);
+        await enforceUserRead(req, res, rateLimiter, config, user);
+        const environments = await store.listEnvironments(user.id);
+        const release = await t3ReleaseStatus();
+        const results = environments.map((environment) => environment.health?.compatibility ?? {
+          environmentId: environment.id,
+          environmentLabel: environment.label,
+          checkedAt: null,
+          installedVersion: null,
+          status: "unchecked",
+          compatible: false,
+          breakingRisk: false,
+          checks: [],
+          findings: [],
+          recommendation: "Run a compatibility check to read this T3 Code version.",
+          recommendedVersion: release.recommendedVersion,
+          minimumVersion: release.minimumVersion,
+          maximumTestedVersion: release.maximumTestedVersion,
+          latestVersion: release.latestVersion,
+        });
+        return sendJson(res, 200, {
+          release,
+          results,
+          summary: summarizeT3Compatibility(results, release),
+        });
+      }
+
+      if (req.method === "POST" && url.pathname === "/v1/settings/t3-compatibility") {
+        const user = await authenticateUser(req, store, config, null, clerkAuth);
+        await enforceUserWrite(req, res, rateLimiter, config, user);
+        const body = await readJson(req);
+        const environmentId = optionalString(body.environmentId);
+        const listed = await store.listEnvironments(user.id);
+        const targets = environmentId
+          ? listed.filter((environment) => environment.id === environmentId)
+          : listed;
+        if (environmentId && targets.length === 0) throw new HttpError(404, "Environment not found.");
+
+        const release = await t3ReleaseStatus();
+        const results = [];
+        for (const listedEnvironment of targets) {
+          const environment = await store.getEnvironmentForUser(user.id, listedEnvironment.id);
+          if (!environment) continue;
+          const result = await runT3CompatibilityCheck({
+            environment,
+            latestVersion: release.latestVersion,
+            previous: listedEnvironment.health?.compatibility ?? null,
+            rpcImpl: t3CompatibilityRpc,
+          });
+          await store.updateEnvironmentHealth({
+            userId: user.id,
+            environmentId: environment.id,
+            health: { compatibility: result },
+          });
+          results.push(result);
+        }
+        return sendJson(res, 200, {
+          release,
+          results,
+          summary: summarizeT3Compatibility(results, release),
+        });
+      }
+
       if (req.method === "PUT" && url.pathname === "/v1/settings/privacy") {
         const user = await authenticateUser(req, store, config, null, clerkAuth);
         await enforceUserWrite(req, res, rateLimiter, config, user);
@@ -947,9 +1379,71 @@ export function createApp({
         await enforceUserWrite(req, res, rateLimiter, config, user);
         const [, commandId, action] = commandActionMatch;
         const output = action === "approve"
-          ? await approveCommand({ store, userId: user.id, commandId })
+          ? await approveCommand({ store, userId: user.id, commandId, config })
           : await rejectCommand({ store, userId: user.id, commandId });
         return sendJson(res, action === "approve" ? 202 : 200, output);
+      }
+
+      const savedActionMatch = url.pathname.match(/^\/v1\/actions\/([^/]+)(?:\/(run))?$/u);
+      if (savedActionMatch && req.method === "GET" && !savedActionMatch[2]) {
+        const user = await authenticateUser(req, store, config, null, clerkAuth);
+        await enforceUserRead(req, res, rateLimiter, config, user);
+        const action = await store.getActionForUser(user.id, savedActionMatch[1]);
+        if (!action) throw new HttpError(404, "Action not found.");
+        return sendJson(res, 200, { action });
+      }
+
+      if (savedActionMatch && req.method === "PUT" && !savedActionMatch[2]) {
+        const user = await authenticateUser(req, store, config, null, clerkAuth);
+        await enforceUserWrite(req, res, rateLimiter, config, user);
+        const existing = await store.getActionForUser(user.id, savedActionMatch[1]);
+        if (!existing) throw new HttpError(404, "Action not found.");
+        const input = normalizeActionInput(await readJson(req), existing);
+        if (["media", "macro"].includes(input.type) && input.type !== existing.type) {
+          const referencingMacroIds = await referencingMacroActionIds(store, user.id, existing.id);
+          if (referencingMacroIds.length > 0) {
+            throw new HttpError(409, "An action used by a macro cannot be changed to media or macro.", { referencingMacroIds });
+          }
+        }
+        await validateSavedActionInput(store, user.id, input, existing.id);
+        const action = await store.updateAction({ userId: user.id, actionId: existing.id, ...input });
+        return sendJson(res, 200, { action });
+      }
+
+      if (savedActionMatch && req.method === "DELETE" && !savedActionMatch[2]) {
+        const user = await authenticateUser(req, store, config, null, clerkAuth);
+        await enforceUserWrite(req, res, rateLimiter, config, user);
+        const referencingMacroIds = await referencingMacroActionIds(store, user.id, savedActionMatch[1]);
+        if (referencingMacroIds.length > 0) {
+          throw new HttpError(409, "Remove this action from its macros before deleting it.", { referencingMacroIds });
+        }
+        const result = await store.deleteAction({ userId: user.id, actionId: savedActionMatch[1] });
+        if (!result) throw new HttpError(404, "Action not found.");
+        return sendJson(res, 200, { ...result, deleted: true });
+      }
+
+      if (savedActionMatch && req.method === "POST" && savedActionMatch[2] === "run") {
+        const user = await authenticateUser(req, store, config, null, clerkAuth);
+        await enforceUserWrite(req, res, rateLimiter, config, user);
+        const body = await readJson(req);
+        const action = await store.getActionForUser(user.id, savedActionMatch[1]);
+        if (!action) throw new HttpError(404, "Action not found.");
+        const output = await executeSavedAction({
+          store,
+          action,
+          runtime: body,
+          actor: { type: "user", id: user.id, userId: user.id, profile: "power-controller" },
+          config,
+          baseUrl: requestBaseUrl(req),
+          policyContext: {
+            user,
+            networkLocation: classifyNetworkLocation(req, config),
+            ...(config.billingEnforced
+              ? { subscriptionTier: effectiveTier(await store.getUserSubscription?.(user.id)) }
+              : {}),
+          },
+        });
+        return sendJson(res, actionRunStatus(output), { action, ...output });
       }
 
       const macroActionMatch = url.pathname.match(/^\/v1\/macros\/([^/]+)(?:\/(run))?$/u);
@@ -1134,7 +1628,7 @@ export function createApp({
         const body = await readJson(req);
         const updatedDevice = await store.recordDeviceHeartbeat({
           deviceId: device.id,
-          status: body.status ?? body,
+          status: { ...(body.status ?? body), ...(body.gateway ? { gateway: body.gateway } : {}) },
         });
         return sendJson(res, 200, { ok: true, device: updatedDevice ?? device });
       }
@@ -1210,7 +1704,183 @@ export function createApp({
         const device = await authenticateDevice(req, store, url, config);
         await enforceDeviceRead(req, res, rateLimiter, config, device);
         requireClaimedDevice(device);
-        return sendJson(res, 200, { deviceId: device.id, config: device.config });
+        const gateway = await deviceGatewayResponse(store, device);
+        return sendJson(res, 200, {
+          deviceId: device.id,
+          config: {
+            ...device.config,
+            gatewayProfiles: gateway.profiles,
+            activeGatewayProfileId: gateway.activeProfileId,
+            gatewaySelection: gateway,
+          },
+        });
+      }
+
+      if (req.method === "GET" && url.pathname === "/v1/device/gateway") {
+        const device = await authenticateDevice(req, store, url, config);
+        await enforceDeviceRead(req, res, rateLimiter, config, device);
+        requireClaimedDevice(device);
+        return sendJson(res, 200, await deviceGatewayResponse(store, device));
+      }
+
+      if (req.method === "POST" && url.pathname === "/v1/device/gateway/switch") {
+        const device = await authenticateDevice(req, store, null, config);
+        await enforceDeviceWrite(req, res, rateLimiter, config, device);
+        requireClaimedDevice(device);
+        const body = await readJson(req);
+        const revision = Number(body.revision);
+        if (!Number.isInteger(revision) || revision < 0) throw new HttpError(400, "revision must be a non-negative integer.");
+        const profileId = requireString(body.profileId, "profileId");
+        const status = requireString(body.status, "status");
+        if (!["requested", "applied", "failed"].includes(status)) {
+          throw new HttpError(400, "status must be requested, applied, or failed.");
+        }
+        const profile = await store.getGatewayProfileForUser(device.userId, profileId);
+        if (!profile) throw new HttpError(404, "Gateway profile not found.");
+        if (body.activeUrl) {
+          let activeOrigin;
+          try { activeOrigin = new URL(requireString(body.activeUrl, "activeUrl")).origin; }
+          catch { throw new HttpError(400, "activeUrl must be a valid URL."); }
+          if (new URL(profile.url).origin !== activeOrigin) {
+            throw new HttpError(409, "activeUrl does not match the selected gateway profile.");
+          }
+        }
+        const result = await store.reportDeviceGatewaySwitch({
+          userId: device.userId, deviceId: device.id, revision, profileId, status,
+          detail: optionalString(body.detail) ?? null,
+        });
+        if (!result) throw new HttpError(409, "Gateway switch could not be recorded.");
+        if (result.conflict) throw new HttpError(409, "Gateway switch revision or pending profile does not match.", {
+          gateway: await deviceGatewayResponse(store, device, result.selection),
+        });
+        return sendJson(res, 200, await deviceGatewayResponse(store, device, result.selection));
+      }
+
+      if (req.method === "GET" && url.pathname === "/v1/device/controls") {
+        const device = await authenticateDevice(req, store, url, config);
+        await enforceDeviceRead(req, res, rateLimiter, config, device);
+        requireClaimedDevice(device);
+        const stored = await store.getDeviceControls({ userId: device.userId, deviceId: device.id });
+        if (!stored?.explicit) throw new HttpError(404, "No protocol-v2 controls layout is assigned.");
+        const controls = await resolveDeviceControls({ store, device, stored, config, forFirmware: true });
+        return sendJson(res, 200, { revision: stored.revision, controls });
+      }
+
+      if (req.method === "POST" && url.pathname === "/v1/device/controls/ack") {
+        const device = await authenticateDevice(req, store, null, config);
+        await enforceDeviceWrite(req, res, rateLimiter, config, device);
+        requireClaimedDevice(device);
+        const body = await readJson(req);
+        const revision = Number(body.revision);
+        if (!Number.isInteger(revision) || revision < 1) {
+          throw new HttpError(400, "revision must be a positive integer.");
+        }
+        const stored = await store.getDeviceControls({ userId: device.userId, deviceId: device.id });
+        if (!stored?.explicit) throw new HttpError(404, "No protocol-v2 controls layout is assigned.");
+        const resolved = await resolveDeviceControls({ store, device, stored, config, forFirmware: true });
+        const appliedCount = body.appliedCount === undefined ? null : Number(body.appliedCount);
+        if (appliedCount !== null && (!Number.isInteger(appliedCount) || appliedCount < 0)) {
+          throw new HttpError(400, "appliedCount must be a non-negative integer.");
+        }
+        const result = await store.acknowledgeDeviceControls({
+          userId: device.userId,
+          deviceId: device.id,
+          revision,
+          status: optionalString(body.status) ?? "applied",
+          error: optionalString(body.error),
+          appliedCount,
+          expectedCount: resolved.length,
+        });
+        if (result?.reason) {
+          throw new HttpError(409, "Controls acknowledgement does not match the current layout.", {
+            reason: result.reason,
+            currentRevision: result.controls.revision,
+            appliedRevision: result.controls.appliedRevision,
+          });
+        }
+        return sendJson(res, 200, { acknowledged: true, revision });
+      }
+
+      const deviceSavedActionRunMatch = url.pathname.match(/^\/v1\/device\/actions\/([^/]+)\/run$/u);
+      if (req.method === "POST" && deviceSavedActionRunMatch) {
+        const device = await authenticateDevice(req, store, null, config);
+        await enforceDeviceWrite(req, res, rateLimiter, config, device);
+        requireClaimedDevice(device);
+        const actionId = deviceSavedActionRunMatch[1];
+        const layout = await store.getDeviceControls({ userId: device.userId, deviceId: device.id });
+        if (!layout?.explicit) throw new HttpError(403, "This device has no assigned controls layout.");
+        const assigned = layout.items.some((item) => item.actionId === actionId)
+          || layout.items.some((item) => !item.actionId && item.id === actionId && systemDeviceAction(actionId));
+        if (!assigned) {
+          throw new HttpError(403, "This action is not assigned to the device.");
+        }
+        const body = await readJson(req);
+        const action = await systemDeviceAction(actionId) ?? await store.getActionForUser(device.userId, actionId);
+        if (!action) throw new HttpError(404, "Action not found.");
+        if (action.type === "media") {
+          const mediaUploadId = requireString(body.mediaUploadId, "mediaUploadId");
+          const media = await store.getMediaForUser(device.userId, mediaUploadId);
+          if (!media || media.deviceId !== device.id) {
+            await store.recordActionRun?.({
+              userId: device.userId,
+              actionId: action.id,
+              actorType: "device",
+              actorId: device.id,
+              status: "blocked",
+              intentType: action.payload.mediaKind === "audio" ? "audio_prompt" : "camera_prompt",
+            });
+            throw new HttpError(403, "Device media actions may only use media captured by this device.");
+          }
+          if (media.kind !== action.payload.mediaKind) {
+            await store.recordActionRun?.({
+              userId: device.userId,
+              actionId: action.id,
+              actorType: "device",
+              actorId: device.id,
+              status: "blocked",
+              intentType: action.payload.mediaKind === "audio" ? "audio_prompt" : "camera_prompt",
+            });
+            throw new HttpError(409, `This action requires ${action.payload.mediaKind} media.`);
+          }
+        }
+        // Follow-up recommendations are optional enrichment for actions that start an agent turn.
+        // Built-in Status/Stop never produce an assistant response, so resolving the entire Action
+        // Library here only adds failure modes to otherwise independent system controls. Likewise,
+        // a stale unrelated library entry must not prevent a valid saved action from running.
+        let followUpInstruction = null;
+        if (!systemDeviceAction(actionId)) {
+          try {
+            const resolvedControls = await resolveDeviceControls({
+              store,
+              device,
+              stored: layout,
+              config,
+              forFirmware: true,
+            });
+            followUpInstruction = buildDeviceFollowUpInstruction(resolvedControls, actionId);
+          } catch (error) {
+            console.warn(`[follow-ups] skipped for device action ${actionId}: ${errorMessage(error)}`);
+          }
+        }
+        const output = await executeSavedAction({
+          store,
+          action,
+          runtime: {
+            environmentId: device.config?.environmentId,
+            threadId: device.config?.threadId,
+            mediaUploadId: optionalString(body.mediaUploadId),
+            __followUpInstruction: followUpInstruction,
+          },
+          actor: { type: "device", id: device.id, userId: device.userId, profile: device.profile },
+          config,
+          baseUrl: requestBaseUrl(req),
+          policyContext: { networkLocation: classifyNetworkLocation(req, config) },
+        });
+        return sendJson(res, actionRunStatus(output), {
+          actionId,
+          responseAfter: actionResponseAfter(output),
+          ...output,
+        });
       }
 
       // Threads the device may switch to. Deliberately scoped to the environment the
@@ -1222,12 +1892,60 @@ export function createApp({
         await enforceDeviceRead(req, res, rateLimiter, config, device);
         requireClaimedDevice(device);
         const environment = await boundDeviceEnvironment(store, device);
-        const snapshot = await fetchT3Snapshot(environment);
+        let snapshot;
+        try {
+          snapshot = await fetchT3Snapshot(environment);
+        } catch (error) {
+          throw new HttpError(502, "T3 environment is unavailable.", {
+            code: "t3_unreachable",
+            environmentId: environment.id,
+            cause: errorMessage(error),
+          });
+        }
         return sendJson(res, 200, {
           environmentId: environment.id,
           threadId: device.config?.threadId ?? null,
-          threads: deviceSelectableThreads(snapshot),
+          threads: deviceSelectableThreads(snapshot, device.config?.threadId),
         });
+      }
+
+      // A controller receives only the currently selected thread's display-safe page.
+      // It cannot supply an arbitrary thread id, and model-proposed actions are reduced
+      // to assigned, enabled opaque ids before they cross the device boundary.
+      if (req.method === "GET" && url.pathname === "/v1/device/thread-output") {
+        const device = await authenticateDevice(req, store, url, config);
+        await enforceDeviceRead(req, res, rateLimiter, config, device);
+        requireClaimedDevice(device);
+        const threadId = optionalString(device.config?.threadId);
+        if (!threadId) throw new HttpError(409, "Device has no thread selected.");
+        const pageText = url.searchParams.get("page") ?? "0";
+        if (!/^\d+$/u.test(pageText)) throw new HttpError(400, "page must be a non-negative integer.");
+        const after = optionalString(url.searchParams.get("after"));
+        if (after && !Number.isFinite(Date.parse(after))) throw new HttpError(400, "after must be an ISO timestamp.");
+        const environment = await boundDeviceEnvironment(store, device);
+        let snapshot;
+        try {
+          snapshot = await fetchT3Snapshot(environment);
+        } catch (error) {
+          throw new HttpError(502, "T3 environment is unavailable.", {
+            code: "t3_unreachable",
+            environmentId: environment.id,
+            cause: errorMessage(error),
+          });
+        }
+        const thread = (Array.isArray(snapshot?.threads) ? snapshot.threads : [])
+          .find((candidate) => optionalString(candidate?.id) === threadId);
+        if (!thread) throw new HttpError(404, "Selected thread was not found in the bound environment.");
+        const stored = await store.getDeviceControls({ userId: device.userId, deviceId: device.id });
+        const controls = stored?.explicit
+          ? await resolveDeviceControls({ store, device, stored, config, forFirmware: true })
+          : [];
+        return sendJson(res, 200, buildDeviceThreadOutput({
+          thread,
+          controls,
+          page: Number.parseInt(pageText, 10),
+          after,
+        }));
       }
 
       // The one piece of its own config a device may write. Anything else stays
@@ -1240,8 +1958,17 @@ export function createApp({
         const body = await readJson(req);
         const threadId = requireString(body.threadId, "threadId");
         const environment = await boundDeviceEnvironment(store, device);
-        const snapshot = await fetchT3Snapshot(environment);
-        const threads = deviceSelectableThreads(snapshot);
+        let snapshot;
+        try {
+          snapshot = await fetchT3Snapshot(environment);
+        } catch (error) {
+          throw new HttpError(502, "T3 environment is unavailable.", {
+            code: "t3_unreachable",
+            environmentId: environment.id,
+            cause: errorMessage(error),
+          });
+        }
+        const threads = deviceSelectableThreads(snapshot, device.config?.threadId);
         // Validated against the live snapshot, so a device cannot invent a thread id
         // or reach one belonging to a different environment.
         if (!threads.some((thread) => thread.id === threadId)) {
@@ -1258,6 +1985,50 @@ export function createApp({
         return sendJson(res, 200, { deviceId: updated.id, config: updated.config });
       }
 
+      const deviceFirmwareArtifactMatch = url.pathname.match(/^\/v1\/device\/firmware\/artifacts\/([a-f0-9]{64})$/u);
+      if (req.method === "GET" && deviceFirmwareArtifactMatch) {
+        const headerDeviceId = optionalString(req.headers["x-device-id"]);
+        const headerDeviceSecret = optionalString(req.headers["x-device-secret"]);
+        if (Boolean(headerDeviceId) !== Boolean(headerDeviceSecret)) {
+          throw new HttpError(400, "Both x-device-id and x-device-secret are required for device authentication.");
+        }
+        let device = null;
+        let hardwareModel;
+        if (headerDeviceId && headerDeviceSecret) {
+          device = await authenticateDevice(req, store, url, config);
+          await enforceDeviceRead(req, res, rateLimiter, config, device);
+          requireClaimedDevice(device);
+          hardwareModel = optionalString(device.status?.hardwareModel) ?? config.defaultHardwareModel;
+        } else {
+          hardwareModel = requireString(url.searchParams.get("hardware"), "hardware");
+        }
+        const release = await store.getFirmwareArtifact({ sha256: deviceFirmwareArtifactMatch[1], hardwareModel });
+        if (!release) throw new HttpError(404, "Firmware artifact not found for this hardware.");
+        if (device) {
+          const policy = await store.getDeviceFirmwarePolicy({ userId: device.userId, deviceId: device.id });
+          if ((release.channel ?? "stable") !== (policy?.channel ?? "stable")
+            && policy?.desiredVersion !== release.version && !release.mandatory) {
+            throw new HttpError(403, "Firmware artifact is not allowed by this device's release policy.");
+          }
+        } else if (!verifyFirmwareArtifactCapability({
+          sha256: release.sha256,
+          hardwareModel: release.hardwareModel,
+          expires: url.searchParams.get("expires"),
+          token: url.searchParams.get("token"),
+          signingKey: firmwareDownloadSigningKey(config),
+          ttlSeconds: config.firmwareDownloadTtlSeconds,
+        })) {
+          throw new HttpError(403, "Firmware download capability is invalid or expired.");
+        }
+        const artifact = await readFirmwareArtifact(release, config);
+        return sendBuffer(res, 200, artifact, {
+          "content-type": "application/octet-stream",
+          "cache-control": device ? "private, max-age=31536000, immutable" : "private, no-store",
+          "content-disposition": `attachment; filename="agent-controller-${release.version}.bin"`,
+          "x-firmware-sha256": release.sha256,
+        });
+      }
+
       if (req.method === "GET" && url.pathname === "/v1/device/firmware") {
         const device = await authenticateDevice(req, store, url, config);
         await enforceDeviceRead(req, res, rateLimiter, config, device);
@@ -1267,13 +2038,22 @@ export function createApp({
         const hardwareModel = optionalString(url.searchParams.get("hardware"))
           ?? optionalString(req.headers["x-hardware-model"])
           ?? config.defaultHardwareModel;
-        const release = await store.getLatestFirmwareRelease({ hardwareModel });
+        const policy = await store.getDeviceFirmwarePolicy({ userId: device.userId, deviceId: device.id });
+        let release = await store.getLatestFirmwareRelease({ hardwareModel, channel: policy?.channel ?? "stable" });
+        if (policy?.desiredVersion) {
+          const releases = await store.listFirmwareReleases({
+            hardwareModel,
+            channel: policy.channel ?? "stable",
+          });
+          release = releases.find((candidate) => candidate.version === policy.desiredVersion) ?? null;
+        }
         if (!release) {
           return sendJson(res, 200, {
             updateAvailable: false,
             currentVersion,
             hardwareModel,
             reason: "no_release",
+            policy,
           });
         }
         if (!isNewerVersion(release.version, currentVersion)) {
@@ -1283,14 +2063,86 @@ export function createApp({
             hardwareModel,
             latestVersion: release.version,
             reason: "current",
+            policy,
           });
         }
+        // A newer compatible release is visible to controllers that advertise the local-confirm
+        // interaction. Older firmware treated every updateAvailable response as permission to
+        // write flash, so it must retain the historical false response under manual/notify policy.
+        // Explicitly queued, automatic, and mandatory releases keep the unattended install path.
+        const supportsLocalConfirmation = Array.isArray(device.status?.features)
+          && device.status.features.includes("ota_confirm");
+        if (!release.mandatory && !policy?.desiredVersion && policy?.updateMode !== "automatic"
+          && !supportsLocalConfirmation) {
+          return sendJson(res, 200, {
+            updateAvailable: false,
+            currentVersion,
+            hardwareModel,
+            latestVersion: release.version,
+            reason: "manual_or_notify",
+            policy,
+          });
+        }
+        const installation = release.mandatory || policy?.desiredVersion || policy?.updateMode === "automatic"
+          ? "automatic"
+          : "confirm";
         return sendJson(res, 200, {
           updateAvailable: true,
           currentVersion,
           hardwareModel,
-          manifest: buildFirmwareManifest(release, signingKey),
+          installation,
+          policy,
+          manifest: buildFirmwareManifest({
+            ...release,
+            url: buildFirmwareArtifactUrl({
+              release,
+              baseUrl: requestBaseUrl(req),
+              signingKey: firmwareDownloadSigningKey(config),
+              ttlSeconds: config.firmwareDownloadTtlSeconds,
+            }),
+          }, signingKey),
         });
+      }
+
+      if (req.method === "POST"
+        && ["/v1/device/firmware/status", "/v1/device/firmware/report"].includes(url.pathname)) {
+        const device = await authenticateDevice(req, store, null, config);
+        await enforceDeviceWrite(req, res, rateLimiter, config, device);
+        requireClaimedDevice(device);
+        const body = await readJson(req);
+        const state = requireString(body.state, "state");
+        if (![
+          "available", "downloading", "installing", "rebooting", "verified", "failed", "rolled_back",
+        ].includes(state)) {
+          throw new HttpError(400, "Unsupported firmware update state.");
+        }
+        const currentPolicy = await store.getDeviceFirmwarePolicy({ userId: device.userId, deviceId: device.id });
+        const reportedVersion = optionalString(body.version);
+        const targetVersion = optionalString(body.targetVersion);
+        const fulfilledDesiredVersion = state === "verified"
+          && currentPolicy?.desiredVersion
+          && [reportedVersion, targetVersion].includes(currentPolicy.desiredVersion);
+        const policy = await store.updateDeviceFirmwarePolicy({
+          userId: device.userId,
+          deviceId: device.id,
+          actorType: "device",
+          actorId: device.id,
+          policy: {
+            lastUpdateStatus: state,
+            lastUpdateAt: new Date().toISOString(),
+            lastUpdateError: state === "failed" ? optionalString(body.detail) ?? "Firmware update failed." : null,
+            targetVersion,
+            updateProgress: body.progress,
+            ...(fulfilledDesiredVersion ? { desiredVersion: null } : {}),
+          },
+        });
+        if (reportedVersion) {
+          await store.recordDeviceHeartbeat({
+            deviceId: device.id,
+            status: { ...device.status, firmwareVersion: reportedVersion },
+          });
+        }
+        return sendJson(res, 200, { accepted: true, policy });
       }
 
       if (req.method === "GET" && url.pathname === "/v1/device/events") {
@@ -1317,7 +2169,7 @@ export function createApp({
         requireClaimedDevice(device);
         const [, commandId, action] = deviceApprovalMatch;
         const output = action === "approve"
-          ? await approveCommand({ store, userId: device.userId, commandId })
+          ? await approveCommand({ store, userId: device.userId, commandId, config })
           : await rejectCommand({ store, userId: device.userId, commandId });
         return sendJson(res, action === "approve" ? 202 : 200, output);
       }
@@ -1490,6 +2342,452 @@ async function onboardingResponse(store, userId, onboarding) {
   };
 }
 
+async function validateSavedActionInput(store, userId, input, actionId = null) {
+  if (input.environmentId && !(await store.getEnvironmentForUser(userId, input.environmentId))) {
+    throw new HttpError(404, "Environment not found.");
+  }
+  if (input.type !== "macro") return;
+  const seen = new Set(actionId ? [actionId] : []);
+  for (const step of input.steps) {
+    const referenced = await store.getActionForUser(userId, step.actionId);
+    if (!referenced) throw new HttpError(404, `Macro step action not found: ${step.actionId}.`);
+    await assertMacroStepSupported(store, userId, referenced, new Set());
+    if (actionId && await actionReferences(store, userId, referenced, actionId, seen)) {
+      throw new HttpError(409, "Macro actions cannot contain a reference cycle.");
+    }
+  }
+}
+
+async function referencingMacroActionIds(store, userId, actionId) {
+  return (await store.listActions(userId))
+    .filter((action) => action.type === "macro"
+      && (action.steps ?? []).some((step) => step.actionId === actionId))
+    .map((action) => action.id);
+}
+
+async function assertMacroStepSupported(store, userId, action, seen) {
+  if (action.type === "media") {
+    throw new HttpError(409, "Media actions cannot be used as macro steps because capture requires direct device input.");
+  }
+  if (action.type === "macro") {
+    throw new HttpError(409, "Nested macros are not supported; macro steps must reference prompt or shell actions.");
+  }
+}
+
+async function actionReferences(store, userId, action, targetId, seen = new Set()) {
+  if (action.id === targetId) return true;
+  if (action.type !== "macro" || seen.has(action.id)) return false;
+  seen.add(action.id);
+  for (const step of action.steps ?? []) {
+    if (step.actionId === targetId) return true;
+    const nested = await store.getActionForUser(userId, step.actionId);
+    if (nested && await actionReferences(store, userId, nested, targetId, seen)) return true;
+  }
+  return false;
+}
+
+async function validateDeviceControlAssignments({ store, device, items, config }) {
+  for (const item of items) {
+    if (!item.actionId) continue;
+    const action = await store.getActionForUser(device.userId, item.actionId);
+    if (!action) throw new HttpError(404, `Action not found: ${item.actionId}.`);
+    const hardware = hardwareSupportsAction(action, device.status);
+    if (!hardware.supported) throw new HttpError(409, hardware.reason, { actionId: action.id });
+    const availability = await savedActionAvailability({ store, device, action, config });
+    if (!availability.enabled && availability.reason?.includes("cannot perform")) {
+      throw new HttpError(409, availability.reason, { actionId: action.id });
+    }
+  }
+}
+
+async function resolveDeviceControls({ store, device, stored, config, forFirmware = false }) {
+  const labelCharacters = Math.max(1, Math.min(80, Number(device.status?.limits?.labelCharacters) || 18));
+  const resolvedLabel = (label) => forFirmware
+    ? Array.from(String(label)).slice(0, labelCharacters).join("")
+    : String(label);
+  const controls = [];
+  for (const item of stored.items ?? []) {
+    if (!item.actionId) {
+      const availability = await systemControlAvailability({ store, device, kind: item.kind, config });
+      controls.push({
+        id: item.id,
+        label: resolvedLabel(item.label),
+        kind: item.kind,
+        ...(["status", "stop"].includes(item.kind) ? { actionId: SYSTEM_CONTROL_IDS[item.kind] } : {}),
+        requiresThread: item.kind === "stop",
+        requiresConfirmation: ["stop", "reset"].includes(item.kind),
+        enabled: availability.enabled,
+        ...(availability.reason ? { reason: availability.reason } : {}),
+      });
+      continue;
+    }
+    const action = await store.getActionForUser(device.userId, item.actionId);
+    if (!action) {
+      controls.push({
+        id: item.id,
+        label: resolvedLabel(item.label ?? "Unavailable action"),
+        kind: "remote_action",
+        actionId: item.actionId,
+        enabled: false,
+        reason: "The saved action was deleted.",
+      });
+      continue;
+    }
+    const availability = await savedActionAvailability({ store, device, action, config });
+    controls.push({
+      id: item.id,
+      label: resolvedLabel(item.label ?? action.label),
+      kind: actionControlKind(action),
+      actionId: action.id,
+      ...(action.type === "media" ? { mediaKind: action.payload.mediaKind } : {}),
+      // Device-current actions are meaningless until the owner has selected a task. Every saved
+      // action receives a local review screen; policy approval remains an independent server step.
+      requiresThread: action.targetMode !== "fixed",
+      requiresConfirmation: true,
+      enabled: availability.enabled,
+      ...(availability.reason ? { reason: availability.reason } : {}),
+    });
+  }
+  return controls;
+}
+
+async function savedActionAvailability({
+  store,
+  device,
+  action,
+  config,
+  seen = new Set(),
+  inheritedEnvironmentId = null,
+  inheritedThreadId = null,
+}) {
+  if (seen.has(action.id)) return { enabled: false, reason: "This macro contains a reference cycle." };
+  const hardware = hardwareSupportsAction(action, device.status);
+  if (!hardware.supported) return { enabled: false, reason: hardware.reason };
+  const environmentId = action.targetMode === "fixed"
+    ? action.environmentId
+    : inheritedEnvironmentId ?? device.config?.environmentId;
+  if (!environmentId) return { enabled: false, reason: "No T3 environment is selected." };
+  const environment = await store.getEnvironmentForUser(device.userId, environmentId);
+  if (!environment) return { enabled: false, reason: "The selected T3 environment is unavailable." };
+  const threadId = action.targetMode === "fixed"
+    ? action.threadId
+    : inheritedThreadId ?? device.config?.threadId;
+  if (!threadId && action.type !== "macro") return { enabled: false, reason: "No T3 task is selected." };
+  if (action.type === "macro") {
+    const nextSeen = new Set(seen).add(action.id);
+    for (const step of action.steps ?? []) {
+      const nested = await store.getActionForUser(device.userId, step.actionId);
+      if (!nested) return { enabled: false, reason: `Macro step ${step.actionId} is unavailable.` };
+      if (nested.type === "media") {
+        return { enabled: false, reason: "Media actions cannot be used as macro steps." };
+      }
+      if (nested.type === "macro") return { enabled: false, reason: "Nested macros are not supported." };
+      const result = await savedActionAvailability({
+        store,
+        device,
+        action: nested,
+        config,
+        seen: nextSeen,
+        inheritedEnvironmentId: environmentId,
+        inheritedThreadId: threadId,
+      });
+      if (!result.enabled) return result;
+    }
+    return { enabled: true, reason: null };
+  }
+  const representativeRuntime = action.type === "media" ? { mediaUploadId: "availability-check" } : {};
+  const policy = evaluateIntentPolicy({
+    device: { profile: await resolveActorProfile(store, device.userId, device.profile) },
+    intent: actionIntent(action, representativeRuntime),
+    environment,
+    ...(config.policyAllowedHours ? { allowedHours: config.policyAllowedHours } : {}),
+  });
+  if (policy.allowed) return { enabled: true, reason: null };
+  if (policy.requiresApproval) return { enabled: true, reason: "Execution requires owner approval." };
+  return { enabled: false, reason: policy.reason };
+}
+
+async function systemControlAvailability({ store, device, kind, config }) {
+  if (kind === "reset") return { enabled: true, reason: null };
+  const environmentId = device.config?.environmentId;
+  if (!environmentId) return { enabled: false, reason: "No T3 environment is selected." };
+  const environment = await store.getEnvironmentForUser(device.userId, environmentId);
+  if (!environment) return { enabled: false, reason: "The selected T3 environment is unavailable." };
+  if (kind === "stop" && !device.config?.threadId) {
+    return { enabled: false, reason: "No T3 task is selected." };
+  }
+  const intent = kind === "stop"
+    ? { type: "session_control", action: "stop" }
+    : { type: "status" };
+  const policy = evaluateIntentPolicy({
+    device: { profile: await resolveActorProfile(store, device.userId, device.profile) },
+    intent,
+    environment,
+    ...(config.policyAllowedHours ? { allowedHours: config.policyAllowedHours } : {}),
+  });
+  return policy.allowed || policy.requiresApproval
+    ? { enabled: true, reason: policy.requiresApproval ? "Execution requires owner approval." : null }
+    : { enabled: false, reason: policy.reason };
+}
+
+async function executeSavedAction({
+  store,
+  action,
+  runtime,
+  actor,
+  config,
+  baseUrl,
+  policyContext,
+  stack = [],
+}) {
+  if (stack.includes(action.id)) throw new HttpError(409, "Macro actions cannot contain a reference cycle.");
+  const environmentId = requireString(
+    action.targetMode === "fixed" ? action.environmentId : runtime.environmentId,
+    "environmentId",
+  );
+  const environment = await store.getEnvironmentForUser(actor.userId, environmentId);
+  if (!environment) throw new HttpError(404, "Environment not found.");
+  const threadId = optionalString(action.targetMode === "fixed" ? action.threadId : runtime.threadId);
+
+  if (action.type === "macro") {
+    const startStepIndex = Number.isInteger(runtime.__macroStartIndex) ? runtime.__macroStartIndex : 0;
+    const executions = Array.isArray(runtime.__macroExecutions) ? structuredClone(runtime.__macroExecutions) : [];
+    const stepActions = [];
+    for (const step of action.steps ?? []) {
+      stepActions.push(await store.getActionForUser(actor.userId, step.actionId));
+    }
+    const resumeSupported = stepActions.every((nested) => nested && nested.type !== "macro" && nested.type !== "media");
+    let aggregateStatus = "completed";
+    let nextStepIndex = null;
+    let approvalCommandId = null;
+    for (let index = startStepIndex; index < (action.steps ?? []).length; index += 1) {
+      const step = action.steps[index];
+      const nested = stepActions[index];
+      if (!nested) throw new HttpError(409, `Macro step action is unavailable: ${step.actionId}.`);
+      if (nested.type === "media") throw new HttpError(409, "Media actions cannot be used as macro steps.");
+      if (nested.type === "macro") throw new HttpError(409, "Nested macros are not supported.");
+      try {
+        const output = await executeSavedAction({
+          store,
+          action: nested,
+          runtime: { ...runtime, environmentId, threadId },
+          actor,
+          config,
+          baseUrl,
+          policyContext,
+          stack: [...stack, action.id],
+        });
+        executions.push({ index, actionId: nested.id, ...output });
+        const status = savedActionOutputStatus(output);
+        if (["approval_required", "failed", "blocked"].includes(status)) {
+          aggregateStatus = status;
+          nextStepIndex = index + 1;
+          approvalCommandId = status === "approval_required" ? output.command?.id ?? null : null;
+          break;
+        }
+        if (status === "dispatched" && aggregateStatus === "completed") aggregateStatus = "dispatched";
+      } catch (error) {
+        if (step.continueOnFailure) {
+          executions.push({ index, actionId: nested.id, error: errorMessage(error), continued: true });
+          aggregateStatus = "failed";
+          continue;
+        }
+        await store.recordActionRun?.({
+          userId: actor.userId,
+          actionId: action.id,
+          actorType: actor.type,
+          actorId: actor.id,
+          status: failedActionStatus(error),
+          intentType: "macro",
+          commandIds: error?.details?.command?.id ? [error.details.command.id] : [],
+        });
+        throw error;
+      }
+    }
+    const output = {
+      macro: {
+        actionId: action.id,
+        status: aggregateStatus,
+        executions,
+        resumeSupported,
+        ...(nextStepIndex !== null && nextStepIndex < action.steps.length
+          ? {
+              nextStepIndex,
+              remainingActionIds: action.steps.slice(nextStepIndex).map((step) => step.actionId),
+            }
+          : {}),
+      },
+    };
+    if (aggregateStatus === "approval_required" && approvalCommandId && resumeSupported) {
+      const run = runtime.__macroRunId
+        ? await store.updateMacroRun({
+            userId: actor.userId,
+            runId: runtime.__macroRunId,
+            approvalCommandId,
+            nextStepIndex,
+            executions,
+            status: "waiting_approval",
+            result: output,
+          })
+        : await store.createMacroRun({
+            userId: actor.userId,
+            actionId: action.id,
+            approvalCommandId,
+            nextStepIndex,
+            runtime: cleanMacroRuntime(runtime, environmentId, threadId),
+            actor,
+            policyContext: {
+              ...policyContext,
+              __policyAllowedHours: config.policyAllowedHours ?? null,
+            },
+            baseUrl,
+            executions,
+          });
+      output.macro.runId = run?.id ?? null;
+    } else if (runtime.__macroRunId) {
+      await store.updateMacroRun({
+        userId: actor.userId,
+        runId: runtime.__macroRunId,
+        status: aggregateStatus,
+        executions,
+        result: output,
+      });
+      output.macro.runId = runtime.__macroRunId;
+    }
+    await store.recordActionRun?.({
+      userId: actor.userId,
+      actionId: action.id,
+      actorType: actor.type,
+      actorId: actor.id,
+      status: aggregateStatus,
+      intentType: "macro",
+      commandIds: actionRunCommandIds(output),
+    });
+    return output;
+  }
+
+  const intent = action.type === "system_status"
+    ? { type: "status" }
+    : action.type === "system_stop"
+      ? { type: "session_control", action: "stop" }
+      : actionIntent(action, runtime);
+  let output;
+  try {
+    output = await submitIntent({
+      store,
+      environment,
+      body: {
+        environmentId,
+        threadId,
+        intent,
+        mediaUploadId: runtime.mediaUploadId,
+        followUpInstruction: runtime.__followUpInstruction,
+      },
+      actor,
+      config,
+      baseUrl,
+      policyContext,
+    });
+  } catch (error) {
+    await store.recordActionRun?.({
+      userId: actor.userId,
+      actionId: action.id,
+      actorType: actor.type,
+      actorId: actor.id,
+      status: failedActionStatus(error),
+      intentType: intent.type,
+      commandIds: error?.details?.command?.id ? [error.details.command.id] : [],
+    });
+    throw error;
+  }
+  await store.recordActionRun?.({
+    userId: actor.userId,
+    actionId: action.id,
+    actorType: actor.type,
+    actorId: actor.id,
+    status: output.command?.status ?? "completed",
+    intentType: intent.type,
+    commandIds: actionRunCommandIds(output),
+  });
+  return output;
+}
+
+function systemDeviceAction(actionId) {
+  if (actionId === SYSTEM_CONTROL_IDS.status) {
+    return { id: actionId, type: "system_status", targetMode: "device-current" };
+  }
+  if (actionId === SYSTEM_CONTROL_IDS.stop) {
+    return { id: actionId, type: "system_stop", targetMode: "device-current" };
+  }
+  return null;
+}
+
+function actionRunStatus(output) {
+  const commands = output?.macro?.executions?.flatMap((entry) => entry.command ? [entry.command] : []) ?? [];
+  const command = output?.command ?? commands.at(-1);
+  return (output?.macro?.status ?? command?.status) === "dispatched" ? 202 : 200;
+}
+
+function actionResponseAfter(output) {
+  const commands = output?.macro?.executions?.flatMap((entry) => entry.command ? [entry.command] : []) ?? [];
+  const command = output?.command ?? commands.at(-1);
+  return optionalString(command?.createdAt) ?? optionalString(command?.updatedAt) ?? null;
+}
+
+function savedActionOutputStatus(output) {
+  return output?.macro?.status ?? output?.command?.status ?? "completed";
+}
+
+function failedActionStatus(error) {
+  return error?.details?.command?.status ?? (error?.status === 403 ? "blocked" : "failed");
+}
+
+function cleanMacroRuntime(runtime, environmentId, threadId) {
+  const { __macroStartIndex, __macroExecutions, __macroRunId, __followUpInstruction, ...publicRuntime } = runtime;
+  return { ...publicRuntime, environmentId, threadId };
+}
+
+function actionRunCommandIds(output) {
+  const ids = [];
+  if (output?.command?.id) ids.push(output.command.id);
+  for (const execution of output?.macro?.executions ?? []) {
+    if (execution.command?.id) ids.push(execution.command.id);
+    for (const id of actionRunCommandIds(execution)) if (!ids.includes(id)) ids.push(id);
+  }
+  return ids;
+}
+
+function validateFirmwarePolicyInput(body) {
+  if (Object.hasOwn(body, "channel") && !["stable", "beta"].includes(body.channel)) {
+    throw new HttpError(400, "channel must be stable or beta.");
+  }
+  if (Object.hasOwn(body, "updateMode") && !["manual", "notify", "automatic"].includes(body.updateMode)) {
+    throw new HttpError(400, "updateMode must be manual, notify, or automatic.");
+  }
+  if (Object.hasOwn(body, "desiredVersion") && body.desiredVersion !== null) {
+    requireString(body.desiredVersion, "desiredVersion");
+  }
+}
+
+async function compatibleFirmwareReleases(store, device, policy, config) {
+  const hardwareModel = optionalString(device.status?.hardwareModel) ?? config.defaultHardwareModel;
+  return await store.listFirmwareReleases({ hardwareModel, channel: policy?.channel ?? "stable" });
+}
+
+async function firmwarePolicyResponse({ store, device, policy, config }) {
+  const availableReleases = await compatibleFirmwareReleases(store, device, policy, config);
+  const latestRelease = availableReleases.at(-1) ?? null;
+  return {
+    deviceId: device.id,
+    policy,
+    currentVersion: device.status?.firmwareVersion ?? null,
+    latestVersion: latestRelease?.version ?? null,
+    latestRelease,
+    availableVersions: availableReleases.map((release) => release.version),
+    availableReleases,
+  };
+}
+
 async function submitIntent({
   store,
   environment,
@@ -1504,6 +2802,8 @@ async function submitIntent({
     store,
     userId: actor.userId,
   });
+  const followUpInstruction = actor.type === "device" ? optionalString(body.followUpInstruction) : null;
+  if (followUpInstruction) intent.deviceFollowUpInstruction = followUpInstruction.slice(0, 4096);
   const policy = evaluateIntentPolicy({
     device: { profile: await resolveActorProfile(store, actor.userId, actor.profile) },
     intent,
@@ -1580,7 +2880,7 @@ async function submitIntent({
       normalized: { type: "snapshot" },
       status: "completed",
       risk: policy.risk,
-      result: compressSnapshot(snapshot),
+      result: compressSnapshot(snapshot, threadIdOrNull),
       metrics: commandMetrics({ startedAt, dispatchStartedAt, completed: true }),
     });
     return { command, screen: command.result };
@@ -1665,6 +2965,21 @@ async function submitIntent({
   try {
     result = await dispatchT3Command(environment, t3Command);
   } catch (error) {
+    if (intent.type === "session_control" && intent.action === "stop" && isAlreadyStoppedT3Error(error)) {
+      const command = await store.createCommand({
+        userId: actor.userId,
+        deviceId: actor.type === "device" ? actor.id : null,
+        environmentId: environment.id,
+        threadId,
+        intent,
+        normalized: storableT3Command(t3Command),
+        status: "completed",
+        risk: policy.risk,
+        result: { alreadyStopped: true },
+        metrics: commandMetrics({ startedAt, dispatchStartedAt, completed: true }),
+      });
+      return { command, alreadyStopped: true };
+    }
     const command = await store.createCommand({
       userId: actor.userId,
       deviceId: actor.type === "device" ? actor.id : null,
@@ -1707,6 +3022,18 @@ async function currentUsage(store, userId) {
     environments: environments?.length ?? 0,
     macros: macros?.length ?? 0,
   };
+}
+
+async function t3ReleaseStatus() {
+  try {
+    const latest = await fetchLatestT3Release();
+    return { ...buildT3ReleaseStatus(latest.version), checkedAt: latest.checkedAt };
+  } catch (error) {
+    return {
+      ...buildT3ReleaseStatus(null, errorMessage(error)),
+      checkedAt: new Date().toISOString(),
+    };
+  }
 }
 
 async function assertWithinPlan(store, userId, resource, config) {
@@ -2080,15 +3407,23 @@ function redactText(value) {
   };
 }
 
-async function approveCommand({ store, userId, commandId }) {
+async function approveCommand({ store, userId, commandId, config }) {
   const startedAt = Date.now();
   const command = await store.getCommandForUser(userId, commandId);
   if (!command) throw new HttpError(404, "Command not found.");
   if (command.status !== "approval_required") {
+    if (command.status === "dispatched") {
+      const macroResume = await resumeMacroRunAfterApproval({ store, userId, commandId, config });
+      if (macroResume) return { command, macroResume };
+    }
     throw new HttpError(409, "Command is not waiting for approval.", {
       command,
       status: command.status,
     });
+  }
+  const approvalClaim = await store.claimCommandApproval?.({ userId, commandId });
+  if (!approvalClaim) {
+    throw new HttpError(409, "Command approval is already being processed.", { commandId });
   }
   const environment = await store.getEnvironmentForUser(userId, command.environmentId);
   if (!environment) throw new HttpError(404, "Environment not found.");
@@ -2108,7 +3443,7 @@ async function approveCommand({ store, userId, commandId }) {
         data: command.intent.data,
         cwd: command.intent.cwd,
       });
-      return await store.updateCommand({
+      const updated = await store.updateCommand({
         userId,
         commandId,
         status: "dispatched",
@@ -2121,6 +3456,7 @@ async function approveCommand({ store, userId, commandId }) {
           existing: command.metrics,
         }),
       });
+      return { command: updated, macroResume: await resumeMacroRunAfterApproval({ store, userId, commandId, config }) };
     } catch (error) {
       const updated = await store.updateCommand({
         userId,
@@ -2172,7 +3508,57 @@ async function approveCommand({ store, userId, commandId }) {
       existing: command.metrics,
     }),
   });
-  return { command: updated };
+  return { command: updated, macroResume: await resumeMacroRunAfterApproval({ store, userId, commandId, config }) };
+}
+
+async function resumeMacroRunAfterApproval({ store, userId, commandId, config }) {
+  const pending = await store.getMacroRunForApproval?.({ userId, commandId });
+  if (!pending) return null;
+  if (["completed", "dispatched", "failed", "blocked"].includes(pending.status)) {
+    return { resumed: false, run: pending, result: pending.result ?? null };
+  }
+  const claimed = await store.claimMacroRunForResume?.({ userId, runId: pending.id });
+  if (!claimed) return { resumed: false, run: pending, reason: "already_resuming" };
+  const action = await store.getActionForUser(userId, claimed.actionId);
+  if (!action) {
+    const run = await store.updateMacroRun({
+      userId,
+      runId: claimed.id,
+      status: "failed",
+      result: { error: "Macro action no longer exists." },
+    });
+    return { resumed: false, run, reason: "action_missing" };
+  }
+  try {
+    const output = await executeSavedAction({
+      store,
+      action,
+      runtime: {
+        ...claimed.runtime,
+        __macroStartIndex: claimed.nextStepIndex,
+        __macroExecutions: claimed.executions,
+        __macroRunId: claimed.id,
+      },
+      actor: claimed.actor,
+      config: {
+        ...config,
+        ...(Object.hasOwn(claimed.policyContext ?? {}, "__policyAllowedHours")
+          ? { policyAllowedHours: claimed.policyContext.__policyAllowedHours }
+          : {}),
+      },
+      baseUrl: claimed.baseUrl,
+      policyContext: claimed.policyContext,
+    });
+    return { resumed: true, runId: claimed.id, ...output };
+  } catch (error) {
+    const run = await store.updateMacroRun({
+      userId,
+      runId: claimed.id,
+      status: failedActionStatus(error),
+      result: { error: errorMessage(error) },
+    });
+    return { resumed: true, run, error: errorMessage(error) };
+  }
 }
 
 async function createTokenExpiredCommand({ store, actor, environment, threadId, intent, risk, startedAt = Date.now() }) {
@@ -2241,6 +3627,11 @@ function t3FailureResult(error) {
 
 function errorMessage(error) {
   return error?.message || "T3 request failed.";
+}
+
+function isAlreadyStoppedT3Error(error) {
+  if (![404, 409].includes(error?.status)) return false;
+  return /already[ _-]?stopped|no active|not running|inactive session/iu.test(String(error?.responseBody ?? ""));
 }
 
 async function authenticateUser(req, store, config, url = null, clerkAuth = null) {
@@ -2337,15 +3728,48 @@ function parseFirmwareRelease(body) {
   }
 }
 
+function sanitizeFirmwareRelease(release) {
+  if (!release) return null;
+  const { artifactKey, artifactProvider, ...output } = release;
+  return output;
+}
+
 function requireOtaSigningKey(config) {
   if (config.otaSigningKey) return config.otaSigningKey;
   if (config.demoMode) return "dev-insecure-ota-signing-key";
   throw new HttpError(503, "OTA_SIGNING_KEY is required for firmware manifests.");
 }
 
+function firmwareDownloadSigningKey(config) {
+  return config.firmwareDownloadSigningKey ?? requireOtaSigningKey(config);
+}
+
 function requestBaseUrl(req) {
   const proto = optionalString(req.headers["x-forwarded-proto"]) ?? "http";
   return `${proto}://${req.headers.host ?? "localhost"}`;
+}
+
+async function deviceGatewayResponse(store, device, suppliedSelection = null) {
+  const profiles = (await store.listGatewayProfiles(device.userId)).map(publicGatewayProfile);
+  const byId = new Map(profiles.map((profile) => [profile.id, profile]));
+  const selection = suppliedSelection ?? await store.getDeviceGatewaySelection({
+    userId: device.userId,
+    deviceId: device.id,
+  });
+  return {
+    deviceId: device.id,
+    revision: selection?.revision ?? 0,
+    state: selection?.state ?? "stable",
+    profiles,
+    activeProfileId: selection?.activeProfileId ?? null,
+    pendingProfileId: selection?.pendingProfileId ?? null,
+    activeProfile: byId.get(selection?.activeProfileId) ?? null,
+    pendingProfile: byId.get(selection?.pendingProfileId) ?? null,
+    previousProfile: byId.get(selection?.previousProfileId) ?? null,
+    lastError: selection?.lastError ?? null,
+    requestedAt: selection?.requestedAt ?? null,
+    appliedAt: selection?.appliedAt ?? null,
+  };
 }
 
 async function authenticateDevice(req, store, url = null, config = {}) {
@@ -2499,15 +3923,28 @@ async function boundDeviceEnvironment(store, device) {
   return environment;
 }
 
-// Compact thread list for a 122x250 panel: id plus a short title, nothing else.
-function deviceSelectableThreads(snapshot) {
+// Compact thread list for a 122x250 panel. `selected` lets the firmware render the
+// current row without duplicating selection logic, while the top-level threadId is
+// retained for older clients. `status` follows the same precedence as the selected
+// thread display: active work wins over a stale stopped session.
+function deviceSelectableThreads(snapshot, selectedThreadId = null) {
   const threads = Array.isArray(snapshot?.threads) ? snapshot.threads : [];
   return threads
     .map((thread) => ({
       id: optionalString(thread?.id) ?? null,
       title: optionalString(thread?.title) ?? optionalString(thread?.name) ?? "Untitled thread",
+      status: deviceThreadStatus(thread),
+      selected: optionalString(thread?.id) === optionalString(selectedThreadId),
     }))
     .filter((thread) => thread.id !== null);
+}
+
+function deviceThreadStatus(thread) {
+  const sessionStatus = optionalString(thread?.session?.status);
+  const turnStatus = optionalString(thread?.latestTurn?.state);
+  if (sessionStatus === "running" || turnStatus === "running") return "running";
+  if (sessionStatus === "starting") return "starting";
+  return turnStatus ?? sessionStatus ?? "idle";
 }
 
 // sw.js must stay at the root so the service worker's scope covers the whole app.

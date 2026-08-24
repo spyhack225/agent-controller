@@ -117,7 +117,7 @@ test("registering the catalogue makes real harnesses and models available", asyn
   assert.match(after.sessionFailures[0].message, /not supported when using Codex/u);
 });
 
-test("launching with a model T3 does not offer is refused before dispatch", async (t) => {
+test("launching with a model T3 does not offer automatically uses the provider's latest model", async (t) => {
   const originalFetch = globalThis.fetch;
   let dispatched = 0;
   globalThis.fetch = async (url) => {
@@ -160,10 +160,12 @@ test("launching with a model T3 does not offer is refused before dispatch", asyn
     body: JSON.stringify({ projectId, text: "hi", modelSelection: { instanceId: "codex", model: "gpt-5..6" } }),
   });
   const body = await response.json();
-  assert.equal(response.status, 422);
-  assert.match(body.error.message, /Unknown model "gpt-5\.\.6"/u);
-  assert.ok(body.error.details.known.includes("gpt-5.6-sol"));
-  assert.equal(dispatched, 0, "a bad model must never reach T3");
+  assert.equal(response.status, 202);
+  assert.equal(body.modelSelection.model, "gpt-5.6-sol");
+  assert.deepEqual(body.modelRecovery.requested, { instanceId: "codex", model: "gpt-5..6" });
+  assert.equal(body.modelRecovery.selected.model, "gpt-5.6-sol");
+  assert.match(body.modelRecovery.reason, /Unknown model "gpt-5\.\.6"/u);
+  assert.equal(dispatched, 2, "only the recovered model reaches T3");
 
   // A real model still launches.
   const ok = await requestJson(originalFetch, baseUrl, `/v1/t3/environments/${environmentId}/threads`, {
@@ -172,7 +174,18 @@ test("launching with a model T3 does not offer is refused before dispatch", asyn
     body: { projectId, text: "hi", modelSelection: { instanceId: "codex", model: "gpt-5.6-sol" } },
   });
   assert.equal(ok.command.status, "dispatched");
-  assert.equal(dispatched, 2, "thread.create plus thread.turn.start");
+  assert.equal(dispatched, 4, "each launch dispatches thread.create plus thread.turn.start");
+
+  // Omitting the selection also chooses the first model in T3's ordered Codex catalogue instead
+  // of the project's older saved default.
+  const automatic = await requestJson(originalFetch, baseUrl, `/v1/t3/environments/${environmentId}/threads`, {
+    method: "POST",
+    headers: authHeaders,
+    body: { projectId, text: "use the current default" },
+  });
+  assert.equal(automatic.modelSelection.model, "gpt-5.6-sol");
+  assert.equal(automatic.modelRecovery, null);
+  assert.equal(dispatched, 6);
 });
 
 test("re-pairing an environment keeps the registered catalogue", async (t) => {

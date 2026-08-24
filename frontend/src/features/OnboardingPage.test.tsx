@@ -65,6 +65,8 @@ function controller(overrides: Record<string, unknown> = {}) {
     refreshCommands: vi.fn(),
     loadSnapshot: vi.fn(),
     saveOnboarding,
+    remoteAccess: null,
+    loadRemoteAccess: vi.fn(),
     run: vi.fn(async (_key: string, _message: string, task: () => Promise<unknown>) => task()),
     ...overrides,
   } as unknown as Controller;
@@ -82,6 +84,43 @@ test("keeps host validation errors inline and does not discard the current step"
   );
   expect(c.saveOnboarding).not.toHaveBeenCalled();
   expect(screen.getByRole("heading", { name: "T3 host" })).toBeVisible();
+});
+
+test("shows the missing machine tunnel steps when Tailscale Serve is selected", async () => {
+  const c = controller({
+    remoteAccess: {
+      checkedAt: "2026-08-08T17:00:00.000Z",
+      gateway: {
+        host: "0.0.0.0",
+        port: 3996,
+        loopbackUrl: "http://127.0.0.1:3996",
+        lanUrls: [],
+        publicBaseUrl: null,
+      },
+      tailscale: {
+        installed: false,
+        connected: false,
+        backendState: "Not installed",
+        dnsName: null,
+        ips: [],
+        httpsUrl: null,
+        serve: { active: false, statusAvailable: false },
+        funnel: { active: false, statusAvailable: false },
+        mode: null,
+        publicBaseUrlConfigured: false,
+        ready: false,
+        error: null,
+        nextStep: "install",
+      },
+    },
+  });
+  render(<OnboardingPage controller={c} onNavigate={vi.fn()} />);
+
+  fireEvent.click(await screen.findByRole("button", { name: /Tailscale Serve/i }));
+
+  expect(screen.getByText("Tailscale installed")).toBeVisible();
+  expect(screen.getByText(/Install Tailscale on the machine running Agent Controller/i)).toBeVisible();
+  expect(screen.getByText(/If T3 runs elsewhere/i)).toBeVisible();
 });
 
 test("recovers a pending one-time device registration without silently duplicating it", async () => {

@@ -1,16 +1,30 @@
 #include "DeviceStore.h"
 
+#include <ArduinoJson.h>
+
 namespace {
 // NVS keys are capped at 15 characters, which is why these are abbreviated rather than spelled out.
 constexpr const char* kNamespace = "agentctl";
 constexpr const char* kKeyDeviceId = "dev_id";
 constexpr const char* kKeyDeviceSecret = "dev_secret";
 constexpr const char* kKeyGatewayUrl = "gw_url";
+constexpr const char* kKeyGatewayProfiles = "gw_profiles";
+constexpr const char* kKeyGatewayRevision = "gw_rev";
+constexpr const char* kKeyGatewayActive = "gw_active";
+constexpr const char* kKeyGatewayPending = "gw_pending";
+constexpr const char* kKeyGatewayPendingUrl = "gw_purl";
+constexpr const char* kKeyGatewayPrevious = "gw_prev";
+constexpr const char* kKeyGatewayState = "gw_state";
+constexpr const char* kKeyGatewayError = "gw_error";
 constexpr const char* kKeyWifiSsid = "wifi_ssid";
 constexpr const char* kKeyWifiPass = "wifi_pass";
 constexpr const char* kKeyClaimCode = "claim_code";
 constexpr const char* kKeyClaimExpiry = "claim_exp";
 constexpr const char* kKeyConfigCache = "cfg_cache";
+constexpr const char* kKeyOtaSource = "ota_from";
+constexpr const char* kKeyOtaTarget = "ota_target";
+constexpr const char* kKeyOtaBoots = "ota_boots";
+constexpr const char* kKeyOtaBootTarget = "ota_bver";
 }  // namespace
 
 bool DeviceStore::begin() {
@@ -24,17 +38,49 @@ bool DeviceStore::begin() {
   deviceId_ = readString(kKeyDeviceId);
   deviceSecret_ = readString(kKeyDeviceSecret);
   gatewayUrl_ = readString(kKeyGatewayUrl);
+  gatewayRevision_ = prefs_.getUInt(kKeyGatewayRevision, 0);
+  activeGatewayProfileId_ = readString(kKeyGatewayActive);
+  pendingGatewayProfileId_ = readString(kKeyGatewayPending);
+  pendingGatewayUrl_ = readString(kKeyGatewayPendingUrl);
+  previousGatewayUrl_ = readString(kKeyGatewayPrevious);
+  gatewaySwitchState_ = readString(kKeyGatewayState);
+  if (gatewaySwitchState_.length() == 0) gatewaySwitchState_ = "stable";
+  gatewaySwitchDetail_ = readString(kKeyGatewayError);
+
+  const String profilesJson = readString(kKeyGatewayProfiles);
+  if (profilesJson.length() > 0) {
+    JsonDocument doc;
+    if (deserializeJson(doc, profilesJson) == DeserializationError::Ok) {
+      JsonArray profiles = doc.as<JsonArray>();
+      for (JsonObject profile : profiles) {
+        if (gatewayProfileCount_ >= kMaxGatewayProfiles) break;
+        GatewayProfile& output = gatewayProfiles_[gatewayProfileCount_];
+        output.id = String(profile["id"] | "");
+        output.label = String(profile["label"] | "");
+        output.mode = String(profile["mode"] | "custom");
+        output.url = String(profile["url"] | "");
+        if (output.id.length() == 0 || output.url.length() == 0) continue;
+        gatewayProfileCount_ += 1;
+      }
+    } else {
+      Serial.println("[store] ignoring invalid persisted gateway profile JSON");
+    }
+  }
   wifiSsid_ = readString(kKeyWifiSsid);
   wifiPassword_ = readString(kKeyWifiPass);
   claimCode_ = readString(kKeyClaimCode);
   claimCodeExpiresAt_ = readString(kKeyClaimExpiry);
   configCache_ = readString(kKeyConfigCache);
+  otaSourceVersion_ = readString(kKeyOtaSource);
+  otaTargetVersion_ = readString(kKeyOtaTarget);
 
   // The secret is never logged, not even truncated: this line ends up in bench transcripts.
   Serial.printf(
-    "[store] id=%s gateway=%s wifi=%s claimCode=%s\n",
+    "[store] id=%s gateway=%s gatewayProfiles=%u gatewayState=%s wifi=%s claimCode=%s\n",
     deviceId_.length() ? deviceId_.c_str() : "(none)",
     gatewayUrl_.length() ? gatewayUrl_.c_str() : "(none)",
+    static_cast<unsigned>(gatewayProfileCount_),
+    gatewaySwitchState_.c_str(),
     wifiSsid_.length() ? wifiSsid_.c_str() : "(none)",
     claimCode_.length() ? "cached" : "(none)"
   );
@@ -90,6 +136,131 @@ bool DeviceStore::setGatewayUrl(const String& url) {
   return true;
 }
 
+const GatewayProfile* DeviceStore::gatewayProfile(size_t index) const {
+  return index < gatewayProfileCount_ ? &gatewayProfiles_[index] : nullptr;
+}
+
+const GatewayProfile* DeviceStore::findGatewayProfile(const String& id) const {
+  for (size_t index = 0; index < gatewayProfileCount_; index += 1) {
+    if (gatewayProfiles_[index].id == id) return &gatewayProfiles_[index];
+  }
+  return nullptr;
+}
+
+bool DeviceStore::replaceGatewayProfiles(
+  const GatewayProfile* profiles,
+  size_t count,
+  uint32_t revision,
+  const String& activeProfileId
+) {
+  if (!opened_ || profiles == nullptr || count == 0 || count > kMaxGatewayProfiles) return false;
+
+  JsonDocument doc;
+  JsonArray output = doc.to<JsonArray>();
+  for (size_t index = 0; index < count; index += 1) {
+    JsonObject profile = output.add<JsonObject>();
+    profile["id"] = profiles[index].id;
+    profile["label"] = profiles[index].label;
+    profile["mode"] = profiles[index].mode;
+    profile["url"] = profiles[index].url;
+  }
+  String encoded;
+  serializeJson(doc, encoded);
+  if (!putString(kKeyGatewayProfiles, encoded)) return false;
+  if (prefs_.putUInt(kKeyGatewayRevision, revision) == 0) return false;
+
+  gatewayProfileCount_ = count;
+  for (size_t index = 0; index < count; index += 1) gatewayProfiles_[index] = profiles[index];
+  gatewayRevision_ = revision;
+
+  // A pending local selection is the controller's recovery journal. A routine GET must not erase
+  // it merely because the server has not observed the ACK yet.
+  if (pendingGatewayProfileId_.length() == 0 && activeProfileId.length() > 0) {
+    if (!putString(kKeyGatewayActive, activeProfileId)) return false;
+    activeGatewayProfileId_ = activeProfileId;
+  }
+  return true;
+}
+
+bool DeviceStore::stageGatewaySwitch(const GatewayProfile& profile, uint32_t revision) {
+  if (!opened_ || profile.id.length() == 0 || profile.url.length() == 0) return false;
+  const String previous = gatewayUrl_;
+  if (!putString(kKeyGatewayPrevious, previous)) return false;
+  if (!putString(kKeyGatewayPending, profile.id)) return false;
+  if (!putString(kKeyGatewayPendingUrl, profile.url)) return false;
+  if (!putString(kKeyGatewayState, "pending")) return false;
+  if (!putString(kKeyGatewayError, "")) return false;
+  if (prefs_.putUInt(kKeyGatewayRevision, revision) == 0) return false;
+  previousGatewayUrl_ = previous;
+  pendingGatewayProfileId_ = profile.id;
+  pendingGatewayUrl_ = profile.url;
+  gatewaySwitchState_ = "pending";
+  gatewaySwitchDetail_ = "";
+  gatewayRevision_ = revision;
+  return true;
+}
+
+bool DeviceStore::completeGatewaySwitch(const GatewayProfile& profile, uint32_t revision) {
+  // gw_url is deliberately written last in the happy-path journal. Until this succeeds, a reboot
+  // continues to use the previous known-good endpoint and resumes the pending selection.
+  if (!putString(kKeyGatewayActive, profile.id)) return false;
+  if (!setGatewayUrl(profile.url)) return false;
+  if (!putString(kKeyGatewayPending, "")) return false;
+  if (!putString(kKeyGatewayPendingUrl, "")) return false;
+  if (!putString(kKeyGatewayPrevious, "")) return false;
+  if (!putString(kKeyGatewayState, "stable")) return false;
+  if (!putString(kKeyGatewayError, "")) return false;
+  if (prefs_.putUInt(kKeyGatewayRevision, revision) == 0) return false;
+  activeGatewayProfileId_ = profile.id;
+  pendingGatewayProfileId_ = "";
+  pendingGatewayUrl_ = "";
+  previousGatewayUrl_ = "";
+  gatewaySwitchState_ = "stable";
+  gatewaySwitchDetail_ = "";
+  gatewayRevision_ = revision;
+  return true;
+}
+
+bool DeviceStore::failGatewaySwitch(const String& detail, uint32_t revision) {
+  // completeGatewaySwitch writes the active URL only after the remote apply ACK, but restore the
+  // journaled URL defensively so this also recovers images that rebooted between older steps.
+  if (previousGatewayUrl_.length() > 0 && gatewayUrl_ != previousGatewayUrl_) {
+    if (!setGatewayUrl(previousGatewayUrl_)) return false;
+  }
+  if (!putString(kKeyGatewayPending, "")) return false;
+  if (!putString(kKeyGatewayPendingUrl, "")) return false;
+  if (!putString(kKeyGatewayPrevious, "")) return false;
+  if (!putString(kKeyGatewayState, "failed")) return false;
+  if (!putString(kKeyGatewayError, detail)) return false;
+  if (prefs_.putUInt(kKeyGatewayRevision, revision) == 0) return false;
+  pendingGatewayProfileId_ = "";
+  pendingGatewayUrl_ = "";
+  previousGatewayUrl_ = "";
+  gatewaySwitchState_ = "failed";
+  gatewaySwitchDetail_ = detail;
+  gatewayRevision_ = revision;
+  return true;
+}
+
+bool DeviceStore::clearGatewaySwitchFailure() {
+  if (gatewaySwitchState_ != "failed") return true;
+  if (!putString(kKeyGatewayState, "stable")) return false;
+  if (!putString(kKeyGatewayError, "")) return false;
+  gatewaySwitchState_ = "stable";
+  gatewaySwitchDetail_ = "";
+  return true;
+}
+
+bool DeviceStore::ensureLegacyGatewayProfile() {
+  if (gatewayProfileCount_ > 0 || gatewayUrl_.length() == 0) return true;
+  GatewayProfile legacy;
+  legacy.id = "legacy";
+  legacy.label = "Current gateway";
+  legacy.mode = "custom";
+  legacy.url = gatewayUrl_;
+  return replaceGatewayProfiles(&legacy, 1, gatewayRevision_, "legacy");
+}
+
 bool DeviceStore::setWifiCredentials(const String& ssid, const String& password) {
   if (!putString(kKeyWifiSsid, ssid)) return false;
   if (!putString(kKeyWifiPass, password)) return false;
@@ -116,6 +287,37 @@ bool DeviceStore::setConfigCache(const String& json) {
   return true;
 }
 
+bool DeviceStore::setOtaAttempt(const String& sourceVersion, const String& targetVersion) {
+  if (!putString(kKeyOtaSource, sourceVersion)) return false;
+  if (!putString(kKeyOtaTarget, targetVersion)) return false;
+  otaSourceVersion_ = sourceVersion;
+  otaTargetVersion_ = targetVersion;
+  return prefs_.putUInt(kKeyOtaBoots, 0) > 0;
+}
+
+uint32_t DeviceStore::registerOtaBootAttempt(const String& runningVersion) {
+  if (!opened_ || otaTargetVersion_.length() == 0 || otaTargetVersion_ != runningVersion) return 0;
+  // The source image may predate the boot counter and therefore cannot reset it
+  // in setOtaAttempt(). Key the count to the running target so an upgrade from
+  // old firmware never inherits a previous release's failed-attempt count.
+  const String countedTarget = readString(kKeyOtaBootTarget);
+  const uint32_t attempts = countedTarget == runningVersion
+    ? prefs_.getUInt(kKeyOtaBoots, 0) + 1
+    : 1;
+  if (!putString(kKeyOtaBootTarget, runningVersion)) return 0;
+  return prefs_.putUInt(kKeyOtaBoots, attempts) > 0 ? attempts : 0;
+}
+
+bool DeviceStore::clearOtaAttempt() {
+  const bool sourceCleared = putString(kKeyOtaSource, "");
+  const bool targetCleared = putString(kKeyOtaTarget, "");
+  const bool bootsCleared = prefs_.remove(kKeyOtaBoots) || !prefs_.isKey(kKeyOtaBoots);
+  const bool bootTargetCleared = putString(kKeyOtaBootTarget, "");
+  if (sourceCleared) otaSourceVersion_ = "";
+  if (targetCleared) otaTargetVersion_ = "";
+  return sourceCleared && targetCleared && bootsCleared && bootTargetCleared;
+}
+
 bool DeviceStore::resetForProvisioning() {
   Serial.println("[store] reset: clearing Wi-Fi, config cache, and claim code; identity kept");
   const bool wifiCleared = setWifiCredentials("", "");
@@ -130,5 +332,24 @@ bool DeviceStore::wipeToFactoryState() {
   // Cleared rather than rewritten: seedIdentityIfEmpty() puts the build-time default back on the
   // next boot, so a unit whose owner pointed it at a private gateway returns to the factory one.
   const bool gatewayCleared = setGatewayUrl("");
-  return reset && gatewayCleared;
+  const bool profilesCleared = putString(kKeyGatewayProfiles, "");
+  const bool activeCleared = putString(kKeyGatewayActive, "");
+  const bool pendingCleared = putString(kKeyGatewayPending, "")
+    && putString(kKeyGatewayPendingUrl, "") && putString(kKeyGatewayPrevious, "");
+  const bool stateCleared = putString(kKeyGatewayState, "") && putString(kKeyGatewayError, "");
+  const bool revisionCleared = prefs_.remove(kKeyGatewayRevision) || !prefs_.isKey(kKeyGatewayRevision);
+  if (profilesCleared) gatewayProfileCount_ = 0;
+  if (activeCleared) activeGatewayProfileId_ = "";
+  if (pendingCleared) {
+    pendingGatewayProfileId_ = "";
+    pendingGatewayUrl_ = "";
+    previousGatewayUrl_ = "";
+  }
+  if (stateCleared) {
+    gatewaySwitchState_ = "stable";
+    gatewaySwitchDetail_ = "";
+  }
+  if (revisionCleared) gatewayRevision_ = 0;
+  return reset && gatewayCleared && profilesCleared && activeCleared && pendingCleared
+    && stateCleared && revisionCleared;
 }

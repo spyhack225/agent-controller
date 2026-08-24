@@ -1,6 +1,7 @@
 export type PageId =
   | "quick"
   | "operate"
+  | "actions"
   | "devices"
   | "environments"
   | "media"
@@ -27,6 +28,66 @@ export interface AuthConfig {
   };
 }
 
+export interface RemoteAccessStatus {
+  checkedAt: string;
+  gateway: {
+    host: string;
+    port: number;
+    loopbackUrl: string;
+    lanUrls: string[];
+    publicBaseUrl: string | null;
+  };
+  tailscale: {
+    installed: boolean;
+    connected: boolean;
+    backendState: string;
+    dnsName: string | null;
+    ips: string[];
+    httpsUrl: string | null;
+    serve: { active: boolean; statusAvailable: boolean };
+    funnel: { active: boolean; statusAvailable: boolean };
+    mode: "serve" | "funnel" | null;
+    publicBaseUrlConfigured: boolean;
+    ready: boolean;
+    error: string | null;
+    nextStep: "install" | "connect" | "enable" | "restart" | "ready";
+  };
+}
+
+export type GatewayProfileMode = "lan" | "tailnet" | "custom";
+
+export interface GatewayProfile {
+  id: string;
+  label: string;
+  mode: GatewayProfileMode;
+  baseUrl: string;
+  createdAt?: string;
+  updatedAt?: string;
+}
+
+export interface DeviceGatewaySwitch {
+  deviceId: string;
+  revision: number;
+  state: "stable" | "pending" | "failed";
+  activeProfile?: GatewayProfile | null;
+  pendingProfile?: GatewayProfile | null;
+  previousProfile?: GatewayProfile | null;
+  lastError?: string | null;
+  requestedAt?: string | null;
+  appliedAt?: string | null;
+}
+
+export interface DeviceGatewaySelection {
+  revision: number;
+  state: "stable" | "pending" | "failed";
+  activeProfileId?: string | null;
+  pendingProfileId?: string | null;
+  previousProfileId?: string | null;
+  lastError?: string | null;
+  requestedAt?: string | null;
+  appliedAt?: string | null;
+}
+
 export interface DeviceProfile {
   id: string;
   label?: string;
@@ -45,6 +106,73 @@ export interface EnvironmentHealth {
     line1?: string;
     line2?: string;
   } | null;
+  compatibility?: T3CompatibilityResult | null;
+}
+
+export type T3CompatibilityStatus =
+  | "unchecked"
+  | "compatible"
+  | "update_recommended"
+  | "review_required"
+  | "incompatible"
+  | "unknown";
+
+export interface T3CompatibilityCheck {
+  id: string;
+  label: string;
+  passed: boolean;
+  detail: string;
+}
+
+export interface T3CompatibilityFinding {
+  level: "danger" | "warning" | "info";
+  code: string;
+  message: string;
+}
+
+export interface T3CompatibilityResult {
+  environmentId: string;
+  environmentLabel: string;
+  checkedAt: string | null;
+  installedVersion: string | null;
+  previousVersion?: string | null;
+  versionChanged?: boolean;
+  status: T3CompatibilityStatus;
+  compatible: boolean;
+  breakingRisk: boolean;
+  latestVersion: string | null;
+  recommendedVersion: string;
+  minimumVersion: string;
+  maximumTestedVersion: string;
+  recommendation: string;
+  checks: T3CompatibilityCheck[];
+  findings: T3CompatibilityFinding[];
+}
+
+export interface T3ReleaseCompatibility {
+  packageName: string;
+  latestVersion: string | null;
+  latestError: string | null;
+  minimumVersion: string;
+  maximumTestedVersion: string;
+  recommendedVersion: string;
+  status: "supported" | "review_required" | "unavailable";
+  alert: string | null;
+  checkedAt?: string;
+}
+
+export interface T3CompatibilityOverview {
+  release: T3ReleaseCompatibility;
+  results: T3CompatibilityResult[];
+  summary: {
+    environments: number;
+    breakingRisks: number;
+    incompatible: number;
+    reviewRequired: number;
+    updatesRecommended: number;
+    unchecked: number;
+    needsAttention: boolean;
+  };
 }
 
 export interface Environment {
@@ -62,6 +190,13 @@ export interface ModelSelection {
   instanceId: string;
   model: string;
   options?: unknown[];
+}
+
+export interface ModelRecovery {
+  requested: ModelSelection | null;
+  selected: ModelSelection;
+  reason: string;
+  catalogueSource: "live" | "registered" | "snapshot-only";
 }
 
 export interface T3ModelOptionChoice {
@@ -115,7 +250,7 @@ export interface T3HarnessCatalogue {
   usable: string[];
   modelSelection: ModelSelection | null;
   sessionFailures: T3SessionFailure[];
-  catalogueSource: "registered" | "snapshot-only";
+  catalogueSource: "live" | "registered" | "snapshot-only";
 }
 
 export interface T3Project {
@@ -126,16 +261,28 @@ export interface T3Project {
   defaultModelSelection?: ModelSelection | null;
 }
 
+export interface T3ThreadMessage {
+  id: string;
+  role: "user" | "assistant" | "system" | "tool";
+  text: string;
+  createdAt?: string | null;
+  streaming?: boolean;
+}
+
 export interface T3Thread {
   id: string;
   label: string;
   projectId?: string | null;
+  modelSelection?: ModelSelection | null;
   status?: string | null;
+  messages?: T3ThreadMessage[];
 }
 
 export interface DeviceConfig {
   environmentId?: string | null;
   threadId?: string | null;
+  gatewayAccessMode?: "local" | "tailscale" | "online";
+  gatewayUrl?: string | null;
   defaultPrompt?: string;
   shellCommand?: string;
   menu?: string[];
@@ -151,6 +298,12 @@ export interface DeviceStatus {
   uptimeMs?: number | null;
   batteryPercent?: number | null;
   batteryMv?: number | null;
+  protocolVersion?: number | null;
+  features?: string[];
+  limits?: {
+    menuItems?: number;
+    labelCharacters?: number;
+  };
 }
 
 export interface Device {
@@ -180,6 +333,7 @@ export interface Device {
   };
   status?: DeviceStatus;
   config?: DeviceConfig;
+  gatewaySelection?: DeviceGatewaySelection;
 }
 
 export interface Command {
@@ -213,6 +367,69 @@ export interface Macro {
   environmentId?: string | null;
   threadId?: string | null;
   intent?: JsonRecord;
+}
+
+export type SavedActionType = "prompt" | "shell" | "media" | "macro";
+
+export interface SavedActionStep {
+  actionId: string;
+  position?: number;
+  continueOnFailure?: boolean;
+}
+
+/** A reusable operation. Payloads remain in the gateway; devices only receive opaque action IDs. */
+export interface SavedAction {
+  id: string;
+  label: string;
+  type: SavedActionType;
+  intent?: JsonRecord | null;
+  payload?: JsonRecord;
+  targetMode?: "device-current" | "fixed";
+  steps?: SavedActionStep[];
+  environmentId?: string | null;
+  threadId?: string | null;
+  createdAt?: string;
+  updatedAt?: string;
+  deviceIds?: string[];
+}
+
+export interface DeviceControlItem {
+  id?: string;
+  kind?: "system" | "status" | "stop" | "remote_action" | string;
+  actionId?: string;
+  label?: string;
+  enabled?: boolean;
+  reason?: string | null;
+  requiresThread?: boolean;
+  requiresConfirmation?: boolean;
+}
+
+export interface DeviceControls {
+  revision: number;
+  acknowledgedRevision?: number | null;
+  appliedRevision?: number | null;
+  appliedAt?: string | null;
+  lastAckStatus?: string | null;
+  lastAckError?: string | null;
+  items: DeviceControlItem[];
+  capacity?: number;
+}
+
+export interface DeviceFirmwarePolicy {
+  channel: "stable" | "beta";
+  updateMode: "manual" | "notify" | "automatic";
+  desiredVersion?: string | null;
+  currentVersion?: string | null;
+  latestVersion?: string | null;
+  availableVersions?: string[];
+  status?: string | null;
+  lastUpdateStatus?: string | null;
+  lastUpdateAt?: string | null;
+  lastError?: string | null;
+  lastUpdateError?: string | null;
+  updateProgress?: number | null;
+  targetVersion?: string | null;
+  releaseNotes?: string | null;
 }
 
 export interface MediaItem {

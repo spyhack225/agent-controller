@@ -23,6 +23,7 @@
     "convex:dev": "convex dev",
     "convex:deploy": "convex deploy",
     "setup:t3": "node scripts/setup-t3.mjs",
+    "setup:tunnel": "node --env-file-if-exists=.env --env-file-if-exists=.env.local scripts/setup-tunnel.mjs",
     "simulate:device": "node scripts/simulate-device.mjs",
     "smoke:local": "node scripts/smoke-local.mjs",
     "smoke:convex": "node scripts/smoke-convex.mjs",

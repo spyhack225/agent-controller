@@ -62,11 +62,18 @@ function summarizeEnvironments(environments, now) {
   let tokenExpired = 0;
   let tokenExpiringSoon = 0;
   let latestHealthCheckAt = null;
+  let compatibilityBreakingRisks = 0;
+  let compatibilityReviewRequired = 0;
+  let compatibilityUpdatesRecommended = 0;
 
   for (const environment of environments) {
     const status = environment.status ?? "unknown";
     byStatus[status] = (byStatus[status] ?? 0) + 1;
     latestHealthCheckAt = latestIso(latestHealthCheckAt, environment.health?.lastCheckedAt);
+    const compatibility = environment.health?.compatibility;
+    if (compatibility?.breakingRisk) compatibilityBreakingRisks += 1;
+    if (compatibility?.status === "review_required") compatibilityReviewRequired += 1;
+    if (compatibility?.status === "update_recommended") compatibilityUpdatesRecommended += 1;
 
     const expiresAt = Date.parse(environment.accessTokenExpiresAt);
     if (Number.isFinite(expiresAt)) {
@@ -81,6 +88,9 @@ function summarizeEnvironments(environments, now) {
     unreachable: byStatus.unreachable ?? 0,
     tokenExpired,
     tokenExpiringSoon,
+    compatibilityBreakingRisks,
+    compatibilityReviewRequired,
+    compatibilityUpdatesRecommended,
     latestHealthCheckAt,
     byStatus,
   };

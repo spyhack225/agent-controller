@@ -36,12 +36,18 @@
 
 // OTA apply is off by default for bench bring-up. Set to 1 when the partition
 // table, rollback plan, and release process have been tested on real hardware.
+#ifndef ENABLE_OTA_APPLY
 #define ENABLE_OTA_APPLY 0
+#endif
 
 // Prototype manifest verification uses the gateway HMAC key. This is useful for
 // development, but production hardware should move to asymmetric signatures.
+#ifndef REQUIRE_OTA_SIGNATURE
 #define REQUIRE_OTA_SIGNATURE 0
+#endif
+#ifndef OTA_MANIFEST_VERIFY_KEY
 #define OTA_MANIFEST_VERIFY_KEY ""
+#endif
 
 // The environment/thread defaults are used by the menu prompt actions.
 // The status action only needs ENVIRONMENT_ID.

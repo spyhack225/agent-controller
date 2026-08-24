@@ -1,7 +1,12 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 
-import { buildT3Command, buildT3ProjectLaunchCommands } from "../src/t3Client.mjs";
+import {
+  buildT3Command,
+  buildT3ProjectLaunchCommands,
+  compressSnapshot,
+  pendingThreadInteractions,
+} from "../src/t3Client.mjs";
 
 test("agent prompts map to T3 turn start commands with approval-required runtime", () => {
   const command = buildT3Command({
@@ -25,6 +30,28 @@ test("approval responses map to T3 approval commands", () => {
   assert.equal(command.type, "thread.approval.respond");
   assert.equal(command.requestId, "approval_1");
   assert.equal(command.decision, "accept");
+});
+
+test("selected thread status preserves T3 session and pending interaction state", () => {
+  const thread = {
+    id: "thread_123",
+    title: "Implement the device session controls with a very long title",
+    interactionMode: "default",
+    latestTurn: { state: "running" },
+    session: { status: "running", runtimeMode: "approval-required" },
+    activities: [
+      { sequence: 1, kind: "approval.requested", payload: { requestId: "approval_1" } },
+      { sequence: 2, kind: "user-input.requested", payload: { requestId: "input_1" } },
+      { sequence: 3, kind: "user-input.resolved", payload: { requestId: "input_1" } },
+    ],
+  };
+  assert.deepEqual(pendingThreadInteractions(thread), { approvals: 1, userInput: 0 });
+  const screen = compressSnapshot({ projects: [{}], threads: [thread] }, thread.id);
+  assert.equal(screen.state, "running");
+  assert.equal(screen.line2, "1 approval waiting");
+  assert.equal(screen.thread.id, thread.id);
+  assert.equal(screen.thread.pendingApprovals, 1);
+  assert.ok(screen.line1.length <= 28);
 });
 
 test("project launch builds a T3 bootstrap turn using the selected harness", () => {

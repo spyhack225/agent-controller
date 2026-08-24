@@ -9,12 +9,13 @@ import {
   extractSessionFailures,
   mergeHostCatalogue,
   normalizeCatalogueEntry,
+  resolveLatestModelSelection,
   resolveModelSelection,
   usableHarnesses,
   validateModelSelection,
 } from "../src/t3Harness.mjs";
 
-// Captured from a live T3 Code 0.0.28 server on this machine:
+// Captured from a live T3 Code 0.0.28 server and revalidated against 0.0.32 on this machine:
 //   t3-snapshot.json        GET /api/orchestration/snapshot
 //   t3-provider-caches.json <base-dir>/caches/*.json
 const FIXTURES = join(dirname(fileURLToPath(import.meta.url)), "fixtures");
@@ -30,13 +31,12 @@ test("the live snapshot exposes only projects and threads, never a provider cata
   );
 });
 
-test("harnesses in use are derived from real project and thread selections", () => {
+test("snapshot-only harnesses use project defaults but exclude historical thread models", () => {
   const harnesses = extractHarnesses(SNAPSHOT);
   assert.deepEqual(harnesses.map((harness) => harness.instanceId), ["codex"]);
 
   const slugs = harnesses[0].models.map((model) => model.slug).sort();
-  // These are the real values recorded on this environment, including the malformed one.
-  assert.deepEqual(slugs, ["gpt-5..6", "gpt-5.4", "gpt-5.6"]);
+  assert.deepEqual(slugs, ["gpt-5.4"]);
 });
 
 test("the host catalogue is normalized from T3's real provider cache shape", () => {
@@ -65,7 +65,7 @@ test("the host catalogue is normalized from T3's real provider cache shape", () 
   assert.equal(byId.get("opencode").available, false);
 });
 
-test("merging the catalogue keeps models the snapshot proved are in use", () => {
+test("merging the catalogue exposes only models T3 currently offers", () => {
   const harnesses = extractHarnesses(SNAPSHOT, { catalogue: CATALOGUE });
   const codex = harnesses.find((harness) => harness.instanceId === "codex");
 
@@ -74,8 +74,8 @@ test("merging the catalogue keeps models the snapshot proved are in use", () => 
 
   const slugs = codex.models.map((model) => model.slug);
   assert.ok(slugs.includes("gpt-5.6-sol"), "catalogue models are present");
-  assert.ok(slugs.includes("gpt-5..6"), "an in-use model absent from the catalogue is retained");
-  assert.equal(codex.models.find((model) => model.slug === "gpt-5..6").observed, true);
+  assert.ok(!slugs.includes("gpt-5..6"), "historical malformed models are not selectable");
+  assert.ok(!slugs.includes("gpt-5.6"), "historical retired aliases are not selectable");
 
   assert.deepEqual(usableHarnesses(harnesses).map((h) => h.instanceId), ["codex", "claudeAgent"]);
 });
@@ -156,12 +156,12 @@ test("selection falls back to a real usable model when the request is invalid", 
     requested: { instanceId: "codex", model: "gpt-5..6" },
     projectDefault: SNAPSHOT.projects[0].defaultModelSelection,
   });
-  // The bad request is discarded; the project default (gpt-5.4) is real and wins, carrying the
-  // option defaults T3 publishes for that model.
+  // The bad request and older project default are discarded in favor of the first model in T3's
+  // ordered catalogue for the project's provider.
   assert.equal(resolved.instanceId, "codex");
-  assert.equal(resolved.model, "gpt-5.4");
+  assert.equal(resolved.model, "gpt-5.6-sol");
   assert.deepEqual(resolved.options, [
-    { id: "reasoningEffort", value: "medium" },
+    { id: "reasoningEffort", value: "low" },
     { id: "serviceTier", value: "default" },
   ]);
 
@@ -172,6 +172,13 @@ test("selection falls back to a real usable model when the request is invalid", 
     { id: "reasoningEffort", value: "low" },
     { id: "serviceTier", value: "default" },
   ]);
+
+  const claudeLatest = resolveLatestModelSelection({
+    harnesses,
+    preferredInstanceId: "claudeAgent",
+  });
+  assert.equal(claudeLatest.instanceId, "claudeAgent");
+  assert.equal(claudeLatest.model, "claude-fable-5");
 
   assert.equal(resolveModelSelection({ harnesses: mergeHostCatalogue([], []) }), null);
 });

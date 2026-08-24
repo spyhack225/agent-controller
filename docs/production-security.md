@@ -35,9 +35,13 @@ Rollback needs three things. The first two are code and are in place:
    bootloader marks a newly flashed image `PENDING_VERIFY`; the firmware confirms it only after a
    **successful gateway heartbeat**. An image that boots but cannot reach the gateway is rolled
    back on the next reset instead of stranding the controller.
-3. **Bootloader rollback enabled** — requires `CONFIG_BOOTLOADER_APP_ROLLBACK_ENABLE=y` in the
-   ESP-IDF sdkconfig. Under Arduino-ESP32 this is a property of the prebuilt bootloader, so
-   confirm it for your core version before relying on it.
+3. **Bootloader rollback enabled** — requires a bootloader actually built with
+   `CONFIG_BOOTLOADER_APP_ROLLBACK_ENABLE=y`. The macro visible to an Arduino application is not
+   proof of the prebuilt bootloader's behavior. On the CrowPanel hardware the distributed
+   Arduino-ESP32 bootloader marked the first OTA boot `VALID`, so firmware also persists a boot
+   attempt counter and returns to the other OTA slot after a pre-heartbeat restart. That fallback
+   covers images that reach `DeviceStore::begin()`; a custom ESP-IDF bootloader is still required
+   to recover failures earlier than application setup.
 
 Build with OTA apply and signature enforcement on:
 
@@ -56,12 +60,13 @@ npm run firmware:publish
 Not automatable, and Phase 12 is not complete without it:
 
 1. Flash a known-good build and let it heartbeat successfully.
-2. Publish an image that boots but **cannot** reach the gateway (for example a deliberately wrong
-   `GATEWAY_BASE_URL`).
-3. Let the device apply it, then power-cycle.
-4. Confirm the bootloader returns to the previous image and the device heartbeats again.
+2. Build a drill image with `AGENT_CONTROLLER_OTA_ROLLBACK_DRILL=1`; it restarts before networking.
+3. Let the device apply it.
+4. Confirm the device selects the previous slot on its second boot, heartbeats again, and reports
+   `rolled_back`. A bootloader-level drill must separately use an image that fails before setup.
 
-Until that passes on real hardware, leave `ENABLE_OTA_APPLY=0` on shipping units.
+Until both application-level and custom-bootloader drills pass on real hardware, do not represent
+early-boot rollback as production-complete.
 
 ## Secure boot and flash encryption
 

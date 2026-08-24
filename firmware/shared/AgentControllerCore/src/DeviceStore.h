@@ -14,6 +14,15 @@
 #include <Arduino.h>
 #include <Preferences.h>
 
+constexpr size_t kMaxGatewayProfiles = 5;
+
+struct GatewayProfile {
+  String id;
+  String label;
+  String mode;
+  String url;
+};
+
 class DeviceStore {
  public:
   // Opens the namespace and caches every value in RAM. Returns false if NVS is unavailable, which
@@ -35,6 +44,32 @@ class DeviceStore {
   const String& gatewayUrl() const { return gatewayUrl_; }
   bool setGatewayUrl(const String& url);
 
+  // Gateway profiles are synced from the authenticated gateway, but remain available when that
+  // gateway is offline. `gw_url` remains the active URL for compatibility with every image already
+  // in the field; profiles and switch metadata are additional keys, never a migration of it.
+  size_t gatewayProfileCount() const { return gatewayProfileCount_; }
+  const GatewayProfile* gatewayProfile(size_t index) const;
+  const GatewayProfile* findGatewayProfile(const String& id) const;
+  uint32_t gatewayRevision() const { return gatewayRevision_; }
+  const String& activeGatewayProfileId() const { return activeGatewayProfileId_; }
+  const String& pendingGatewayProfileId() const { return pendingGatewayProfileId_; }
+  const String& pendingGatewayUrl() const { return pendingGatewayUrl_; }
+  const String& previousGatewayUrl() const { return previousGatewayUrl_; }
+  const String& gatewaySwitchState() const { return gatewaySwitchState_; }
+  const String& gatewaySwitchDetail() const { return gatewaySwitchDetail_; }
+
+  bool replaceGatewayProfiles(
+    const GatewayProfile* profiles,
+    size_t count,
+    uint32_t revision,
+    const String& activeProfileId
+  );
+  bool stageGatewaySwitch(const GatewayProfile& profile, uint32_t revision);
+  bool completeGatewaySwitch(const GatewayProfile& profile, uint32_t revision);
+  bool failGatewaySwitch(const String& detail, uint32_t revision);
+  bool clearGatewaySwitchFailure();
+  bool ensureLegacyGatewayProfile();
+
   // --- Wi-Fi. Written by the owner during provisioning. ---
   const String& wifiSsid() const { return wifiSsid_; }
   const String& wifiPassword() const { return wifiPassword_; }
@@ -55,6 +90,16 @@ class DeviceStore {
   // --- Runtime config cache, so a boot with no gateway still renders something useful. ---
   const String& configCache() const { return configCache_; }
   bool setConfigCache(const String& json);
+
+  // --- OTA attempt marker. ---
+  // Written only after a new image has been completely verified and committed to the inactive
+  // partition. It survives the restart, which lets the previous image report a real bootloader
+  // rollback instead of making that event indistinguishable from an ordinary boot.
+  const String& otaSourceVersion() const { return otaSourceVersion_; }
+  const String& otaTargetVersion() const { return otaTargetVersion_; }
+  bool setOtaAttempt(const String& sourceVersion, const String& targetVersion);
+  uint32_t registerOtaBootAttempt(const String& runningVersion);
+  bool clearOtaAttempt();
 
   // Wipes Wi-Fi credentials, the config cache, and the cached claim code, and keeps the device
   // identity. This is the long-press reset: the recovery path for a revoked device, a moved
@@ -82,9 +127,20 @@ class DeviceStore {
   String deviceId_;
   String deviceSecret_;
   String gatewayUrl_;
+  GatewayProfile gatewayProfiles_[kMaxGatewayProfiles];
+  size_t gatewayProfileCount_ = 0;
+  uint32_t gatewayRevision_ = 0;
+  String activeGatewayProfileId_;
+  String pendingGatewayProfileId_;
+  String pendingGatewayUrl_;
+  String previousGatewayUrl_;
+  String gatewaySwitchState_ = "stable";
+  String gatewaySwitchDetail_;
   String wifiSsid_;
   String wifiPassword_;
   String claimCode_;
   String claimCodeExpiresAt_;
   String configCache_;
+  String otaSourceVersion_;
+  String otaTargetVersion_;
 };

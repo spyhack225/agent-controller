@@ -21,6 +21,7 @@ import {
 
 import type { AuthConfig, ClerkBridge } from "../types";
 import { Button } from "../ui";
+import { LandingBrand, MarketingSwitch, Shot } from "./landingChrome";
 
 interface LandingPageProps {
   authConfig: AuthConfig;
@@ -184,19 +185,6 @@ const faq = [
 ];
 
 /**
- * Placeholder frames for product photography that does not exist yet. They are deliberately
- * captioned rather than blank so an empty slot reads as "shot pending", not as a broken image.
- */
-function Shot({ icon: Icon, caption, ratio }: { icon: LucideIcon; caption: string; ratio: string }) {
-  return (
-    <div className="landing__shot" style={{ aspectRatio: ratio }}>
-      <Icon className="size-5" aria-hidden="true" />
-      <p>{caption}</p>
-    </div>
-  );
-}
-
-/**
  * The signed-out front door. Before this existed, an unauthenticated visitor was dropped into the
  * full app shell — empty sidebar, empty Operate page, and a small "Sign in" button in the corner —
  * with nothing explaining what the product was or what signing in would get them.
@@ -209,15 +197,7 @@ export function LandingPage({ authConfig, clerk }: LandingPageProps) {
     <div className="landing">
       <header className="landing__bar">
         <div className="landing__bar-inner">
-          <div className="landing__brand">
-            <div className="brand-mark" aria-hidden="true">
-              <TerminalSquare className="size-4" />
-            </div>
-            <div className="brand-copy">
-              <p className="brand-copy__name">Agent Controller</p>
-              <p className="brand-copy__meta">NIGHTLY</p>
-            </div>
-          </div>
+          <LandingBrand />
 
           <nav className="landing__nav" aria-label="Page sections">
             {navLinks.map((link) => (
@@ -468,6 +448,7 @@ export function LandingPage({ authConfig, clerk }: LandingPageProps) {
             </div>
             <span>Agent Controller · self-hostable gateway · MIT firmware</span>
           </div>
+          <MarketingSwitch current="home" />
           <p className="landing__footer-meta">Docs · Hardware protocol · Security · Status</p>
         </div>
       </footer>

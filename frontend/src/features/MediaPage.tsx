@@ -5,7 +5,7 @@ import {
   FileUp,
   Image,
   Mic,
-  Play,
+  Plus,
   RefreshCw,
   Save,
   Square,
@@ -13,8 +13,9 @@ import {
   UploadCloud,
   VideoOff,
   WandSparkles,
+  X,
 } from "lucide-react";
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 
 import type { Controller } from "../controller";
 import {
@@ -29,16 +30,22 @@ import {
   EmptyState,
   Field,
   Panel,
-  SectionHeader,
   StatusBadge,
   useConfirm,
 } from "../ui";
+
+type MediaSource = "upload" | "audio" | "camera";
 
 export function MediaPage({ controller: c }: { controller: Controller }) {
   const confirm = useConfirm();
   const [file, setFile] = useState<File | null>(null);
   const [uploadTranscript, setUploadTranscript] = useState("");
   const [transcriptDrafts, setTranscriptDrafts] = useState<Record<string, string>>({});
+  const [creatorOpen, setCreatorOpen] = useState(false);
+  const [source, setSource] = useState<MediaSource>("upload");
+  const creatorTriggerRef = useRef<HTMLButtonElement>(null);
+  const creatorDialogRef = useRef<HTMLElement>(null);
+  const creatorCloseRef = useRef<HTMLButtonElement>(null);
 
   useEffect(() => {
     setTranscriptDrafts((current) => {
@@ -97,6 +104,61 @@ export function MediaPage({ controller: c }: { controller: Controller }) {
   });
 
   const camera = useCameraCapture({ onError: notifyError });
+
+  const closeCreator = () => {
+    if (recorder.recording) {
+      c.setNotice({ tone: "info", message: "Stop the recording before closing Add media." });
+      return;
+    }
+    camera.close();
+    setCreatorOpen(false);
+    setSource("upload");
+    setFile(null);
+    setUploadTranscript("");
+  };
+
+  const selectSource = (next: MediaSource) => {
+    if (recorder.recording) return;
+    if (source === "camera" && next !== "camera") camera.close();
+    setSource(next);
+  };
+
+  useEffect(() => {
+    if (!creatorOpen) return;
+    const previousFocus = document.activeElement instanceof HTMLElement
+      ? document.activeElement
+      : creatorTriggerRef.current;
+    const frame = window.requestAnimationFrame(() => creatorCloseRef.current?.focus());
+    const onKeyDown = (event: KeyboardEvent) => {
+      if (event.key === "Escape") {
+        event.preventDefault();
+        creatorCloseRef.current?.click();
+        return;
+      }
+      if (event.key !== "Tab") return;
+      const focusable = Array.from(
+        creatorDialogRef.current?.querySelectorAll<HTMLElement>(
+          'button:not([disabled]), input:not([disabled]), textarea:not([disabled]), [href], [tabindex]:not([tabindex="-1"])',
+        ) ?? [],
+      ).filter((element) => element.offsetParent !== null);
+      if (!focusable.length) return;
+      const first = focusable[0];
+      const last = focusable[focusable.length - 1];
+      if (event.shiftKey && document.activeElement === first) {
+        event.preventDefault();
+        last.focus();
+      } else if (!event.shiftKey && document.activeElement === last) {
+        event.preventDefault();
+        first.focus();
+      }
+    };
+    window.addEventListener("keydown", onKeyDown);
+    return () => {
+      window.cancelAnimationFrame(frame);
+      window.removeEventListener("keydown", onKeyDown);
+      previousFocus?.focus();
+    };
+  }, [creatorOpen]);
 
   const captureCamera = async () => {
     const blob = await camera.capture().catch((error: unknown) => {
@@ -159,139 +221,33 @@ export function MediaPage({ controller: c }: { controller: Controller }) {
   };
 
   return (
-    <div className="page-stack">
-      <div className="grid gap-4 xl:grid-cols-3">
-        <Panel elevated className="overflow-hidden xl:col-span-1">
-          <SectionHeader
-            eyebrow="Upload"
-            title="Add media context"
-            description="Images and audio can be attached to agent prompts."
-          />
-          <div className="space-y-4 border-t border-control p-5">
-            <label className="upload-drop">
-              <input
-                type="file"
-                className="sr-only"
-                accept="image/png,image/jpeg,image/webp,audio/wav,audio/mpeg,audio/mp4,audio/webm,audio/ogg"
-                onChange={(event) => setFile(event.target.files?.[0] ?? null)}
-              />
-              <UploadCloud className="size-6 text-primary" />
-              <span className="font-display text-sm font-semibold">{file?.name ?? "Choose image or audio"}</span>
-              <span className="text-xs text-ink-muted">PNG, JPEG, WebP, WAV, MP3, MP4, WebM, or OGG</span>
-            </label>
-            <Field label="Audio transcript" htmlFor="upload-transcript" hint="Optional for audio uploads.">
-              <textarea
-                id="upload-transcript"
-                rows={3}
-                value={uploadTranscript}
-                onChange={(event) => setUploadTranscript(event.target.value)}
-                placeholder="Paste or enter a transcript"
-              />
-            </Field>
+    <div className="page-stack media-workspace media-library-workspace">
+      <header className="media-library-header">
+        <div>
+          <p className="eyebrow">Library</p>
+          <h2>Media context</h2>
+          <p>Uploads and captures available to attach from Operations.</p>
+        </div>
+        <div className="media-library-header__actions">
+          <Button size="sm" onClick={() => void c.refreshMedia()}>
+            <RefreshCw className="size-4" /> Refresh
+          </Button>
+          {c.media.length ? (
             <Button
-              className="w-full"
+              ref={creatorTriggerRef}
+              size="sm"
               variant="primary"
-              busy={c.busyAction === "upload-media"}
-              onClick={() => void uploadFile()}
+              onClick={() => setCreatorOpen(true)}
             >
-              <FileUp className="size-4" /> Upload media
+              <Plus className="size-4" /> Add media
             </Button>
-          </div>
-        </Panel>
+          ) : null}
+        </div>
+      </header>
 
-        <Panel className="overflow-hidden">
-          <SectionHeader
-            eyebrow="Microphone"
-            title="Record audio"
-            action={
-              <StatusBadge
-                tone={recorder.recording ? "danger" : recorder.status === "uploaded" ? "success" : "neutral"}
-                label={CAPTURE_STATUS_LABEL[recorder.status]}
-              />
-            }
-          />
-          <div className="grid min-h-52 place-items-center border-t border-control bg-surface-inset/40 p-5 text-center">
-            <div>
-              <div className="mx-auto grid size-16 place-items-center rounded-full border border-control bg-surface-raised shadow-sm">
-                <Mic className="size-7 text-primary" />
-              </div>
-              <p className="mt-4 text-sm font-semibold">
-                {recorder.recording ? "Recording in progress" : "Capture a voice prompt"}
-              </p>
-              <p className="mt-1 text-xs text-ink-muted">Recording uploads automatically when stopped.</p>
-              <div className="mt-4 flex justify-center gap-2">
-                <Button
-                  disabled={!recorder.supported || recorder.recording || c.busyAction === "upload-recording"}
-                  onClick={() => void recorder.start()}
-                >
-                  <Play className="size-4" /> Record
-                </Button>
-                <Button
-                  variant="danger-ghost"
-                  disabled={!recorder.recording}
-                  onClick={recorder.stop}
-                >
-                  <Square className="size-4" /> Stop
-                </Button>
-              </div>
-            </div>
-          </div>
-        </Panel>
-
-        <Panel className="overflow-hidden">
-          <SectionHeader
-            eyebrow="Camera"
-            title="Capture an image"
-            action={
-              <StatusBadge
-                tone={camera.status === "ready" ? "live" : camera.status === "uploaded" ? "success" : "neutral"}
-                label={CAPTURE_STATUS_LABEL[camera.status]}
-              />
-            }
-          />
-          <div className="border-t border-control bg-console p-3">
-            <div className="relative aspect-[4/3] overflow-hidden rounded-lg border border-white/10 bg-black">
-              <video ref={camera.videoRef} className="size-full object-cover" playsInline muted />
-              {!camera.active ? (
-                <div className="absolute inset-0 grid place-items-center text-console-muted">
-                  <div className="text-center">
-                    <VideoOff className="mx-auto size-7" />
-                    <p className="mt-2 text-xs">Camera closed</p>
-                  </div>
-                </div>
-              ) : null}
-            </div>
-            <div className="mt-3 flex gap-2">
-              <Button className="flex-1" disabled={!camera.supported} onClick={() => void camera.toggle()}>
-                <Camera className="size-4" /> {camera.active ? "Close" : "Open"}
-              </Button>
-              <Button
-                className="flex-1"
-                variant="primary"
-                disabled={!camera.active}
-                busy={c.busyAction === "capture-camera"}
-                onClick={() => void captureCamera()}
-              >
-                <Image className="size-4" /> Capture
-              </Button>
-            </div>
-          </div>
-        </Panel>
-      </div>
-
-      <Panel elevated className="overflow-hidden">
-        <SectionHeader
-          eyebrow="Library"
-          title="Stored media"
-          description="Processing, transcripts, and retention state for user-scoped captures."
-          action={
-            <Button size="sm" onClick={() => void c.refreshMedia()}>
-              <RefreshCw className="size-4" /> Refresh
-            </Button>
-          }
-        />
+      <Panel className="media-library overflow-hidden">
         {c.media.length ? (
-          <div className="divide-y divide-control border-t border-control">
+          <div className="divide-y divide-control">
             {c.media.map((item) => (
               <article key={item.id} className="grid gap-4 p-4 lg:grid-cols-[auto_minmax(180px,0.55fr)_minmax(260px,1fr)_auto] lg:items-center">
                 <div className="grid size-10 place-items-center rounded-lg border border-control bg-surface-inset text-primary">
@@ -329,7 +285,7 @@ export function MediaPage({ controller: c }: { controller: Controller }) {
                     </Field>
                   ) : (
                     <div className="rounded-lg border border-dashed border-control p-4 text-center text-xs text-ink-muted">
-                      Image context is ready to attach from Operate.
+                      Image context is ready to attach from Operations.
                     </div>
                   )}
                 </div>
@@ -355,10 +311,232 @@ export function MediaPage({ controller: c }: { controller: Controller }) {
           <EmptyState
             icon={UploadCloud}
             title="No stored media"
-            description="Upload a file, record audio, or capture a camera frame to add context."
+            description="Add a file, voice recording, or camera frame when you need visual or audio context."
+            action={
+              <Button variant="primary" onClick={() => setCreatorOpen(true)}>
+                <Plus className="size-4" /> Add media
+              </Button>
+            }
           />
         )}
       </Panel>
+
+      {creatorOpen ? (
+        <div
+          className="media-creator-backdrop"
+          role="presentation"
+          onMouseDown={(event) => {
+            if (event.target === event.currentTarget) closeCreator();
+          }}
+        >
+          <section
+            ref={creatorDialogRef}
+            className="media-creator"
+            role="dialog"
+            aria-modal="true"
+            aria-labelledby="media-creator-title"
+            aria-describedby="media-creator-description"
+          >
+            <header className="media-creator__header">
+              <div>
+                <p className="eyebrow">New context</p>
+                <h2 id="media-creator-title">Add media</h2>
+                <p id="media-creator-description">Choose one source. You can attach the result from Operations.</p>
+              </div>
+              <Button
+                ref={creatorCloseRef}
+                size="icon"
+                variant="ghost"
+                disabled={recorder.recording}
+                aria-label="Close Add media"
+                title={recorder.recording ? "Stop recording before closing" : "Close Add media"}
+                onClick={closeCreator}
+              >
+                <X className="size-4" />
+              </Button>
+            </header>
+
+            <div className="media-source-tabs" role="tablist" aria-label="Media source">
+              <button
+                id="media-tab-upload"
+                type="button"
+                role="tab"
+                aria-selected={source === "upload"}
+                aria-controls="media-panel-upload"
+                data-active={source === "upload" || undefined}
+                disabled={recorder.recording}
+                onClick={() => selectSource("upload")}
+              >
+                <UploadCloud className="size-4" /> Upload file
+              </button>
+              <button
+                id="media-tab-audio"
+                type="button"
+                role="tab"
+                aria-selected={source === "audio"}
+                aria-controls="media-panel-audio"
+                data-active={source === "audio" || undefined}
+                onClick={() => selectSource("audio")}
+              >
+                <Mic className="size-4" /> Record audio
+              </button>
+              <button
+                id="media-tab-camera"
+                type="button"
+                role="tab"
+                aria-selected={source === "camera"}
+                aria-controls="media-panel-camera"
+                data-active={source === "camera" || undefined}
+                disabled={recorder.recording}
+                onClick={() => selectSource("camera")}
+              >
+                <Camera className="size-4" /> Use camera
+              </button>
+            </div>
+
+            <div className="media-creator__body">
+              {source === "upload" ? (
+                <div
+                  id="media-panel-upload"
+                  className="media-creator-panel"
+                  role="tabpanel"
+                  aria-labelledby="media-tab-upload"
+                >
+                  <label className="upload-drop">
+                    <input
+                      type="file"
+                      className="sr-only"
+                      accept="image/png,image/jpeg,image/webp,audio/wav,audio/mpeg,audio/mp4,audio/webm,audio/ogg"
+                      onChange={(event) => {
+                        setFile(event.target.files?.[0] ?? null);
+                        setUploadTranscript("");
+                      }}
+                    />
+                    <UploadCloud className="size-6 text-primary" />
+                    <span className="font-display text-sm font-semibold">{file?.name ?? "Choose an image or audio file"}</span>
+                    <span className="text-xs text-ink-muted">PNG, JPEG, WebP, WAV, MP3, MP4, WebM, or OGG</span>
+                  </label>
+                  {file?.type.startsWith("audio/") ? (
+                    <Field label="Audio transcript" htmlFor="upload-transcript" hint="Optional. You can also add or generate it later.">
+                      <textarea
+                        id="upload-transcript"
+                        rows={3}
+                        value={uploadTranscript}
+                        onChange={(event) => setUploadTranscript(event.target.value)}
+                        placeholder="Paste or enter a transcript"
+                      />
+                    </Field>
+                  ) : null}
+                  <Button
+                    className="w-full"
+                    variant="primary"
+                    disabled={!file}
+                    busy={c.busyAction === "upload-media"}
+                    onClick={() => void uploadFile()}
+                  >
+                    <FileUp className="size-4" /> Upload file
+                  </Button>
+                </div>
+              ) : null}
+
+              {source === "audio" ? (
+                <div
+                  id="media-panel-audio"
+                  className="media-creator-panel media-capture-panel"
+                  role="tabpanel"
+                  aria-labelledby="media-tab-audio"
+                >
+                  <div className="media-capture-panel__icon" data-live={recorder.recording || undefined}>
+                    <Mic className="size-7" />
+                  </div>
+                  <div className="media-capture-panel__copy">
+                    <div className="flex items-center justify-center gap-2">
+                      <h3>{recorder.recording ? "Recording…" : "Record a voice clip"}</h3>
+                      {recorder.status !== "idle" ? (
+                        <StatusBadge
+                          tone={recorder.recording ? "danger" : recorder.status === "uploaded" ? "success" : "neutral"}
+                          label={CAPTURE_STATUS_LABEL[recorder.status]}
+                        />
+                      ) : null}
+                    </div>
+                    <p>
+                      {recorder.supported
+                        ? "The recording uploads when you stop it."
+                        : "Microphone recording is unavailable in this browser."}
+                    </p>
+                  </div>
+                  {!recorder.recording ? (
+                    <details className="media-creator-optional">
+                      <summary>Add transcript (optional)</summary>
+                      <Field label="Transcript" htmlFor="recording-transcript" hint="You can also generate it from the library later.">
+                        <textarea
+                          id="recording-transcript"
+                          rows={3}
+                          value={uploadTranscript}
+                          onChange={(event) => setUploadTranscript(event.target.value)}
+                          placeholder="Paste or enter a transcript"
+                        />
+                      </Field>
+                    </details>
+                  ) : null}
+                  <Button
+                    className="w-full"
+                    variant={recorder.recording ? "danger" : "primary"}
+                    disabled={!recorder.supported || recorder.status === "saving" || c.busyAction === "upload-recording"}
+                    onClick={recorder.recording ? recorder.stop : () => void recorder.start()}
+                  >
+                    {recorder.recording ? <Square className="size-4" /> : <Mic className="size-4" />}
+                    {recorder.recording ? "Stop recording" : "Start recording"}
+                  </Button>
+                </div>
+              ) : null}
+
+              {source === "camera" ? (
+                <div
+                  id="media-panel-camera"
+                  className="media-creator-panel"
+                  role="tabpanel"
+                  aria-labelledby="media-tab-camera"
+                >
+                  {camera.active ? (
+                    <>
+                      <div className="media-camera-preview relative overflow-hidden rounded-lg border border-white/10 bg-black">
+                        <video ref={camera.videoRef} className="size-full object-cover" playsInline muted />
+                      </div>
+                      <div className="grid grid-cols-2 gap-2">
+                        <Button onClick={camera.close}>
+                          <VideoOff className="size-4" /> Close camera
+                        </Button>
+                        <Button
+                          variant="primary"
+                          busy={c.busyAction === "capture-camera"}
+                          onClick={() => void captureCamera()}
+                        >
+                          <Image className="size-4" /> Capture image
+                        </Button>
+                      </div>
+                    </>
+                  ) : (
+                    <EmptyState
+                      compact
+                      icon={VideoOff}
+                      title="Camera is off"
+                      description={camera.supported
+                        ? "Open it only when you are ready to capture a frame."
+                        : "Camera capture is unavailable in this browser."}
+                      action={
+                        <Button variant="primary" disabled={!camera.supported} onClick={() => void camera.open()}>
+                          <Camera className="size-4" /> Open camera
+                        </Button>
+                      }
+                    />
+                  )}
+                </div>
+              ) : null}
+            </div>
+          </section>
+        </div>
+      ) : null}
     </div>
   );
 }

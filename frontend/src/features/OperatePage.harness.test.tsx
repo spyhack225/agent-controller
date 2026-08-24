@@ -1,4 +1,4 @@
-import { render, screen, waitFor } from "@testing-library/react";
+import { fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { vi } from "vitest";
 
 import type { Controller } from "../controller";
@@ -85,6 +85,95 @@ function controller(overrides: Record<string, unknown> = {}) {
   } as unknown as Controller;
 }
 
+test("automatically loads the selected workspace without waiting for a button click", async () => {
+  const loadSnapshot = vi.fn(async () => new Promise(() => {}));
+  const c = controller({
+    selectedThreadId: "",
+    selectedProjectId: "",
+    selectedProject: null,
+    threads: [],
+    projects: [],
+    loadSnapshot,
+  });
+
+  render(<ConfirmProvider><OperatePage controller={c} /></ConfirmProvider>);
+
+  await waitFor(() => expect(loadSnapshot).toHaveBeenCalledWith("env_1"));
+  expect(loadSnapshot).toHaveBeenCalledTimes(1);
+  expect(screen.queryByRole("button", { name: /Load workspace/u })).toBeNull();
+  expect(screen.getByRole("status")).toHaveTextContent("Loading workspace…");
+});
+
+test("shows a refresh action only after an automatically loaded workspace is confirmed empty", async () => {
+  const loadSnapshot = vi.fn(async () => ({}));
+  const c = controller({
+    selectedThreadId: "",
+    selectedProjectId: "",
+    selectedProject: null,
+    threads: [],
+    projects: [],
+    loadSnapshot,
+  });
+
+  render(<ConfirmProvider><OperatePage controller={c} /></ConfirmProvider>);
+
+  expect(await screen.findByText("Workspace is empty")).toBeTruthy();
+  expect(loadSnapshot).toHaveBeenCalledTimes(1);
+  expect(screen.getByRole("button", { name: "Refresh workspace" })).toBeTruthy();
+});
+
+test("keeps the full command context available while a workspace is fetching", () => {
+  render(<ConfirmProvider><OperatePage controller={controller({
+    selectedThreadId: "",
+    selectedProjectId: "",
+    selectedProject: null,
+    threads: [],
+    projects: [],
+    loadSnapshot: vi.fn(async () => new Promise(() => {})),
+  })} /></ConfirmProvider>);
+
+  expect(screen.getByLabelText("Environment")).toBeVisible();
+  expect(screen.getByLabelText("Project")).toBeVisible();
+  expect(screen.getByLabelText("Thread")).toBeVisible();
+  expect(screen.getByLabelText("Agent harness")).toBeVisible();
+  expect(screen.getByLabelText("Model")).toBeVisible();
+});
+
+test("changing environment immediately fetches its complete workspace", async () => {
+  const c = controller({
+    environments: [
+      { id: "env_1", label: "Mac T3" },
+      { id: "env_2", label: "Build server" },
+    ],
+  });
+  render(<ConfirmProvider><OperatePage controller={c} /></ConfirmProvider>);
+
+  fireEvent.change(screen.getByLabelText("Environment"), { target: { value: "env_2" } });
+
+  expect(c.setSelectedEnvironmentId).toHaveBeenCalledWith("env_2");
+  await waitFor(() => expect(c.loadSnapshot).toHaveBeenCalledWith("env_2"));
+});
+
+test("changing project selects one of that project's threads and filters the thread field", () => {
+  const c = controller({
+    projects: [
+      { id: "project_1", title: "Tacs" },
+      { id: "project_2", title: "Console" },
+    ],
+    threads: [
+      { id: "thread_1", label: "Tacs thread", projectId: "project_1" },
+      { id: "thread_2", label: "Console thread", projectId: "project_2" },
+    ],
+  });
+  render(<ConfirmProvider><OperatePage controller={c} /></ConfirmProvider>);
+
+  expect(within(screen.getByLabelText("Thread")).queryByText("Console thread")).toBeNull();
+  fireEvent.change(screen.getByLabelText("Project"), { target: { value: "project_2" } });
+
+  expect(c.setSelectedProjectId).toHaveBeenCalledWith("project_2");
+  expect(c.setSelectedThreadId).toHaveBeenCalledWith("thread_2");
+});
+
 test("the model field is a list of real models, not free text", async () => {
   render(<ConfirmProvider><OperatePage controller={controller()} /></ConfirmProvider>);
 
@@ -111,10 +200,39 @@ test("the harness field lists usable harnesses and disables unavailable ones wit
   expect(grok?.textContent).toContain("Not installed on the T3 host.");
 });
 
-test("a project default that T3 still offers is preselected", async () => {
+test("the latest model for the project's provider is preselected", async () => {
   render(<ConfirmProvider><OperatePage controller={controller()} /></ConfirmProvider>);
   await waitFor(() => {
-    expect((screen.getByLabelText("Model") as HTMLSelectElement).value).toBe("gpt-5.4");
+    expect((screen.getByLabelText("Model") as HTMLSelectElement).value).toBe("gpt-5.6-sol");
+  });
+});
+
+test("an existing thread synchronizes its harness and model into the toolbar", async () => {
+  render(<ConfirmProvider><OperatePage controller={controller({
+    threads: [{
+      id: "thread_1",
+      label: "Thread",
+      projectId: "project_1",
+      modelSelection: { instanceId: "claudeAgent", model: "claude-fable-5" },
+    }],
+  })} /></ConfirmProvider>);
+
+  await waitFor(() => {
+    expect(screen.getByLabelText("Agent harness")).toHaveValue("claudeAgent");
+    expect(screen.getByLabelText("Model")).toHaveValue("claude-fable-5");
+  });
+});
+
+test("changing harness starts a new thread with that harness's available model", async () => {
+  const c = controller();
+  render(<ConfirmProvider><OperatePage controller={c} /></ConfirmProvider>);
+
+  fireEvent.change(screen.getByLabelText("Agent harness"), { target: { value: "claudeAgent" } });
+
+  expect(c.setSelectedThreadId).toHaveBeenCalledWith("");
+  await waitFor(() => {
+    expect(screen.getByLabelText("Agent harness")).toHaveValue("claudeAgent");
+    expect(screen.getByLabelText("Model")).toHaveValue("claude-fable-5");
   });
 });
 
@@ -141,6 +259,138 @@ test("stopped sessions surface T3's provider error instead of staying silent", a
   expect(screen.getByText(/Verify Workspace and Current Branch/u)).toBeTruthy();
 });
 
+test("a failed unsupported-model session offers a safe replacement without relaunching immediately", async () => {
+  const c = controller({ sessionFailures: [FAILURE] });
+  render(<ConfirmProvider><OperatePage controller={c} /></ConfirmProvider>);
+
+  fireEvent.click(await screen.findByRole("button", { name: /Prepare replacement/u }));
+
+  expect(c.setSelectedThreadId).toHaveBeenCalledWith("");
+  expect(screen.getByLabelText("Command or prompt")).toHaveValue("Verify Workspace and Current Branch");
+  expect(screen.getByLabelText("Model")).toHaveValue("gpt-5.6-sol");
+  expect(c.launchProject).not.toHaveBeenCalled();
+  expect(c.setNotice).toHaveBeenCalledWith(expect.objectContaining({
+    tone: "info",
+    message: expect.stringContaining("replacement is ready with codex/gpt-5.6-sol"),
+  }));
+});
+
+test("a recovered launch tells the user which model was substituted", async () => {
+  const c = controller({
+    selectedThreadId: "",
+    launchProject: vi.fn(async () => ({
+      threadId: "thread_new",
+      modelSelection: { instanceId: "codex", model: "gpt-5.6-sol" },
+      modelRecovery: {
+        requested: { instanceId: "codex", model: "gpt-5..6" },
+        selected: { instanceId: "codex", model: "gpt-5.6-sol" },
+        reason: "Unknown model",
+        catalogueSource: "registered",
+      },
+      command: { id: "command_new", status: "dispatched" },
+    })),
+  });
+  render(<ConfirmProvider><OperatePage controller={c} /></ConfirmProvider>);
+
+  fireEvent.change(screen.getByLabelText("Command or prompt"), { target: { value: "Verify workspace" } });
+  fireEvent.click(await screen.findByRole("button", { name: "Start new thread" }));
+
+  await waitFor(() => expect(c.setNotice).toHaveBeenCalledWith({
+    tone: "info",
+    message: "codex/gpt-5..6 is unavailable. Started this thread with codex/gpt-5.6-sol instead.",
+  }));
+});
+
+test("loads only the selected thread's messages and failures into the Operations feed", () => {
+  const otherFailure = { ...FAILURE, threadId: "thread_2", title: "Other thread", message: "Other failure" };
+  render(
+    <ConfirmProvider>
+      <OperatePage controller={controller({
+        threads: [
+          {
+            id: "thread_1",
+            label: "Selected thread",
+            projectId: "project_1",
+            messages: [
+              { id: "message_1", role: "user", text: "Review the selected branch" },
+              { id: "message_2", role: "assistant", text: "The selected branch is ready" },
+            ],
+          },
+          {
+            id: "thread_2",
+            label: "Other thread",
+            projectId: "project_1",
+            messages: [{ id: "message_3", role: "user", text: "This belongs elsewhere" }],
+          },
+        ],
+        sessionFailures: [FAILURE, otherFailure],
+      })} />
+    </ConfirmProvider>,
+  );
+
+  expect(screen.getByText("Review the selected branch")).toBeVisible();
+  expect(screen.getByText("The selected branch is ready")).toBeVisible();
+  expect(screen.queryByText("This belongs elsewhere")).toBeNull();
+  expect(screen.getByText("1 failed")).toBeVisible();
+  expect(screen.queryByText("Other failure")).toBeNull();
+});
+
+test("filters command activity and approvals to the selected thread", () => {
+  render(
+    <ConfirmProvider>
+      <OperatePage controller={controller({
+        recentCommands: [
+          { id: "command_selected", environmentId: "env_1", threadId: "thread_1", status: "completed", intent: { type: "agent_prompt", text: "Selected command" } },
+          { id: "command_other", environmentId: "env_1", threadId: "thread_2", status: "completed", intent: { type: "agent_prompt", text: "Other command" } },
+        ],
+        pendingApprovals: [
+          { id: "approval_selected", environmentId: "env_1", threadId: "thread_1", status: "approval_required", intent: { type: "shell_input", command: "npm test" } },
+          { id: "approval_other", environmentId: "env_1", threadId: "thread_2", status: "approval_required", intent: { type: "shell_input", command: "npm publish" } },
+        ],
+      })} />
+    </ConfirmProvider>,
+  );
+
+  expect(screen.getByText("Selected command")).toBeVisible();
+  expect(screen.getByText("npm test")).toBeVisible();
+  expect(screen.queryByText("Other command")).toBeNull();
+  expect(screen.queryByText("npm publish")).toBeNull();
+});
+
+test("renders the T3 reply instead of dispatch receipt JSON", () => {
+  const command = {
+    id: "command_selected",
+    environmentId: "env_1",
+    threadId: "thread_1",
+    status: "completed",
+    intent: { type: "agent_prompt", text: "Verify the current branch" },
+  };
+  render(
+    <ConfirmProvider>
+      <OperatePage controller={controller({
+        recentCommands: [command],
+        timelineCommand: command,
+        commandEvents: [
+          {
+            id: "event_dispatched",
+            status: "dispatched",
+            result: { createThread: { sequence: 2 }, startTurn: { sequence: 4 } },
+          },
+          {
+            id: "event_completed",
+            status: "completed",
+            result: { response: "The current branch is codex/render-t3-response." },
+          },
+        ],
+      })} />
+    </ConfirmProvider>,
+  );
+
+  expect(screen.getByText("Sent to T3 Code")).toBeVisible();
+  expect(screen.getByText("The current branch is codex/render-t3-response.")).toBeVisible();
+  expect(screen.queryByText('{"createThread":{"sequence":2},"startTurn":{"sequence":4}}')).toBeNull();
+});
+
 test("an unregistered catalogue tells the user how to register it", async () => {
   render(
     <ConfirmProvider>
@@ -150,10 +400,109 @@ test("an unregistered catalogue tells the user how to register it", async () => 
   expect(await screen.findByText(/setup:t3/u)).toBeTruthy();
 });
 
-test("launch is blocked when no model can be selected", async () => {
-  const c = controller({ harnesses: [], suggestedModelSelection: null, selectedProject: { id: "project_1", title: "Tacs" } });
+test("starting a new thread is blocked when no model can be selected", async () => {
+  const c = controller({
+    selectedThreadId: "",
+    harnesses: [],
+    suggestedModelSelection: null,
+    selectedProject: { id: "project_1", title: "Tacs" },
+  });
   render(<ConfirmProvider><OperatePage controller={c} /></ConfirmProvider>);
 
-  const launch = await screen.findByRole("button", { name: /Launch/u });
-  await waitFor(() => expect((launch as HTMLButtonElement).disabled).toBe(true));
+  fireEvent.change(screen.getByLabelText("Command or prompt"), { target: { value: "Start reviewing" } });
+  const start = await screen.findByRole("button", { name: "Start new thread" });
+  await waitFor(() => expect((start as HTMLButtonElement).disabled).toBe(true));
+});
+
+test("sends composer messages to the selected thread instead of launching another thread", async () => {
+  const c = controller();
+  render(<ConfirmProvider><OperatePage controller={c} /></ConfirmProvider>);
+
+  fireEvent.change(screen.getByLabelText("Command or prompt"), { target: { value: "Review the next change" } });
+  fireEvent.click(screen.getByRole("button", { name: "Send message" }));
+
+  await waitFor(() => expect(c.api).toHaveBeenCalledWith("/v1/intents", {
+    method: "POST",
+    body: {
+      environmentId: "env_1",
+      threadId: "thread_1",
+      intent: { type: "agent_prompt", text: "Review the next change" },
+    },
+  }));
+  expect(c.launchProject).not.toHaveBeenCalled();
+  expect(c.loadSnapshot).toHaveBeenCalledWith("env_1");
+});
+
+test("creates a separate T3 thread only from explicit new-thread mode", async () => {
+  const c = controller({ selectedThreadId: "" });
+  render(<ConfirmProvider><OperatePage controller={c} /></ConfirmProvider>);
+
+  fireEvent.change(screen.getByLabelText("Command or prompt"), { target: { value: "Build the release checklist" } });
+  const start = await screen.findByRole("button", { name: "Start new thread" });
+  await waitFor(() => expect(start).toBeEnabled());
+  fireEvent.click(start);
+
+  await waitFor(() => expect(c.launchProject).toHaveBeenCalledWith(expect.objectContaining({
+    projectId: "project_1",
+    text: "Build the release checklist",
+    modelSelection: { instanceId: "codex", model: "gpt-5.6-sol" },
+  })));
+});
+
+test("saves the current composer as a reusable payload-backed action", async () => {
+  const c = controller({ actions: [] });
+  render(<ConfirmProvider><OperatePage controller={c} /></ConfirmProvider>);
+
+  fireEvent.change(screen.getByLabelText("Command or prompt"), { target: { value: "Review this branch" } });
+  fireEvent.click(screen.getByText(/Saved actions \(0\)/u));
+  fireEvent.change(screen.getByLabelText("Action label"), { target: { value: "Review branch" } });
+  fireEvent.click(screen.getByRole("button", { name: "Save" }));
+
+  await waitFor(() => expect(c.api).toHaveBeenCalledWith("/v1/actions", {
+    method: "POST",
+    body: expect.objectContaining({
+      label: "Review branch",
+      type: "prompt",
+      payload: { text: "Review this branch" },
+      targetMode: "fixed",
+    }),
+  }));
+});
+
+test("loads a saved action back into the composer for editing", async () => {
+  const c = controller({
+    actions: [{ id: "action_review", label: "Review branch", type: "prompt", payload: { text: "Review this branch" } }],
+  });
+  render(<ConfirmProvider><OperatePage controller={c} /></ConfirmProvider>);
+
+  fireEvent.click(screen.getByText(/Saved actions \(1\)/u));
+  fireEvent.click(screen.getByRole("button", { name: "Edit Review branch" }));
+  expect(screen.getByLabelText("Command or prompt")).toHaveValue("Review this branch");
+  expect(screen.getByLabelText("Action label")).toHaveValue("Review branch");
+  fireEvent.change(screen.getByLabelText("Command or prompt"), { target: { value: "Review release branch" } });
+  fireEvent.click(screen.getByRole("button", { name: "Update" }));
+
+  await waitFor(() => expect(c.api).toHaveBeenCalledWith("/v1/actions/action_review", expect.objectContaining({
+    method: "PUT",
+    body: expect.objectContaining({ payload: { text: "Review release branch" } }),
+  })));
+});
+
+test("does not run a media action without selecting an upload", () => {
+  const c = controller({
+    actions: [{
+      id: "action_photo",
+      label: "Inspect photo",
+      type: "media",
+      payload: { mediaKind: "image", prompt: "Inspect this image" },
+    }],
+  });
+  render(<ConfirmProvider><OperatePage controller={c} /></ConfirmProvider>);
+
+  fireEvent.click(screen.getByText(/Saved actions \(1\)/u));
+  const guidance = screen.getByText("Choose media in Actions");
+  const row = guidance.closest(".thread-tool-row");
+  expect(row).not.toBeNull();
+  expect(within(row as HTMLElement).getByRole("button", { name: "Run" })).toBeDisabled();
+  expect(c.api).not.toHaveBeenCalledWith("/v1/actions/action_photo/run", expect.anything());
 });

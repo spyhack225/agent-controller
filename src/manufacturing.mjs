@@ -40,9 +40,15 @@ export function buildFlashConfig({
     `#define DEFAULT_SHELL_COMMAND "${cString(shellCommand)}"`,
     `#define HARDWARE_MODEL "${cString(hardwareModel)}"`,
     `#define FIRMWARE_VERSION "${cString(firmwareVersion)}"`,
+    "#ifndef ENABLE_OTA_APPLY",
     `#define ENABLE_OTA_APPLY ${enableOtaApply ? 1 : 0}`,
+    "#endif",
+    "#ifndef REQUIRE_OTA_SIGNATURE",
     `#define REQUIRE_OTA_SIGNATURE ${requireOtaSignature ? 1 : 0}`,
+    "#endif",
+    "#ifndef OTA_MANIFEST_VERIFY_KEY",
     `#define OTA_MANIFEST_VERIFY_KEY "${cString(otaManifestVerifyKey)}"`,
+    "#endif",
     "",
     "// CrowPanel ESP32 2.13\" E-Paper HMI (122x250) pin map, from Elecrow's factory source.",
     "// Keep this block in sync with firmware/esp32-controller/include/controller_config.example.h.",
@@ -221,6 +227,7 @@ export function claimLabelFilename(deviceId) {
 export function buildFirmwareManifest(release, signingKey) {
   const unsigned = {
     version: release.version,
+    channel: release.channel ?? "stable",
     hardwareModel: release.hardwareModel,
     url: release.url,
     sha256: release.sha256,
@@ -253,8 +260,11 @@ export function isNewerVersion(candidate, current) {
 }
 
 export function normalizeFirmwareRelease(input) {
+  const channel = typeof input.channel === "string" ? input.channel.trim().toLowerCase() : "stable";
+  if (!["stable", "beta"].includes(channel)) throw new Error("channel must be stable or beta.");
   return {
     version: nonEmpty(input.version, "version"),
+    channel,
     hardwareModel: nonEmpty(input.hardwareModel ?? "e213-esp32-s3r8", "hardwareModel"),
     url: nonEmpty(input.url, "url"),
     sha256: nonEmpty(input.sha256, "sha256").toLowerCase(),

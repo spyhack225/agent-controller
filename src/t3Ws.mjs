@@ -2,7 +2,8 @@
 //
 // The orchestration HTTP API exposes only projects and threads. Everything else — including the
 // provider/harness catalogue — is served over an authenticated WebSocket speaking Effect's RPC
-// protocol (effect/unstable/rpc). Reverse-engineered against T3 Code 0.0.28 and verified live.
+// protocol (effect/unstable/rpc). Reverse-engineered against T3 Code 0.0.28 and verified live
+// through T3 Code 0.0.32.
 //
 // Wire protocol (effect RpcMessage):
 //   client -> { _tag: "Request", id, tag, payload, headers: [[k,v]...] }

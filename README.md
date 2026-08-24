@@ -59,6 +59,22 @@ To persist local platform state:
 DATA_FILE=.data/agent-controller.json npm start
 ```
 
+## Remote Access
+
+Use private Tailscale Serve for stable HTTPS access from your Tailnet:
+
+```bash
+npm run setup:tunnel -- --mode serve --write-env
+```
+
+Use Tailscale Funnel only when the gateway must be reachable from the public internet:
+
+```bash
+npm run setup:tunnel -- --mode funnel --write-env
+```
+
+Restart Agent Controller after the command updates `.env`. The Settings workspace includes the same guided setup and disable commands. See [docs/remote-access.md](docs/remote-access.md) for the gateway-versus-T3 distinction, Clerk requirements, LAN hardware guidance, and troubleshooting.
+
 ## Create A Device
 
 ```bash
@@ -107,6 +123,17 @@ FIRMWARE_VERSION=0.2.0 \
 FIRMWARE_URL=https://cdn.example.com/firmware/agent-controller-0.2.0.bin \
 FIRMWARE_SHA256=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa \
 FIRMWARE_SIZE_BYTES=901385 \
+npm run firmware:publish
+```
+
+For a managed artifact, set `FIRMWARE_FILE` instead of the URL, digest, and size. The gateway
+computes integrity metadata and stores the immutable binary on disk or in configured private S3/R2:
+
+```bash
+AGENT_CONTROLLER_URL=https://gateway.example.com \
+FACTORY_TOKEN=replace-with-factory-secret \
+FIRMWARE_FILE=.pio/build/secure/firmware.bin \
+FIRMWARE_VERSION=0.2.0 \
 npm run firmware:publish
 ```
 

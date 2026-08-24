@@ -72,16 +72,25 @@ test("covers hardware, capabilities, pricing and FAQ below the hero", () => {
 });
 
 // Every in-page link has to resolve to something that exists. A marketing header whose nav
-// scrolls nowhere is worse than a header with no nav at all.
+// scrolls nowhere is worse than a header with no nav at all. `#/…` hrefs are routes to the other
+// signed-out pages, not anchors, so they are checked against the router instead.
 test("only links to sections that are actually rendered", () => {
   const { container } = render(<LandingPage authConfig={clerkEnabled} clerk={clerkBridge()} />);
 
   const hrefs = Array.from(container.querySelectorAll("a[href^='#']")).map(
     (anchor) => anchor.getAttribute("href") ?? "",
   );
-  expect(hrefs.length).toBeGreaterThan(0);
-  for (const href of hrefs) {
+  const anchors = hrefs.filter((href) => !href.startsWith("#/"));
+  const routes = hrefs.filter((href) => href.startsWith("#/"));
+
+  expect(anchors.length).toBeGreaterThan(0);
+  for (const href of anchors) {
     expect(container.querySelector(href), `${href} has no target on the page`).not.toBeNull();
+  }
+
+  expect(routes.length).toBeGreaterThan(0);
+  for (const href of routes) {
+    expect(["#/", "#/developers", "#/early-access"], `${href} is not a route`).toContain(href);
   }
 });
 

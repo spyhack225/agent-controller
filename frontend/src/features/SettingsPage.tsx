@@ -1,13 +1,18 @@
 import {
   BellOff,
   BellRing,
+  CheckCircle2,
+  Clipboard,
   Download,
   ExternalLink,
+  Globe2,
   LogIn,
   LogOut,
+  Network,
   Save,
   ShieldCheck,
   Sparkles,
+  SquareTerminal,
   Trash2,
   UserRound,
   Wrench,
@@ -15,6 +20,16 @@ import {
 import { useEffect, useState } from "react";
 
 import type { Controller } from "../controller";
+import {
+  buildGatewayTunnelDisableCommand,
+  buildGatewayTunnelSetupCommand,
+  remoteAccessOptions,
+  type RemoteAccessMode,
+} from "../remoteAccess";
+import {
+  RemoteAccessReadiness,
+  remoteAccessReady,
+} from "./RemoteAccessReadiness";
 import {
   Button,
   Field,
@@ -24,6 +39,8 @@ import {
   StatusBadge,
   useConfirm,
 } from "../ui";
+import { T3CompatibilityPanel } from "./T3CompatibilityPanel";
+import { GatewayProfilesPanel } from "./GatewayProfilesPanel";
 
 const NOTIFICATION_HINTS: Record<string, string> = {
   unsupported: "This browser cannot raise notifications. Install the console to your home screen, or use a desktop browser.",
@@ -37,10 +54,15 @@ export function SettingsPage({ controller: c }: { controller: Controller }) {
     c.privacyDays === null ? "" : String(c.privacyDays),
   );
   const [notificationHint, setNotificationHint] = useState<string | null>(null);
+  const [remoteAccessMode, setRemoteAccessMode] = useState<RemoteAccessMode>("serve");
 
   useEffect(() => {
     setRetentionDraft(c.privacyDays === null ? "" : String(c.privacyDays));
   }, [c.privacyDays]);
+
+  useEffect(() => {
+    if (c.remoteAccess?.tailscale.mode) setRemoteAccessMode(c.remoteAccess.tailscale.mode);
+  }, [c.remoteAccess?.tailscale.mode]);
 
   const toggleApprovalNotifications = async () => {
     if (c.approvalNotificationsEnabled) {
@@ -92,8 +114,158 @@ export function SettingsPage({ controller: c }: { controller: Controller }) {
     });
   };
 
+  const copyRemoteAccessCommand = async (command: string, label: string) => {
+    try {
+      await navigator.clipboard.writeText(command);
+      c.setNotice({ tone: "success", message: `${label} copied.` });
+    } catch {
+      c.setNotice({ tone: "danger", message: "Clipboard access was blocked. Select and copy the command manually." });
+    }
+  };
+
+  const tunnelCommand = buildGatewayTunnelSetupCommand(remoteAccessMode);
+  const disableCommand = buildGatewayTunnelDisableCommand(remoteAccessMode);
+  const tunnelReady = remoteAccessReady(c.remoteAccess, remoteAccessMode);
+
   return (
     <div className="page-stack">
+      <T3CompatibilityPanel controller={c} />
+
+      <GatewayProfilesPanel controller={c} />
+
+      <Panel elevated className="overflow-hidden">
+        <SectionHeader
+          eyebrow="Remote access"
+          title="Connect securely from anywhere"
+          description="Put this gateway behind a stable Tailscale HTTPS address without opening router ports. Serve is private to your Tailnet; Funnel is an intentionally public option."
+          action={
+            <StatusBadge
+              tone={tunnelReady ? "success" : c.remoteAccess ? "warning" : "neutral"}
+              label={tunnelReady ? "Remote access ready" : c.remoteAccess ? "Setup needed" : "Checking"}
+            />
+          }
+        />
+        <div className="grid gap-5 border-t border-control p-5 xl:grid-cols-[minmax(0,0.82fr)_minmax(360px,1.18fr)]">
+          <div className="space-y-3">
+            <p className="text-xs font-semibold uppercase tracking-[0.14em] text-ink-faint">Choose visibility</p>
+            {remoteAccessOptions.map((option) => {
+              const selected = remoteAccessMode === option.id;
+              const Icon = option.id === "serve" ? Network : Globe2;
+              return (
+                <button
+                  key={option.id}
+                  type="button"
+                  aria-pressed={selected}
+                  className="flex w-full items-start gap-3 rounded-lg border border-control bg-surface-inset/35 p-4 text-left outline-none transition hover:border-control-strong hover:bg-surface-inset focus-visible:ring-2 focus-visible:ring-focus"
+                  data-selected={selected || undefined}
+                  onClick={() => setRemoteAccessMode(option.id)}
+                >
+                  <span className={`grid size-9 shrink-0 place-items-center rounded-md ${selected ? "bg-primary/12 text-primary" : "bg-surface-raised text-ink-muted"}`}>
+                    <Icon className="size-4" aria-hidden="true" />
+                  </span>
+                  <span className="min-w-0 flex-1">
+                    <span className="flex flex-wrap items-center gap-2">
+                      <strong className="text-sm">{option.label}</strong>
+                      <StatusBadge tone={option.id === "serve" ? "success" : "warning"} label={option.visibility} />
+                    </span>
+                    <span className="mt-1 block text-xs leading-relaxed text-ink-muted">{option.description}</span>
+                  </span>
+                </button>
+              );
+            })}
+            {remoteAccessMode === "funnel" ? (
+              <div className="rounded-lg border border-warning/25 bg-warning/8 p-3 text-xs leading-relaxed text-warning" role="note">
+                Funnel exposes the gateway to the public internet. The setup script refuses to enable it unless Clerk is configured, unless you explicitly acknowledge another production authentication layer.
+              </div>
+            ) : (
+              <p className="rounded-lg border border-success/20 bg-success/7 p-3 text-xs leading-relaxed text-ink-muted">
+                Serve follows T3 Code’s recommended remote-access model: a trusted private network, stable MagicDNS address, HTTPS, and Tailnet access controls.
+              </p>
+            )}
+          </div>
+
+          <div className="space-y-4">
+            <RemoteAccessReadiness
+              status={c.remoteAccess}
+              mode={remoteAccessMode}
+              refreshing={c.busyAction === "refresh-remote-access"}
+              onRefresh={() => void c.run(
+                "refresh-remote-access",
+                "Remote access status refreshed.",
+                () => c.loadRemoteAccess(true),
+              )}
+            />
+
+            {tunnelReady && c.remoteAccess?.tailscale.httpsUrl ? (
+              <div className="rounded-lg border border-success/25 bg-success/8 p-4">
+                <div className="flex items-start gap-3">
+                  <CheckCircle2 className="mt-0.5 size-4 shrink-0 text-success" aria-hidden="true" />
+                  <div className="min-w-0 flex-1">
+                    <p className="text-sm font-semibold text-ink">Remote access is configured</p>
+                    <p className="mt-1 break-all font-mono text-[11px] text-ink-muted">{c.remoteAccess.tailscale.httpsUrl}</p>
+                    <a
+                      className="mt-3 inline-flex min-h-8 items-center gap-2 rounded-md border border-success/25 bg-success/10 px-3 text-xs font-semibold text-success outline-none hover:bg-success/15 focus-visible:ring-2 focus-visible:ring-focus"
+                      href={c.remoteAccess.tailscale.httpsUrl}
+                      target="_blank"
+                      rel="noreferrer"
+                    >
+                      Open remote console <ExternalLink className="size-3.5" />
+                    </a>
+                  </div>
+                </div>
+              </div>
+            ) : (
+              <>
+                {!c.remoteAccess?.tailscale.installed ? (
+                  <a
+                    className="inline-flex min-h-9 w-full items-center justify-center gap-2 rounded-md border border-primary bg-primary px-3 text-sm font-semibold text-primary-foreground outline-none hover:bg-primary-hover focus-visible:ring-2 focus-visible:ring-focus"
+                    href="https://tailscale.com/download"
+                    target="_blank"
+                    rel="noreferrer"
+                  >
+                    Install Tailscale <ExternalLink className="size-3.5" />
+                  </a>
+                ) : null}
+                <div className="rounded-lg border border-control bg-console p-3">
+                  <div className="flex items-center justify-between gap-3">
+                    <span className="flex items-center gap-2 text-xs font-semibold text-console-ink">
+                      <SquareTerminal className="size-3.5" aria-hidden="true" /> Run on the gateway host
+                    </span>
+                    <Button size="sm" onClick={() => void copyRemoteAccessCommand(tunnelCommand, "Tunnel setup command")}>
+                      <Clipboard className="size-3.5" /> Copy
+                    </Button>
+                  </div>
+                  <code className="mt-3 block select-all overflow-x-auto whitespace-nowrap font-mono text-xs text-console-ink">{tunnelCommand}</code>
+                </div>
+              </>
+            )}
+
+            <div className="flex flex-wrap gap-x-4 gap-y-2 text-xs">
+              <button
+                type="button"
+                className="text-ink-muted underline decoration-control-strong underline-offset-4 hover:text-ink"
+                onClick={() => void copyRemoteAccessCommand(disableCommand, "Disable command")}
+              >
+                Copy disable command
+              </button>
+              <a className="text-primary hover:underline" href="https://tailscale.com/download" target="_blank" rel="noreferrer">
+                Install Tailscale <ExternalLink className="ml-1 inline size-3" />
+              </a>
+              <a className="text-primary hover:underline" href="https://tailscale.com/docs/features/tailscale-serve" target="_blank" rel="noreferrer">
+                Tailscale Serve docs <ExternalLink className="ml-1 inline size-3" />
+              </a>
+              <a className="text-primary hover:underline" href="https://github.com/pingdotgg/t3code/blob/main/docs/user/remote-access.md" target="_blank" rel="noreferrer">
+                T3 Code remote access <ExternalLink className="ml-1 inline size-3" />
+              </a>
+            </div>
+
+            <p className="border-t border-control pt-4 text-xs leading-relaxed text-ink-muted">
+              This tunnel exposes the Agent Controller console. To expose a T3 Code host too, choose <strong className="text-ink">Tailscale Serve</strong> in Initial setup, or run <code className="font-mono text-[11px] text-ink">npx t3 pair --tailscale</code> for an already-running T3 server.
+            </p>
+          </div>
+        </div>
+      </Panel>
+
       <div className="grid gap-4 xl:grid-cols-2">
         <Panel elevated className="overflow-hidden">
           <SectionHeader

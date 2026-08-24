@@ -199,8 +199,8 @@ export function ActivityPage({ controller: c }: { controller: Controller }) {
               icon={view === "approvals" ? ShieldAlert : History}
               title={view === "approvals" ? "No pending approvals" : "No matching commands"}
               description={view === "approvals"
-                ? "The queue is clear. Supervised actions will appear here and beside the Operate composer."
-                : "Adjust the filter or dispatch a command from Operate."}
+                ? "The queue is clear. Supervised actions will appear here and beside the Operations composer."
+                : "Adjust the filter or dispatch a command from Operations."}
             />
           )}
         </div>

@@ -18,13 +18,18 @@ import type {
   JsonRecord,
   Macro,
   MediaItem,
+  ModelRecovery,
   ModelSelection,
   OnboardingReadiness,
   OnboardingResponse,
   OnboardingState,
+  RemoteAccessStatus,
   T3HarnessCatalogue,
   T3Project,
   T3Thread,
+  T3ThreadMessage,
+  SavedAction,
+  GatewayProfile,
 } from "./types";
 
 interface Notice {
@@ -32,12 +37,36 @@ interface Notice {
   message: string;
 }
 
+interface WorkspaceRecovery {
+  environmentId: string;
+  message: string;
+}
+
+export const T3_SNAPSHOT_UNAVAILABLE_MESSAGE = "T3 snapshot is unavailable.";
+
+export function isT3SnapshotUnavailableError(error: unknown): error is Error {
+  return error instanceof Error && error.message === T3_SNAPSHOT_UNAVAILABLE_MESSAGE;
+}
+
 interface UseControllerOptions {
   authConfig: AuthConfig;
   clerk: ClerkBridge | null;
 }
 
-function normalizeThread(thread: JsonRecord, projects: T3Project[]): T3Thread | null {
+function messageText(value: unknown): string {
+  if (typeof value === "string") return value.trim();
+  if (!Array.isArray(value)) return "";
+  return value.map((part) => {
+    if (typeof part === "string") return part;
+    if (!part || typeof part !== "object") return "";
+    const record = part as JsonRecord;
+    return typeof record.text === "string"
+      ? record.text
+      : typeof record.content === "string" ? record.content : "";
+  }).filter(Boolean).join("\n").trim();
+}
+
+export function normalizeThread(thread: JsonRecord, projects: T3Project[]): T3Thread | null {
   const idValue = thread.id ?? thread.threadId ?? thread.sessionId;
   if (typeof idValue !== "string" || !idValue) return null;
   const projectValue = thread.projectId
@@ -50,12 +79,69 @@ function normalizeThread(thread: JsonRecord, projects: T3Project[]): T3Thread | 
   const title = typeof titleValue === "string" && titleValue ? titleValue : idValue;
   const suffix = project?.title ?? project?.name ?? projectId ?? "";
   const statusValue = thread.status ?? thread.state;
+  const rawModelSelection = thread.modelSelection;
+  const modelSelection = rawModelSelection && typeof rawModelSelection === "object"
+    && typeof (rawModelSelection as JsonRecord).instanceId === "string"
+    && typeof (rawModelSelection as JsonRecord).model === "string"
+    ? {
+        instanceId: (rawModelSelection as JsonRecord).instanceId as string,
+        model: (rawModelSelection as JsonRecord).model as string,
+        ...(Array.isArray((rawModelSelection as JsonRecord).options)
+          ? { options: (rawModelSelection as JsonRecord).options as unknown[] }
+          : {}),
+      }
+    : null;
+  const messages = Array.isArray(thread.messages) ? thread.messages.flatMap((message, index) => {
+    if (!message || typeof message !== "object") return [];
+    const record = message as JsonRecord;
+    const text = messageText(record.text ?? record.content ?? record.message);
+    if (!text) return [];
+    const rawRole = typeof record.role === "string" ? record.role.toLowerCase() : "system";
+    const role: T3ThreadMessage["role"] = rawRole === "user" || rawRole === "assistant" || rawRole === "tool"
+      ? rawRole
+      : "system";
+    const id = typeof record.id === "string"
+      ? record.id
+      : typeof record.messageId === "string" ? record.messageId : `${idValue}-message-${index}`;
+    return [{
+      id,
+      role,
+      text,
+      createdAt: typeof record.createdAt === "string" ? record.createdAt : null,
+      streaming: record.streaming === true,
+    }];
+  }) : [];
   return {
     id: idValue,
     label: suffix ? `${title} — ${suffix}` : title,
     projectId,
+    modelSelection,
     status: typeof statusValue === "string" ? statusValue : null,
+    messages,
   };
+}
+
+export function dedupeEnvironments(environments: Environment[]): Environment[] {
+  const unique = new Map<string, Environment>();
+  for (const environment of environments) {
+    const key = environment.baseUrl.trim().replace(/\/+$/u, "").toLowerCase();
+    const current = unique.get(key);
+    if (!current) {
+      unique.set(key, environment);
+      continue;
+    }
+
+    // Legacy pairing could create a second row for the same T3 server. Keep the oldest identity so
+    // device/onboarding references remain stable; when timestamps are unavailable, retain the first
+    // API result (the stores return records in creation order).
+    const currentCreatedAt = Date.parse(current.createdAt ?? "");
+    const candidateCreatedAt = Date.parse(environment.createdAt ?? "");
+    if (Number.isFinite(candidateCreatedAt)
+      && (!Number.isFinite(currentCreatedAt) || candidateCreatedAt < currentCreatedAt)) {
+      unique.set(key, environment);
+    }
+  }
+  return [...unique.values()];
 }
 
 export function useController({ authConfig, clerk }: UseControllerOptions) {
@@ -64,6 +150,7 @@ export function useController({ authConfig, clerk }: UseControllerOptions) {
   const [connectionDetail, setConnectionDetail] = useState("Authentication required");
   const [busyAction, setBusyAction] = useState<string | null>(null);
   const [notice, setNotice] = useState<Notice | null>(null);
+  const [workspaceRecovery, setWorkspaceRecovery] = useState<WorkspaceRecovery | null>(null);
   const [lastResult, setLastResult] = useState<unknown>({
     message: "Console ready.",
   });
@@ -78,22 +165,27 @@ export function useController({ authConfig, clerk }: UseControllerOptions) {
   const [commandEvents, setCommandEvents] = useState<CommandEvent[]>([]);
   const [timelineCommand, setTimelineCommand] = useState<Command | null>(null);
   const [macros, setMacros] = useState<Macro[]>([]);
+  const [actions, setActions] = useState<SavedAction[]>([]);
   const [media, setMedia] = useState<MediaItem[]>([]);
   const [audit, setAudit] = useState<AuditEvent[]>([]);
   const [display, setDisplay] = useState<DisplayState | null>(null);
   const [privacyDays, setPrivacyDays] = useState<number | null>(30);
+  const [remoteAccess, setRemoteAccess] = useState<RemoteAccessStatus | null>(null);
+  const [gatewayProfiles, setGatewayProfiles] = useState<GatewayProfile[]>([]);
   const [deviceSecret, setDeviceSecret] = useState<DeviceSecret | null>(null);
   const [onboarding, setOnboarding] = useState<OnboardingState | null>(null);
   const [onboardingReadiness, setOnboardingReadiness] = useState<OnboardingReadiness | null>(null);
   const [onboardingLoaded, setOnboardingLoaded] = useState(false);
 
   const [selectedEnvironmentId, setSelectedEnvironmentIdState] = useState("");
-  const [selectedProjectId, setSelectedProjectId] = useState("");
-  const [selectedThreadId, setSelectedThreadId] = useState("");
+  const [selectedProjectId, setSelectedProjectIdState] = useState("");
+  const [selectedThreadId, setSelectedThreadIdState] = useState("");
   const [selectedDeviceId, setSelectedDeviceId] = useState("");
   const [deviceConfig, setDeviceConfig] = useState<DeviceConfig>({
     environmentId: null,
     threadId: null,
+    gatewayAccessMode: "local",
+    gatewayUrl: null,
     defaultPrompt: "",
     shellCommand: "npm test",
     menu: ["status", "prompt", "shell", "macro", "thread", "media", "stop"],
@@ -106,6 +198,11 @@ export function useController({ authConfig, clerk }: UseControllerOptions) {
   const refreshQueuedRef = useRef(false);
   const rateLimitedUntilRef = useRef(0);
   const refreshAllRef = useRef<(() => Promise<void>) | null>(null);
+  const selectedEnvironmentIdRef = useRef("");
+  const selectedProjectIdRef = useRef("");
+  const selectedThreadIdRef = useRef("");
+  const snapshotRequestRef = useRef(0);
+  const harnessRequestRef = useRef(0);
 
   const api = useCallback(async <T,>(path: string, options: ApiOptions = {}): Promise<T> => {
     try {
@@ -158,7 +255,7 @@ export function useController({ authConfig, clerk }: UseControllerOptions) {
     // what turns one 429 into a storm, because every failed refresh triggers another one.
     if (Date.now() < rateLimitedUntilRef.current) return;
 
-    // A refresh is nine requests. Overlapping refreshes multiply that against the rate limit for
+    // A refresh is twelve requests. Overlapping refreshes multiply that against the rate limit for
     // no benefit, so coalesce instead: remember that another was asked for and run it once.
     if (refreshInFlightRef.current) {
       refreshQueuedRef.current = true;
@@ -167,7 +264,7 @@ export function useController({ authConfig, clerk }: UseControllerOptions) {
     refreshInFlightRef.current = true;
 
     try {
-      // allSettled, not all: one throttled endpoint must not discard eight good responses.
+      // allSettled, not all: one throttled endpoint must not discard the other good responses.
       const results = await Promise.allSettled([
         api<{ environments: Environment[] }>("/v1/t3/environments"),
         api<{ devices: Device[] }>("/v1/devices"),
@@ -178,18 +275,22 @@ export function useController({ authConfig, clerk }: UseControllerOptions) {
         api<{ events: AuditEvent[] }>("/v1/audit"),
         api<{ display: DisplayState }>("/v1/display"),
         api<OnboardingResponse>("/v1/onboarding"),
+        api<{ actions: SavedAction[] }>("/v1/actions"),
+        api<{ remoteAccess: RemoteAccessStatus }>("/v1/settings/remote-access"),
+        api<{ profiles: GatewayProfile[] }>("/v1/gateway-profiles"),
       ]);
 
       const [
         environmentResult, deviceResult, commandResult, macroResult, privacyResult,
-        mediaResult, auditResult, displayResult, onboardingResult,
+        mediaResult, auditResult, displayResult, onboardingResult, actionsResult, remoteAccessResult,
+        gatewayProfilesResult,
       ] = results;
 
       const valueOf = <T,>(result: PromiseSettledResult<T>): T | null =>
         result.status === "fulfilled" ? result.value : null;
 
       if (environmentResult.status === "fulfilled") {
-        setEnvironments(environmentResult.value.environments ?? []);
+        setEnvironments(dedupeEnvironments(environmentResult.value.environments ?? []));
       }
       if (deviceResult.status === "fulfilled") setDevices(deviceResult.value.devices ?? []);
       if (commandResult.status === "fulfilled") setCommands(commandResult.value.commands ?? []);
@@ -202,6 +303,13 @@ export function useController({ authConfig, clerk }: UseControllerOptions) {
         setAudit((auditResult.value.events ?? []).slice(-120).reverse());
       }
       if (displayResult.status === "fulfilled") setDisplay(displayResult.value.display ?? null);
+      if (actionsResult.status === "fulfilled") setActions(actionsResult.value.actions ?? []);
+      if (remoteAccessResult.status === "fulfilled") {
+        setRemoteAccess(remoteAccessResult.value.remoteAccess ?? null);
+      }
+      if (gatewayProfilesResult.status === "fulfilled") {
+        setGatewayProfiles(gatewayProfilesResult.value.profiles ?? []);
+      }
       const onboardingValue = valueOf(onboardingResult);
       if (onboardingValue) {
         setOnboarding(onboardingValue.onboarding);
@@ -243,6 +351,14 @@ export function useController({ authConfig, clerk }: UseControllerOptions) {
     }
   }, [api, authenticated]);
 
+  const loadRemoteAccess = useCallback(async (force = false) => {
+    const result = await api<{ remoteAccess: RemoteAccessStatus }>(
+      `/v1/settings/remote-access${force ? "?refresh=1" : ""}`,
+    );
+    setRemoteAccess(result.remoteAccess);
+    return result.remoteAccess;
+  }, [api]);
+
   // Lets the coalescing tail call the latest refreshAll without making it a dependency of itself.
   refreshAllRef.current = refreshAll;
 
@@ -267,12 +383,16 @@ export function useController({ authConfig, clerk }: UseControllerOptions) {
     setDevices([]);
     setCommands([]);
     setMacros([]);
+    setActions([]);
     setMedia([]);
     setAudit([]);
     setDisplay(null);
+    setRemoteAccess(null);
+    setGatewayProfiles([]);
     setOnboarding(null);
     setOnboardingReadiness(null);
     setOnboardingLoaded(false);
+    setWorkspaceRecovery(null);
   }, []);
 
   useEffect(() => {
@@ -360,12 +480,14 @@ export function useController({ authConfig, clerk }: UseControllerOptions) {
 
   useEffect(() => {
     if (environments.length === 0) {
+      selectedEnvironmentIdRef.current = "";
       setSelectedEnvironmentIdState("");
       setProjects([]);
       setThreads([]);
       return;
     }
     if (!environments.some((environment) => environment.id === selectedEnvironmentId)) {
+      selectedEnvironmentIdRef.current = environments[0].id;
       setSelectedEnvironmentIdState(environments[0].id);
     }
   }, [environments, selectedEnvironmentId]);
@@ -389,6 +511,8 @@ export function useController({ authConfig, clerk }: UseControllerOptions) {
           setDeviceConfig({
             environmentId: result.config.environmentId ?? null,
             threadId: result.config.threadId ?? null,
+            gatewayAccessMode: result.config.gatewayAccessMode ?? "local",
+            gatewayUrl: result.config.gatewayUrl ?? null,
             defaultPrompt: result.config.defaultPrompt ?? "",
             shellCommand: result.config.shellCommand ?? "npm test",
             menu: result.config.menu ?? [],
@@ -404,57 +528,119 @@ export function useController({ authConfig, clerk }: UseControllerOptions) {
   }, [api, authenticated, selectedDeviceId]);
 
   const setSelectedEnvironmentId = useCallback((environmentId: string) => {
+    selectedEnvironmentIdRef.current = environmentId;
+    selectedProjectIdRef.current = "";
+    selectedThreadIdRef.current = "";
+    snapshotRequestRef.current += 1;
+    harnessRequestRef.current += 1;
     setSelectedEnvironmentIdState(environmentId);
     setProjects([]);
     setThreads([]);
-    setSelectedProjectId("");
-    setSelectedThreadId("");
+    setHarnessCatalogue(null);
+    setSelectedProjectIdState("");
+    setSelectedThreadIdState("");
   }, []);
+
+  const setSelectedProjectId = useCallback((projectId: string) => {
+    selectedProjectIdRef.current = projectId;
+    setSelectedProjectIdState(projectId);
+    const selectedThread = threads.find((thread) => thread.id === selectedThreadIdRef.current);
+    if (selectedThread?.projectId === projectId) return;
+    const nextThreadId = threads.find((thread) => thread.projectId === projectId)?.id ?? "";
+    selectedThreadIdRef.current = nextThreadId;
+    setSelectedThreadIdState(nextThreadId);
+  }, [threads]);
+
+  const setSelectedThreadId = useCallback((threadId: string) => {
+    selectedThreadIdRef.current = threadId;
+    setSelectedThreadIdState(threadId);
+    const thread = threads.find((candidate) => candidate.id === threadId);
+    if (thread?.projectId) {
+      selectedProjectIdRef.current = thread.projectId;
+      setSelectedProjectIdState(thread.projectId);
+    }
+  }, [threads]);
 
   // The agent harnesses and models this environment can actually launch. Kept separate from the
   // snapshot because a failure here must not stop projects and threads from loading.
   const loadHarnesses = useCallback(async (environmentId = selectedEnvironmentId) => {
     if (!environmentId) return null;
+    const requestId = ++harnessRequestRef.current;
     try {
       const result = await api<T3HarnessCatalogue>(
         `/v1/t3/environments/${encodeURIComponent(environmentId)}/harnesses`,
       );
-      setHarnessCatalogue(result);
+      if (requestId === harnessRequestRef.current
+        && selectedEnvironmentIdRef.current === environmentId) {
+        setHarnessCatalogue(result);
+      }
       return result;
     } catch {
-      setHarnessCatalogue(null);
+      if (requestId === harnessRequestRef.current
+        && selectedEnvironmentIdRef.current === environmentId) {
+        setHarnessCatalogue(null);
+      }
       return null;
     }
   }, [api, selectedEnvironmentId]);
 
   const loadSnapshot = useCallback(async (environmentId = selectedEnvironmentId) => {
     if (!environmentId) throw new Error("Select a T3 environment first.");
-    const result = await api<{
+    const requestId = ++snapshotRequestRef.current;
+    const harnessRequest = loadHarnesses(environmentId);
+    let result: {
       environment: Environment;
       snapshot?: { projects?: JsonRecord[]; threads?: JsonRecord[] };
       screen?: unknown;
-    }>(`/v1/t3/environments/${encodeURIComponent(environmentId)}/snapshot`);
+    };
+    try {
+      result = await api<typeof result>(
+        `/v1/t3/environments/${encodeURIComponent(environmentId)}/snapshot`,
+      );
+      setWorkspaceRecovery(null);
+    } catch (error) {
+      if (isT3SnapshotUnavailableError(error)) {
+        setWorkspaceRecovery({ environmentId, message: T3_SNAPSHOT_UNAVAILABLE_MESSAGE });
+      }
+      throw error;
+    }
+    await harnessRequest;
+    if (requestId !== snapshotRequestRef.current
+      || selectedEnvironmentIdRef.current !== environmentId) {
+      return result;
+    }
     const nextProjects = (result.snapshot?.projects ?? [])
       .filter((project): project is JsonRecord => typeof project?.id === "string")
       .map((project) => project as unknown as T3Project);
     const nextThreads = (result.snapshot?.threads ?? [])
       .map((thread) => normalizeThread(thread, nextProjects))
       .filter((thread): thread is T3Thread => Boolean(thread));
+    const preservedThread = nextThreads.find((thread) => thread.id === selectedThreadIdRef.current) ?? null;
+    const preservedProject = nextProjects.find((project) => project.id === selectedProjectIdRef.current) ?? null;
+    const nextProjectId = preservedThread?.projectId
+      ?? preservedProject?.id
+      ?? nextProjects[0]?.id
+      ?? nextThreads[0]?.projectId
+      ?? "";
+    const nextThreadId = preservedThread?.id
+      ?? nextThreads.find((thread) => thread.projectId === nextProjectId)?.id
+      ?? nextThreads[0]?.id
+      ?? "";
+    const synchronizedProjectId = nextThreads.find((thread) => thread.id === nextThreadId)?.projectId
+      ?? nextProjectId;
     setProjects(nextProjects);
     setThreads(nextThreads);
-    setSelectedProjectId((current) =>
-      nextProjects.some((project) => project.id === current)
-        ? current
-        : nextProjects[0]?.id ?? ""
-    );
-    setSelectedThreadId((current) =>
-      nextThreads.some((thread) => thread.id === current)
-        ? current
-        : nextThreads[0]?.id ?? ""
-    );
-    void loadHarnesses(environmentId);
+    selectedProjectIdRef.current = synchronizedProjectId;
+    selectedThreadIdRef.current = nextThreadId;
+    setSelectedProjectIdState(synchronizedProjectId);
+    setSelectedThreadIdState(nextThreadId);
     return result;
   }, [api, loadHarnesses, selectedEnvironmentId]);
+
+  const dismissWorkspaceRecovery = useCallback(() => {
+    setWorkspaceRecovery(null);
+    setNotice((current) => current?.message === T3_SNAPSHOT_UNAVAILABLE_MESSAGE ? null : current);
+  }, []);
 
   const launchProject = useCallback(async (input: {
     projectId: string;
@@ -462,14 +648,20 @@ export function useController({ authConfig, clerk }: UseControllerOptions) {
     modelSelection?: ModelSelection;
   }) => {
     if (!selectedEnvironmentId) throw new Error("Select a T3 environment first.");
-    const result = await api<{ threadId: string; command: Command }>(
+    const result = await api<{
+      threadId: string;
+      command: Command;
+      modelSelection: ModelSelection;
+      modelRecovery?: ModelRecovery | null;
+    }>(
       `/v1/t3/environments/${encodeURIComponent(selectedEnvironmentId)}/threads`,
       {
         method: "POST",
         body: input,
       },
     );
-    setSelectedThreadId(result.threadId);
+    selectedThreadIdRef.current = result.threadId;
+    setSelectedThreadIdState(result.threadId);
     await loadSnapshot(selectedEnvironmentId);
     await refreshCommands();
     return result;
@@ -540,6 +732,8 @@ export function useController({ authConfig, clerk }: UseControllerOptions) {
     busyAction,
     notice,
     setNotice,
+    workspaceRecovery,
+    dismissWorkspaceRecovery,
     lastResult,
     setLastResult,
     deviceProfiles,
@@ -558,11 +752,15 @@ export function useController({ authConfig, clerk }: UseControllerOptions) {
     commandEvents,
     timelineCommand,
     macros,
+    actions,
     media,
     audit,
     display,
     privacyDays,
     setPrivacyDays,
+    remoteAccess,
+    gatewayProfiles,
+    loadRemoteAccess,
     deviceSecret,
     setDeviceSecret,
     onboarding,

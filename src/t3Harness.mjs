@@ -1,18 +1,19 @@
 // Reads agent harnesses (T3 "provider instances"), their models, and live session health out of a
 // T3 orchestration snapshot.
 //
-// Verified against a live T3 Code 0.0.28 server. `GET /api/orchestration/snapshot` returns exactly:
+// Verified against live T3 Code 0.0.28 and 0.0.32 servers.
+// `GET /api/orchestration/snapshot` returns exactly:
 //   { snapshotSequence, projects, threads, updatedAt }
 // There is no provider catalogue on that endpoint — T3 publishes the full catalogue to its own web
 // UI over the authenticated WebSocket instead (server spans: upsertProviders, syncProvider,
 // publishEnrichedSnapshot). So the instances and models reachable over the paired HTTP API are the
-// ones actually referenced by projects and threads:
+// ones actually referenced by projects:
 //   projects[].defaultModelSelection = { instanceId, model }
-//   threads[].modelSelection         = { instanceId, model }
 //   threads[].session                = { status, providerInstanceId, lastError, activeTurnId, ... }
 //
 // A host-side catalogue (T3's <base-dir>/caches/<instanceId>.json) can be registered separately to
-// enrich this; see mergeHostCatalogue.
+// enrich this; see mergeHostCatalogue. Historical thread model selections are intentionally not
+// treated as available models: failed threads can contain malformed or retired slugs.
 
 export function extractHarnesses(snapshot, { catalogue = null } = {}) {
   const byInstance = new Map();
@@ -38,7 +39,6 @@ export function extractHarnesses(snapshot, { catalogue = null } = {}) {
 
   for (const project of array(snapshot?.projects)) record(project?.defaultModelSelection, "project");
   for (const thread of array(snapshot?.threads)) {
-    record(thread?.modelSelection, "thread");
     const instanceId = string(thread?.session?.providerInstanceId);
     if (instanceId) record({ instanceId }, "session");
   }
@@ -69,22 +69,28 @@ export function extractHarnesses(snapshot, { catalogue = null } = {}) {
  *     models: [{ slug, name, isCustom, capabilities: { optionDescriptors: [...] } }] }
  */
 export function mergeHostCatalogue(harnesses, entries) {
-  const merged = new Map(harnesses.map((harness) => [harness.instanceId, harness]));
   // Accepts either raw cache records or a persisted catalogue envelope.
   const records = Array.isArray(entries) ? entries : array(entries?.instances);
+  const catalogued = new Map();
 
   for (const raw of records) {
     const normalized = normalizeCatalogueEntry(raw);
     if (!normalized) continue;
-    const existing = merged.get(normalized.instanceId);
-    merged.set(normalized.instanceId, {
-      ...normalized,
-      // Keep any model the snapshot proved is in use even if the catalogue omits it.
-      models: mergeModels(normalized.models, existing?.models ?? []),
-    });
+    catalogued.set(normalized.instanceId, normalized);
   }
 
-  return [...merged.values()];
+  // Prefer the current project's provider ordering, then append the other providers in the order
+  // T3 returned them. Only catalogue entries survive: snapshot values describe history, not what
+  // can be launched now.
+  const merged = [];
+  for (const harness of array(harnesses)) {
+    const normalized = catalogued.get(harness.instanceId);
+    if (!normalized) continue;
+    merged.push(normalized);
+    catalogued.delete(harness.instanceId);
+  }
+  merged.push(...catalogued.values());
+  return merged;
 }
 
 export function normalizeCatalogueEntry(raw) {
@@ -165,10 +171,18 @@ export function extractThreadOutcomes(snapshot) {
     const failure = parseProviderError(session.lastError);
     const assistantMessages = array(thread.messages)
       .filter((message) => string(message.role) === "assistant" && !message.streaming);
-    const lastAssistantAt = assistantMessages
-      .map((message) => string(message.createdAt))
-      .filter(Boolean)
-      .sort()
+    const lastAssistantMessage = assistantMessages
+      .map((message, index) => ({
+        text: string(message.text) ?? "",
+        createdAt: string(message.createdAt) ?? null,
+        index,
+      }))
+      .sort((left, right) => {
+        if (left.createdAt && right.createdAt) return left.createdAt.localeCompare(right.createdAt);
+        if (left.createdAt) return 1;
+        if (right.createdAt) return -1;
+        return left.index - right.index;
+      })
       .at(-1) ?? null;
 
     outcomes.set(threadId, {
@@ -179,7 +193,8 @@ export function extractThreadOutcomes(snapshot) {
         ? { message: failure.message, code: failure.code, at: string(session.updatedAt) ?? null }
         : null,
       assistantMessageCount: assistantMessages.length,
-      lastAssistantAt,
+      lastAssistantAt: lastAssistantMessage?.createdAt ?? null,
+      lastAssistantText: lastAssistantMessage?.text ?? null,
     });
   }
 
@@ -215,7 +230,11 @@ export function reconcileCommandStatus(command, outcome) {
     if (Number.isFinite(dispatchedAt) && Number.isFinite(repliedAt) && repliedAt < dispatchedAt) return null;
     return {
       status: "completed",
-      result: { reason: "The agent replied.", repliedAt: outcome.lastAssistantAt, source: "t3-session" },
+      result: {
+        response: outcome.lastAssistantText || "The agent replied.",
+        repliedAt: outcome.lastAssistantAt,
+        source: "t3-session",
+      },
     };
   }
 
@@ -268,14 +287,12 @@ export function validateModelSelection(selection, harnesses) {
   if (harness.available === false) {
     return { reason: harness.unavailableReason ?? `Provider instance "${instanceId}" is unavailable.` };
   }
-  // Only enforce the model list when we actually have a catalogue for it.
-  const catalogued = harness.models.filter((entry) => entry.observed !== true);
-  if (catalogued.length === 0) return null;
-  if (catalogued.some((entry) => entry.slug === model)) return null;
+  if (harness.models.length === 0) return null;
+  if (harness.models.some((entry) => entry.slug === model)) return null;
 
   return {
     reason: `Unknown model "${model}" for provider instance "${instanceId}".`,
-    known: catalogued.map((entry) => entry.slug),
+    known: harness.models.map((entry) => entry.slug),
   };
 }
 
@@ -283,26 +300,31 @@ export function usableHarnesses(harnesses) {
   return harnesses.filter((harness) => harness.available !== false && harness.models.length > 0);
 }
 
+export function resolveLatestModelSelection({ harnesses, preferredInstanceId = null }) {
+  const usable = usableHarnesses(harnesses);
+  const harness = usable.find((entry) => entry.instanceId === preferredInstanceId) ?? usable[0];
+  if (!harness) return null;
+  const model = harness.models[0];
+  return {
+    instanceId: harness.instanceId,
+    model: model.slug,
+    options: defaultModelOptions(model),
+  };
+}
+
 export function resolveModelSelection({ harnesses, requested = null, projectDefault = null }) {
-  for (const candidate of [requested, projectDefault]) {
-    if (validateModelSelection(candidate, harnesses) === null) {
-      const harness = harnesses.find((entry) => entry.instanceId === candidate.instanceId);
-      const model = harness.models.find((entry) => entry.slug === candidate.model);
-      return {
-        instanceId: harness.instanceId,
-        model: candidate.model,
-        options: candidate.options ?? defaultModelOptions(model),
-      };
-    }
+  if (requested && validateModelSelection(requested, harnesses) === null) {
+    return {
+      instanceId: requested.instanceId,
+      model: requested.model,
+      ...(requested.options ? { options: requested.options } : {}),
+    };
   }
 
-  const fallback = usableHarnesses(harnesses)[0];
-  if (!fallback) return null;
-  return {
-    instanceId: fallback.instanceId,
-    model: fallback.models[0].slug,
-    options: defaultModelOptions(fallback.models[0]),
-  };
+  return resolveLatestModelSelection({
+    harnesses,
+    preferredInstanceId: projectDefault?.instanceId ?? requested?.instanceId ?? null,
+  });
 }
 
 export function defaultModelOptions(model) {
@@ -312,14 +334,6 @@ export function defaultModelOptions(model) {
     if (value !== undefined && value !== null) options.push({ id: descriptor.id, value });
   }
   return options;
-}
-
-function mergeModels(catalogued, observed) {
-  const merged = new Map(catalogued.map((model) => [model.slug, model]));
-  for (const model of observed) {
-    if (!merged.has(model.slug)) merged.set(model.slug, { ...model, observed: true });
-  }
-  return [...merged.values()];
 }
 
 function normalizeModel(raw) {

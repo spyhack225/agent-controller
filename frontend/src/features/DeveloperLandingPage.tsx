@@ -1,0 +1,218 @@
+import { CircleAlert, LogIn, Radio, ShieldCheck, Smartphone, Sparkles } from "lucide-react";
+
+import type { AuthConfig, ClerkBridge } from "../types";
+import { Button } from "../ui";
+import { LandingBrand, MarketingSwitch, Shot } from "./landingChrome";
+
+interface DeveloperLandingPageProps {
+  authConfig: AuthConfig;
+  clerk: ClerkBridge | null;
+}
+
+const pipeline = [
+  {
+    n: "01",
+    title: "Authenticate the operator",
+    body: "Clerk owns identity; the gateway mints short-lived, user-scoped sessions and rate-limits per user, per device and per factory client.",
+    route: "POST /v1/session",
+  },
+  {
+    n: "02",
+    title: "Screen the intent against policy",
+    body: "Prompt, media, session control and shell input each carry a capability requirement and a risk score from the device's policy profile.",
+    route: "POST /v1/intents",
+  },
+  {
+    n: "03",
+    title: "Hold risky work for approval",
+    body: "A screened command stops at approval_required and raises a notification. Approve or reject from the console, the phone, or the controller.",
+    route: "POST /v1/commands/:id/approve",
+  },
+  {
+    n: "04",
+    title: "Dispatch to your T3 host",
+    body: "The gateway selects the session, resolves the harness and model from the live catalogue, and posts the orchestration request.",
+    route: "POST /v1/environments/:id/dispatch",
+  },
+  {
+    n: "05",
+    title: "Keep the receipt",
+    body: "Every transition is recorded with actor, previous status and result — the same timeline support sees in a redacted export.",
+    route: "GET /v1/commands/:id/events",
+  },
+];
+
+/**
+ * The terminal transcript is illustrative, not captured output: the host name, the setup code and
+ * the environment id are stand-ins. Everything it *claims* — the command, the ordering of the
+ * steps, the shape of the ids — matches what `scripts/setup-t3.mjs` actually prints.
+ */
+function SetupTranscript() {
+  return (
+    <div className="devland__terminal">
+      <div className="devland__terminal-bar">
+        <span className="devland__dot" data-tone="danger" aria-hidden="true" />
+        <span className="devland__dot" data-tone="warning" aria-hidden="true" />
+        <span className="devland__dot" data-tone="success" aria-hidden="true" />
+        <span className="devland__terminal-title">dana@studio — zsh</span>
+        <span className="devland__paired">
+          <span aria-hidden="true" />
+          paired
+        </span>
+      </div>
+      <pre>
+        <span className="devland__hash"># </span>
+        <span className="devland__comment">on the machine already running T3 Code</span>
+        {"\n"}
+        <span className="devland__prompt">$</span>
+        {" AGENT_CONTROLLER_URL=https://gateway.agentcontroller.dev \\\n    SETUP_CODE=7QK2-M4XP npm run setup:t3\n\n"}
+        <span className="devland__arrow">→</span>
+        {" reached T3 Code at http://127.0.0.1:4381\n"}
+        <span className="devland__arrow">→</span>
+        {" registered environment  env_7k3p1nzq  \"Studio Mac mini\"\n"}
+        <span className="devland__arrow">→</span>
+        {" catalogued harnesses    codex (6 models), claude-code (4)\n"}
+        <span className="devland__arrow">→</span>
+        {" snapshot                2 projects · 3 threads\n"}
+        <span className="devland__ok">✓</span>
+        {" paired. open https://gateway.agentcontroller.dev"}
+      </pre>
+    </div>
+  );
+}
+
+/**
+ * The terminal-first cut of the front door, for someone who already runs T3 Code and wants to see
+ * the command before the pitch. Same tokens and same claims as the main landing page — it leads
+ * with the setup transcript instead of a product shot, and holds the account CTA to the end.
+ */
+export function DeveloperLandingPage({ authConfig, clerk }: DeveloperLandingPageProps) {
+  const clerkReady = Boolean(authConfig.clerk?.enabled && clerk);
+  const checkingSession = clerkReady && !clerk?.loaded;
+
+  const accountActions = clerkReady ? (
+    <div className="landing__actions">
+      <Button size="lg" variant="primary" disabled={checkingSession} onClick={() => clerk?.openSignUp()}>
+        <Sparkles className="size-4" />
+        {checkingSession ? "Checking session…" : "Create your account"}
+      </Button>
+      <Button size="lg" variant="secondary" disabled={checkingSession} onClick={() => clerk?.openSignIn()}>
+        I already have one
+      </Button>
+    </div>
+  ) : (
+    <div className="landing__notice" role="status">
+      <CircleAlert className="size-4 shrink-0" aria-hidden="true" />
+      <div>
+        <p className="font-semibold">Sign-in is not configured on this gateway.</p>
+        <p className="mt-1 text-xs leading-relaxed">
+          Set <code>CLERK_PUBLISHABLE_KEY</code> and <code>CLERK_SECRET_KEY</code> in the gateway
+          environment, then restart the service.
+        </p>
+      </div>
+    </div>
+  );
+
+  return (
+    <div className="landing landing--console devland">
+      <header className="landing__bar">
+        <div className="landing__bar-inner">
+          <LandingBrand />
+          <div className="landing__bar-actions">
+            <MarketingSwitch current="developers" />
+            {clerkReady ? (
+              <Button variant="secondary" size="sm" disabled={checkingSession} onClick={() => clerk?.openSignIn()}>
+                <LogIn className="size-4" /> Sign in
+              </Button>
+            ) : null}
+          </div>
+        </div>
+      </header>
+
+      <main className="landing__main" id="main-content">
+        <section className="landing__section devland__hero">
+          <div className="landing__inner landing__inner--narrow">
+            <p className="devland__command">$ npm run setup:t3</p>
+            <h1>Your agent stays home. The controls come with you.</h1>
+            <p className="landing__lede">
+              One command on the machine already running T3 Code. After that you can dispatch
+              prompts, shell input, camera frames and voice from a browser, a phone, or a knob on
+              your desk — with a policy gate in front of anything destructive.
+            </p>
+
+            <SetupTranscript />
+
+            {accountActions}
+
+            <p className="landing__reassure">
+              <ShieldCheck className="size-3.5 shrink-0" aria-hidden="true" />
+              Gateway is self-hostable. Provider credentials never leave your machine.
+            </p>
+          </div>
+        </section>
+
+        <section className="landing__section" aria-labelledby="pipeline-title">
+          <div className="landing__inner landing__inner--narrow">
+            <h2 className="eyebrow" id="pipeline-title">
+              What the gateway is responsible for
+            </h2>
+            <ol className="devland__pipeline">
+              {pipeline.map((stage) => (
+                <li key={stage.n}>
+                  <span className="devland__pipeline-n" aria-hidden="true">
+                    {stage.n}
+                  </span>
+                  <div>
+                    <h3>{stage.title}</h3>
+                    <p>{stage.body}</p>
+                  </div>
+                  <code>{stage.route}</code>
+                </li>
+              ))}
+            </ol>
+          </div>
+        </section>
+
+        <section className="landing__section">
+          <div className="landing__inner landing__inner--narrow devland__split">
+            <article>
+              <div className="landing__step-icon" aria-hidden="true">
+                <Smartphone className="size-4" />
+              </div>
+              <h3>Browser-only is a complete setup</h3>
+              <p>
+                Push-to-talk, camera prompts, approvals and macros all work from the PWA at 375px.
+                Hardware is an addition, never a requirement.
+              </p>
+            </article>
+            <article>
+              <div className="landing__feature-icon" aria-hidden="true">
+                <Radio className="size-4" />
+              </div>
+              <h3>Or claim the controller</h3>
+              <p>
+                ESP32, 2.13" e-ink, one rotary encoder. Claim it with a code, point it at a thread,
+                and it polls compact display state over WiFi.
+              </p>
+              <Shot icon={Radio} ratio="16 / 7" caption="controller, front view" />
+              <a className="landing__link-button" href="#/early-access">
+                See the hardware
+              </a>
+            </article>
+          </div>
+        </section>
+
+        <section className="landing__section devland__close">
+          <div className="landing__inner landing__inner--narrow">
+            <h2>Pair a host, get a thread that answers.</h2>
+            <p>Free while it's nightly. Bring your own provider keys; they stay on your machine.</p>
+            {accountActions}
+            <p className="devland__wordmark">
+              gateway.agentcontroller.dev · self-host · MIT firmware
+            </p>
+          </div>
+        </section>
+      </main>
+    </div>
+  );
+}

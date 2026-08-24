@@ -62,6 +62,7 @@ test("outcomes are read from the real snapshot's failed threads", () => {
     assert.equal(outcome.failure.code, "invalid_request_error");
     assert.equal(outcome.assistantMessageCount, 0);
     assert.equal(outcome.lastAssistantAt, null);
+    assert.equal(outcome.lastAssistantText, null);
     // Session status is "stopped" on failure and success alike, so it proves nothing on its own.
     assert.equal(outcome.sessionStatus, "stopped");
   }
@@ -74,6 +75,7 @@ test("a succeeded thread is distinguished from a failed one despite both being s
   assert.equal(outcome.failure, null);
   assert.equal(outcome.assistantMessageCount, 1);
   assert.equal(outcome.lastAssistantAt, "2026-07-24T19:10:00.000Z");
+  assert.equal(outcome.lastAssistantText, "done");
 });
 
 test("a streaming assistant message does not count as a reply yet", () => {
@@ -82,6 +84,7 @@ test("a streaming assistant message does not count as a reply yet", () => {
   const outcome = extractThreadOutcomes({ threads: [thread] }).get("thread_ok");
   assert.equal(outcome.assistantMessageCount, 0);
   assert.equal(outcome.lastAssistantAt, null);
+  assert.equal(outcome.lastAssistantText, null);
 });
 
 test("reconciliation marks failed, completed, or leaves the command alone", () => {
@@ -101,6 +104,7 @@ test("reconciliation marks failed, completed, or leaves the command alone", () =
   );
   assert.equal(completed.status, "completed");
   assert.equal(completed.result.repliedAt, "2026-07-24T19:10:00.000Z");
+  assert.equal(completed.result.response, "done");
 
   // Still running: no evidence either way.
   assert.equal(
@@ -193,6 +197,7 @@ test("the poller completes a command once the agent has replied", async () => {
 
   const [stored] = (await store.listCommands("user_1")).filter((entry) => entry.id === command.id);
   assert.equal(stored.status, "completed");
+  assert.equal(stored.result.response, "done");
   assert.ok(stored.metrics.completedAt);
 });
 

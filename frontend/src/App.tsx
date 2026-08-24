@@ -1,5 +1,6 @@
 import {
   Activity,
+  Blocks,
   Boxes,
   Cable,
   ChevronDown,
@@ -28,16 +29,29 @@ import { useEffect, useMemo, useRef, useState } from "react";
 import { type ClaimLink, readClaimLink } from "./claimLink";
 import { useController } from "./controller";
 import { ActivityPage } from "./features/ActivityPage";
+import { ActionsPage } from "./features/ActionsPage";
 import { ClaimPage } from "./features/ClaimPage";
-import { DevicesPage } from "./features/DevicesPage";
-import { EnvironmentsPage } from "./features/EnvironmentsPage";
+import { DeveloperLandingPage } from "./features/DeveloperLandingPage";
+import {
+  DeviceActionCluster,
+  DevicesPage,
+  type DeviceOnboardingFlow,
+} from "./features/DevicesPage";
+import {
+  EnvironmentActionCluster,
+  EnvironmentsPage,
+} from "./features/EnvironmentsPage";
+import { HardwareLandingPage } from "./features/HardwareLandingPage";
 import { LandingPage } from "./features/LandingPage";
 import { MediaPage } from "./features/MediaPage";
 import { OnboardingPage } from "./features/OnboardingPage";
 import { OperatePage } from "./features/OperatePage";
 import { QuickPage } from "./features/QuickPage";
 import { SettingsPage } from "./features/SettingsPage";
-import type { AuthConfig, ClerkBridge, PageId } from "./types";
+import { WorkspaceRecoveryDialog } from "./features/WorkspaceRecoveryDialog";
+import { type MarketingRoute, readMarketingRoute } from "./marketingRoute";
+import type { AuthConfig, ClerkBridge, Environment, PageId } from "./types";
+import { useWorkspaceRecoveryMonitor } from "./useWorkspaceRecoveryMonitor";
 import {
   Button,
   ConfirmProvider,
@@ -63,17 +77,24 @@ interface NavItem {
 const navItems: NavItem[] = [
   {
     id: "quick",
-    label: "Quick control",
-    shortLabel: "Quick",
-    description: "Push-to-talk, camera, approvals, and macros",
+    label: "Dashboard",
+    shortLabel: "Dashboard",
+    description: "Workspace, approvals, and actions",
     icon: Zap,
   },
   {
     id: "operate",
-    label: "Operate",
-    shortLabel: "Operate",
+    label: "Operations",
+    shortLabel: "Operations",
     description: "Dispatch and supervise agent work",
     icon: TerminalSquare,
+  },
+  {
+    id: "actions",
+    label: "Actions",
+    shortLabel: "Actions",
+    description: "Author reusable prompts, commands, media, and macros",
+    icon: Blocks,
   },
   {
     id: "devices",
@@ -169,12 +190,15 @@ function AppContent({ authConfig, clerk = null }: AppProps) {
   const controller = useController({ authConfig, clerk });
   const c = controller;
   const [page, setPageState] = useState<PageId>(readPage);
+  const [marketingRoute, setMarketingRoute] = useState<MarketingRoute>(readMarketingRoute);
   // Read once, before anything else can rewrite the URL. A scanned QR is a one-shot arrival.
   const [claimLink, setClaimLink] = useState<ClaimLink | null>(() => readClaimLink());
   const [sidebarCollapsed, setSidebarCollapsed] = useState(false);
   const [mobileMenuOpen, setMobileMenuOpen] = useState(false);
   const [mobileViewport, setMobileViewport] = useState(readMobileViewport);
   const [theme, setTheme] = useState<"light" | "dark">(readTheme);
+  const [deviceOnboardingFlow, setDeviceOnboardingFlow] = useState<DeviceOnboardingFlow | null>(null);
+  const [environmentConnectOpen, setEnvironmentConnectOpen] = useState(false);
   const [sidebarQuery, setSidebarQuery] = useState("");
   const sidebarSearchRef = useRef<HTMLInputElement>(null);
   const onboardingAutoOpenedRef = useRef(false);
@@ -185,8 +209,29 @@ function AppContent({ authConfig, clerk = null }: AppProps) {
     setMobileMenuOpen(false);
   };
 
+  const { checking: workspaceRecoveryChecking } = useWorkspaceRecoveryMonitor({
+    environmentId: c.workspaceRecovery?.environmentId ?? null,
+    checkAvailability: async (environmentId) => {
+      const result = await c.api<{ environment?: Environment; error?: string }>(
+        `/v1/t3/environments/${encodeURIComponent(environmentId)}/check`,
+        { method: "POST", body: {} },
+      );
+      return result.environment?.status === "reachable" && !result.error;
+    },
+    reloadWorkspace: async (environmentId) => {
+      await c.loadSnapshot(environmentId);
+    },
+    onRecovered: () => {
+      setPage("operate");
+      c.setNotice({ tone: "success", message: "T3 Code is available. Operations reloaded." });
+    },
+  });
+
   useEffect(() => {
-    const onHashChange = () => setPageState(readPage());
+    const onHashChange = () => {
+      setPageState(readPage());
+      setMarketingRoute(readMarketingRoute());
+    };
     window.addEventListener("hashchange", onHashChange);
     return () => window.removeEventListener("hashchange", onHashChange);
   }, []);
@@ -278,6 +323,7 @@ function AppContent({ authConfig, clerk = null }: AppProps) {
   const counts: Record<PageId, number> = {
     quick: c.pendingApprovals.length,
     operate: c.pendingApprovals.length,
+    actions: (c.actions ?? []).length,
     devices: c.devices.length,
     environments: c.environments.length,
     media: c.media.length,
@@ -290,9 +336,23 @@ function AppContent({ authConfig, clerk = null }: AppProps) {
       case "quick":
         return <QuickPage controller={controller} onNavigate={setPage} />;
       case "devices":
-        return <DevicesPage controller={controller} />;
+        return (
+          <DevicesPage
+            controller={controller}
+            onboardingFlow={deviceOnboardingFlow}
+            onOnboardingFlowChange={setDeviceOnboardingFlow}
+          />
+        );
+      case "actions":
+        return <ActionsPage controller={controller} />;
       case "environments":
-        return <EnvironmentsPage controller={controller} />;
+        return (
+          <EnvironmentsPage
+            controller={controller}
+            connectOpen={environmentConnectOpen}
+            onConnectOpenChange={setEnvironmentConnectOpen}
+          />
+        );
       case "media":
         return <MediaPage controller={controller} />;
       case "activity":
@@ -304,7 +364,7 @@ function AppContent({ authConfig, clerk = null }: AppProps) {
       default:
         return <OperatePage controller={controller} />;
     }
-  }, [controller, page]);
+  }, [controller, deviceOnboardingFlow, environmentConnectOpen, page]);
 
   if (claimLink) {
     return (
@@ -345,6 +405,12 @@ function AppContent({ authConfig, clerk = null }: AppProps) {
     // unresolved session gets a neutral hold instead.
     if (authConfig.clerk?.enabled && clerk && !clerk.loaded) {
       return <div className="landing landing--resolving" role="status" aria-label="Restoring your session" />;
+    }
+    if (marketingRoute === "developers") {
+      return <DeveloperLandingPage authConfig={authConfig} clerk={clerk} />;
+    }
+    if (marketingRoute === "early-access") {
+      return <HardwareLandingPage authConfig={authConfig} clerk={clerk} />;
     }
     return <LandingPage authConfig={authConfig} clerk={clerk} />;
   }
@@ -417,7 +483,7 @@ function AppContent({ authConfig, clerk = null }: AppProps) {
               <span className="resource-row__status resource-row__status--live" aria-label="Setup incomplete" />
             </button>
           ) : null}
-          {[nav("quick"), nav("operate"), nav("activity")].map((item) => {
+          {[nav("quick"), nav("operate"), nav("actions"), nav("activity")].map((item) => {
             const Icon = item.icon;
             const active = page === item.id;
             const count = counts[item.id];
@@ -460,7 +526,10 @@ function AppContent({ authConfig, clerk = null }: AppProps) {
                 type="button"
                 aria-label="Add environment"
                 title="Add environment"
-                onClick={() => setPage("environments")}
+                onClick={() => {
+                  setPage("environments");
+                  setEnvironmentConnectOpen(true);
+                }}
               >
                 <Plus className="size-3.5" />
               </button>
@@ -574,7 +643,14 @@ function AppContent({ authConfig, clerk = null }: AppProps) {
                 </div>
               );
             }) : (
-              <button type="button" className="resource-empty resource-empty--root" onClick={() => setPage("environments")}>
+              <button
+                type="button"
+                className="resource-empty resource-empty--root"
+                onClick={() => {
+                  setPage("environments");
+                  if (!normalizedSidebarQuery) setEnvironmentConnectOpen(true);
+                }}
+              >
                 <Plus className="size-3.5" />
                 {normalizedSidebarQuery ? "No matching environments" : "Connect an environment"}
               </button>
@@ -665,11 +741,21 @@ function AppContent({ authConfig, clerk = null }: AppProps) {
                 Sign in
               </Button>
             ) : null}
-            {page !== "onboarding" ? (
+            {page === "devices" ? (
+              <DeviceActionCluster
+                className="devices-topbar-actions"
+                onOpen={(flow) => setDeviceOnboardingFlow(flow)}
+              />
+            ) : page === "environments" ? (
+              <EnvironmentActionCluster
+                className="environments-topbar-actions"
+                onConnect={() => setEnvironmentConnectOpen(true)}
+              />
+            ) : page !== "onboarding" ? (
               <Button
                 className="topbar-add-action hidden sm:inline-flex"
                 size="sm"
-                onClick={() => setPage("operate")}
+                onClick={() => setPage("actions")}
               >
                 <Plus className="size-4" /> Add action
               </Button>
@@ -697,7 +783,7 @@ function AppContent({ authConfig, clerk = null }: AppProps) {
           </div>
         </header>
 
-        <main className="workspace__content" id="main-content">
+        <main className="workspace__content" id="main-content" data-page={page}>
           {pageContent}
         </main>
       </div>
@@ -728,11 +814,33 @@ function AppContent({ authConfig, clerk = null }: AppProps) {
         })}
       </nav>
 
-      {c.notice ? (
+      {c.notice && !c.workspaceRecovery ? (
         <Toast tone={c.notice.tone} onDismiss={() => c.setNotice(null)}>
           {c.notice.message}
         </Toast>
       ) : null}
+
+      <WorkspaceRecoveryDialog
+        open={Boolean(c.workspaceRecovery)}
+        message={c.workspaceRecovery?.message ?? "T3 snapshot is unavailable."}
+        retrying={c.busyAction === "retry-workspace-snapshot"}
+        checking={workspaceRecoveryChecking}
+        onClose={c.dismissWorkspaceRecovery}
+        onOpenEnvironments={() => {
+          c.dismissWorkspaceRecovery();
+          setPage("environments");
+        }}
+        onRetry={() => {
+          const environmentId = c.workspaceRecovery?.environmentId;
+          if (!environmentId) return;
+          c.dismissWorkspaceRecovery();
+          void c.run(
+            "retry-workspace-snapshot",
+            "T3 workspace loaded.",
+            () => c.loadSnapshot(environmentId),
+          );
+        }}
+      />
     </div>
   );
 }

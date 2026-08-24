@@ -19,6 +19,8 @@ export const updateDeviceConfig = mutation({
     config: v.object({
       environmentId: v.optional(v.string()),
       threadId: v.optional(v.string()),
+      gatewayAccessMode: v.optional(v.union(v.literal("local"), v.literal("tailscale"), v.literal("online"))),
+      gatewayUrl: v.optional(v.union(v.string(), v.null())),
       defaultPrompt: v.string(),
       shellCommand: v.optional(v.string()),
       menu: v.array(v.string()),

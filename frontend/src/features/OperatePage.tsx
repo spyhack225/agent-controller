@@ -12,7 +12,9 @@ import {
   Image,
   LoaderCircle,
   Mic,
+  Pencil,
   Play,
+  Plus,
   RefreshCw,
   Save,
   Send,
@@ -20,11 +22,11 @@ import {
   Terminal,
   X,
 } from "lucide-react";
-import { useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 
 import type { Controller } from "../controller";
 import { commandSummary, commandType, formatRelativeTime, renderEventResult } from "../format";
-import type { Command, JsonRecord } from "../types";
+import type { Command, JsonRecord, SavedAction, T3SessionFailure } from "../types";
 import {
   Button,
   EmptyState,
@@ -71,66 +73,213 @@ function intentFromForm(type: string, text: string, mediaUploadId: string): Json
   return { type: "agent_prompt", text: trimmed };
 }
 
+function isRecoverableModelFailure(failure: T3SessionFailure) {
+  return failure.code === "invalid_request_error"
+    && /(model.+not supported|unknown model)/iu.test(failure.message);
+}
+
 export function OperatePage({ controller }: { controller: Controller }) {
   const c = controller;
   const confirm = useConfirm();
+  const autoLoadEnvironmentRef = useRef<string | null>(null);
+  const [workspaceLoadState, setWorkspaceLoadState] = useState<{
+    environmentId: string;
+    status: "loading" | "loaded" | "failed";
+  } | null>(null);
   const [intentType, setIntentType] = useState("agent_prompt");
   const [prompt, setPrompt] = useState("");
   const [mediaId, setMediaId] = useState("");
   const [providerInstance, setProviderInstance] = useState("");
   const [model, setModel] = useState("");
-  const [macroLabel, setMacroLabel] = useState("");
+  const [modelSelectionMode, setModelSelectionMode] = useState<"automatic" | "manual">("automatic");
+  const [actionLabel, setActionLabel] = useState("");
+  const [editingActionId, setEditingActionId] = useState<string | null>(null);
+  const savedActions = c.actions ?? [];
 
   const usableHarnesses = c.harnesses.filter((harness) => harness.available !== false);
   const activeHarness = c.harnesses.find((harness) => harness.instanceId === providerInstance) ?? null;
   const availableModels = activeHarness?.models ?? [];
+  const selectedThread = c.threads.find((thread) => thread.id === c.selectedThreadId) ?? null;
+  const projectThreads = useMemo(
+    () => c.selectedProjectId
+      ? c.threads.filter((thread) => thread.projectId === c.selectedProjectId)
+      : c.threads,
+    [c.selectedProjectId, c.threads],
+  );
+  const threadMessages = selectedThread?.messages ?? [];
+  const threadPendingApprovals = useMemo(
+    () => c.pendingApprovals.filter((command) =>
+      command.threadId === c.selectedThreadId
+      && (!command.environmentId || command.environmentId === c.selectedEnvironmentId)
+    ),
+    [c.pendingApprovals, c.selectedEnvironmentId, c.selectedThreadId],
+  );
+  const threadCommands = useMemo(
+    () => c.recentCommands.filter((command) =>
+      command.threadId === c.selectedThreadId
+      && (!command.environmentId || command.environmentId === c.selectedEnvironmentId)
+    ),
+    [c.recentCommands, c.selectedEnvironmentId, c.selectedThreadId],
+  );
+  const threadFailures = useMemo(
+    () => c.sessionFailures.filter((failure) => failure.threadId === c.selectedThreadId),
+    [c.sessionFailures, c.selectedThreadId],
+  );
+  const latestModelSelection = useMemo(() => {
+    const preferredInstanceId = c.selectedProject?.defaultModelSelection?.instanceId
+      ?? c.suggestedModelSelection?.instanceId
+      ?? null;
+    const launchable = c.harnesses.filter((harness) =>
+      harness.available !== false && harness.models.length > 0
+    );
+    const harness = launchable.find((entry) => entry.instanceId === preferredInstanceId)
+      ?? launchable[0];
+    const latestModel = harness?.models[0];
+    return harness && latestModel
+      ? { instanceId: harness.instanceId, model: latestModel.slug }
+      : null;
+  }, [c.harnesses, c.selectedProject, c.suggestedModelSelection]);
+  const recoveryModelSelection = latestModelSelection;
 
-  // Prefer the project's own default, but only when T3 still offers it. Otherwise fall back to
-  // what the gateway resolved from the live catalogue, so the fields are never left holding a
-  // model that would be rejected at dispatch.
+  // Existing threads keep a valid provider/model pair. New threads use the first model in T3's
+  // ordered live catalogue for the project's provider, which is T3's current preferred model.
   useEffect(() => {
-    const projectDefault = c.selectedProject?.defaultModelSelection ?? null;
-    const suggested = c.suggestedModelSelection;
+    const threadSelection = selectedThread?.modelSelection ?? null;
     const isOffered = (instanceId?: string, slug?: string) =>
       Boolean(instanceId && slug && c.harnesses
         .find((harness) => harness.instanceId === instanceId && harness.available !== false)
         ?.models.some((entry) => entry.slug === slug));
 
-    if (isOffered(projectDefault?.instanceId, projectDefault?.model)) {
-      setProviderInstance(projectDefault!.instanceId);
-      setModel(projectDefault!.model);
+    if (threadSelection && isOffered(threadSelection.instanceId, threadSelection.model)) {
+      setProviderInstance(threadSelection.instanceId);
+      setModel(threadSelection.model);
+      setModelSelectionMode("automatic");
       return;
     }
-    if (suggested) {
-      setProviderInstance(suggested.instanceId);
-      setModel(suggested.model);
+    if (modelSelectionMode === "manual" && isOffered(providerInstance, model)) return;
+    if (latestModelSelection) {
+      setProviderInstance(latestModelSelection.instanceId);
+      setModel(latestModelSelection.model);
       return;
     }
-    setProviderInstance(projectDefault?.instanceId ?? "");
-    setModel(projectDefault?.model ?? "");
-  }, [c.selectedProject, c.harnesses, c.suggestedModelSelection]);
+    setProviderInstance("");
+    setModel("");
+  }, [
+    c.harnesses,
+    latestModelSelection,
+    model,
+    modelSelectionMode,
+    providerInstance,
+    selectedThread,
+  ]);
+
+  const loadWorkspace = useCallback(async (environmentId: string) => {
+    if (!environmentId) return;
+    autoLoadEnvironmentRef.current = environmentId;
+    setWorkspaceLoadState({ environmentId, status: "loading" });
+    try {
+      await c.loadSnapshot(environmentId);
+      if (autoLoadEnvironmentRef.current === environmentId) {
+        setWorkspaceLoadState({ environmentId, status: "loaded" });
+      }
+    } catch {
+      if (autoLoadEnvironmentRef.current === environmentId) {
+        setWorkspaceLoadState({ environmentId, status: "failed" });
+      }
+    }
+  }, [c.loadSnapshot]);
+
+  useEffect(() => {
+    const environmentId = c.selectedEnvironmentId;
+    if (!environmentId) {
+      autoLoadEnvironmentRef.current = null;
+      setWorkspaceLoadState(null);
+      return;
+    }
+    if (c.threads.length > 0 || c.projects.length > 0) {
+      setWorkspaceLoadState({ environmentId, status: "loaded" });
+      return;
+    }
+    if (autoLoadEnvironmentRef.current === environmentId) return;
+
+    void loadWorkspace(environmentId);
+  }, [
+    c.projects.length,
+    c.selectedEnvironmentId,
+    c.threads.length,
+    loadWorkspace,
+  ]);
 
   const selectHarness = (instanceId: string) => {
+    setModelSelectionMode("manual");
+    if (c.selectedThreadId) c.setSelectedThreadId("");
     setProviderInstance(instanceId);
     const harness = c.harnesses.find((entry) => entry.instanceId === instanceId);
     const models = harness?.models ?? [];
     setModel(models.some((entry) => entry.slug === model) ? model : models[0]?.slug ?? "");
   };
 
+  const selectModel = (slug: string) => {
+    setModelSelectionMode("manual");
+    if (c.selectedThreadId) c.setSelectedThreadId("");
+    setModel(slug);
+  };
+
+  const selectEnvironment = (environmentId: string) => {
+    setModelSelectionMode("automatic");
+    setProviderInstance("");
+    setModel("");
+    setIntentType("agent_prompt");
+    setMediaId("");
+    c.setSelectedEnvironmentId(environmentId);
+    void loadWorkspace(environmentId);
+  };
+
+  const selectProject = (projectId: string) => {
+    setModelSelectionMode("automatic");
+    const nextThread = c.threads.find((thread) => thread.projectId === projectId) ?? null;
+    c.setSelectedProjectId(projectId);
+    c.setSelectedThreadId(nextThread?.id ?? "");
+    setIntentType("agent_prompt");
+    setMediaId("");
+  };
+
+  const selectThread = (threadId: string) => {
+    setModelSelectionMode("automatic");
+    const nextThread = c.threads.find((thread) => thread.id === threadId) ?? null;
+    if (nextThread?.projectId && nextThread.projectId !== c.selectedProjectId) {
+      c.setSelectedProjectId(nextThread.projectId);
+    }
+    c.setSelectedThreadId(threadId);
+    if (!threadId) {
+      setIntentType("agent_prompt");
+      setMediaId("");
+    }
+  };
+
   const selectedIntent = intentOptions.find((option) => option.value === intentType)
     ?? intentOptions[0];
   const SelectedIntentIcon = selectedIntent.icon;
-  const canSend = Boolean(c.selectedEnvironmentId)
+  const canSendFollowUp = Boolean(c.selectedEnvironmentId && c.selectedThreadId)
     && (intentType === "camera_prompt" || intentType === "audio_prompt"
       ? Boolean(prompt.trim() || mediaId)
       : Boolean(prompt.trim()));
+  const canStartThread = Boolean(
+    c.selectedEnvironmentId
+    && c.selectedProjectId
+    && intentType === "agent_prompt"
+    && prompt.trim()
+    && model
+    && activeHarness?.available !== false,
+  );
+  const canSend = c.selectedThreadId ? canSendFollowUp : canStartThread;
 
   const sendIntent = async (intent: JsonRecord, successMessage: string) => {
     if (!c.selectedEnvironmentId) {
       c.setNotice({ tone: "danger", message: "Pair and select a T3 environment first." });
       return;
     }
-    await c.run("send-intent", successMessage, async () => {
+    return c.run("send-intent", successMessage, async () => {
       const body: JsonRecord = {
         environmentId: c.selectedEnvironmentId,
         intent,
@@ -138,31 +287,55 @@ export function OperatePage({ controller }: { controller: Controller }) {
       if (intent.type !== "status") body.threadId = c.selectedThreadId;
       const result = await c.api("/v1/intents", { method: "POST", body });
       await c.refreshAll();
+      // The message has already been accepted at this point. A snapshot outage should open the
+      // existing recovery flow without making the composer imply that the user needs to resend it.
+      try {
+        await c.loadSnapshot(c.selectedEnvironmentId);
+      } catch {
+        // loadSnapshot owns the recovery dialog state.
+      }
       return result;
     });
   };
 
-  const createMacro = async () => {
+  const saveAction = async () => {
     const intent = intentFromForm(intentType, prompt, mediaId);
-    await c.run("create-macro", "Macro saved.", async () => {
-      const result = await c.api("/v1/macros", {
-        method: "POST",
+    const actionType = intentType === "shell_input"
+      ? "shell"
+      : intentType === "camera_prompt" || intentType === "audio_prompt" ? "media" : "prompt";
+    const payload = actionType === "shell"
+      ? { command: prompt.trim() }
+      : actionType === "media"
+        ? { mediaKind: intentType === "audio_prompt" ? "audio" : "image", prompt: prompt.trim() }
+        : { text: prompt.trim() };
+    await c.run(editingActionId ? `update-action-${editingActionId}` : "create-action", editingActionId ? "Action updated." : "Action saved.", async () => {
+      const result = await c.api(editingActionId ? `/v1/actions/${encodeURIComponent(editingActionId)}` : "/v1/actions", {
+        method: editingActionId ? "PUT" : "POST",
         body: {
-          label: macroLabel.trim() || prompt.trim() || selectedIntent.label,
+          label: actionLabel.trim() || prompt.trim().slice(0, 32) || selectedIntent.label,
+          type: actionType,
+          payload,
+          targetMode: c.selectedEnvironmentId ? "fixed" : "device-current",
           environmentId: c.selectedEnvironmentId || null,
           threadId: c.selectedThreadId || null,
           intent,
         },
       });
-      setMacroLabel("");
+      setActionLabel("");
+      setEditingActionId(null);
       await c.refreshAll();
       return result;
     });
   };
 
-  const runMacro = async (macroId: string) => {
-    await c.run(`macro-${macroId}`, "Macro dispatched.", async () => {
-      const result = await c.api(`/v1/macros/${encodeURIComponent(macroId)}/run`, {
+  const runSavedAction = async (action: SavedAction) => {
+    if (action.type === "media") {
+      c.setNotice({ tone: "info", message: "Choose a compatible upload from the Actions library to run this media action." });
+      return;
+    }
+    const actionId = action.id;
+    await c.run(`action-${actionId}`, "Action dispatched.", async () => {
+      const result = await c.api(`/v1/actions/${encodeURIComponent(actionId)}/run`, {
         method: "POST",
         body: {
           environmentId: c.selectedEnvironmentId || undefined,
@@ -174,18 +347,33 @@ export function OperatePage({ controller }: { controller: Controller }) {
     });
   };
 
-  const deleteMacro = async (macroId: string, label: string) => {
+  const deleteSavedAction = async (actionId: string, label: string) => {
     const accepted = await confirm({
       title: `Delete “${label}”?`,
-      description: "The saved macro will be removed from the web dashboard and claimed controllers.",
-      confirmLabel: "Delete macro",
+      description: "The saved action will be removed from the library and claimed controllers.",
+      confirmLabel: "Delete action",
     });
     if (!accepted) return;
-    await c.run(`delete-macro-${macroId}`, "Macro deleted.", async () => {
-      const result = await c.api(`/v1/macros/${encodeURIComponent(macroId)}`, { method: "DELETE" });
+    await c.run(`delete-action-${actionId}`, "Action deleted.", async () => {
+      const result = await c.api(`/v1/actions/${encodeURIComponent(actionId)}`, { method: "DELETE" });
       await c.refreshAll();
       return result;
     });
+  };
+
+  const editSavedAction = (action: SavedAction) => {
+    const type = typeof action.intent?.type === "string" ? action.intent.type : "agent_prompt";
+    const content = action.payload?.text ?? action.payload?.prompt ?? action.payload?.command
+      ?? action.intent?.text ?? action.intent?.prompt ?? action.intent?.transcript ?? action.intent?.command;
+    const resolvedType = action.type === "shell"
+      ? "shell_input"
+      : action.type === "media"
+        ? action.payload?.mediaKind === "audio" ? "audio_prompt" : "camera_prompt"
+        : type;
+    setIntentType(resolvedType === "audio_prompt" || resolvedType === "camera_prompt" || resolvedType === "shell_input" ? resolvedType : "agent_prompt");
+    setPrompt(typeof content === "string" ? content : "");
+    setActionLabel(action.label);
+    setEditingActionId(action.id);
   };
 
   const decideCommand = async (command: Command, decision: "approve" | "reject") => {
@@ -219,7 +407,7 @@ export function OperatePage({ controller }: { controller: Controller }) {
       });
       return;
     }
-    await c.run("launch-project", "Project session launched.", async () =>
+    const result = await c.run("launch-project", "Project session launched.", async () =>
       c.launchProject({
         projectId: c.selectedProjectId,
         text: prompt.trim() || "Open this project and report that the remote session is ready.",
@@ -228,40 +416,213 @@ export function OperatePage({ controller }: { controller: Controller }) {
           : {}),
       })
     );
+    if (result?.modelRecovery) {
+      const { requested, selected } = result.modelRecovery;
+      const unavailable = requested
+        ? `${requested.instanceId}/${requested.model}`
+        : "The selected model";
+      c.setNotice({
+        tone: "info",
+        message: `${unavailable} is unavailable. Started this thread with ${selected.instanceId}/${selected.model} instead.`,
+      });
+    }
+    return result;
+  };
+
+  const prepareFailureRecovery = (failure: T3SessionFailure) => {
+    if (!recoveryModelSelection) return;
+    setModelSelectionMode("manual");
+    setProviderInstance(recoveryModelSelection.instanceId);
+    setModel(recoveryModelSelection.model);
+    setIntentType("agent_prompt");
+    setMediaId("");
+    setPrompt(failure.title ?? selectedThread?.label ?? "Continue this task.");
+    c.setSelectedThreadId("");
+    c.setNotice({
+      tone: "info",
+      message: `A replacement is ready with ${recoveryModelSelection.instanceId}/${recoveryModelSelection.model}. Review the prompt, then start the new thread.`,
+    });
+  };
+
+  const submitComposer = async () => {
+    const result = c.selectedThreadId
+      ? await sendIntent(intentFromForm(intentType, prompt, mediaId), "Message sent.")
+      : await launchProject();
+    if (result !== undefined) {
+      setPrompt("");
+      setMediaId("");
+    }
   };
 
   const counts = c.display?.counts ?? {};
+  const selectedEnvironmentLabel = c.environments.find(
+    (environment) => environment.id === c.selectedEnvironmentId,
+  )?.label ?? "the selected T3 environment";
+  const selectedWorkspaceLoadState = workspaceLoadState?.environmentId === c.selectedEnvironmentId
+    ? workspaceLoadState.status
+    : "loading";
+  const contextToolbar = (
+    <div className="thread-context-toolbar" aria-label="Command context">
+      <label className="thread-context-control">
+        <span>Environment</span>
+        <select
+          aria-label="Environment"
+          value={c.selectedEnvironmentId}
+          onChange={(event) => selectEnvironment(event.target.value)}
+        >
+          {c.environments.length === 0 ? <option value="">No environments paired</option> : null}
+          {c.environments.map((environment) => (
+            <option key={environment.id} value={environment.id}>{environment.label}</option>
+          ))}
+        </select>
+      </label>
+      <label className="thread-context-control">
+        <span>Project</span>
+        <select
+          aria-label="Project"
+          value={c.selectedProjectId}
+          onChange={(event) => selectProject(event.target.value)}
+          disabled={c.projects.length === 0}
+        >
+          {c.projects.length === 0 ? <option value="">No projects loaded</option> : null}
+          {c.projects.map((project) => (
+            <option key={project.id} value={project.id}>
+              {project.title ?? project.name ?? project.workspaceRoot ?? project.id}
+            </option>
+          ))}
+        </select>
+      </label>
+      <label className="thread-context-control">
+        <span>Thread</span>
+        <select
+          aria-label="Thread"
+          value={c.selectedThreadId}
+          onChange={(event) => selectThread(event.target.value)}
+          disabled={!c.selectedProjectId}
+        >
+          <option value="">New thread…</option>
+          {projectThreads.map((thread) => (
+            <option key={thread.id} value={thread.id}>{thread.label}</option>
+          ))}
+        </select>
+      </label>
+      <label className="thread-context-control">
+        <span>Harness</span>
+        <select
+          aria-label="Agent harness"
+          value={providerInstance}
+          onChange={(event) => selectHarness(event.target.value)}
+          disabled={!c.selectedProjectId || c.harnesses.length === 0}
+        >
+          {c.harnesses.length === 0 ? <option value="">No harnesses reported</option> : null}
+          {usableHarnesses.map((harness) => (
+            <option key={harness.instanceId} value={harness.instanceId}>
+              {harness.label}
+              {harness.models.length ? ` (${harness.models.length})` : ""}
+            </option>
+          ))}
+          {c.harnesses
+            .filter((harness) => harness.available === false)
+            .map((harness) => (
+              <option key={harness.instanceId} value={harness.instanceId} disabled>
+                {harness.label} — {harness.unavailableReason ?? "unavailable"}
+              </option>
+            ))}
+        </select>
+      </label>
+      <label className="thread-context-control">
+        <span>Model</span>
+        <select
+          aria-label="Model"
+          value={model}
+          onChange={(event) => selectModel(event.target.value)}
+          disabled={!c.selectedProjectId || availableModels.length === 0}
+        >
+          {availableModels.length === 0 ? <option value="">No models reported</option> : null}
+          {availableModels.map((entry) => (
+            <option key={entry.slug} value={entry.slug}>
+              {entry.name}
+            </option>
+          ))}
+        </select>
+      </label>
+      <div className="thread-context-actions">
+        {selectedWorkspaceLoadState === "loading" ? (
+          <span className="thread-context-sync" aria-live="polite">
+            <LoaderCircle className="size-3.5 animate-spin motion-reduce:animate-none" /> Syncing…
+          </span>
+        ) : selectedWorkspaceLoadState === "failed" ? (
+          <span className="thread-context-sync" data-error="true" aria-live="polite">Sync failed</span>
+        ) : null}
+        {c.selectedThreadId && c.projects.length ? (
+          <Button
+            size="sm"
+            variant="ghost"
+            onClick={() => {
+              setModelSelectionMode("automatic");
+              c.setSelectedThreadId("");
+              setIntentType("agent_prompt");
+              setMediaId("");
+            }}
+          >
+            <Plus className="size-3.5" /> New thread
+          </Button>
+        ) : null}
+        <Button
+          size="sm"
+          variant="ghost"
+          busy={selectedWorkspaceLoadState === "loading"}
+          disabled={!c.selectedEnvironmentId}
+          onClick={() => void loadWorkspace(c.selectedEnvironmentId)}
+        >
+          <RefreshCw className="size-3.5" /> Refresh
+        </Button>
+      </div>
+    </div>
+  );
 
   if (!c.selectedEnvironmentId || (!c.selectedThreadId && c.threads.length === 0 && c.projects.length === 0)) {
+    const workspaceFailed = c.selectedEnvironmentId && selectedWorkspaceLoadState === "failed";
+    const workspaceLoaded = c.selectedEnvironmentId && selectedWorkspaceLoadState === "loaded";
     return (
-      <div className="thread-empty-shell">
-        <div className="thread-empty-state">
+      <div className="thread-workspace">
+        <div className="thread-feed">
+          <div className="thread-empty-state">
           <h2>
-            {c.selectedEnvironmentId ? "Pick a thread to continue" : "Connect an environment to begin"}
+            {!c.selectedEnvironmentId
+              ? "Connect an environment to begin"
+              : workspaceFailed
+                ? "Workspace unavailable"
+                : workspaceLoaded
+                  ? "Workspace is empty"
+                  : "Loading workspace"}
           </h2>
           <p>
-            {c.selectedEnvironmentId
-              ? "Load the selected T3 workspace, then choose an existing thread or launch a new one."
-              : "Pair a T3 Code environment from the sidebar to start operating an agent."}
+            {!c.selectedEnvironmentId
+              ? "Pair a T3 Code environment from the sidebar to start operating an agent."
+              : workspaceFailed
+                ? `Could not fetch projects and threads from ${selectedEnvironmentLabel}.`
+                : workspaceLoaded
+                  ? `${selectedEnvironmentLabel} did not report any projects or threads.`
+                  : `Fetching projects and threads from ${selectedEnvironmentLabel}.`}
           </p>
-          {c.selectedEnvironmentId ? (
+          {c.selectedEnvironmentId && !workspaceFailed && !workspaceLoaded ? (
+            <div className="thread-empty-loading" role="status" aria-live="polite">
+              <LoaderCircle className="size-4 animate-spin motion-reduce:animate-none" />
+              <span>Loading workspace…</span>
+            </div>
+          ) : null}
+          {c.selectedEnvironmentId && (workspaceFailed || workspaceLoaded) ? (
             <Button
-              busy={c.busyAction === "load-snapshot"}
-              onClick={() => void c.run("load-snapshot", "T3 sessions loaded.", () => c.loadSnapshot())}
+              variant="secondary"
+              onClick={() => void loadWorkspace(c.selectedEnvironmentId)}
             >
-              <RefreshCw className="size-4" /> Load workspace
+              <RefreshCw className="size-4" /> {workspaceFailed ? "Retry" : "Refresh workspace"}
             </Button>
           ) : null}
+          </div>
         </div>
-        <div className="thread-empty-footer">
-          <span className="connection-dot" data-live={c.connection === "live" || undefined} />
-          <span>{c.connectionDetail}</span>
-          <span className="thread-empty-footer__hint">
-            {c.environments.length
-              ? `${c.environments.length} ${c.environments.length === 1 ? "environment" : "environments"} available`
-              : "No environments paired"}
-          </span>
-        </div>
+        <div className="thread-composer-dock">{contextToolbar}</div>
       </div>
     );
   }
@@ -270,7 +631,67 @@ export function OperatePage({ controller }: { controller: Controller }) {
     <div className="thread-workspace">
       <div className="thread-feed">
         <div className="thread-feed__inner">
-          {c.pendingApprovals.map((command) => (
+          {threadFailures.length > 0 ? (
+            <section className="thread-failure-notice" role="status" aria-label="Session failures">
+              <header>
+                <span className="thread-failure-notice__icon" aria-hidden="true">
+                  <ShieldAlert className="size-4" />
+                </span>
+                <span>
+                  <strong>Session issues</strong>
+                  <small>Provider errors from recent launches</small>
+                </span>
+                <StatusBadge
+                  tone="danger"
+                  label={`${threadFailures.length} failed`}
+                />
+              </header>
+              <div className="thread-failure-notice__list">
+                {threadFailures.map((failure) => (
+                  <article key={`${failure.threadId}-${failure.updatedAt}`}>
+                    <p>
+                      <strong>{failure.title ?? failure.threadId}</strong>
+                      <span>
+                        Stopped{failure.model ? ` on ${failure.instanceId}/${failure.model}` : ""}
+                      </span>
+                    </p>
+                    <div className="thread-failure-notice__detail">
+                      <small>{failure.message}</small>
+                      {recoveryModelSelection
+                        && isRecoverableModelFailure(failure)
+                        && (failure.instanceId !== recoveryModelSelection.instanceId
+                          || failure.model !== recoveryModelSelection.model) ? (
+                          <div className="thread-failure-notice__recovery">
+                            <span>
+                              Available: {recoveryModelSelection.instanceId}/{recoveryModelSelection.model}
+                            </span>
+                            <Button
+                              variant="secondary"
+                              size="sm"
+                              onClick={() => prepareFailureRecovery(failure)}
+                            >
+                              <Play className="size-3.5" /> Prepare replacement
+                            </Button>
+                          </div>
+                        ) : null}
+                    </div>
+                  </article>
+                ))}
+              </div>
+            </section>
+          ) : null}
+
+          {c.harnessCatalogueSource === "snapshot-only" && c.projects.length ? (
+            <div className="thread-catalogue-notice" role="note">
+              <Braces className="size-4" aria-hidden="true" />
+              <p>
+                Only harnesses already in use are listed. Run <code>npm run setup:t3</code> on the T3 host
+                to register its full harness and model catalogue.
+              </p>
+            </div>
+          ) : null}
+
+          {threadPendingApprovals.map((command) => (
             <section key={command.id} className="thread-approval">
               <div>
                 <div className="flex flex-wrap items-center gap-2">
@@ -299,9 +720,24 @@ export function OperatePage({ controller }: { controller: Controller }) {
             </section>
           ))}
 
-          {c.recentCommands.length ? (
+          {threadMessages.length ? (
+            <div className="thread-message-list" aria-label="Thread messages">
+              {threadMessages.map((message) => (
+                <article key={message.id} className="thread-message" data-role={message.role}>
+                  <header>
+                    <span>{message.role === "user" ? "You" : message.role === "assistant" ? "Agent" : message.role}</span>
+                    <span>
+                      {message.streaming ? "Responding" : null}
+                      {message.createdAt ? <time>{formatRelativeTime(message.createdAt)}</time> : null}
+                    </span>
+                  </header>
+                  <p>{message.text}</p>
+                </article>
+              ))}
+            </div>
+          ) : threadCommands.length ? (
             <div className="thread-command-list">
-              {c.recentCommands.slice(0, 16).reverse().map((command) => (
+              {threadCommands.slice(0, 16).reverse().map((command) => (
                 <article key={command.id} className="thread-command">
                   <div className="thread-command__meta">
                     <span className="capitalize">{commandType(command)}</span>
@@ -335,123 +771,19 @@ export function OperatePage({ controller }: { controller: Controller }) {
           ) : (
             <div className="thread-feed__empty">
               <Bot className="size-5" />
-              <p>This thread is ready</p>
-              <span>Send the first instruction from the composer below.</span>
+              <p>{c.selectedThreadId ? "This thread is ready" : "Start a new thread"}</p>
+              <span>
+                {c.selectedThreadId
+                  ? "Send the next instruction from the composer below."
+                  : "Write the first message below. Future messages will stay in this thread."}
+              </span>
             </div>
           )}
         </div>
       </div>
 
       <div className="thread-composer-dock">
-        <div className="thread-context-toolbar" aria-label="Command context">
-          <select
-            aria-label="Environment"
-            value={c.selectedEnvironmentId}
-            onChange={(event) => c.setSelectedEnvironmentId(event.target.value)}
-          >
-            {c.environments.map((environment) => (
-              <option key={environment.id} value={environment.id}>{environment.label}</option>
-            ))}
-          </select>
-          <select
-            aria-label="Thread"
-            value={c.selectedThreadId}
-            onChange={(event) => c.setSelectedThreadId(event.target.value)}
-          >
-            {c.threads.map((thread) => (
-              <option key={thread.id} value={thread.id}>{thread.label}</option>
-            ))}
-          </select>
-          {c.projects.length ? (
-            <>
-              <select
-                aria-label="Project"
-                value={c.selectedProjectId}
-                onChange={(event) => c.setSelectedProjectId(event.target.value)}
-              >
-                {c.projects.map((project) => (
-                  <option key={project.id} value={project.id}>
-                    {project.title ?? project.name ?? project.workspaceRoot ?? project.id}
-                  </option>
-                ))}
-              </select>
-              <select
-                aria-label="Agent harness"
-                value={providerInstance}
-                onChange={(event) => selectHarness(event.target.value)}
-                disabled={c.harnesses.length === 0}
-              >
-                {c.harnesses.length === 0 ? <option value="">No harnesses reported</option> : null}
-                {usableHarnesses.map((harness) => (
-                  <option key={harness.instanceId} value={harness.instanceId}>
-                    {harness.label}
-                    {harness.models.length ? ` (${harness.models.length})` : ""}
-                  </option>
-                ))}
-                {c.harnesses
-                  .filter((harness) => harness.available === false)
-                  .map((harness) => (
-                    <option key={harness.instanceId} value={harness.instanceId} disabled>
-                      {harness.label} — {harness.unavailableReason ?? "unavailable"}
-                    </option>
-                  ))}
-              </select>
-              <select
-                aria-label="Model"
-                value={model}
-                onChange={(event) => setModel(event.target.value)}
-                disabled={availableModels.length === 0}
-              >
-                {availableModels.length === 0 ? <option value="">No models reported</option> : null}
-                {availableModels.map((entry) => (
-                  <option key={entry.slug} value={entry.slug}>
-                    {entry.name}
-                    {entry.observed ? " (in use, not in catalogue)" : ""}
-                  </option>
-                ))}
-              </select>
-              <Button
-                size="sm"
-                busy={c.busyAction === "launch-project"}
-                disabled={!model || activeHarness?.available === false}
-                onClick={() => void launchProject()}
-              >
-                <Play className="size-3.5" /> Launch
-              </Button>
-            </>
-          ) : null}
-          <Button
-            size="sm"
-            variant="ghost"
-            busy={c.busyAction === "load-snapshot"}
-            onClick={() => void c.run("load-snapshot", "T3 sessions loaded.", () => c.loadSnapshot())}
-          >
-            <RefreshCw className="size-3.5" /> Refresh
-          </Button>
-        </div>
-
-        {/* T3 accepts a dispatch and only then has the provider reject it, so a stopped session is
-            the only place that failure shows up. */}
-        {c.sessionFailures.length > 0 ? (
-          <div className="thread-session-failures" role="status">
-            {c.sessionFailures.map((failure) => (
-              <p key={`${failure.threadId}-${failure.updatedAt}`}>
-                <strong>{failure.title ?? failure.threadId}</strong>
-                {" stopped"}
-                {failure.model ? ` on ${failure.instanceId}/${failure.model}` : ""}
-                {": "}
-                {failure.message}
-              </p>
-            ))}
-          </div>
-        ) : null}
-
-        {c.harnessCatalogueSource === "snapshot-only" && c.projects.length ? (
-          <p className="thread-catalogue-hint">
-            Only harnesses already in use are listed. Run <code>npm run setup:t3</code> on the T3 host
-            to register its full harness and model catalogue.
-          </p>
-        ) : null}
+        {contextToolbar}
 
         {(intentType === "camera_prompt" || intentType === "audio_prompt") ? (
           <select
@@ -476,11 +808,13 @@ export function OperatePage({ controller }: { controller: Controller }) {
             rows={4}
             placeholder={intentType === "shell_input"
               ? "Enter a shell command, for example: npm test"
-              : "Ask for follow-up changes or attach context…"}
+              : c.selectedThreadId
+                ? "Ask for follow-up changes or attach context…"
+                : "Describe the first task for this new thread…"}
             onKeyDown={(event) => {
               if ((event.metaKey || event.ctrlKey) && event.key === "Enter" && canSend) {
                 event.preventDefault();
-                void sendIntent(intentFromForm(intentType, prompt, mediaId), "Command dispatched.");
+                void submitComposer();
               }
             }}
           />
@@ -504,12 +838,12 @@ export function OperatePage({ controller }: { controller: Controller }) {
               <Button
                 variant="primary"
                 size="icon"
-                busy={c.busyAction === "send-intent"}
+                busy={c.busyAction === (c.selectedThreadId ? "send-intent" : "launch-project")}
                 disabled={!canSend}
-                aria-label="Send command"
-                onClick={() => void sendIntent(intentFromForm(intentType, prompt, mediaId), "Command dispatched.")}
+                aria-label={c.selectedThreadId ? "Send message" : "Start new thread"}
+                onClick={() => void submitComposer()}
               >
-                <Send className="size-4" />
+                {c.selectedThreadId ? <Send className="size-4" /> : <Play className="size-4" />}
               </Button>
             </div>
           </div>
@@ -529,22 +863,37 @@ export function OperatePage({ controller }: { controller: Controller }) {
             </Button>
           </div>
           <details className="thread-tools">
-            <summary><Braces className="size-3.5" /> Saved actions ({c.macros.length})</summary>
+            <summary><Braces className="size-3.5" /> Saved actions ({savedActions.length})</summary>
             <div className="thread-tools__panel">
               <div className="grid grid-cols-[1fr_auto] gap-2 p-3">
                 <input
-                  aria-label="Macro label"
-                  value={macroLabel}
-                  onChange={(event) => setMacroLabel(event.target.value)}
+                  aria-label="Action label"
+                  value={actionLabel}
+                  onChange={(event) => setActionLabel(event.target.value)}
                   placeholder="Action label"
                 />
-                <Button size="sm" onClick={() => void createMacro()}><Save className="size-3.5" /> Save</Button>
+                <Button size="sm" disabled={!prompt.trim()} onClick={() => void saveAction()}><Save className="size-3.5" /> {editingActionId ? "Update" : "Save"}</Button>
               </div>
-              {c.macros.length ? c.macros.slice(0, 8).map((macro) => (
-                <div key={macro.id} className="thread-tool-row">
-                  <span>{macro.label}</span>
-                  <Button size="sm" variant="ghost" onClick={() => void runMacro(macro.id)}>Run</Button>
-                  <Button size="sm" variant="danger-ghost" onClick={() => void deleteMacro(macro.id, macro.label)}>Delete</Button>
+              {editingActionId ? (
+                <button type="button" className="thread-tools__cancel-edit" onClick={() => { setEditingActionId(null); setActionLabel(""); }}>
+                  <X className="size-3" /> Editing saved action — cancel
+                </button>
+              ) : null}
+              {savedActions.length ? savedActions.slice(0, 8).map((action) => (
+                <div key={action.id} className="thread-tool-row">
+                  <span className="thread-tool-row__copy">
+                    <span>{action.label}</span>
+                    {action.type === "media" ? <small>Choose media in Actions</small> : null}
+                  </span>
+                  <Button size="icon" variant="ghost" aria-label={`Edit ${action.label}`} onClick={() => editSavedAction(action)}><Pencil className="size-3.5" /></Button>
+                  <Button
+                    size="sm"
+                    variant="ghost"
+                    disabled={action.type === "media"}
+                    title={action.type === "media" ? "Choose a compatible upload from the Actions library" : undefined}
+                    onClick={() => void runSavedAction(action)}
+                  >Run</Button>
+                  <Button size="sm" variant="danger-ghost" onClick={() => void deleteSavedAction(action.id, action.label)}>Delete</Button>
                 </div>
               )) : <p className="p-4 text-xs text-ink-muted">No saved actions yet.</p>}
             </div>

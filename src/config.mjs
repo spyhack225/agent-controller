@@ -29,6 +29,13 @@ export function loadConfig(env = process.env) {
     // AWS does not). Coercing this to false would break non-AWS endpoints.
     s3ForcePathStyle: normalizeOptionalBoolean(env.S3_FORCE_PATH_STYLE),
     s3TimeoutMs: normalizePositiveInt(env.S3_TIMEOUT_MS, 15_000),
+    firmwareStorageProvider: env.FIRMWARE_STORAGE_PROVIDER === "s3" ? "s3" : "disk",
+    firmwareDir: env.FIRMWARE_DIR ?? ".data/firmware",
+    firmwareS3Bucket: env.FIRMWARE_S3_BUCKET ?? env.S3_BUCKET ?? null,
+    firmwareS3Prefix: (env.FIRMWARE_S3_PREFIX ?? "firmware").replace(/^\/+|\/+$/gu, "") || "firmware",
+    maxFirmwareBytes: normalizePositiveInt(env.MAX_FIRMWARE_BYTES, 16 * 1024 * 1024),
+    firmwareDownloadSigningKey: env.FIRMWARE_DOWNLOAD_SIGNING_KEY ?? null,
+    firmwareDownloadTtlSeconds: normalizePositiveInt(env.FIRMWARE_DOWNLOAD_TTL_SECONDS, 600),
     mediaInlineMaxBytes: normalizePositiveInt(env.MEDIA_INLINE_MAX_BYTES, 256 * 1024),
     transcriptionProvider: normalizeTranscriptionProvider(env.TRANSCRIPTION_PROVIDER),
     transcriptionUrl: env.TRANSCRIPTION_URL ?? null,

@@ -12,7 +12,7 @@ import {
 const ENVIRONMENT = { baseUrl: "http://127.0.0.1:3773", accessToken: "test-access-token" };
 
 // Minimal stand-in for the Effect RPC server, replaying the wire shapes captured from a live
-// T3 Code 0.0.28 instance.
+// T3 Code 0.0.28 instance; the same envelope remains live-compatible with 0.0.32.
 function fakeSocketFactory({ respond, autoOpen = true }) {
   const sockets = [];
   class FakeSocket {
