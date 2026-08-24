@@ -358,6 +358,221 @@ test("transcription failures surface as 502 and record the error", async (t) => 
   assert.match(stored.processing.lastError, /HTTP 429/u);
 });
 
+test("a project launch carries media on its very first turn", async (t) => {
+  const originalFetch = globalThis.fetch;
+  const dispatches = [];
+  globalThis.fetch = async (url, init = {}) => {
+    const parsed = new URL(String(url));
+    if (parsed.pathname === "/api/orchestration/snapshot") {
+      return jsonResponse({
+        projects: [{
+          id: "project_launch",
+          title: "Launch",
+          defaultModelSelection: { instanceId: "codex", model: "gpt-5.4" },
+        }],
+        threads: [],
+      }, 200);
+    }
+    if (parsed.pathname === "/api/orchestration/dispatch") {
+      dispatches.push(JSON.parse(init.body));
+      return jsonResponse({ accepted: true }, 200);
+    }
+    return jsonResponse({ error: "not found" }, 404);
+  };
+  t.after(() => {
+    globalThis.fetch = originalFetch;
+  });
+
+  const mediaDir = await mkdtemp(join(tmpdir(), "agent-controller-launch-"));
+  t.after(() => rm(mediaDir, { recursive: true, force: true }));
+
+  const { server } = createApp({ config: { ...MEDIA_CONFIG, mediaDir } });
+  await listen(server);
+  t.after(() => server.close());
+  const baseUrl = `http://127.0.0.1:${server.address().port}`;
+  const authHeaders = await createAuthHeaders(originalFetch, baseUrl);
+
+  const environment = await requestJson(originalFetch, baseUrl, "/v1/t3/environments", {
+    method: "POST",
+    headers: authHeaders,
+    body: { label: "Mock T3", baseUrl: "https://mock-t3.example", accessToken: "mock-token" },
+  });
+  const upload = await requestJson(originalFetch, baseUrl, "/v1/media", {
+    method: "POST",
+    headers: authHeaders,
+    body: {
+      kind: "image",
+      contentType: "image/png",
+      dataBase64: PNG_BASE64,
+      originalName: "snapshot.png",
+    },
+  });
+
+  const launched = await requestJson(
+    originalFetch,
+    baseUrl,
+    `/v1/t3/environments/${environment.environment.id}/threads`,
+    {
+      method: "POST",
+      headers: authHeaders,
+      body: {
+        projectId: "project_launch",
+        text: "Look at this screenshot before you start.",
+        mediaUploadIds: [upload.media.id],
+      },
+    },
+  );
+
+  assert.equal(dispatches.length, 2);
+  assert.equal(dispatches[0].type, "thread.create");
+  const startTurn = dispatches[1];
+  assert.equal(startTurn.type, "thread.turn.start");
+  assert.equal(startTurn.message.attachments.length, 1, "the first turn must carry the attachment");
+
+  const [attachment] = startTurn.message.attachments;
+  assert.equal(attachment.type, "image");
+  assert.equal(attachment.mediaId, upload.media.id);
+  assert.equal(attachment.name, "snapshot.png");
+  assert.equal(attachment.dataBase64, PNG_BASE64);
+  assert.ok(attachment.url, "attachment must carry a signed callback URL");
+
+  const stored = launched.command.normalized.startTurn.message.attachments[0];
+  assert.equal(stored.mediaId, upload.media.id);
+  assert.equal(stored.dataBase64, undefined, "media bytes must not be persisted on the command");
+  assert.equal(stored.url, undefined, "a live signed URL must not be persisted on the command");
+  assert.equal(stored.inlined, true);
+  assert.equal(stored.urlIssued, true);
+  assert.deepEqual(launched.command.intent.mediaUploadIds, [upload.media.id]);
+
+  const serialized = JSON.stringify(launched.command);
+  assert.ok(!serialized.includes(PNG_BASE64), "command payload must not embed the image bytes");
+});
+
+test("a project launch refuses media owned by another user", async (t) => {
+  const originalFetch = globalThis.fetch;
+  const dispatches = [];
+  globalThis.fetch = async (url, init = {}) => {
+    const parsed = new URL(String(url));
+    if (parsed.pathname === "/api/orchestration/snapshot") {
+      return jsonResponse({
+        projects: [{
+          id: "project_launch",
+          defaultModelSelection: { instanceId: "codex", model: "gpt-5.4" },
+        }],
+        threads: [],
+      }, 200);
+    }
+    if (parsed.pathname === "/api/orchestration/dispatch") {
+      dispatches.push(JSON.parse(init.body));
+      return jsonResponse({ accepted: true }, 200);
+    }
+    return jsonResponse({ error: "not found" }, 404);
+  };
+  t.after(() => {
+    globalThis.fetch = originalFetch;
+  });
+
+  const mediaDir = await mkdtemp(join(tmpdir(), "agent-controller-launch-owner-"));
+  t.after(() => rm(mediaDir, { recursive: true, force: true }));
+
+  const { server } = createApp({ config: { ...MEDIA_CONFIG, mediaDir } });
+  await listen(server);
+  t.after(() => server.close());
+  const baseUrl = `http://127.0.0.1:${server.address().port}`;
+  const ownerHeaders = await createAuthHeaders(originalFetch, baseUrl, "user_dev");
+  const intruderHeaders = await createAuthHeaders(originalFetch, baseUrl, "user_intruder");
+
+  const upload = await requestJson(originalFetch, baseUrl, "/v1/media", {
+    method: "POST",
+    headers: ownerHeaders,
+    body: { kind: "image", contentType: "image/png", dataBase64: PNG_BASE64 },
+  });
+  const environment = await requestJson(originalFetch, baseUrl, "/v1/t3/environments", {
+    method: "POST",
+    headers: intruderHeaders,
+    body: { label: "Mock T3", baseUrl: "https://mock-t3.example", accessToken: "mock-token" },
+  });
+
+  const response = await originalFetch(
+    new URL(`/v1/t3/environments/${environment.environment.id}/threads`, baseUrl),
+    {
+      method: "POST",
+      headers: { "content-type": "application/json", ...intruderHeaders },
+      body: JSON.stringify({
+        projectId: "project_launch",
+        text: "Read the other tenant's screenshot.",
+        mediaUploadIds: [upload.media.id],
+      }),
+    },
+  );
+
+  assert.equal(response.status, 404);
+  assert.equal(dispatches.length, 0, "nothing may reach T3 when the media is not the caller's");
+});
+
+test("a turn is refused when it references unknown media or too many attachments", async (t) => {
+  const originalFetch = globalThis.fetch;
+  const dispatches = [];
+  globalThis.fetch = async (url, init = {}) => {
+    const parsed = new URL(String(url));
+    if (parsed.pathname === "/api/orchestration/dispatch") {
+      dispatches.push(JSON.parse(init.body));
+      return jsonResponse({ accepted: true }, 200);
+    }
+    return jsonResponse({ error: "not found" }, 404);
+  };
+  t.after(() => {
+    globalThis.fetch = originalFetch;
+  });
+
+  const mediaDir = await mkdtemp(join(tmpdir(), "agent-controller-limits-"));
+  t.after(() => rm(mediaDir, { recursive: true, force: true }));
+
+  const { server } = createApp({ config: { ...MEDIA_CONFIG, mediaDir } });
+  await listen(server);
+  t.after(() => server.close());
+  const baseUrl = `http://127.0.0.1:${server.address().port}`;
+  const authHeaders = await createAuthHeaders(originalFetch, baseUrl);
+
+  const environment = await requestJson(originalFetch, baseUrl, "/v1/t3/environments", {
+    method: "POST",
+    headers: authHeaders,
+    body: { label: "Mock T3", baseUrl: "https://mock-t3.example", accessToken: "mock-token" },
+  });
+
+  const submit = (mediaUploadIds) => originalFetch(new URL("/v1/intents", baseUrl), {
+    method: "POST",
+    headers: { "content-type": "application/json", ...authHeaders },
+    body: JSON.stringify({
+      environmentId: environment.environment.id,
+      threadId: "thread_limits",
+      mediaUploadIds,
+      intent: { type: "agent_prompt", text: "Look at these." },
+    }),
+  });
+
+  const unknown = await submit(["media_does_not_exist"]);
+  assert.equal(unknown.status, 404);
+
+  const uploads = [];
+  for (let index = 0; index < 9; index += 1) {
+    const upload = await requestJson(originalFetch, baseUrl, "/v1/media", {
+      method: "POST",
+      headers: authHeaders,
+      body: { kind: "image", contentType: "image/png", dataBase64: PNG_BASE64 },
+    });
+    uploads.push(upload.media.id);
+  }
+
+  const tooMany = await submit(uploads);
+  assert.equal(tooMany.status, 400);
+
+  const withinLimit = await submit(uploads.slice(0, 8));
+  assert.equal(withinLimit.status, 202);
+  assert.equal(dispatches.length, 1);
+  assert.equal(dispatches[0].message.attachments.length, 8);
+});
+
 function listen(server) {
   return new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
 }
@@ -375,11 +590,11 @@ async function requestJson(fetchImpl, baseUrl, path, input) {
   return JSON.parse(text);
 }
 
-async function createAuthHeaders(fetchImpl, baseUrl) {
+async function createAuthHeaders(fetchImpl, baseUrl, userId = "user_dev") {
   const auth = await requestJson(fetchImpl, baseUrl, "/v1/users/dev", {
     method: "POST",
     headers: {},
-    body: { userId: "user_dev", email: "dev@example.local" },
+    body: { userId, email: `${userId}@example.local` },
   });
   return { authorization: `Bearer ${auth.apiToken.secret}` };
 }

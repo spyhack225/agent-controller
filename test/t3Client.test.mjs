@@ -74,4 +74,21 @@ test("project launch builds a T3 bootstrap turn using the selected harness", () 
   assert.equal(launch.createThread.projectId, "project_123");
   assert.equal(launch.createThread.runtimeMode, "approval-required");
   assert.equal(launch.startTurn.message.text, "Inspect this project and report its current state.");
+  assert.deepEqual(launch.startTurn.message.attachments, []);
+});
+
+test("a project launch puts attachments on the bootstrap turn, not the thread creation", () => {
+  const attachments = [{ type: "image", mediaId: "media_1", contentType: "image/png" }];
+  const launch = buildT3ProjectLaunchCommands({
+    project: {
+      id: "project_123",
+      defaultModelSelection: { instanceId: "claudeAgent", model: "claude-sonnet-5" },
+    },
+    text: "Explain this screenshot.",
+    threadId: "thread_123",
+    attachments,
+  });
+
+  assert.deepEqual(launch.startTurn.message.attachments, attachments);
+  assert.equal(launch.createThread.message, undefined);
 });

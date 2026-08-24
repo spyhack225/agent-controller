@@ -183,6 +183,7 @@ export function buildT3ProjectLaunchCommands({
   runtimeMode = "approval-required",
   interactionMode = "default",
   threadId = createId("thread"),
+  attachments = [],
 }) {
   if (!project?.id) throw new Error("T3 project id is required.");
   if (!modelSelection?.instanceId || !modelSelection?.model) {
@@ -214,7 +215,7 @@ export function buildT3ProjectLaunchCommands({
         messageId: createId("msg"),
         role: "user",
         text,
-        attachments: [],
+        attachments,
       },
       modelSelection,
       titleSeed: title,

@@ -11,7 +11,17 @@
 #include <Arduino.h>
 #include <Adafruit_ILI9341.h>
 
+#include <ThinkingOrb.h>
+
 bool displayBegin();
+
+// Paints one orb frame centred at (cx, cy). Dots are drawn far-to-near as the renderer ordered
+// them, so overlap reads as depth.
+void displayDrawOrb(ThinkingOrb& orb, int16_t cx, int16_t cy, uint32_t elapsedMs);
+
+// The status line under the orb, with the shimmer sweep the web component uses. `phase` advances
+// the highlight; pass the same elapsedMs as the orb.
+void displayDrawStatus(const char* label, int16_t cy, uint32_t elapsedMs);
 void displayBacklight(bool on);
 Adafruit_ILI9341& displayPanel();
 

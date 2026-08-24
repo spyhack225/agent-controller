@@ -11,6 +11,8 @@ const ALLOWED_MEDIA = {
   image: new Set(["image/jpeg", "image/png", "image/webp"]),
 };
 
+const MAX_MEDIA_ATTACHMENTS = 8;
+
 const EXTENSIONS = new Map([
   ["audio/wav", "wav"],
   ["audio/mpeg", "mp3"],
@@ -271,14 +273,23 @@ export async function buildMediaAttachment({ media, config, baseUrl, now = Date.
   return attachment;
 }
 
+// Every referenced upload must resolve for the calling user. Skipping an unknown or foreign id
+// would dispatch a turn whose text talks about media the agent never received.
 export async function buildMediaAttachments({ store, userId, mediaUploadIds, config, baseUrl, now }) {
   const ids = [...new Set((mediaUploadIds ?? []).filter((id) => typeof id === "string" && id))];
   if (ids.length === 0) return [];
+  if (ids.length > MAX_MEDIA_ATTACHMENTS) {
+    throw new HttpError(400, `A turn can carry at most ${MAX_MEDIA_ATTACHMENTS} media attachments.`);
+  }
 
   const attachments = [];
   for (const mediaId of ids) {
     const media = await store.getMediaForUser(userId, mediaId);
-    if (media) attachments.push(await buildMediaAttachment({ media, config, baseUrl, now }));
+    if (!media) throw new HttpError(404, "Media upload not found.");
+    if (!ALLOWED_MEDIA[media.kind]) {
+      throw new HttpError(415, `Unsupported media kind: ${media.kind}.`);
+    }
+    attachments.push(await buildMediaAttachment({ media, config, baseUrl, now }));
   }
   return attachments;
 }

@@ -18,6 +18,8 @@
 
 #include "display.h"
 
+#include <ThinkingOrb.h>
+
 #include <DeviceStore.h>
 #include <Provisioning.h>
 

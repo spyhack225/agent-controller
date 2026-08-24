@@ -4,7 +4,7 @@ Live progress ledger for
 [open-input-media-voice-environments-roadmap.md](open-input-media-voice-environments-roadmap.md).
 Updated as work lands, not at the end. Anything not listed as **done** is not done.
 
-Last updated: 2026-08-24.
+Last updated: 2026-08-24 (Milestone 0.5 in progress).
 
 ## Legend
 
@@ -36,10 +36,10 @@ Depend on none of the new infrastructure.
 
 | Item | State | Notes |
 |---|---|---|
-| Remove environment + dependency repair | todo | Orphans actions, macros, onboarding today |
-| Reason-specific recovery dialog | todo | Widen the existing 3-status classification and stop discarding it |
-| First-turn attachments | todo | `buildT3ProjectLaunchCommands` hardcodes `attachments: []` |
-| Multi-attachment end to end | todo | Intent schema is scalar-only; array path is dead code |
+| Remove environment + dependency repair | done | `GET /v1/t3/environments/:id/dependencies` preview; cascade repair for actions, macros, onboarding across memory + Convex |
+| Reason-specific recovery dialog | wip | Server half done (`src/environmentFailure.mjs` classifies the reason); frontend not wired yet |
+| First-turn attachments | wip | In flight |
+| Multi-attachment end to end | wip | In flight |
 
 ## Milestone 0 — contracts and diagnostics
 
@@ -87,7 +87,9 @@ on near-black, with a shimmer-swept label.
 | Item | State | Notes |
 |---|---|---|
 | Orb spec vendored | done | 9 modes + parameters extracted from the MIT library's own spec |
-| Orb renderer in C++ | wip | `ThinkingOrb.h` interface written in `firmware/shared`; renderer-agnostic by design (emits depth-sorted dots, the board paints them) |
+| Orb renderer in C++ | done | `ThinkingOrb.{h,cpp}` in `firmware/shared`. Five modes, painter-sorted, depth-scaled radius and ink. Compiles; unseen because the panel is down |
+| Orb painting + shimmer label | done | `displayDrawOrb` / `displayDrawStatus` in the Hosyond display adapter. Erases per-dot rather than clearing the box, which is ~10x less SPI traffic |
+| Agent-state to orb-mode mapping | done | `orbModeForAgentState()` |
 | Agent-state to orb-mode mapping | todo | The library already maps 9 states to 9 modes |
 | Screen layout on 240x320 | todo | |
 | Web console parity | todo | Same orb for agent thinking states |

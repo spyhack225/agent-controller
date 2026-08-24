@@ -1070,13 +1070,29 @@ export function createApp({
           });
         }
         const startedAt = Date.now();
+        // A first turn carries media on exactly the same terms as a follow-up turn: same
+        // ownership, kind and count validation, same signed-link-plus-inline attachment shape.
+        const mediaUploadIds = collectMediaUploadIds(null, body);
+        const attachments = await buildMediaAttachments({
+          store,
+          userId: user.id,
+          mediaUploadIds,
+          config,
+          baseUrl: config.publicBaseUrl ?? requestBaseUrl(req),
+        });
         const launch = buildT3ProjectLaunchCommands({
           project,
           text,
           modelSelection,
           runtimeMode: normalizeT3RuntimeMode(body.runtimeMode),
           interactionMode: normalizeT3InteractionMode(body.interactionMode),
+          attachments,
         });
+        const launchIntent = {
+          type: "agent_prompt",
+          text,
+          ...(mediaUploadIds.length > 0 ? { mediaUploadIds } : {}),
+        };
         const dispatchStartedAt = Date.now();
         let result;
         try {
@@ -1089,12 +1105,12 @@ export function createApp({
             deviceId: null,
             environmentId: environment.id,
             threadId: launch.threadId,
-            intent: { type: "agent_prompt", text },
-            normalized: {
+            intent: launchIntent,
+            normalized: storableT3Command({
               type: "thread.launch",
               ...launch,
               ...(modelRecovery ? { modelRecovery } : {}),
-            },
+            }),
             status: "failed",
             risk: "medium",
             result: {
@@ -1113,12 +1129,12 @@ export function createApp({
           deviceId: null,
           environmentId: environment.id,
           threadId: launch.threadId,
-          intent: { type: "agent_prompt", text },
-          normalized: {
+          intent: launchIntent,
+          normalized: storableT3Command({
             type: "thread.launch",
             ...launch,
             ...(modelRecovery ? { modelRecovery } : {}),
-          },
+          }),
           status: "dispatched",
           risk: "medium",
           result: {
@@ -3247,6 +3263,14 @@ function collectMediaUploadIds(intent, body) {
 // Inline media bytes and the signed callback URL are stripped so neither media content
 // nor a live access token is retained in the command record.
 function storableT3Command(command) {
+  // A project launch persists two nested commands; the first turn is the one that carries media.
+  if (command?.createThread || command?.startTurn) {
+    return {
+      ...command,
+      ...(command.createThread ? { createThread: storableT3Command(command.createThread) } : {}),
+      ...(command.startTurn ? { startTurn: storableT3Command(command.startTurn) } : {}),
+    };
+  }
   const attachments = command?.message?.attachments;
   if (!Array.isArray(attachments) || attachments.length === 0) return command;
   return {

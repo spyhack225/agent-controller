@@ -676,9 +676,12 @@ Content-Type: application/json
     "model": "gpt-5.4"
   },
   "runtimeMode": "approval-required",
-  "interactionMode": "default"
+  "interactionMode": "default",
+  "mediaUploadIds": ["media_id"]
 }
 ```
+
+`mediaUploadIds` (or a single `mediaUploadId`) attaches already-uploaded media to the first turn, on the same terms as `POST /v1/intents`: every id must belong to the caller (404 otherwise), and at most 8 may be attached (400 otherwise).
 
 `modelSelection` is optional when the T3 project has a default. Provider instance IDs are not restricted to built-ins, so user-defined T3 provider instances are supported. The gateway dispatches `thread.create` followed by `thread.turn.start` because T3's HTTP orchestration endpoint requires the thread to exist before accepting the first turn.
 
