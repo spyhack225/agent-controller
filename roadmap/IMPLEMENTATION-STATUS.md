@@ -4,7 +4,7 @@ Live progress ledger for
 [open-input-media-voice-environments-roadmap.md](open-input-media-voice-environments-roadmap.md).
 Updated as work lands, not at the end. Anything not listed as **done** is not done.
 
-Last updated: 2026-08-24 (Milestone 0.5 in progress).
+Last updated: 2026-08-24. **Milestone 0.5 is complete.** Gate: 166 frontend tests, 341 server tests, exit 0.
 
 ## Legend
 
@@ -37,11 +37,13 @@ Depend on none of the new infrastructure.
 | Item | State | Notes |
 |---|---|---|
 | Remove environment + dependency repair | done | `GET /v1/t3/environments/:id/dependencies` preview; cascade repair for actions, macros, onboarding across memory + Convex |
-| Reason-specific recovery dialog | wip | Server half done (`src/environmentFailure.mjs` classifies the reason); frontend not wired yet |
-| First-turn attachments | wip | In flight |
-| Multi-attachment end to end | wip | In flight |
+| Reason-specific recovery dialog | done | Eight-reason enum; dialog branches per reason; polling stops for the three that need owner action and resumes on a credential epoch |
+| First-turn attachments | done | Launch resolves media through the same ownership/kind checks as submitIntent; attachments land on the bootstrap turn |
+| Multi-attachment end to end | done | Ordered list, per-item validation, scalar kept as a protocol-v1 alias; Operate has add/remove/reorder chips |
 
 ## Milestone 0 — contracts and diagnostics
+
+Next up. The open design question below has to be settled before the first item starts.
 
 | Item | State | Notes |
 |---|---|---|
