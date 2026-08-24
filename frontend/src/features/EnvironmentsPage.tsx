@@ -596,6 +596,7 @@ function ConnectEnvironmentDialog({
         },
       });
       setCredential("");
+      c.markEnvironmentCredentialChanged();
       await c.refreshAll();
       c.setSelectedEnvironmentId(response.environment.id);
       return response;
@@ -963,6 +964,7 @@ function EnvironmentEditorDialog({
         },
       });
       setCredential("");
+      if (credential.trim()) c.markEnvironmentCredentialChanged();
       await c.refreshAll();
       return result;
     });

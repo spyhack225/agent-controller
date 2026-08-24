@@ -1,5 +1,5 @@
 import { HttpError, requireString } from "./http.mjs";
-import { normalizeMediaIntent } from "./media.mjs";
+import { normalizeMediaIntent, normalizeMediaUploadIds } from "./media.mjs";
 
 export async function normalizeIntent(payload, context = {}) {
   const type = requireString(payload.type, "type");
@@ -18,13 +18,13 @@ export async function normalizeIntent(payload, context = {}) {
         type,
         transcript: typeof payload.transcript === "string" ? payload.transcript : undefined,
         prompt: typeof payload.prompt === "string" ? payload.prompt : undefined,
-        mediaUploadId: typeof payload.mediaUploadId === "string" ? payload.mediaUploadId : undefined,
+        mediaUploadIds: normalizeMediaUploadIds(payload),
       }, context);
     case "camera_prompt":
       return normalizeMediaIntent({
         type,
         prompt: typeof payload.prompt === "string" ? payload.prompt : undefined,
-        mediaUploadId: typeof payload.mediaUploadId === "string" ? payload.mediaUploadId : undefined,
+        mediaUploadIds: normalizeMediaUploadIds(payload),
       }, context);
     case "shell_input":
       return { type, command: requireString(payload.command, "command") };

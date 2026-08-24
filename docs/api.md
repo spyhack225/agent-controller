@@ -554,11 +554,16 @@ Reference the `media.id` from an audio or camera prompt:
   "threadId": "thread_...",
   "intent": {
     "type": "camera_prompt",
-    "mediaUploadId": "media_...",
-    "prompt": "Use this image as context for the current task."
+    "mediaUploadIds": ["media_...", "media_..."],
+    "prompt": "Use these images as context for the current task."
   }
 }
 ```
+
+`mediaUploadIds` is an ordered list and the agent receives the attachments in that order. A single
+`mediaUploadId` stays accepted as an alias for a one-item list, which is what protocol-v1 firmware
+sends. Every id must belong to the caller (404 otherwise), every referenced upload must be a
+supported kind (415 otherwise), and at most 8 may be attached to one turn (400 otherwise).
 
 For `audio_prompt`, the gateway uses `intent.transcript` first. If it is omitted, the gateway uses the stored transcript on the referenced audio media. If no transcript is ready yet, the prompt is dispatched as media context so the command remains auditable.
 
@@ -926,7 +931,7 @@ Audio prompt using a stored media transcript:
   "threadId": "thread_...",
   "intent": {
     "type": "audio_prompt",
-    "mediaUploadId": "media_..."
+    "mediaUploadIds": ["media_..."]
   }
 }
 ```
@@ -939,7 +944,7 @@ Camera prompt:
   "threadId": "thread_...",
   "intent": {
     "type": "camera_prompt",
-    "mediaUploadId": "media_...",
+    "mediaUploadIds": ["media_..."],
     "prompt": "Use this image as context for the current coding task."
   }
 }

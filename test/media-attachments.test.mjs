@@ -573,6 +573,161 @@ test("a turn is refused when it references unknown media or too many attachments
   assert.equal(dispatches[0].message.attachments.length, 8);
 });
 
+test("an intent attaches every listed upload, in the order the client listed them", async (t) => {
+  const gateway = await startGateway(t);
+  const first = await uploadImage(gateway, "first.png");
+  const second = await uploadImage(gateway, "second.png");
+  const third = await uploadImage(gateway, "third.png");
+
+  const dispatched = await requestJson(gateway.fetch, gateway.baseUrl, "/v1/intents", {
+    method: "POST",
+    headers: gateway.authHeaders,
+    body: {
+      environmentId: gateway.environmentId,
+      threadId: "thread_multi",
+      intent: {
+        type: "camera_prompt",
+        prompt: "Compare these three shots.",
+        mediaUploadIds: [third, first, second],
+      },
+    },
+  });
+
+  assert.equal(dispatched.command.status, "dispatched");
+  assert.equal(gateway.dispatches.length, 1);
+
+  const attachments = gateway.dispatches[0].message.attachments;
+  assert.deepEqual(attachments.map((attachment) => attachment.mediaId), [third, first, second]);
+  assert.deepEqual(attachments.map((attachment) => attachment.name), [
+    "third.png",
+    "first.png",
+    "second.png",
+  ]);
+  assert.deepEqual(dispatched.command.intent.mediaUploadIds, [third, first, second]);
+
+  // Every attachment is described to the agent, not only the first one.
+  const text = gateway.dispatches[0].message.text;
+  for (const mediaId of [first, second, third]) {
+    assert.ok(text.includes(`id=${mediaId}`), `prompt must describe ${mediaId}`);
+  }
+});
+
+test("an intent listing more uploads than the attachment limit is refused", async (t) => {
+  const gateway = await startGateway(t);
+  const mediaUploadIds = [];
+  for (let index = 0; index < 9; index += 1) {
+    mediaUploadIds.push(await uploadImage(gateway, `shot-${index}.png`));
+  }
+
+  const response = await gateway.fetch(new URL("/v1/intents", gateway.baseUrl), {
+    method: "POST",
+    headers: { "content-type": "application/json", ...gateway.authHeaders },
+    body: JSON.stringify({
+      environmentId: gateway.environmentId,
+      threadId: "thread_multi",
+      intent: { type: "camera_prompt", prompt: "Too many.", mediaUploadIds },
+    }),
+  });
+
+  assert.equal(response.status, 400);
+  assert.equal(gateway.dispatches.length, 0, "nothing may reach T3 over the attachment limit");
+});
+
+test("an intent is refused when any listed upload belongs to another user", async (t) => {
+  const gateway = await startGateway(t);
+  const own = await uploadImage(gateway, "mine.png");
+  const strangerHeaders = await createAuthHeaders(gateway.fetch, gateway.baseUrl, "user_stranger");
+  const foreign = await requestJson(gateway.fetch, gateway.baseUrl, "/v1/media", {
+    method: "POST",
+    headers: strangerHeaders,
+    body: { kind: "image", contentType: "image/png", dataBase64: PNG_BASE64 },
+  });
+
+  const response = await gateway.fetch(new URL("/v1/intents", gateway.baseUrl), {
+    method: "POST",
+    headers: { "content-type": "application/json", ...gateway.authHeaders },
+    body: JSON.stringify({
+      environmentId: gateway.environmentId,
+      threadId: "thread_multi",
+      intent: {
+        type: "camera_prompt",
+        prompt: "One of these is not mine.",
+        mediaUploadIds: [own, foreign.media.id],
+      },
+    }),
+  });
+
+  assert.equal(response.status, 404);
+  assert.equal(gateway.dispatches.length, 0, "a foreign id anywhere in the list fails the turn");
+});
+
+test("the scalar mediaUploadId stays an accepted alias for a one-item list", async (t) => {
+  const gateway = await startGateway(t);
+  const mediaId = await uploadImage(gateway, "legacy.png");
+
+  const dispatched = await requestJson(gateway.fetch, gateway.baseUrl, "/v1/intents", {
+    method: "POST",
+    headers: gateway.authHeaders,
+    body: {
+      environmentId: gateway.environmentId,
+      threadId: "thread_multi",
+      // protocol-v1 firmware sends exactly this shape.
+      intent: { type: "camera_prompt", mediaUploadId: mediaId },
+    },
+  });
+
+  assert.deepEqual(dispatched.command.intent.mediaUploadIds, [mediaId]);
+  const attachments = gateway.dispatches[0].message.attachments;
+  assert.deepEqual(attachments.map((attachment) => attachment.mediaId), [mediaId]);
+});
+
+async function startGateway(t) {
+  const originalFetch = globalThis.fetch;
+  const dispatches = [];
+  globalThis.fetch = async (url, init = {}) => {
+    const parsed = new URL(String(url));
+    if (parsed.pathname === "/api/orchestration/dispatch") {
+      dispatches.push(JSON.parse(init.body));
+      return jsonResponse({ status: "accepted" }, 200);
+    }
+    return jsonResponse({ error: "not found" }, 404);
+  };
+  t.after(() => {
+    globalThis.fetch = originalFetch;
+  });
+
+  const mediaDir = await mkdtemp(join(tmpdir(), "agent-controller-multi-"));
+  t.after(() => rm(mediaDir, { recursive: true, force: true }));
+
+  const { server } = createApp({ config: { ...MEDIA_CONFIG, mediaDir } });
+  await listen(server);
+  t.after(() => server.close());
+  const baseUrl = `http://127.0.0.1:${server.address().port}`;
+  const authHeaders = await createAuthHeaders(originalFetch, baseUrl);
+  const environment = await requestJson(originalFetch, baseUrl, "/v1/t3/environments", {
+    method: "POST",
+    headers: authHeaders,
+    body: { label: "Mock T3", baseUrl: "https://mock-t3.example", accessToken: "mock-token" },
+  });
+
+  return {
+    fetch: originalFetch,
+    baseUrl,
+    authHeaders,
+    dispatches,
+    environmentId: environment.environment.id,
+  };
+}
+
+async function uploadImage(gateway, originalName) {
+  const upload = await requestJson(gateway.fetch, gateway.baseUrl, "/v1/media", {
+    method: "POST",
+    headers: gateway.authHeaders,
+    body: { kind: "image", contentType: "image/png", dataBase64: PNG_BASE64, originalName },
+  });
+  return upload.media.id;
+}
+
 function listen(server) {
   return new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
 }

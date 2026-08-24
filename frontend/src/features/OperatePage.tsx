@@ -4,7 +4,9 @@ import {
   Bot,
   Braces,
   Check,
+  ChevronDown,
   ChevronRight,
+  ChevronUp,
   CircleStop,
   FolderKanban,
   Gauge,
@@ -26,7 +28,7 @@ import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 
 import type { Controller } from "../controller";
 import { commandSummary, commandType, formatRelativeTime, renderEventResult } from "../format";
-import type { Command, JsonRecord, SavedAction, T3SessionFailure } from "../types";
+import type { Command, JsonRecord, MediaItem, SavedAction, T3SessionFailure } from "../types";
 import {
   Button,
   EmptyState,
@@ -53,24 +55,39 @@ function statusTone(status?: string) {
   return "neutral" as const;
 }
 
-function intentFromForm(type: string, text: string, mediaUploadId: string): JsonRecord {
+function intentFromForm(type: string, text: string, mediaUploadIds: string[]): JsonRecord {
   const trimmed = text.trim();
   if (type === "shell_input") return { type, command: trimmed };
+  const attached = mediaUploadIds.length > 0 ? { mediaUploadIds } : {};
   if (type === "camera_prompt") {
     return {
       type,
-      prompt: trimmed || "Use the selected image as context.",
-      ...(mediaUploadId ? { mediaUploadId } : {}),
+      prompt: trimmed || "Use the selected images as context.",
+      ...attached,
     };
   }
   if (type === "audio_prompt") {
     return {
       type,
       transcript: trimmed,
-      ...(mediaUploadId ? { mediaUploadId } : {}),
+      ...attached,
     };
   }
   return { type: "agent_prompt", text: trimmed };
+}
+
+const MAX_ATTACHMENTS = 8;
+
+function attachmentState(item: MediaItem): string {
+  const processing = item.processing ?? {};
+  const status = item.kind === "image"
+    ? processing.visionStatus ?? (item.description ? "described" : "stored")
+    : processing.transcriptionStatus ?? (item.transcript ? "transcribed" : "stored");
+  return status === "not_applicable" ? "stored" : status;
+}
+
+function attachmentName(item: MediaItem): string {
+  return item.originalName ?? item.id;
 }
 
 function isRecoverableModelFailure(failure: T3SessionFailure) {
@@ -88,7 +105,7 @@ export function OperatePage({ controller }: { controller: Controller }) {
   } | null>(null);
   const [intentType, setIntentType] = useState("agent_prompt");
   const [prompt, setPrompt] = useState("");
-  const [mediaId, setMediaId] = useState("");
+  const [attachmentIds, setAttachmentIds] = useState<string[]>([]);
   const [providerInstance, setProviderInstance] = useState("");
   const [model, setModel] = useState("");
   const [modelSelectionMode, setModelSelectionMode] = useState<"automatic" | "manual">("automatic");
@@ -230,7 +247,7 @@ export function OperatePage({ controller }: { controller: Controller }) {
     setProviderInstance("");
     setModel("");
     setIntentType("agent_prompt");
-    setMediaId("");
+    setAttachmentIds([]);
     c.setSelectedEnvironmentId(environmentId);
     void loadWorkspace(environmentId);
   };
@@ -241,7 +258,7 @@ export function OperatePage({ controller }: { controller: Controller }) {
     c.setSelectedProjectId(projectId);
     c.setSelectedThreadId(nextThread?.id ?? "");
     setIntentType("agent_prompt");
-    setMediaId("");
+    setAttachmentIds([]);
   };
 
   const selectThread = (threadId: string) => {
@@ -253,8 +270,39 @@ export function OperatePage({ controller }: { controller: Controller }) {
     c.setSelectedThreadId(threadId);
     if (!threadId) {
       setIntentType("agent_prompt");
-      setMediaId("");
+      setAttachmentIds([]);
     }
+  };
+
+  // The draft is an ordered list: its order is the attachment order the agent receives, so the
+  // composer has to let the user reorder it, not just add and drop items.
+  const attachments = useMemo(
+    () => attachmentIds.map((id) =>
+      c.media.find((item) => item.id === id) ?? { id, kind: "unknown", contentType: "" }),
+    [attachmentIds, c.media],
+  );
+  const attachableMedia = c.media.filter((item) => !attachmentIds.includes(item.id));
+
+  const addAttachment = (mediaUploadId: string) => {
+    if (!mediaUploadId) return;
+    setAttachmentIds((current) => current.includes(mediaUploadId) || current.length >= MAX_ATTACHMENTS
+      ? current
+      : [...current, mediaUploadId]);
+  };
+
+  const removeAttachment = (mediaUploadId: string) => {
+    setAttachmentIds((current) => current.filter((id) => id !== mediaUploadId));
+  };
+
+  const moveAttachment = (index: number, offset: number) => {
+    setAttachmentIds((current) => {
+      const target = index + offset;
+      if (target < 0 || target >= current.length) return current;
+      const next = [...current];
+      const [moved] = next.splice(index, 1);
+      next.splice(target, 0, moved);
+      return next;
+    });
   };
 
   const selectedIntent = intentOptions.find((option) => option.value === intentType)
@@ -262,7 +310,7 @@ export function OperatePage({ controller }: { controller: Controller }) {
   const SelectedIntentIcon = selectedIntent.icon;
   const canSendFollowUp = Boolean(c.selectedEnvironmentId && c.selectedThreadId)
     && (intentType === "camera_prompt" || intentType === "audio_prompt"
-      ? Boolean(prompt.trim() || mediaId)
+      ? Boolean(prompt.trim() || attachmentIds.length > 0)
       : Boolean(prompt.trim()));
   const canStartThread = Boolean(
     c.selectedEnvironmentId
@@ -299,7 +347,7 @@ export function OperatePage({ controller }: { controller: Controller }) {
   };
 
   const saveAction = async () => {
-    const intent = intentFromForm(intentType, prompt, mediaId);
+    const intent = intentFromForm(intentType, prompt, attachmentIds);
     const actionType = intentType === "shell_input"
       ? "shell"
       : intentType === "camera_prompt" || intentType === "audio_prompt" ? "media" : "prompt";
@@ -435,7 +483,7 @@ export function OperatePage({ controller }: { controller: Controller }) {
     setProviderInstance(recoveryModelSelection.instanceId);
     setModel(recoveryModelSelection.model);
     setIntentType("agent_prompt");
-    setMediaId("");
+    setAttachmentIds([]);
     setPrompt(failure.title ?? selectedThread?.label ?? "Continue this task.");
     c.setSelectedThreadId("");
     c.setNotice({
@@ -446,11 +494,11 @@ export function OperatePage({ controller }: { controller: Controller }) {
 
   const submitComposer = async () => {
     const result = c.selectedThreadId
-      ? await sendIntent(intentFromForm(intentType, prompt, mediaId), "Message sent.")
+      ? await sendIntent(intentFromForm(intentType, prompt, attachmentIds), "Message sent.")
       : await launchProject();
     if (result !== undefined) {
       setPrompt("");
-      setMediaId("");
+      setAttachmentIds([]);
     }
   };
 
@@ -562,7 +610,7 @@ export function OperatePage({ controller }: { controller: Controller }) {
               setModelSelectionMode("automatic");
               c.setSelectedThreadId("");
               setIntentType("agent_prompt");
-              setMediaId("");
+              setAttachmentIds([]);
             }}
           >
             <Plus className="size-3.5" /> New thread
@@ -786,17 +834,60 @@ export function OperatePage({ controller }: { controller: Controller }) {
         {contextToolbar}
 
         {(intentType === "camera_prompt" || intentType === "audio_prompt") ? (
-          <select
-            className="thread-media-select"
-            aria-label="Attached media"
-            value={mediaId}
-            onChange={(event) => setMediaId(event.target.value)}
-          >
-            <option value="">No media selected</option>
-            {c.media.map((item) => (
-              <option key={item.id} value={item.id}>{item.originalName ?? `${item.kind} · ${item.id}`}</option>
-            ))}
-          </select>
+          <div className="thread-attachments">
+            <select
+              className="thread-media-select"
+              aria-label="Attach media"
+              value=""
+              disabled={attachmentIds.length >= MAX_ATTACHMENTS || attachableMedia.length === 0}
+              onChange={(event) => addAttachment(event.target.value)}
+            >
+              <option value="">
+                {attachmentIds.length >= MAX_ATTACHMENTS
+                  ? `Attachment limit reached (${MAX_ATTACHMENTS})`
+                  : "Add an attachment…"}
+              </option>
+              {attachableMedia.map((item) => (
+                <option key={item.id} value={item.id}>
+                  {`${attachmentName(item)} · ${item.kind}`}
+                </option>
+              ))}
+            </select>
+            {attachments.length > 0 ? (
+              <ol className="thread-attachment-chips" aria-label="Attachments">
+                {attachments.map((item, index) => (
+                  <li key={item.id} className="thread-attachment-chip">
+                    <span className="thread-attachment-chip__position">{index + 1}</span>
+                    <span className="thread-attachment-chip__name">{attachmentName(item)}</span>
+                    <small>{item.kind} · {attachmentState(item)}</small>
+                    <button
+                      type="button"
+                      aria-label={`Move ${attachmentName(item)} earlier`}
+                      disabled={index === 0}
+                      onClick={() => moveAttachment(index, -1)}
+                    >
+                      <ChevronUp className="size-3.5" />
+                    </button>
+                    <button
+                      type="button"
+                      aria-label={`Move ${attachmentName(item)} later`}
+                      disabled={index === attachments.length - 1}
+                      onClick={() => moveAttachment(index, 1)}
+                    >
+                      <ChevronDown className="size-3.5" />
+                    </button>
+                    <button
+                      type="button"
+                      aria-label={`Remove ${attachmentName(item)}`}
+                      onClick={() => removeAttachment(item.id)}
+                    >
+                      <X className="size-3.5" />
+                    </button>
+                  </li>
+                ))}
+              </ol>
+            ) : null}
+          </div>
         ) : null}
 
         <div className="composer-shell">

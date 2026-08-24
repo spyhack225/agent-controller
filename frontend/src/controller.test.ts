@@ -2,8 +2,10 @@ import { ApiError } from "./api";
 import {
   T3_SNAPSHOT_UNAVAILABLE_MESSAGE,
   dedupeEnvironments,
+  genericEnvironmentFailure,
   isT3SnapshotUnavailableError,
   normalizeThread,
+  parseEnvironmentFailure,
 } from "./controller";
 
 test("identifies only the T3 snapshot failure that needs recovery guidance", () => {
@@ -54,4 +56,60 @@ test("normalizes the messages that belong to a T3 thread", () => {
     expect.objectContaining({ id: "message_1", role: "user", text: "Review this branch" }),
     expect.objectContaining({ id: "message_2", role: "assistant", text: "The branch is ready." }),
   ]);
+});
+
+test("reads the gateway failure envelope off a snapshot error", () => {
+  const failure = parseEnvironmentFailure({
+    cause: "fetch failed",
+    reason: "token_expired",
+    failure: {
+      reason: "token_expired",
+      message: "T3 access token has expired. Re-pair this environment.",
+      retryable: false,
+      baseUrl: "https://t3.example.test",
+    },
+  });
+
+  expect(failure).toEqual({
+    reason: "token_expired",
+    message: "T3 access token has expired. Re-pair this environment.",
+    retryable: false,
+    baseUrl: "https://t3.example.test",
+    installedVersion: null,
+    minimumVersion: null,
+    maximumTestedVersion: null,
+  });
+});
+
+test("keeps the compatibility versions a contract failure carries", () => {
+  const failure = parseEnvironmentFailure({
+    failure: {
+      reason: "contract_incompatible",
+      message: "The T3 host does not expose the orchestration contract this gateway requires.",
+      retryable: false,
+      baseUrl: "https://t3.example.test",
+      installedVersion: "0.0.19",
+      minimumVersion: "0.0.24",
+      maximumTestedVersion: "0.0.28",
+    },
+  });
+
+  expect(failure?.installedVersion).toBe("0.0.19");
+  expect(failure?.minimumVersion).toBe("0.0.24");
+  expect(failure?.maximumTestedVersion).toBe("0.0.28");
+});
+
+test("refuses a reason the console does not model, so copy is never chosen from junk", () => {
+  expect(parseEnvironmentFailure({ failure: { reason: "teapot", message: "no" } })).toBeNull();
+  expect(parseEnvironmentFailure({ failure: { message: "no reason at all" } })).toBeNull();
+  expect(parseEnvironmentFailure({ reason: "token_expired" })).toBeNull();
+  expect(parseEnvironmentFailure(undefined)).toBeNull();
+});
+
+test("falls back to a generic retryable failure when nothing was classified", () => {
+  expect(genericEnvironmentFailure()).toEqual({
+    reason: "unknown",
+    message: T3_SNAPSHOT_UNAVAILABLE_MESSAGE,
+    retryable: true,
+  });
 });

@@ -18,6 +18,7 @@ function controller(environments: Environment[] = []): Controller {
     selectedEnvironmentId: environments[0]?.id ?? "",
     selectedEnvironment: environments[0] ?? null,
     setSelectedEnvironmentId: vi.fn(),
+    markEnvironmentCredentialChanged: vi.fn(),
     projects: [],
     threads: [],
     busyAction: null,

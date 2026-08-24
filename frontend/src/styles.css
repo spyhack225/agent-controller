@@ -5301,6 +5301,59 @@ html:not(.dark)[data-theme="light"] {
     font-size: 0.72rem;
   }
 
+  .thread-attachment-chips {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 0.35rem;
+    margin-bottom: 0.35rem;
+    padding: 0;
+    list-style: none;
+  }
+
+  .thread-attachment-chip {
+    display: flex;
+    align-items: center;
+    gap: 0.35rem;
+    border: 1px solid var(--ac-border);
+    border-radius: 999px;
+    background: var(--ac-surface);
+    padding: 0.2rem 0.4rem 0.2rem 0.55rem;
+    font-size: 0.7rem;
+  }
+
+  .thread-attachment-chip__position {
+    color: var(--ac-ink-muted);
+    font-variant-numeric: tabular-nums;
+  }
+
+  .thread-attachment-chip__name {
+    max-width: 12rem;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+
+  .thread-attachment-chip small {
+    color: var(--ac-ink-muted);
+  }
+
+  .thread-attachment-chip button {
+    display: inline-flex;
+    align-items: center;
+    border-radius: 999px;
+    color: var(--ac-ink-muted);
+    padding: 0.15rem;
+  }
+
+  .thread-attachment-chip button:hover:not(:disabled) {
+    background: var(--ac-surface-raised);
+    color: var(--ac-ink);
+  }
+
+  .thread-attachment-chip button:disabled {
+    opacity: 0.35;
+  }
+
   .thread-composer-dock .composer-shell {
     border-radius: 1.2rem;
     background: var(--ac-surface-raised);

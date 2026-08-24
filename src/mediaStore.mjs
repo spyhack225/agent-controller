@@ -11,7 +11,13 @@ const ALLOWED_MEDIA = {
   image: new Set(["image/jpeg", "image/png", "image/webp"]),
 };
 
-const MAX_MEDIA_ATTACHMENTS = 8;
+export const MAX_MEDIA_ATTACHMENTS = 8;
+
+export function assertSupportedMediaKind(kind) {
+  if (!ALLOWED_MEDIA[kind]) {
+    throw new HttpError(415, `Unsupported media kind: ${kind}.`);
+  }
+}
 
 const EXTENSIONS = new Map([
   ["audio/wav", "wav"],
@@ -286,9 +292,7 @@ export async function buildMediaAttachments({ store, userId, mediaUploadIds, con
   for (const mediaId of ids) {
     const media = await store.getMediaForUser(userId, mediaId);
     if (!media) throw new HttpError(404, "Media upload not found.");
-    if (!ALLOWED_MEDIA[media.kind]) {
-      throw new HttpError(415, `Unsupported media kind: ${media.kind}.`);
-    }
+    assertSupportedMediaKind(media.kind);
     attachments.push(await buildMediaAttachment({ media, config, baseUrl, now }));
   }
   return attachments;

@@ -491,11 +491,14 @@ export interface MediaItem {
   sizeBytes?: number;
   originalName?: string | null;
   transcript?: string | null;
+  description?: string | null;
   createdAt?: string;
   expiresAt?: string | null;
   processing?: {
     transcriptionStatus?: string;
     transcriptSource?: string | null;
+    visionStatus?: string;
+    descriptionSource?: string | null;
     lastError?: string | null;
   };
 }

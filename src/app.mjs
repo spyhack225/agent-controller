@@ -3250,7 +3250,10 @@ async function earliestMediaCreatedAt(store, userId, mediaUploadIds) {
 }
 
 function collectMediaUploadIds(intent, body) {
+  // The normalized intent carries the ordered list; the scalars stay readable for stored intents
+  // written before attachments became a list.
   const candidates = [
+    ...(Array.isArray(intent?.mediaUploadIds) ? intent.mediaUploadIds : []),
     intent?.mediaUploadId,
     intent?.media?.mediaUploadId,
     body?.mediaUploadId,

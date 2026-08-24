@@ -194,6 +194,9 @@ export function useController({ authConfig, clerk }: UseControllerOptions) {
   const [busyAction, setBusyAction] = useState<string | null>(null);
   const [notice, setNotice] = useState<Notice | null>(null);
   const [workspaceRecovery, setWorkspaceRecovery] = useState<WorkspaceRecovery | null>(null);
+  // Bumped when the owner supplies a new T3 credential. A paused recovery watch keys off this,
+  // because an environment's updatedAt also moves on every health check.
+  const [environmentCredentialEpoch, setEnvironmentCredentialEpoch] = useState(0);
   const [lastResult, setLastResult] = useState<unknown>({
     message: "Console ready.",
   });
@@ -687,6 +690,10 @@ export function useController({ authConfig, clerk }: UseControllerOptions) {
     setNotice((current) => current?.message === T3_SNAPSHOT_UNAVAILABLE_MESSAGE ? null : current);
   }, []);
 
+  const markEnvironmentCredentialChanged = useCallback(() => {
+    setEnvironmentCredentialEpoch((current) => current + 1);
+  }, []);
+
   const launchProject = useCallback(async (input: {
     projectId: string;
     text: string;
@@ -779,6 +786,8 @@ export function useController({ authConfig, clerk }: UseControllerOptions) {
     setNotice,
     workspaceRecovery,
     dismissWorkspaceRecovery,
+    environmentCredentialEpoch,
+    markEnvironmentCredentialChanged,
     lastResult,
     setLastResult,
     deviceProfiles,

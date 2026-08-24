@@ -1,13 +1,29 @@
-import { AlertTriangle, Cable, Check, Clipboard, LoaderCircle, RefreshCw, RotateCcw, X } from "lucide-react";
-import { useEffect, useRef, useState } from "react";
+import { AlertTriangle, Cable, Check, Clipboard, LoaderCircle, PauseCircle, RefreshCw, RotateCcw, X } from "lucide-react";
+import { useEffect, useRef, useState, type ReactNode } from "react";
 
+import type { EnvironmentFailure, EnvironmentFailureReason } from "../types";
 import { Button } from "../ui";
 
 const T3_SETUP_COMMAND = "npm run setup:t3";
 
+interface RecoveryStep {
+  title: string;
+  body: ReactNode;
+  /** Rendered as a copyable command block under the step body. */
+  command?: string;
+}
+
+interface RecoveryContent {
+  eyebrow: string;
+  title: string;
+  summary: string;
+  steps: RecoveryStep[];
+}
+
 interface WorkspaceRecoveryDialogProps {
   open: boolean;
-  message: string;
+  /** The gateway's classification. Null falls back to the generic unreachable copy. */
+  failure: EnvironmentFailure | null;
   retrying?: boolean;
   checking?: boolean;
   onClose: () => void;
@@ -15,9 +31,169 @@ interface WorkspaceRecoveryDialogProps {
   onOpenEnvironments: () => void;
 }
 
+function versionLabel(value: string | null | undefined): string {
+  return value && value.trim() ? value : "unknown";
+}
+
+// The failure envelope never carries a token, and nothing here may add one: the dialog is the
+// screen an owner is most likely to screenshot when asking for help.
+function recoveryContent(
+  failure: EnvironmentFailure | null,
+  onOpenEnvironments: () => void,
+): RecoveryContent {
+  const reason: EnvironmentFailureReason = failure?.reason ?? "unknown";
+  const summary = failure?.message ?? "T3 snapshot is unavailable.";
+  const address = failure?.baseUrl ?? null;
+
+  const credentialSteps: RecoveryStep[] = [
+    {
+      title: "Get a fresh pairing token",
+      body: "Run the guided setup on the workspace computer and copy the pairing token it prints. Tokens are single-use and short-lived, so mint a new one rather than reusing an old note.",
+      command: T3_SETUP_COMMAND,
+    },
+    {
+      title: "Paste it into this environment's credential",
+      body: (
+        <>
+          <span>
+            Open the connection editor for this environment and replace the stored credential. The
+            workspace reloads on its own once the new token is accepted.
+          </span>
+          <span className="mt-2 block">
+            <Button size="sm" onClick={onOpenEnvironments}>
+              <Cable className="size-4" aria-hidden="true" /> Open credential settings
+            </Button>
+          </span>
+        </>
+      ),
+    },
+  ];
+
+  switch (reason) {
+    case "process_not_running":
+      return {
+        eyebrow: "T3 Code is not running",
+        title: "Start T3 Code on the workspace computer",
+        summary,
+        steps: [
+          {
+            title: "Start T3 Code on the workspace computer",
+            body: "Nothing is listening on the saved address. From the Agent Controller project on that machine, run the guided setup again:",
+            command: T3_SETUP_COMMAND,
+          },
+          {
+            title: "Leave it running",
+            body: "Keep the terminal open until setup reports that T3 Code is listening and paired. Agent Controller reconnects on its own.",
+          },
+        ],
+      };
+    case "token_expired":
+      return {
+        eyebrow: "Credential expired",
+        title: "Re-pair this T3 environment",
+        summary,
+        steps: credentialSteps,
+      };
+    case "authentication_failed":
+      return {
+        eyebrow: "Credential rejected",
+        title: "Replace this environment's credential",
+        summary,
+        steps: [
+          {
+            title: "Check the credential is still valid",
+            body: "The T3 host answered but refused the stored credential. It was most likely rotated or revoked on that machine.",
+          },
+          ...credentialSteps,
+        ],
+      };
+    case "network_unreachable":
+      return {
+        eyebrow: "Host unreachable",
+        title: "Check the route to the T3 host",
+        summary,
+        steps: [
+          {
+            title: "Confirm the saved address",
+            body: address
+              ? "Agent Controller is dialling this address:"
+              : "No address is saved for this environment. Add one in the connection settings.",
+            command: address ?? undefined,
+          },
+          {
+            title: "Check the host and the path to it",
+            body: "Make sure the workspace computer is awake and on the network, that the port is open, and that any tunnel (Tailscale, ngrok) in front of it is still up.",
+          },
+        ],
+      };
+    case "tls_error":
+      return {
+        eyebrow: "TLS not verified",
+        title: "Fix the T3 host certificate",
+        summary,
+        steps: [
+          {
+            title: "Confirm the saved address",
+            body: address
+              ? "Agent Controller is dialling this address:"
+              : "No address is saved for this environment. Add one in the connection settings.",
+            command: address ?? undefined,
+          },
+          {
+            title: "Check the certificate",
+            body: "The certificate could not be verified. Confirm it is issued for this hostname, that its chain is complete and unexpired, and prefer the HTTPS address your tunnel provides over a self-signed one.",
+          },
+        ],
+      };
+    case "contract_incompatible":
+      return {
+        eyebrow: "Version not supported",
+        title: "Update T3 Code on the workspace computer",
+        summary,
+        steps: [
+          {
+            title: "Compare versions",
+            body: (
+              <dl className="mt-1 grid grid-cols-[auto_1fr] gap-x-3 gap-y-1 text-xs">
+                <dt className="text-ink-faint">Installed</dt>
+                <dd className="font-mono text-ink">{versionLabel(failure?.installedVersion)}</dd>
+                <dt className="text-ink-faint">Minimum supported</dt>
+                <dd className="font-mono text-ink">{versionLabel(failure?.minimumVersion)}</dd>
+                <dt className="text-ink-faint">Highest tested</dt>
+                <dd className="font-mono text-ink">{versionLabel(failure?.maximumTestedVersion)}</dd>
+              </dl>
+            ),
+          },
+          {
+            title: "Update, then re-check compatibility",
+            body: "Install a supported T3 Code release on the workspace computer, then run the guided setup so this environment re-registers its version:",
+            command: T3_SETUP_COMMAND,
+          },
+        ],
+      };
+    default:
+      return {
+        eyebrow: "Connection interrupted",
+        title: "Restart and reconnect T3 Code",
+        summary,
+        steps: [
+          {
+            title: "Restart T3 Code on the workspace computer",
+            body: "From the Agent Controller project, run the guided setup again:",
+            command: T3_SETUP_COMMAND,
+          },
+          {
+            title: "Confirm the connection",
+            body: "Wait until setup reports that T3 Code is listening and paired. If its URL or credential changed, update the environment connection before trying again.",
+          },
+        ],
+      };
+  }
+}
+
 export function WorkspaceRecoveryDialog({
   open,
-  message,
+  failure,
   retrying = false,
   checking = false,
   onClose,
@@ -27,26 +203,32 @@ export function WorkspaceRecoveryDialog({
   const dialogRef = useRef<HTMLDivElement>(null);
   const retryButtonRef = useRef<HTMLButtonElement>(null);
   const returnFocusRef = useRef<HTMLElement | null>(null);
-  const [copyState, setCopyState] = useState<"idle" | "copied" | "error">("idle");
+  const [copied, setCopied] = useState<string | null>(null);
+  const [copyFailed, setCopyFailed] = useState(false);
 
-  const copySetupCommand = async () => {
+  const copyCommand = async (command: string) => {
     try {
-      await navigator.clipboard.writeText(T3_SETUP_COMMAND);
-      setCopyState("copied");
+      await navigator.clipboard.writeText(command);
+      setCopied(command);
+      setCopyFailed(false);
     } catch {
-      setCopyState("error");
+      setCopied(null);
+      setCopyFailed(true);
     }
   };
 
   useEffect(() => {
-    if (!open) setCopyState("idle");
+    if (!open) {
+      setCopied(null);
+      setCopyFailed(false);
+    }
   }, [open]);
 
   useEffect(() => {
-    if (copyState !== "copied") return;
-    const timeout = window.setTimeout(() => setCopyState("idle"), 2200);
+    if (!copied) return;
+    const timeout = window.setTimeout(() => setCopied(null), 2200);
     return () => window.clearTimeout(timeout);
-  }, [copyState]);
+  }, [copied]);
 
   useEffect(() => {
     if (!open) return;
@@ -86,6 +268,9 @@ export function WorkspaceRecoveryDialog({
 
   if (!open) return null;
 
+  const content = recoveryContent(failure, onOpenEnvironments);
+  const retryable = failure?.retryable ?? true;
+
   return (
     <div
       className="fixed inset-0 z-[110] grid place-items-center overflow-y-auto bg-black/65 p-4 backdrop-blur-[2px]"
@@ -107,9 +292,9 @@ export function WorkspaceRecoveryDialog({
             <AlertTriangle className="size-5" aria-hidden="true" />
           </div>
           <div className="min-w-0 flex-1">
-            <p className="eyebrow text-warning-strong">Connection interrupted</p>
+            <p className="eyebrow text-warning-strong">{content.eyebrow}</p>
             <h2 id="workspace-recovery-title" className="font-display text-lg font-semibold">
-              Restart and reconnect T3 Code
+              {content.title}
             </h2>
           </div>
           <button
@@ -128,67 +313,76 @@ export function WorkspaceRecoveryDialog({
             className="rounded-md border border-danger/20 bg-danger/8 px-3 py-2 font-mono text-xs text-danger"
             role="alert"
           >
-            {message}
-          </p>
-          <p className="mt-4 text-sm leading-relaxed text-ink-muted">
-            Agent Controller cannot read the selected workspace from its T3 host. The T3 process may
-            have stopped, or its saved connection may no longer be reachable.
+            {content.summary}
           </p>
           <ol className="mt-4 grid gap-4 text-sm">
-            <li className="grid grid-cols-[1.5rem_1fr] gap-2">
-              <span className="font-mono text-xs text-ink-faint">01</span>
-              <div>
-                <p className="font-semibold text-ink">Restart T3 Code on the workspace computer</p>
-                <p className="mt-1 leading-relaxed text-ink-muted">
-                  From the Agent Controller project, run the guided setup again:
-                </p>
-                <div className="mt-2 flex items-center gap-2 rounded-md border border-control bg-console p-1.5 pl-3">
-                  <code className="min-w-0 flex-1 overflow-x-auto text-xs text-console-ink">
-                    {T3_SETUP_COMMAND}
-                  </code>
-                  <Button
-                    size="sm"
-                    variant="ghost"
-                    className="border-control-strong text-console-ink"
-                    onClick={() => void copySetupCommand()}
-                    aria-label={copyState === "copied" ? "Setup command copied" : "Copy setup command"}
-                  >
-                    {copyState === "copied"
-                      ? <Check className="size-3.5 text-success" aria-hidden="true" />
-                      : <Clipboard className="size-3.5" aria-hidden="true" />}
-                    <span aria-live="polite">
-                      {copyState === "copied" ? "Copied" : copyState === "error" ? "Try copy again" : "Copy"}
-                    </span>
-                  </Button>
+            {content.steps.map((step, index) => (
+              <li key={step.title} className="grid grid-cols-[1.5rem_1fr] gap-2">
+                <span className="font-mono text-xs text-ink-faint">
+                  {String(index + 1).padStart(2, "0")}
+                </span>
+                <div>
+                  <p className="font-semibold text-ink">{step.title}</p>
+                  <div className="mt-1 leading-relaxed text-ink-muted">{step.body}</div>
+                  {step.command ? (
+                    <div className="mt-2 flex items-center gap-2 rounded-md border border-control bg-console p-1.5 pl-3">
+                      <code className="min-w-0 flex-1 overflow-x-auto text-xs text-console-ink">
+                        {step.command}
+                      </code>
+                      <Button
+                        size="sm"
+                        variant="ghost"
+                        className="border-control-strong text-console-ink"
+                        onClick={() => void copyCommand(step.command as string)}
+                        aria-label={copied === step.command
+                          ? `${step.command} copied`
+                          : `Copy ${step.command}`}
+                      >
+                        {copied === step.command
+                          ? <Check className="size-3.5 text-success" aria-hidden="true" />
+                          : <Clipboard className="size-3.5" aria-hidden="true" />}
+                        <span aria-live="polite">
+                          {copied === step.command ? "Copied" : copyFailed ? "Try copy again" : "Copy"}
+                        </span>
+                      </Button>
+                    </div>
+                  ) : null}
                 </div>
-              </div>
-            </li>
-            <li className="grid grid-cols-[1.5rem_1fr] gap-2">
-              <span className="font-mono text-xs text-ink-faint">02</span>
+              </li>
+            ))}
+          </ol>
+          {retryable ? (
+            <div
+              className="mt-4 flex items-start gap-3 rounded-md border border-info/20 bg-info/8 px-3 py-2.5"
+              role="status"
+              aria-busy={checking}
+            >
+              {checking
+                ? <LoaderCircle className="mt-0.5 size-4 shrink-0 animate-spin text-info motion-reduce:animate-none" aria-hidden="true" />
+                : <RefreshCw className="mt-0.5 size-4 shrink-0 text-info" aria-hidden="true" />}
               <div>
-                <p className="font-semibold text-ink">Confirm the connection</p>
-                <p className="mt-1 leading-relaxed text-ink-muted">
-                  Wait until setup reports that T3 Code is listening and paired. If its URL or
-                  credential changed, update the environment connection before trying again.
+                <p className="text-sm font-semibold text-ink">Checking automatically</p>
+                <p className="mt-0.5 text-xs leading-relaxed text-ink-muted">
+                  Operations will reload as soon as T3 Code is available.
                 </p>
               </div>
-            </li>
-          </ol>
-          <div
-            className="mt-4 flex items-start gap-3 rounded-md border border-info/20 bg-info/8 px-3 py-2.5"
-            role="status"
-            aria-busy={checking}
-          >
-            {checking
-              ? <LoaderCircle className="mt-0.5 size-4 shrink-0 animate-spin text-info motion-reduce:animate-none" aria-hidden="true" />
-              : <RefreshCw className="mt-0.5 size-4 shrink-0 text-info" aria-hidden="true" />}
-            <div>
-              <p className="text-sm font-semibold text-ink">Checking automatically</p>
-              <p className="mt-0.5 text-xs leading-relaxed text-ink-muted">
-                Operations will reload as soon as T3 Code is available.
-              </p>
             </div>
-          </div>
+          ) : (
+            <div
+              className="mt-4 flex items-start gap-3 rounded-md border border-control bg-surface-inset px-3 py-2.5"
+              role="status"
+              aria-busy={false}
+            >
+              <PauseCircle className="mt-0.5 size-4 shrink-0 text-ink-muted" aria-hidden="true" />
+              <div>
+                <p className="text-sm font-semibold text-ink">Automatic checks are paused</p>
+                <p className="mt-0.5 text-xs leading-relaxed text-ink-muted">
+                  Retrying cannot help until this is fixed on the workspace computer. Checks resume
+                  once the credential changes.
+                </p>
+              </div>
+            </div>
+          )}
         </div>
 
         <div className="flex flex-col-reverse gap-2 border-t border-control px-5 py-4 sm:flex-row sm:justify-end">

@@ -202,6 +202,9 @@ function AppContent({ authConfig, clerk = null }: AppProps) {
   const [sidebarQuery, setSidebarQuery] = useState("");
   const sidebarSearchRef = useRef<HTMLInputElement>(null);
   const onboardingAutoOpenedRef = useRef(false);
+  // Sending the owner to the connection editor hides the modal but keeps the watch alive, so a
+  // replaced credential still recovers the workspace without a second trip through the dialog.
+  const [workspaceRecoveryDeferred, setWorkspaceRecoveryDeferred] = useState(false);
 
   const setPage = (next: PageId) => {
     setPageState(next);
@@ -209,8 +212,14 @@ function AppContent({ authConfig, clerk = null }: AppProps) {
     setMobileMenuOpen(false);
   };
 
+  useEffect(() => {
+    setWorkspaceRecoveryDeferred(false);
+  }, [c.workspaceRecovery]);
+
   const { checking: workspaceRecoveryChecking } = useWorkspaceRecoveryMonitor({
     environmentId: c.workspaceRecovery?.environmentId ?? null,
+    retryable: c.workspaceRecovery?.failure.retryable ?? true,
+    credentialKey: String(c.environmentCredentialEpoch),
     checkAvailability: async (environmentId) => {
       const result = await c.api<{ environment?: Environment; error?: string }>(
         `/v1/t3/environments/${encodeURIComponent(environmentId)}/check`,
@@ -226,6 +235,8 @@ function AppContent({ authConfig, clerk = null }: AppProps) {
       c.setNotice({ tone: "success", message: "T3 Code is available. Operations reloaded." });
     },
   });
+
+  const workspaceRecoveryOpen = Boolean(c.workspaceRecovery) && !workspaceRecoveryDeferred;
 
   useEffect(() => {
     const onHashChange = () => {
@@ -814,20 +825,20 @@ function AppContent({ authConfig, clerk = null }: AppProps) {
         })}
       </nav>
 
-      {c.notice && !c.workspaceRecovery ? (
+      {c.notice && !workspaceRecoveryOpen ? (
         <Toast tone={c.notice.tone} onDismiss={() => c.setNotice(null)}>
           {c.notice.message}
         </Toast>
       ) : null}
 
       <WorkspaceRecoveryDialog
-        open={Boolean(c.workspaceRecovery)}
-        message={c.workspaceRecovery?.message ?? "T3 snapshot is unavailable."}
+        open={workspaceRecoveryOpen}
+        failure={c.workspaceRecovery?.failure ?? null}
         retrying={c.busyAction === "retry-workspace-snapshot"}
         checking={workspaceRecoveryChecking}
         onClose={c.dismissWorkspaceRecovery}
         onOpenEnvironments={() => {
-          c.dismissWorkspaceRecovery();
+          setWorkspaceRecoveryDeferred(true);
           setPage("environments");
         }}
         onRetry={() => {
