@@ -120,6 +120,9 @@ int GatewayClient::request(const char* method, const char* path, const String& b
   const char* kCollected[] = {"retry-after"};
   http.collectHeaders(kCollected, 1);
 
+  // Everything from here to the end of the read is socket wait, so the lock goes back first. The
+  // renderer can take it and paint a frame from the values already published while this waits.
+  const uint32_t heldDepth = releaseStateForBlockingCall();
   const int code = String(method) == "POST" ? http.POST(body) : http.GET();
   if (code > 0) {
     // A device-facing body larger than this is a bug or an attack, never a payload — the biggest
@@ -137,6 +140,9 @@ int GatewayClient::request(const char* method, const char* path, const String& b
   // HTTPClient logs "error(-11): read Timeout" with no indication of which call died, which makes a
   // recurring failure impossible to attribute. Name the path and the code.
   if (code <= 0) Serial.printf("[gateway] %s failed code=%d\n", path, code);
+
+  // Reader is done; take the lock back before touching a single member below.
+  reacquireStateAfterBlockingCall(heldDepth);
 
   // 401 means the credential itself was rejected — the owner revoked this device, or it was
   // transfer-reset. No amount of retrying fixes that, so it is recorded here, once, rather than
@@ -302,17 +308,93 @@ void GatewayClient::goOffline() {
   if (link_ != GatewayLink::NoIdentity) link_ = GatewayLink::Idle;
 }
 
+void GatewayClient::lockState() {
+  if (!stateMutex_) return;
+  xSemaphoreTakeRecursive((SemaphoreHandle_t)stateMutex_, portMAX_DELAY);
+  lockOwner_ = xTaskGetCurrentTaskHandle();
+  lockDepth_ += 1;
+}
+
 bool GatewayClient::tryLockState(uint32_t waitMs) {
   if (!stateMutex_) return true;   // task not started yet: single-threaded, nothing to guard
-  return xSemaphoreTakeRecursive((SemaphoreHandle_t)stateMutex_, pdMS_TO_TICKS(waitMs)) == pdTRUE;
+  if (xSemaphoreTakeRecursive((SemaphoreHandle_t)stateMutex_, pdMS_TO_TICKS(waitMs)) != pdTRUE) {
+    return false;
+  }
+  lockOwner_ = xTaskGetCurrentTaskHandle();
+  lockDepth_ += 1;
+  return true;
 }
 
 void GatewayClient::unlockState() {
-  if (stateMutex_) xSemaphoreGiveRecursive((SemaphoreHandle_t)stateMutex_);
+  if (!stateMutex_) return;
+  if (lockDepth_ > 0) {
+    lockDepth_ -= 1;
+    if (lockDepth_ == 0) lockOwner_ = nullptr;
+  }
+  xSemaphoreGiveRecursive((SemaphoreHandle_t)stateMutex_);
+}
+
+// Hands the lock back for the duration of a blocking call, all the way down.
+//
+// This is the whole reason the second core is usable at all. The task holds the lock across a
+// fetch so its parse and its member writes are atomic against the renderer — but the socket wait
+// inside that fetch is up to the full request timeout, and a renderer blocked on it drops every
+// frame in that window. That is precisely the stall this was meant to remove.
+//
+// A recursive mutex is only released when it has been given back as many times as it was taken, so
+// releasing once would leave the renderer queued behind the remaining depth. Hence the explicit
+// count: nothing else can tell us what it is.
+uint32_t GatewayClient::releaseStateForBlockingCall() {
+  if (!stateMutex_) return 0;
+  if (lockOwner_ != xTaskGetCurrentTaskHandle()) return 0;
+  const uint32_t depth = lockDepth_;
+  lockDepth_ = 0;
+  lockOwner_ = nullptr;
+  for (uint32_t i = 0; i < depth; i += 1) xSemaphoreGiveRecursive((SemaphoreHandle_t)stateMutex_);
+  return depth;
+}
+
+void GatewayClient::reacquireStateAfterBlockingCall(uint32_t depth) {
+  if (!stateMutex_ || depth == 0) return;
+  for (uint32_t i = 0; i < depth; i += 1) {
+    xSemaphoreTakeRecursive((SemaphoreHandle_t)stateMutex_, portMAX_DELAY);
+  }
+  lockOwner_ = xTaskGetCurrentTaskHandle();
+  lockDepth_ = depth;
 }
 
 namespace {
+
+void gatewayNetworkTask(void* arg) {
+  GatewayClient* client = static_cast<GatewayClient*>(arg);
+  for (;;) {
+    client->networkTick();
+    vTaskDelay(pdMS_TO_TICKS(100));
+  }
+}
+
 }  // namespace
+
+void GatewayClient::networkTick() {
+  if (networkPaused_) return;
+  const bool justConnected = justConnectedPending_;
+  justConnectedPending_ = false;
+  if (!tryLockState(5000)) return;
+  runCycle(justConnected);
+  unlockState();
+}
+
+void GatewayClient::startNetworkTask() {
+  if (stateMutex_) return;
+  stateMutex_ = xSemaphoreCreateRecursiveMutex();
+  if (!stateMutex_) {
+    Serial.println("[gateway] could not create the state mutex; staying on the caller's thread");
+    return;
+  }
+  // Core 0. The Arduino loop, and therefore the renderer, runs on core 1.
+  xTaskCreatePinnedToCore(gatewayNetworkTask, "gwnet", 8192, this, 1, nullptr, 0);
+  Serial.println("[gateway] network task started; the render loop no longer waits on HTTP");
+}
 
 
 void GatewayClient::runCycle(bool justConnected) {

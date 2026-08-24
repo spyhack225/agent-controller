@@ -57,7 +57,26 @@ class GatewayClient {
   // previous frame's values for 30 ms is invisible; blocking the renderer behind a 5-second socket
   // is not.
   bool tryLockState(uint32_t waitMs = 0);
+  void lockState();   // waits; for callers that must run, not skip
   void unlockState();
+
+  // Starts the network task. Until this is called stateMutex_ is null, every lock helper is a
+  // no-op and the class behaves exactly as it did single-threaded — which is what the boards that
+  // still drive runCycle() from their loop rely on.
+  void startNetworkTask();
+
+  // One pass of the cycle, taking the lock itself. Public only because the task calls it.
+  void networkTick();
+
+  // Set while the microphone is open. The I2S ring holds only tens of milliseconds, and although
+  // the cycle no longer runs on the render loop, an upload competing for the radio mid-capture can
+  // still cost samples out of the middle of a voice note. The task simply does nothing while this
+  // is set; nothing is dropped, because every due-time is a deadline it catches up to afterwards.
+  void setNetworkPaused(bool paused) { networkPaused_ = paused; }
+
+  // Latches the just-connected edge for the network task to consume, since the task is not the one
+  // watching provisioning.
+  void notifyJustConnected() { justConnectedPending_ = true; }
 
   // Call when the link is NOT up, so the client stops claiming to know anything.
   void goOffline();
@@ -212,6 +231,17 @@ class GatewayClient {
   uint32_t backoffUntil_ = 0;   // honours 429 retry-after
   bool revoked_ = false;
   void* stateMutex_ = nullptr;      // SemaphoreHandle_t, kept opaque so the header stays portable
+
+  // Who holds the lock and how deep. A recursive mutex will not tell us either, and request() has
+  // to hand the lock back COMPLETELY while it blocks on a socket — giving it back once would leave
+  // the renderer waiting on the remaining depth.
+  void* lockOwner_ = nullptr;       // TaskHandle_t
+  uint32_t lockDepth_ = 0;
+  volatile bool justConnectedPending_ = false;
+  volatile bool networkPaused_ = false;
+
+  uint32_t releaseStateForBlockingCall();
+  void reacquireStateAfterBlockingCall(uint32_t depth);
 
   bool hasMicrophone_ = false;
   bool hasCamera_ = false;

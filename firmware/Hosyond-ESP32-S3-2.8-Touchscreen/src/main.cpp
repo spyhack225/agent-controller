@@ -207,6 +207,7 @@ void setup() {
   gateway.setLimits(limits);
 
   gateway.begin(store, HARDWARE_MODEL, FIRMWARE_VERSION);
+  gateway.startNetworkTask();
   gatewayProbeBegin();
   provisioning.begin(store, store.deviceId());
   lastState = provisioning.status().state;
@@ -235,16 +236,16 @@ void loop() {
   // Mirrors the reference loop: while the link is down the portal owns the screen, and polling the
   // gateway would only stack up failures.
   if (state == ProvisioningState::Online) {
-    // Never while a clip is being captured. runCycle() makes one blocking HTTP request — up to the
-    // client's five-second timeout against a gateway that has gone away — and the I2S ring holds
-    // only tens of milliseconds, so a poll landing mid-recording drops audio out of the middle of
-    // the voice note. consumeJustConnected() latches until it is read, so deferring costs nothing.
-    // Single-threaded on purpose. Moving this to its own task removed the stall (worst frame gap
-    // 1823 ms -> 99 ms) but crashed the board: ui.cpp reads gateway state in 68 places across its
-    // render path, so a task mutating those Strings while the renderer walks them faults on core 0
-    // within seconds. Making it safe needs the client restructured to do its HTTP unlocked and
-    // publish results under a short lock — a deliberate change, not one to rush in behind a fix.
-    if (!audio::recording()) gateway.runCycle(provisioning.consumeJustConnected());
+    // The cycle runs on its own core now; the loop only forwards edges to it.
+    //
+    // This was tried once before and withdrawn, because a task mutating gateway state while the
+    // renderer walked the same Strings faulted within seconds. What makes it safe now is not the
+    // task but the lock discipline underneath it: the task holds the state lock across a fetch so
+    // its parse is atomic, request() hands that lock back for the duration of the socket wait, and
+    // every touch-driven entry point takes it too. The renderer takes it with a zero timeout and
+    // reuses the previous frame's values when it cannot, so it never waits on the network at all.
+    gateway.setNetworkPaused(audio::recording());
+    if (provisioning.consumeJustConnected()) gateway.notifyJustConnected();
   } else {
     gateway.goOffline();
   }

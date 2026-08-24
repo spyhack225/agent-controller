@@ -105,6 +105,19 @@ const PendingApproval* GatewayClient::approval(size_t index) const {
 // Runtime config
 // ---------------------------------------------------------------------------------------------
 
+// Held by the touch-driven entry points below. Each mutates client state and then blocks in
+// request(), which hands the lock back for the socket wait on its own — so the renderer is never
+// queued behind a gesture, only behind the microseconds of parsing on either side of it.
+namespace {
+struct StateLock {
+  explicit StateLock(GatewayClient* client) : client_(client) { if (client_) client_->lockState(); }
+  ~StateLock() { if (client_) client_->unlockState(); }
+  StateLock(const StateLock&) = delete;
+  StateLock& operator=(const StateLock&) = delete;
+  GatewayClient* client_;
+};
+}  // namespace
+
 bool GatewayClient::applyConfigJson(const String& payload) {
   JsonDocument doc;
   if (deserializeJson(doc, payload)) return false;
@@ -349,6 +362,7 @@ String GatewayClient::selectedThreadLabel() const {
 }
 
 bool GatewayClient::refreshThreads() {
+  StateLock guard(this);
   threadCount_ = 0;
   selectedThreadIndex_ = 0;
   threadsDetail_ = "";
@@ -392,6 +406,7 @@ bool GatewayClient::refreshThreads() {
 }
 
 bool GatewayClient::selectThread(size_t index) {
+  StateLock guard(this);
   if (index >= threadCount_) return false;
   ThreadOption& target = threads_[index];
 
@@ -514,6 +529,7 @@ DispatchResult GatewayClient::postIntent(const String& intentJson, const String&
 }
 
 DispatchResult GatewayClient::sendPrompt(const String& text) {
+  StateLock guard(this);
   JsonDocument intent;
   intent["type"] = "agent_prompt";
   intent["text"] = text.length() > 0 ? text : context_.defaultPrompt;
@@ -523,6 +539,7 @@ DispatchResult GatewayClient::sendPrompt(const String& text) {
 }
 
 DispatchResult GatewayClient::sendAudioPrompt(const String& mediaUploadId, const String& prompt) {
+  StateLock guard(this);
   if (mediaUploadId.length() == 0) {
     DispatchResult bad;
     bad.detail = "No audio uploaded";
@@ -540,6 +557,7 @@ DispatchResult GatewayClient::sendAudioPrompt(const String& mediaUploadId, const
 }
 
 DispatchResult GatewayClient::sendShell(const String& command) {
+  StateLock guard(this);
   const String& text = command.length() > 0 ? command : context_.shellCommand;
   if (text.length() == 0) {
     DispatchResult bad;
@@ -555,14 +573,17 @@ DispatchResult GatewayClient::sendShell(const String& command) {
 }
 
 DispatchResult GatewayClient::sendStatus() {
+  StateLock guard(this);
   return postIntent("{\"type\":\"status\"}", "status");
 }
 
 DispatchResult GatewayClient::sendStop() {
+  StateLock guard(this);
   return postIntent("{\"type\":\"session_control\",\"action\":\"stop\"}", "stop");
 }
 
 DispatchResult GatewayClient::runAction(const String& actionId, const String& mediaUploadId) {
+  StateLock guard(this);
   if (actionId.length() == 0) {
     DispatchResult bad;
     bad.detail = "Action missing id";
@@ -585,6 +606,7 @@ DispatchResult GatewayClient::runAction(const String& actionId, const String& me
 // review step and is a separate gate from gateway approval — the UI owns it, and keeping it out of
 // here is what lets a confirmed action be re-dispatched without looping back into the prompt.
 DispatchResult GatewayClient::runControl(const DeviceControl& control, const String& mediaUploadId) {
+  StateLock guard(this);
   DispatchResult blocked;
   if (!control.enabled) {
     blocked.detail = control.reason.length() > 0 ? control.reason : String("Unavailable");
@@ -621,6 +643,7 @@ DispatchResult GatewayClient::runControl(const DeviceControl& control, const Str
 // ---------------------------------------------------------------------------------------------
 
 bool GatewayClient::refreshMacros() {
+  StateLock guard(this);
   macroCount_ = 0;
   String response;
   const int code = request("GET", "/v1/device/macros", "", response);
@@ -642,6 +665,7 @@ bool GatewayClient::refreshMacros() {
 }
 
 DispatchResult GatewayClient::runMacro(const String& macroId) {
+  StateLock guard(this);
   if (macroId.length() == 0) {
     DispatchResult bad;
     bad.detail = "Macro missing id";
@@ -683,6 +707,7 @@ void GatewayClient::closeResponse() {
 }
 
 bool GatewayClient::fetchResponsePage(int page) {
+  StateLock guard(this);
   String path = String("/v1/device/thread-output?page=") + (page < 0 ? 0 : page);
   if (responseAfter_.length() > 0) path += String("&after=") + encodePathSegment(responseAfter_);
 
@@ -754,6 +779,7 @@ bool GatewayClient::fetchResponsePage(int page) {
 // ---------------------------------------------------------------------------------------------
 
 bool GatewayClient::refreshApprovals() {
+  StateLock guard(this);
   String response;
   const int code = request("GET", "/v1/device/approvals", "", response);
   if (!ok(code)) {
@@ -795,6 +821,7 @@ bool GatewayClient::refreshApprovals() {
 }
 
 DispatchResult GatewayClient::answerApproval(const String& commandId, bool approve) {
+  StateLock guard(this);
   if (commandId.length() == 0) {
     DispatchResult bad;
     bad.detail = "Approval missing id";
