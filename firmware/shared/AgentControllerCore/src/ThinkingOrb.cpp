@@ -45,13 +45,13 @@ const Profile kProfiles[] = {
   // Orbits — working. Particles riding inclined rings.
   { 0,  0,   1.2f, 1.6f, 0.55f, 0.45f, 1.885f, 1.00f, 1.00f },
   // Globe — searching. The flagship lat/lon dot sphere.
-  { 17, 44,  0.6f, 1.7f, 0.62f, 0.54f, 2.015f, 0.42f, 1.15f },
+  { 17, 44,  0.6f, 1.7f, 0.62f, 0.54f, 2.015f, 1.00f, 1.15f },
   // Wave — listening. Sphere whose rings breathe with amplitude.
-  { 15, 40,  0.6f, 1.7f, 0.62f, 0.54f, 4.388f, 0.341f, 1.00f },
+  { 15, 40,  0.6f, 1.7f, 0.62f, 0.54f, 4.388f, 0.90f, 1.00f },
   // Ring — breathing. Face-on lanes; the calm state.
-  { 5,  88,  1.1f, 1.7f, 0.60f, 0.50f, 1.200f, 0.30f, 1.00f },
+  { 5,  88,  1.1f, 1.7f, 0.60f, 0.50f, 1.200f, 0.85f, 1.00f },
   // Web — connecting. Sparse nodes, sparser than a globe on purpose.
-  { 9,  22,  0.9f, 1.5f, 0.55f, 0.50f, 2.400f, 0.30f, 1.20f },
+  { 9,  22,  0.9f, 1.5f, 0.55f, 0.50f, 2.400f, 1.00f, 1.20f },
 };
 
 const Profile& profileFor(OrbMode m) { return kProfiles[static_cast<uint8_t>(m)]; }
@@ -71,6 +71,8 @@ inline uint8_t inkToGrey(float ink) {
 
 }  // namespace
 
+// The dot budget is generous now that dots composite into a RAM canvas rather than costing an SPI
+// transaction each. Density is what makes the sphere read as solid.
 bool ThinkingOrb::begin(uint16_t diameter, uint16_t capacity) {
   end();
   if (diameter < 8 || capacity < 16) return false;
@@ -145,10 +147,18 @@ void ThinkingOrb::project(float x, float y, float z, float cosA, float sinA, flo
   const float depth = (z2 + 1.0f) * 0.5f;
   const float shaped = powf(depth, kRsPow);
 
-  const float ink = inkFar * depth + inkSpan * shaped;
+  // inkFar is the ink of the FURTHEST dot, not a coefficient on depth. Multiplying by depth drove
+  // the back hemisphere to zero, where the cull below deleted it — which is why the sphere looked
+  // like a sparse scatter instead of a solid: half of it was never drawn.
+  float ink = inkFar + inkSpan * shaped;
+  if (ink > 1.0f) ink = 1.0f;
   if (ink < kCullInk) return;
 
-  float r = (rBase + rDepth * shaped) * (radiusPx_ / 32.0f);
+  // The spec's radii are in the reference canvas's own pixels, and that canvas is rendered at
+  // device-pixel-ratio 2 — so a 64 px orb is a 128 px canvas. Dividing by 64 reproduces the
+  // reference dot size; dividing by 32 (the CSS size) doubles every dot, which is what turned the
+  // sphere into overlapping blobs.
+  float r = (rBase + rDepth * shaped) * (radiusPx_ / 64.0f);
   if (r < kRMin) r = kRMin;
 
   Scratch& s = scratch[n++];

@@ -11,9 +11,14 @@
 #include <Arduino.h>
 #include <Adafruit_ILI9341.h>
 
+#include <Adafruit_GFX.h>
 #include <ThinkingOrb.h>
 
 bool displayBegin();
+
+// Allocates the off-screen canvases the orb and label composite into. Must be called after
+// displayBegin() and before either draw function.
+bool displayBeginCanvases(uint16_t orbSize);
 
 // Paints one orb frame centred at (cx, cy). Dots are drawn far-to-near as the renderer ordered
 // them, so overlap reads as depth.

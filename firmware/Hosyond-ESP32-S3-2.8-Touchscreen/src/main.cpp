@@ -451,11 +451,12 @@ void pollBootButton() {
   if (!bootWasDown) return;
   bootWasDown = false;
 
-#if ENABLE_AUDIO_CAPTURE
-  // A press this short was push-to-talk, not a reset. Record on the *next* hold: press and hold to
-  // talk, which is the interaction the roadmap specifies.
-  Serial.println("[audio] Press and hold BOOT to record.");
-#endif
+  // A short press opens the config portal. This is the escape hatch for a wrong gateway URL: the
+  // portal closes as soon as Wi-Fi joins, so without it a typo left the device online, unable to
+  // reach any gateway, and recoverable only by the long-press wipe — which also destroys Wi-Fi
+  // credentials that were perfectly good.
+  Serial.println("[provisioning] BOOT tapped — opening the config portal.");
+  provisioning.openConfigPortal();
 }
 
 // The controller screen.
@@ -540,7 +541,7 @@ void tickScreen() {
 
   static uint32_t lastFrame = 0;
   const uint32_t now = millis();
-  if (now - lastFrame < 30) return;
+  if (now - lastFrame < 33) return;   // ~30 fps; the blit is the floor, not the maths
   lastFrame = now;
 
   const uint32_t elapsed = now - orbStartedAt;
@@ -568,7 +569,7 @@ void setup() {
     Serial.println("[display] ILI9341V up, 240x320, backlight on.");
     // 132 px across, comfortably inside the 240 px panel, and a dot budget that keeps a frame
     // under the 30 ms tick.
-    if (orb.begin(132, 360)) {
+    if (displayBeginCanvases(148) && orb.begin(140, 900)) {
       orbStartedAt = millis();
       setOrbState(OrbMode::Ring, "Starting", "");
     } else {

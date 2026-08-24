@@ -61,8 +61,9 @@ void Provisioning::begin(DeviceStore& store, const String& apNameSeed) {
 }
 
 void Provisioning::enterProvisioning() {
+  const bool keepStation = store_ != nullptr && store_->hasWifiCredentials();
   status_.state = ProvisioningState::Provisioning;
-  status_.detail = "Join " + apName_;
+  status_.detail = keepStation ? "Reconfigure at " + apName_ : "Join " + apName_;
   // Only tear down a station that exists. On a first boot with no stored credentials the Wi-Fi
   // driver has never been started, and disconnect() logs ESP_ERR_WIFI_NOT_INIT at error level --
   // alarming, and the very first thing an owner sees on the serial console of a new unit.
@@ -84,6 +85,12 @@ void Provisioning::resetToProvisioning() {
   if (store_ != nullptr) store_->resetForProvisioning();
   status_.joinFailures = 0;
   portalError_ = "";
+  enterProvisioning();
+}
+
+void Provisioning::openConfigPortal() {
+  status_.joinFailures = 0;
+  portalError_ = "Update the gateway URL, then Save.";
   enterProvisioning();
 }
 
@@ -249,13 +256,21 @@ void Provisioning::handlePortalRoot() {
 
   page += "<form method=\"POST\" action=\"/save\">"
     "<label for=\"ssid\">Wi-Fi network</label>"
-    "<select id=\"ssid\" name=\"ssid\">" + scanOptionsHtml() + "</select>"
+    "<select id=\"ssid\" name=\"ssid\">"
+    // An empty first option is what makes a gateway-only save reachable: a <select> always submits
+    // something, so without it there is no way to say "keep the network I already have".
+    + String(store_->hasWifiCredentials()
+        ? "<option value=\"\">Keep " + htmlEscape(store_->wifiSsid()) + "</option>"
+        : "")
+    + scanOptionsHtml() + "</select>"
     "<label for=\"password\">Password</label>"
     "<input id=\"password\" name=\"password\" type=\"password\" autocomplete=\"off\">"
-    "<label for=\"gateway\">Gateway URL (optional)</label>"
-    "<input id=\"gateway\" name=\"gateway\" type=\"url\" placeholder=\""
+    "<label for=\"gateway\">Gateway URL</label>"
+    "<input id=\"gateway\" name=\"gateway\" type=\"url\" value=\""
     + htmlEscape(store_->gatewayUrl()) + "\">"
-    "<button type=\"submit\">Connect</button></form>"
+    "<button type=\"submit\">Save</button></form>"
+    "<p class=\"hint\">To correct only the gateway, leave the network blank and press Save; "
+    "the controller keeps the Wi-Fi it already has.</p>"
     "<p class=\"hint\">The controller tries the network before saving it, so a wrong password "
     "brings you back here instead of locking the device.</p>"
     "</main></body></html>";
@@ -270,6 +285,25 @@ void Provisioning::handlePortalSubmit() {
   const String gateway = server_.arg("gateway");
 
   if (ssid.length() == 0) {
+    // A gateway-only correction. The owner reached this portal to fix a URL, and the stored
+    // network is already known good — making them re-pick it and retype the password would be
+    // asking for a second chance to get something wrong.
+    if (gateway.length() > 0 && store_->hasWifiCredentials()) {
+      store_->setGatewayUrl(gateway);
+      Serial.printf("[wifi] gateway updated to %s; rejoining %s\n",
+                    gateway.c_str(), store_->wifiSsid().c_str());
+      server_.send(
+        200,
+        "text/html; charset=utf-8",
+        "<!doctype html><meta charset=\"utf-8\">"
+        "<body style=\"font-family:system-ui;background:#111211;color:#f1f1ef;padding:1.5rem\">"
+        "<p>Gateway saved. Reconnecting to your network…</p></body>"
+      );
+      server_.client().flush();
+      portalError_ = "";
+      enterConnecting();
+      return;
+    }
     portalError_ = "Choose a network.";
     handlePortalRoot();
     return;

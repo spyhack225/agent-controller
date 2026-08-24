@@ -52,6 +52,14 @@ class Provisioning {
   // Called by the long-press reset. Wipes credentials and re-raises the portal.
   void resetToProvisioning();
 
+  // Re-raises the portal WITHOUT wiping anything, so the owner can correct a setting and rejoin.
+  //
+  // This exists because the gateway URL is entered once, during first setup, and the portal closes
+  // the moment Wi-Fi joins. A typo in that URL therefore left the device online, unable to reach
+  // any gateway, and with no way back into the form — the only escape was the long-press wipe,
+  // which also destroys working Wi-Fi credentials the owner had no reason to lose.
+  void openConfigPortal();
+
   // True exactly once after a successful join, so the caller can re-run its gateway handshake.
   bool consumeJustConnected();
 

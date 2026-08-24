@@ -20,6 +20,7 @@ namespace {
 // is constructed regardless of whether the display is ever used.
 Adafruit_ILI9341* panel = nullptr;
 bool ready = false;
+uint32_t panelFreq = 24000000;
 
 }  // namespace
 
@@ -59,18 +60,23 @@ bool displayBegin() {
   // an animated orb, so the bus is the budget. 40 MHz is the compromise: a real speed-up, with
   // margin against the ribbon and the breadboard-grade routing on a module like this.
   SPI.begin(LCD_SCLK, LCD_MISO, LCD_MOSI, LCD_CS);
+  // The vendor drives this panel at 80 MHz (docs/.../Example_01/spi_dev.h). Adafruit defaults to
+  // 24 MHz, which leaves the frame time dominated by the blit. 40 MHz roughly halves it while
+  // keeping margin against the ribbon on a module like this.
+  panelFreq = 40000000;
 
   // Built here, after Arduino's init and after SPI is known to exist.
   if (!panel) panel = new Adafruit_ILI9341(LCD_CS, LCD_DC, LCD_RST);
   if (!panel) return false;
 
-  panel->begin();
+  panel->begin(panelFreq);
 
-  // Display inversion ON. This is the one thing Adafruit's stock ILI9341 init does not do and this
-  // panel requires: the vendor's own init sequence (docs/.../ILI9341V_Init.txt) sends 0x21 (INVON)
-  // because the glass is IPS, not TN. Without it every colour comes out inverted — a fillScreen
-  // (BLACK) renders white — which reads as "the driver is wrong" rather than "one bit is wrong".
-  panel->invertDisplay(true);
+  // Inversion OFF. The vendor's init sends 0x21 (INVON), but that sequence is relative to their
+  // own register setup, not to Adafruit's — whose ILI9341 init already leaves this panel the right
+  // way round. Sending it on top produced a white screen with dark dots on real glass (photo
+  // evidence, 2026-08-24), so the two inversions were cancelling. Verified visually: do not
+  // "restore" this from the vendor file without looking at the panel.
+  panel->invertDisplay(false);
 
   panel->setRotation(0);           // portrait, 240x320, ribbon at the bottom
   panel->fillScreen(ILI9341_BLACK);
@@ -94,51 +100,62 @@ inline uint16_t greyToRgb565(uint8_t g) {
   return (uint16_t)(((g & 0xF8) << 8) | ((g & 0xFC) << 3) | (g >> 3));
 }
 
-// Tracks the previous frame's dots so each one can be erased individually. Clearing the whole orb
-// box every frame is ~40k pixels over SPI and visibly tears; erasing ~300 small discs is an order
-// of magnitude less traffic and reads as smooth.
-constexpr uint16_t kMaxTracked = 512;
-struct PaintedDot { int16_t x, y; uint8_t r; };
-PaintedDot painted[kMaxTracked];
-uint16_t paintedCount = 0;
+// Off-screen canvases, blitted in one transaction each.
+//
+// The first version drew every dot straight to the panel and erased the previous frame dot by dot.
+// That is ~600 separate SPI transactions per frame, and the panel is scanning out the whole time,
+// so the user sees the redraw sweep across the glass — the dark band visible in the bring-up
+// video. Compositing in RAM and pushing one rectangle removes both problems: the cost stops
+// scaling with dot count, and the panel never shows a half-built frame.
+//
+// A 148x148 canvas is 43 KB and the label strip is 11 KB, against ~300 KB of free internal heap.
+GFXcanvas16* orbCanvas = nullptr;
+GFXcanvas16* labelCanvas = nullptr;
+
+constexpr int16_t kLabelH = 22;
 
 }  // namespace
 
+bool displayBeginCanvases(uint16_t orbSize) {
+  if (!orbCanvas) orbCanvas = new GFXcanvas16(orbSize, orbSize);
+  if (!labelCanvas) labelCanvas = new GFXcanvas16(240, kLabelH);
+  return orbCanvas && labelCanvas && orbCanvas->getBuffer() && labelCanvas->getBuffer();
+}
+
 void displayDrawOrb(ThinkingOrb& orb, int16_t cx, int16_t cy, uint32_t elapsedMs) {
-  if (!displayReady()) return;
-  Adafruit_ILI9341& g = displayPanel();
+  if (!displayReady() || !orbCanvas) return;
 
   const OrbFrame frame = orb.render(elapsedMs);
 
-  for (uint16_t i = 0; i < paintedCount; ++i) {
-    g.fillCircle(painted[i].x, painted[i].y, painted[i].r, 0x0000);
-  }
+  const int16_t w = orbCanvas->width();
+  const int16_t h = orbCanvas->height();
+  const int16_t mid = w / 2;
 
-  paintedCount = 0;
+  orbCanvas->fillScreen(0x0000);
   for (uint16_t i = 0; i < frame.count; ++i) {
     const OrbDot& d = frame.dots[i];
-    const int16_t x = cx + d.x;
-    const int16_t y = cy + d.y;
-    const uint8_t r = d.radius;
-
-    if (r <= 1) g.drawPixel(x, y, greyToRgb565(d.ink));
-    else g.fillCircle(x, y, r, greyToRgb565(d.ink));
-
-    if (paintedCount < kMaxTracked) {
-      painted[paintedCount++] = {x, y, (uint8_t)(r + 1)};
-    }
+    const uint16_t colour = greyToRgb565(d.ink);
+    const int16_t x = mid + d.x;
+    const int16_t y = mid + d.y;
+    // A 1 px dot as a filled circle costs a bounding-box walk for one pixel, and most of the
+    // sphere is 1 px dots.
+    if (d.radius <= 1) orbCanvas->drawPixel(x, y, colour);
+    else orbCanvas->fillCircle(x, y, d.radius, colour);
   }
+
+  displayPanel().drawRGBBitmap(cx - mid, cy - mid, orbCanvas->getBuffer(), w, h);
 }
 
 void displayDrawStatus(const char* label, int16_t cy, uint32_t elapsedMs) {
-  if (!displayReady() || !label) return;
-  Adafruit_ILI9341& g = displayPanel();
+  if (!displayReady() || !labelCanvas || !label) return;
 
   const size_t len = strlen(label);
   if (len == 0) return;
 
-  g.setTextSize(2);
-  const int16_t charW = 12;                       // 6px base glyph at size 2
+  labelCanvas->fillScreen(0x0000);
+  labelCanvas->setTextSize(2);
+
+  const int16_t charW = 12;                       // 6 px base glyph at size 2
   const int16_t textW = (int16_t)(len * charW);
   const int16_t x0 = (int16_t)((240 - textW) / 2);
 
@@ -146,13 +163,14 @@ void displayDrawStatus(const char* label, int16_t cy, uint32_t elapsedMs) {
   // gradient here, so the same read is produced per-glyph: a moving window of brighter characters.
   const float head = fmodf(elapsedMs / 1100.0f, 1.6f) * (len + 3.0f) - 1.5f;
 
-  g.fillRect(0, cy - 2, 240, 20, 0x0000);
   for (size_t i = 0; i < len; ++i) {
     const float d = fabsf((float)i - head);
     const float lift = d > 2.2f ? 0.0f : (1.0f - d / 2.2f);
     const uint8_t grey = (uint8_t)(96 + lift * 159);
-    g.setTextColor(greyToRgb565(grey));
-    g.setCursor(x0 + (int16_t)(i * charW), cy);
-    g.write(label[i]);
+    labelCanvas->setTextColor(greyToRgb565(grey));
+    labelCanvas->setCursor(x0 + (int16_t)(i * charW), 4);
+    labelCanvas->write(label[i]);
   }
+
+  displayPanel().drawRGBBitmap(0, cy - 4, labelCanvas->getBuffer(), 240, kLabelH);
 }
