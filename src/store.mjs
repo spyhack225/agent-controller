@@ -2446,7 +2446,11 @@ function publicMediaUpload(media) {
   const { storagePath, ...publicFields } = media;
   return {
     ...publicFields,
-    processing: normalizeMediaProcessing(media.processing, media.kind, media.transcript),
+    // `description` matters: without it an image whose stored processing carries no visionStatus
+    // falls back to "pending" even though a description exists. updateMediaProcessing already
+    // passes it, so omitting it here made the public view disagree with the internal one about the
+    // same record.
+    processing: normalizeMediaProcessing(media.processing, media.kind, media.transcript, media.description),
     expiresAt: media.expiresAt ?? null,
   };
 }

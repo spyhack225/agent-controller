@@ -377,3 +377,29 @@ function jsonResponse(body, status) {
     headers: { "content-type": "application/json" },
   });
 }
+
+test("a described image reports vision ready in the public view", () => {
+  // publicMediaUpload dropped the `description` argument that updateMediaProcessing passes, so an
+  // image whose stored processing carried no visionStatus read back "pending" while a description
+  // existed — the public view disagreeing with the internal one about the same record.
+  const store = createStore();
+  const media = store.createMediaUpload({
+    userId: USER_ID,
+    kind: "image",
+    contentType: "image/png",
+    sizeBytes: 12,
+    sha256: "a".repeat(64),
+    storagePath: "/tmp/vision-public.png",
+  });
+
+  store.updateMediaDescription({
+    userId: USER_ID,
+    mediaId: media.id,
+    description: "A photograph of a bench controller.",
+    source: "mock",
+  });
+
+  const listed = store.listMediaUploads(USER_ID).find((item) => item.id === media.id);
+  assert.equal(listed.processing.visionStatus, "ready");
+  assert.equal(listed.processing.transcriptionStatus, "not_applicable");
+});
