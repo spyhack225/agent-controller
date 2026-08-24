@@ -26,6 +26,7 @@ import {
 } from "lucide-react";
 import { useEffect, useMemo, useRef, useState } from "react";
 
+import { connectionActivity, refreshActivity } from "./activity";
 import { type ClaimLink, readClaimLink } from "./claimLink";
 import { useController } from "./controller";
 import { ActivityPage } from "./features/ActivityPage";
@@ -50,6 +51,9 @@ import { QuickPage } from "./features/QuickPage";
 import { SettingsPage } from "./features/SettingsPage";
 import { WorkspaceRecoveryDialog } from "./features/WorkspaceRecoveryDialog";
 import { type MarketingRoute, readMarketingRoute } from "./marketingRoute";
+import { ActivityOrb, NavLiquidIndicator } from "./motion";
+import { useReorderable } from "./reorderable";
+import { environmentScope, projectScope, threadScope } from "./resourceOrder";
 import type { AuthConfig, ClerkBridge, Environment, PageId } from "./types";
 import { useWorkspaceRecoveryMonitor } from "./useWorkspaceRecoveryMonitor";
 import {
@@ -201,6 +205,10 @@ function AppContent({ authConfig, clerk = null }: AppProps) {
   const [environmentConnectOpen, setEnvironmentConnectOpen] = useState(false);
   const [sidebarQuery, setSidebarQuery] = useState("");
   const sidebarSearchRef = useRef<HTMLInputElement>(null);
+  const mobileNavRef = useRef<HTMLElement>(null);
+  // Local to the button rather than controller state: `refreshAll` is fire-and-forget everywhere
+  // else, and nothing outside this control needs to know a manual refresh is in flight.
+  const [refreshing, setRefreshing] = useState(false);
   const onboardingAutoOpenedRef = useRef(false);
   // Sending the owner to the connection editor hides the modal but keeps the watch alive, so a
   // replaced credential still recovers the workspace without a second trip through the dialog.
@@ -309,6 +317,20 @@ function AppContent({ authConfig, clerk = null }: AppProps) {
     ? onboardingNavItem
     : navById.get(page) ?? nav("operate");
   const normalizedSidebarQuery = sidebarQuery.trim().toLowerCase();
+  const reorderable = useReorderable({
+    onReorder: c.reorderResources,
+    onNudge: c.nudgeResource,
+  });
+  // Reordering is disabled while the tree is filtered. A drag inside a search result would record
+  // an arrangement of the matches alone, and everything hidden by the query would come back
+  // unplaced — so the answer is to arrange the whole list, not the visible slice of it.
+  const canReorder = !normalizedSidebarQuery;
+  // Always the *unfiltered* siblings: these are the ids an arrangement is written against.
+  const environmentIds = c.environments.map((environment) => environment.id);
+  const projectIds = c.projects.map((project) => project.id);
+  const ungroupedThreadIds = c.threads
+    .filter((thread) => !thread.projectId)
+    .map((thread) => thread.id);
   const visibleEnvironments = c.environments.filter((environment) =>
     !normalizedSidebarQuery || environment.label.toLowerCase().includes(normalizedSidebarQuery)
   );
@@ -551,7 +573,17 @@ function AppContent({ authConfig, clerk = null }: AppProps) {
             {visibleEnvironments.length ? visibleEnvironments.map((environment) => {
               const selected = environment.id === c.selectedEnvironmentId;
               return (
-                <div key={environment.id} className="resource-group">
+                <div
+                  key={environment.id}
+                  className="resource-group"
+                  {...reorderable.rowProps({
+                    scope: environmentScope(),
+                    id: environment.id,
+                    ids: environmentIds,
+                    label: environment.label,
+                    enabled: canReorder,
+                  })}
+                >
                   <button
                     type="button"
                     className="resource-row resource-row--environment"
@@ -593,8 +625,21 @@ function AppContent({ authConfig, clerk = null }: AppProps) {
                             || projectMatches
                             || thread.label.toLowerCase().includes(normalizedSidebarQuery))
                         );
+                        const projectThreadIds = c.threads
+                          .filter((thread) => thread.projectId === project.id)
+                          .map((thread) => thread.id);
                         return (
-                          <div key={project.id} className="resource-project">
+                          <div
+                            key={project.id}
+                            className="resource-project"
+                            {...reorderable.rowProps({
+                              scope: projectScope(environment.id),
+                              id: project.id,
+                              ids: projectIds,
+                              label: projectLabel,
+                              enabled: canReorder,
+                            })}
+                          >
                             <button
                               type="button"
                               className="resource-row resource-row--project"
@@ -612,6 +657,13 @@ function AppContent({ authConfig, clerk = null }: AppProps) {
                                 key={thread.id}
                                 type="button"
                                 className="resource-thread"
+                                {...reorderable.rowProps({
+                                  scope: threadScope(project.id),
+                                  id: thread.id,
+                                  ids: projectThreadIds,
+                                  label: thread.label,
+                                  enabled: canReorder,
+                                })}
                                 data-active={thread.id === c.selectedThreadId || undefined}
                                 onClick={() => {
                                   c.setSelectedProjectId(project.id);
@@ -631,6 +683,13 @@ function AppContent({ authConfig, clerk = null }: AppProps) {
                           key={thread.id}
                           type="button"
                           className="resource-thread"
+                          {...reorderable.rowProps({
+                            scope: threadScope(null),
+                            id: thread.id,
+                            ids: ungroupedThreadIds,
+                            label: thread.label,
+                            enabled: canReorder,
+                          })}
                           data-active={thread.id === c.selectedThreadId || undefined}
                           onClick={() => {
                             c.setSelectedThreadId(thread.id);
@@ -772,19 +831,30 @@ function AppContent({ authConfig, clerk = null }: AppProps) {
               </Button>
             ) : null}
             {c.authenticated ? (
-              <StatusBadge
-                className="hidden sm:inline-flex"
-                tone={connectionTone(c.connection)}
-                label={c.connection}
-              />
+              <>
+                <ActivityOrb activity={connectionActivity(c.connection)} />
+                <StatusBadge
+                  className="hidden sm:inline-flex"
+                  tone={connectionTone(c.connection)}
+                  label={c.connection}
+                />
+              </>
             ) : null}
-            <IconButton
+            <Button
               variant="ghost"
-              icon={RefreshCw}
-              label="Refresh gateway data"
-              disabled={!c.authenticated}
-              onClick={() => void c.refreshAll()}
-            />
+              size="icon"
+              aria-label="Refresh gateway data"
+              title="Refresh gateway data"
+              disabled={!c.authenticated || refreshing}
+              onClick={() => {
+                setRefreshing(true);
+                void c.refreshAll().finally(() => setRefreshing(false));
+              }}
+            >
+              {refreshing
+                ? <ActivityOrb activity={refreshActivity(true)} />
+                : <RefreshCw className="size-4" aria-hidden="true" />}
+            </Button>
             <IconButton
               variant="ghost"
               icon={theme === "dark" ? Sun : Moon}
@@ -800,10 +870,12 @@ function AppContent({ authConfig, clerk = null }: AppProps) {
       </div>
 
       <nav
+        ref={mobileNavRef}
         className="mobile-nav"
         aria-label="Mobile navigation"
         inert={mobileViewport && mobileMenuOpen ? true : undefined}
       >
+        <NavLiquidIndicator containerRef={mobileNavRef} activeKey={page} />
         {mobileNavItems.map((item) => {
           const Icon = item.icon;
           const active = page === item.id;

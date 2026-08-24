@@ -2,6 +2,12 @@ import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 
 import { ApiError, downloadJson, requestJson, type ApiOptions } from "./api";
 import { useApprovalNotifications } from "./notifications";
+import {
+  projectScope,
+  threadScope,
+  useResourceOrdering,
+  environmentScope,
+} from "./resourceOrder";
 import type {
   AuditEvent,
   AuthConfig,
@@ -818,6 +824,49 @@ export function useController({ authConfig, clerk }: UseControllerOptions) {
     setNotice({ tone: "success", message: "Redacted diagnostics downloaded." });
   }, [api]);
 
+  // The operator's own arrangement of the tree. Applied to what the controller hands out rather
+  // than to the state it keeps, so ordering stays a presentation concern and every consumer — the
+  // sidebar, the Operations toolbar, the dashboard pickers — agrees without asking for it.
+  const ordering = useResourceOrdering();
+
+  const orderedEnvironments = useMemo(
+    () => ordering.order(environmentScope(), environments, (environment) => environment.id),
+    [environments, ordering],
+  );
+
+  const orderedProjects = useMemo(
+    () => ordering.order(projectScope(selectedEnvironmentId), projects, (project) => project.id),
+    [ordering, projects, selectedEnvironmentId],
+  );
+
+  /**
+   * Threads are exposed as one flat list but arranged per folder, so a consumer that filters by
+   * project gets the operator's order and one that does not gets the threads grouped by folder in
+   * folder order — which is the same tree, flattened.
+   */
+  const orderedThreads = useMemo(() => {
+    const byProject = new Map<string, T3Thread[]>();
+    for (const thread of threads) {
+      const key = thread.projectId ?? "";
+      const bucket = byProject.get(key);
+      if (bucket) bucket.push(thread);
+      else byProject.set(key, [thread]);
+    }
+    const arranged: T3Thread[] = [];
+    for (const project of orderedProjects) {
+      const bucket = byProject.get(project.id);
+      if (!bucket) continue;
+      arranged.push(...ordering.order(threadScope(project.id), bucket, (thread) => thread.id));
+      byProject.delete(project.id);
+    }
+    // Whatever is left is unfoldered, or belongs to a folder this snapshot did not report. Neither
+    // is a reason to drop a thread from the list.
+    for (const [key, bucket] of byProject) {
+      arranged.push(...ordering.order(threadScope(key || null), bucket, (thread) => thread.id));
+    }
+    return arranged;
+  }, [orderedProjects, ordering, threads]);
+
   const pendingApprovals = useMemo(
     () => commands.filter((command) => command.status === "approval_required").slice(-12).reverse(),
     [commands],
@@ -857,9 +906,11 @@ export function useController({ authConfig, clerk }: UseControllerOptions) {
     deviceProfiles,
     hardwareBoards,
     defaultHardwareBoard,
-    environments,
-    projects,
-    threads,
+    environments: orderedEnvironments,
+    projects: orderedProjects,
+    threads: orderedThreads,
+    reorderResources: ordering.reorder,
+    nudgeResource: ordering.nudge,
     harnesses: harnessCatalogue?.harnesses ?? [],
     harnessCatalogueSource: harnessCatalogue?.catalogueSource ?? null,
     sessionFailures: harnessCatalogue?.sessionFailures ?? [],

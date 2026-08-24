@@ -26,6 +26,7 @@ function controller(overrides: Record<string, unknown> = {}) {
     busyAction: null,
     environments: [{ id: "env_1", label: "Studio Mac", baseUrl: "http://127.0.0.1:3773" }],
     threads: [{ id: "thread_1", label: "Agent Controller", status: "running", messages: [] }],
+    projects: [{ id: "project_1", label: "agent-controller" }],
     actions: [],
     media: [CLIP],
     pendingApprovals: [],
@@ -37,6 +38,8 @@ function controller(overrides: Record<string, unknown> = {}) {
     refreshMedia: vi.fn(),
     uploadMedia: vi.fn(async () => ({ id: "media_new", kind: "audio", contentType: "audio/webm" })),
     loadSnapshot: vi.fn(async () => ({})),
+    setSelectedEnvironmentId: vi.fn(),
+    setSelectedThreadId: vi.fn(),
     run: vi.fn(async (_key: string, _message: string, task: () => Promise<unknown>) => task()),
     ...overrides,
   } as unknown as Controller;
@@ -192,15 +195,36 @@ test("push-to-talk records, attaches, and sends as an audio prompt", async () =>
   }));
 });
 
-test("without a thread the composer explains where to pick one instead of failing at dispatch", () => {
-  const onNavigate = renderDashboard(controller({ selectedThreadId: "" }));
+test("without a thread the composer stays inert and points at the picker on this page", () => {
+  const c = controller({ selectedThreadId: "" });
+  renderDashboard(c);
 
   expect(screen.getByRole("button", { name: "Add attachment" })).toBeDisabled();
   expect(screen.getByRole("button", { name: "Record voice" })).toBeDisabled();
   expect(screen.getByRole("button", { name: "Send message" })).toBeDisabled();
+  expect(screen.getByText("Choose a thread above to send from here.")).toBeVisible();
+});
 
-  fireEvent.click(screen.getByRole("button", { name: "Choose a thread" }));
-  expect(onNavigate).toHaveBeenCalledWith("operate");
+test("environment and thread are chosen here, without a detour through Operations", () => {
+  const c = controller({ selectedThreadId: "" });
+  renderDashboard(c);
+
+  // Arriving on the dashboard is enough: the selected environment's workspace is fetched here.
+  expect(c.loadSnapshot).not.toHaveBeenCalled();
+
+  fireEvent.change(screen.getByLabelText("Thread"), { target: { value: "thread_1" } });
+  expect(c.setSelectedThreadId).toHaveBeenCalledWith("thread_1");
+
+  fireEvent.change(screen.getByLabelText("Environment"), { target: { value: "env_1" } });
+  expect(c.setSelectedEnvironmentId).toHaveBeenCalledWith("env_1");
+  expect(c.loadSnapshot).toHaveBeenCalledWith("env_1");
+});
+
+test("an environment with nothing loaded yet is fetched on arrival", async () => {
+  const c = controller({ threads: [], projects: [], selectedThreadId: "" });
+  renderDashboard(c);
+
+  await waitFor(() => expect(c.loadSnapshot).toHaveBeenCalledWith("env_1"));
 });
 
 test("resumes the selected thread in Operations", () => {
@@ -217,6 +241,7 @@ test("routes an operator without an environment to pairing", () => {
   const onNavigate = renderDashboard(controller({
     environments: [],
     threads: [],
+    projects: [],
     selectedEnvironmentId: "",
     selectedThreadId: "",
   }));

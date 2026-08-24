@@ -413,6 +413,18 @@
   }
 }
 
+@layer components {
+  @media (max-width: 620px) {
+    .dashboard-home__pickers {
+      grid-template-columns: minmax(0, 1fr);
+    }
+
+    .dashboard-home__pickers > button {
+      width: 100%;
+    }
+  }
+}
+
 @media (max-width: 680px) {
   .dashboard-workspace {
     grid-template-columns: minmax(0, 1fr);
@@ -5297,11 +5309,15 @@ html:not(.dark)[data-theme="light"] {
 
   .thread-empty-state {
     display: grid;
-    max-width: 38rem;
+    min-height: 100%;
     place-items: center;
+    align-content: center;
     gap: 0.7rem;
     text-align: center;
-    transform: translateY(-3vh);
+  }
+
+  .thread-empty-state > * {
+    max-width: min(38rem, 100%);
   }
 
   .thread-empty-state h2 {
@@ -5519,7 +5535,7 @@ html:not(.dark)[data-theme="light"] {
   .thread-command > button {
     display: grid;
     width: 100%;
-    grid-template-columns: minmax(0, 1fr) auto auto;
+    grid-template-columns: minmax(0, 1fr) auto auto auto;
     align-items: center;
     gap: 0.75rem;
     cursor: pointer;
@@ -5878,7 +5894,7 @@ html:not(.dark)[data-theme="light"] {
   }
 
   .thread-command > button {
-    grid-template-columns: minmax(0, 1fr) auto;
+    grid-template-columns: minmax(0, 1fr) auto auto;
   }
 
   .thread-command > button > svg {
@@ -8061,6 +8077,54 @@ html:not(.dark)[data-theme="light"] {
     line-height: 1.5;
   }
 
+  /* Environment and thread, chosen where they are used. Two equal columns plus a reload, collapsing
+     to a single column on a phone so neither select is squeezed below a readable label. */
+  .dashboard-home__pickers {
+    display: grid;
+    min-width: 0;
+    grid-template-columns: minmax(0, 1fr) minmax(0, 1fr) auto;
+    align-items: end;
+    gap: 0.5rem;
+    margin-top: 0.85rem;
+  }
+
+  .dashboard-home__pickers label {
+    display: grid;
+    min-width: 0;
+    gap: 0.2rem;
+  }
+
+  .dashboard-home__pickers label > span {
+    overflow: hidden;
+    color: var(--ac-ink-faint);
+    font-family: var(--font-mono);
+    font-size: 0.56rem;
+    font-weight: 500;
+    letter-spacing: 0.08em;
+    text-overflow: ellipsis;
+    text-transform: uppercase;
+    white-space: nowrap;
+  }
+
+  .dashboard-home__pickers select {
+    width: 100%;
+    min-width: 0;
+    max-width: none;
+    min-height: 2.1rem;
+    border-color: var(--ac-border);
+    background: var(--ac-surface);
+    color: var(--ac-ink-muted);
+    padding: 0.3rem 1.55rem 0.3rem 0.5rem;
+    font-size: 0.72rem;
+  }
+
+  .dashboard-home__pickers select:hover:not(:disabled),
+  .dashboard-home__pickers select:focus {
+    border-color: var(--ac-border-strong);
+    background: var(--ac-surface-raised);
+    color: var(--ac-ink);
+  }
+
   .dashboard-composer {
     display: grid;
     min-width: 0;
@@ -8526,5 +8590,124 @@ html:not(.dark)[data-theme="light"] {
 
   .media-creator-panel .upload-drop {
     min-height: 10rem;
+  }
+}
+
+/* Motion primitives — see `motion.tsx` for what each effect is allowed to claim. */
+@layer components {
+  .activity-orb {
+    display: inline-grid;
+    flex: 0 0 auto;
+    place-items: center;
+    line-height: 0;
+  }
+
+  .activity-status {
+    display: inline-flex;
+    min-width: 0;
+    align-items: center;
+    gap: 0.4rem;
+    color: var(--ac-ink-muted);
+    font-size: 0.72rem;
+  }
+
+  .activity-status > span:last-child {
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+
+  /* The beam wrapper must not become a layout box of its own: every element it frames already
+     owns its own spacing, and an extra block would double the gap it sits in. */
+  .live-frame {
+    display: block;
+    min-width: 0;
+  }
+
+  .live-frame--approval {
+    margin-bottom: 1rem;
+  }
+
+  .live-frame--approval > .thread-approval {
+    margin-bottom: 0;
+  }
+
+  /* The phone nav's travelling pill sits behind the buttons and is never a hit target. The static
+     `[data-active]` fill stays as the fallback for first paint and reduced-motion. */
+  /* The group's own `position` and box arrive as inline style from the library; this only has to
+     keep it out of the hit-testing path and behind the buttons. */
+  .nav-liquid {
+    z-index: 0;
+    pointer-events: none;
+  }
+
+  .nav-liquid__pill {
+    position: absolute;
+    top: 0;
+    left: 0;
+    border-radius: 0.55rem;
+    transition: transform 340ms cubic-bezier(0.2, 0, 0, 1);
+  }
+
+  @media (prefers-reduced-motion: reduce) {
+    .nav-liquid__pill {
+      transition: none;
+    }
+  }
+
+  .mobile-nav:has(.nav-liquid) button[data-active] {
+    background: transparent;
+  }
+
+  .mobile-nav button {
+    position: relative;
+    z-index: 1;
+  }
+}
+
+@layer components {
+  /* The workspace-loading orb is the panel-scale one, so its label sits under it rather than beside. */
+  .thread-empty-loading .activity-status {
+    flex-direction: column;
+    gap: 0.6rem;
+    color: var(--ac-ink-muted);
+    font-size: 0.8rem;
+    font-weight: 600;
+  }
+}
+
+/* Reordering the sidebar tree — see `reorderable.ts` for which rows accept a drop. */
+@layer components {
+  .resource-group[draggable="true"],
+  .resource-project[draggable="true"],
+  .resource-thread[draggable="true"] {
+    cursor: grab;
+  }
+
+  .resource-group[data-dragging],
+  .resource-project[data-dragging],
+  .resource-thread[data-dragging] {
+    cursor: grabbing;
+    opacity: 0.45;
+  }
+
+  /* The indicator is a rule above the row being dropped on, drawn on a pseudo-element so it costs
+     no space and cannot disturb the fixed grid tracks these rows are laid out on. */
+  .resource-group,
+  .resource-project,
+  .resource-thread {
+    position: relative;
+  }
+
+  .resource-group[data-drop-target]::before,
+  .resource-project[data-drop-target]::before,
+  .resource-thread[data-drop-target]::before {
+    position: absolute;
+    inset: -1px 0 auto;
+    height: 2px;
+    border-radius: 999px;
+    background: var(--ac-primary);
+    content: "";
+    pointer-events: none;
   }
 }

@@ -21,9 +21,11 @@ import {
 } from "lucide-react";
 import { useEffect, useRef, useState } from "react";
 
+import { recordingActivity } from "../activity";
 import type { Controller } from "../controller";
 import { fileToBase64 } from "../format";
 import { CAPTURE_STATUS_LABEL, useAudioRecorder, useCameraCapture } from "../mediaCapture";
+import { ActivityOrb } from "../motion";
 import type { MediaItem } from "../types";
 import { Button, EmptyState, Field, StatusBadge } from "../ui";
 
@@ -349,7 +351,9 @@ export function MediaCaptureDialog({
               aria-labelledby="media-tab-audio"
             >
               <div className="media-capture-panel__icon" data-live={recorder.recording || undefined}>
-                <Mic className="size-7" />
+                {recorder.recording
+                  ? <ActivityOrb activity={recordingActivity(true)} size={64} />
+                  : <Mic className="size-7" aria-hidden="true" />}
               </div>
               <div className="media-capture-panel__copy">
                 <div className="flex items-center justify-center gap-2">

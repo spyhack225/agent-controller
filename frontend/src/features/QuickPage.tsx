@@ -7,13 +7,15 @@
  * the composer must never grow tall enough to push the attention queue past the fold.
  */
 
-import { ArrowRight, Check, CheckCircle2, CircleAlert, Mic, Play, Send, X, Zap } from "lucide-react";
+import { ArrowRight, Check, CheckCircle2, CircleAlert, Mic, Play, RefreshCw, Send, X, Zap } from "lucide-react";
 import { useState } from "react";
 
 import type { Controller } from "../controller";
 import { commandSummary, commandType, formatRelativeTime } from "../format";
+import { LiveFrame } from "../motion";
 import type { Command, PageId, SavedAction } from "../types";
 import { Button, StatusBadge, useConfirm } from "../ui";
+import { useWorkspaceLoader } from "../useWorkspaceLoader";
 import {
   AttachmentChips,
   AttachmentSourceMenu,
@@ -50,7 +52,7 @@ function QuickComposer({
   const hasRequest = Boolean(draft.prompt.trim()) || draft.attachmentIds.length > 0;
   const canSend = ready && hasRequest;
   const blockedReason = c.selectedEnvironmentId
-    ? "Pick a thread in Operations first."
+    ? "Choose a thread above to send from here."
     : "Pair a T3 environment first.";
 
   const submit = async () => {
@@ -74,7 +76,7 @@ function QuickComposer({
         onChange={draft.setPrompt}
         placeholder={ready
           ? "Send a message to this thread…"
-          : "Pick a thread in Operations to send from here"}
+          : "Choose a thread above to send from here"}
         canSend={canSend}
         onSubmit={() => void submit()}
         onFiles={ready ? (files) => void attachFiles(files) : undefined}
@@ -124,7 +126,7 @@ function QuickComposer({
           <span>{blockedReason}</span>
           {c.selectedEnvironmentId ? (
             <Button size="sm" variant="ghost" onClick={() => onNavigate("operate")}>
-              Choose a thread
+              Open Operations
             </Button>
           ) : null}
         </p>
@@ -149,6 +151,10 @@ function QuickComposer({
 
 export function QuickPage({ controller: c, onNavigate }: QuickPageProps) {
   const confirm = useConfirm();
+  // The dashboard is the page people land on, so it pulls the selected environment's workspace
+  // itself instead of sending them to Operations to do it. `loadSnapshot` selects a thread out of
+  // what it finds, which is why arriving here is now enough to start typing.
+  const { status: workspaceStatus, loadWorkspace } = useWorkspaceLoader(c);
   const selectedEnvironment = c.environments.find(
     (environment) => environment.id === c.selectedEnvironmentId,
   ) ?? null;
@@ -188,14 +194,26 @@ export function QuickPage({ controller: c, onNavigate }: QuickPageProps) {
     });
   };
 
+  const loading = workspaceStatus === "loading";
+  const failed = workspaceStatus === "failed";
+
   const workspaceTitle = !selectedEnvironment
     ? "Connect T3 Code to begin"
-    : selectedThread?.label ?? "Choose a thread to continue";
+    : selectedThread?.label
+      ?? (loading
+        ? "Loading workspace"
+        : failed
+          ? "Workspace unavailable"
+          : "Choose a thread to continue");
   const workspaceDescription = !selectedEnvironment
     ? "Pair a workspace once, then resume agent work from this dashboard."
     : selectedThread
       ? `${selectedEnvironment.label} · ${selectedThread.messages?.length ?? 0} messages`
-      : `${selectedEnvironment.label} is selected, but no thread is active.`;
+      : loading
+        ? `Fetching projects and threads from ${selectedEnvironment.label}.`
+        : failed
+          ? `Could not reach ${selectedEnvironment.label}. Retry, or pick another environment.`
+          : `${selectedEnvironment.label} reported no threads yet.`;
 
   return (
     <div className="dashboard-home">
@@ -211,6 +229,58 @@ export function QuickPage({ controller: c, onNavigate }: QuickPageProps) {
           />
         </div>
         <p className="dashboard-home__description">{workspaceDescription}</p>
+
+        {/*
+          Environment and thread are chosen here rather than only in Operations. They are the two
+          things every send on this page depends on, and bouncing to another workspace to set them
+          was the reason the composer spent most of its life disabled.
+        */}
+        {c.environments.length ? (
+          <div className="dashboard-home__pickers">
+            <label>
+              <span>Environment</span>
+              <select
+                aria-label="Environment"
+                value={c.selectedEnvironmentId}
+                onChange={(event) => {
+                  c.setSelectedEnvironmentId(event.target.value);
+                  void loadWorkspace(event.target.value);
+                }}
+              >
+                {c.environments.map((environment) => (
+                  <option key={environment.id} value={environment.id}>{environment.label}</option>
+                ))}
+              </select>
+            </label>
+            <label>
+              <span>Thread</span>
+              <select
+                aria-label="Thread"
+                value={c.selectedThreadId}
+                disabled={!c.threads.length}
+                onChange={(event) => c.setSelectedThreadId(event.target.value)}
+              >
+                {c.threads.length
+                  ? null
+                  : <option value="">{loading ? "Loading…" : "No threads reported"}</option>}
+                {c.threads.map((thread) => (
+                  <option key={thread.id} value={thread.id}>{thread.label}</option>
+                ))}
+              </select>
+            </label>
+            <Button
+              size="sm"
+              variant="ghost"
+              busy={loading}
+              disabled={!c.selectedEnvironmentId}
+              aria-label="Reload workspace"
+              onClick={() => void loadWorkspace(c.selectedEnvironmentId)}
+            >
+              <RefreshCw className="size-3.5" aria-hidden="true" /> {failed ? "Retry" : "Reload"}
+            </Button>
+          </div>
+        ) : null}
+
         <QuickComposer controller={c} onNavigate={onNavigate} />
         <div className="dashboard-home__workspace-actions">
           <Button
@@ -246,29 +316,31 @@ export function QuickPage({ controller: c, onNavigate }: QuickPageProps) {
         {c.pendingApprovals.length ? (
           <div className="dashboard-approval-list">
             {c.pendingApprovals.slice(0, 4).map((command) => (
-              <article key={command.id} className="dashboard-approval-row">
-                <div className="dashboard-approval-row__copy">
-                  <div>
-                    <StatusBadge tone="warning" label={command.risk ?? "review"} />
-                    <span>{commandType(command)}</span>
-                    <time>{formatRelativeTime(command.createdAt)}</time>
+              <LiveFrame key={command.id} active tone="attention" className="live-frame">
+                <article className="dashboard-approval-row">
+                  <div className="dashboard-approval-row__copy">
+                    <div>
+                      <StatusBadge tone="warning" label={command.risk ?? "review"} />
+                      <span>{commandType(command)}</span>
+                      <time>{formatRelativeTime(command.createdAt)}</time>
+                    </div>
+                    <p>{commandSummary(command)}</p>
                   </div>
-                  <p>{commandSummary(command)}</p>
-                </div>
-                <div className="dashboard-approval-row__actions">
-                  <Button
-                    size="sm"
-                    variant="primary"
-                    busy={c.busyAction === `approve-${command.id}`}
-                    onClick={() => void decide(command, "approve")}
-                  >
-                    <Check className="size-3.5" aria-hidden="true" /> Approve
-                  </Button>
-                  <Button size="sm" variant="danger-ghost" onClick={() => void decide(command, "reject")}>
-                    <X className="size-3.5" aria-hidden="true" /> Reject
-                  </Button>
-                </div>
-              </article>
+                  <div className="dashboard-approval-row__actions">
+                    <Button
+                      size="sm"
+                      variant="primary"
+                      busy={c.busyAction === `approve-${command.id}`}
+                      onClick={() => void decide(command, "approve")}
+                    >
+                      <Check className="size-3.5" aria-hidden="true" /> Approve
+                    </Button>
+                    <Button size="sm" variant="danger-ghost" onClick={() => void decide(command, "reject")}>
+                      <X className="size-3.5" aria-hidden="true" /> Reject
+                    </Button>
+                  </div>
+                </article>
+              </LiveFrame>
             ))}
             {c.pendingApprovals.length > 4 ? (
               <Button variant="ghost" onClick={() => onNavigate("activity")}>

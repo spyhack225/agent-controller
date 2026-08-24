@@ -10,6 +10,7 @@ import {
 } from "lucide-react";
 import { useEffect, useRef, useState } from "react";
 
+import { mediaJobActivity } from "../activity";
 import type { Controller } from "../controller";
 import {
   formatMediaJob,
@@ -17,6 +18,7 @@ import {
   formatRelativeTime,
   mediaJobTone,
 } from "../format";
+import { ActivityOrb } from "../motion";
 import type { MediaItem, MediaJob } from "../types";
 import {
   Button,
@@ -155,6 +157,7 @@ export function MediaPage({ controller: c }: { controller: Controller }) {
                       label={formatMediaProcessing(item)}
                     />
                     {job ? <StatusBadge tone={mediaJobTone(job)} label={formatMediaJob(job)} /> : null}
+                    <ActivityOrb activity={job ? mediaJobActivity(job.stage) : null} />
                   </div>
                   <p className="mt-1 truncate font-mono text-[11px] text-ink-faint">{item.id}</p>
                   <p className="mt-1 text-xs text-ink-muted">

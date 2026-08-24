@@ -9,7 +9,6 @@ import {
   FolderKanban,
   Gauge,
   History,
-  LoaderCircle,
   Pencil,
   Play,
   Plus,
@@ -19,11 +18,18 @@ import {
   ShieldAlert,
   X,
 } from "lucide-react";
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 
+import {
+  commandActivity,
+  streamingActivity,
+  workspaceSyncActivity,
+} from "../activity";
 import type { Controller } from "../controller";
 import { commandSummary, commandType, formatRelativeTime, renderEventResult } from "../format";
+import { ActivityOrb, ActivityStatus, LiveFrame } from "../motion";
 import type { Command, JsonRecord, SavedAction, T3SessionFailure } from "../types";
+import { useWorkspaceLoader } from "../useWorkspaceLoader";
 import {
   Button,
   EmptyState,
@@ -62,11 +68,9 @@ function isRecoverableModelFailure(failure: T3SessionFailure) {
 export function OperatePage({ controller }: { controller: Controller }) {
   const c = controller;
   const confirm = useConfirm();
-  const autoLoadEnvironmentRef = useRef<string | null>(null);
-  const [workspaceLoadState, setWorkspaceLoadState] = useState<{
-    environmentId: string;
-    status: "loading" | "loaded" | "failed";
-  } | null>(null);
+  // Shared with the Dashboard: whichever page the operator lands on pulls the workspace, and
+  // `loadSnapshot` picks a thread out of what comes back.
+  const { status: workspaceStatus, loadWorkspace } = useWorkspaceLoader(c);
   // Shell stays an explicit secondary mode: its policy screening and approval path differ, so it
   // must never be something a request falls into by accident.
   const [composerMode, setComposerMode] = useState<ComposerMode>("prompt");
@@ -104,6 +108,15 @@ export function OperatePage({ controller }: { controller: Controller }) {
       && (!command.environmentId || command.environmentId === c.selectedEnvironmentId)
     ),
     [c.recentCommands, c.selectedEnvironmentId, c.selectedThreadId],
+  );
+  // A turn is in flight while T3 holds a command it has not answered, or an assistant message is
+  // still arriving. `dispatched` is explicitly included: it means T3 accepted the command, not that
+  // the agent replied, and that gap is exactly the interval the composer should look occupied.
+  const turnInFlight = useMemo(
+    () => threadMessages.some((message) => message.streaming)
+      || threadCommands.some((command) =>
+        command.status === "dispatched" || command.status === "running"),
+    [threadCommands, threadMessages],
   );
   const threadFailures = useMemo(
     () => c.sessionFailures.filter((failure) => failure.threadId === c.selectedThreadId),
@@ -155,43 +168,6 @@ export function OperatePage({ controller }: { controller: Controller }) {
     modelSelectionMode,
     providerInstance,
     selectedThread,
-  ]);
-
-  const loadWorkspace = useCallback(async (environmentId: string) => {
-    if (!environmentId) return;
-    autoLoadEnvironmentRef.current = environmentId;
-    setWorkspaceLoadState({ environmentId, status: "loading" });
-    try {
-      await c.loadSnapshot(environmentId);
-      if (autoLoadEnvironmentRef.current === environmentId) {
-        setWorkspaceLoadState({ environmentId, status: "loaded" });
-      }
-    } catch {
-      if (autoLoadEnvironmentRef.current === environmentId) {
-        setWorkspaceLoadState({ environmentId, status: "failed" });
-      }
-    }
-  }, [c.loadSnapshot]);
-
-  useEffect(() => {
-    const environmentId = c.selectedEnvironmentId;
-    if (!environmentId) {
-      autoLoadEnvironmentRef.current = null;
-      setWorkspaceLoadState(null);
-      return;
-    }
-    if (c.threads.length > 0 || c.projects.length > 0) {
-      setWorkspaceLoadState({ environmentId, status: "loaded" });
-      return;
-    }
-    if (autoLoadEnvironmentRef.current === environmentId) return;
-
-    void loadWorkspace(environmentId);
-  }, [
-    c.projects.length,
-    c.selectedEnvironmentId,
-    c.threads.length,
-    loadWorkspace,
   ]);
 
   const selectHarness = (instanceId: string) => {
@@ -430,9 +406,8 @@ export function OperatePage({ controller }: { controller: Controller }) {
   const selectedEnvironmentLabel = c.environments.find(
     (environment) => environment.id === c.selectedEnvironmentId,
   )?.label ?? "the selected T3 environment";
-  const selectedWorkspaceLoadState = workspaceLoadState?.environmentId === c.selectedEnvironmentId
-    ? workspaceLoadState.status
-    : "loading";
+  // Not yet reported for this environment means the fetch has not settled, which reads as loading.
+  const selectedWorkspaceLoadState = workspaceStatus ?? "loading";
   const contextToolbar = (
     <div className="thread-context-toolbar" aria-label="Command context">
       <label className="thread-context-control">
@@ -520,9 +495,11 @@ export function OperatePage({ controller }: { controller: Controller }) {
       </label>
       <div className="thread-context-actions">
         {selectedWorkspaceLoadState === "loading" ? (
-          <span className="thread-context-sync" aria-live="polite">
-            <LoaderCircle className="size-3.5 animate-spin motion-reduce:animate-none" /> Syncing…
-          </span>
+          <ActivityStatus
+            className="thread-context-sync"
+            activity={workspaceSyncActivity("loading")}
+            label="Syncing…"
+          />
         ) : selectedWorkspaceLoadState === "failed" ? (
           <span className="thread-context-sync" data-error="true" aria-live="polite">Sync failed</span>
         ) : null}
@@ -579,9 +556,13 @@ export function OperatePage({ controller }: { controller: Controller }) {
                   : `Fetching projects and threads from ${selectedEnvironmentLabel}.`}
           </p>
           {c.selectedEnvironmentId && !workspaceFailed && !workspaceLoaded ? (
-            <div className="thread-empty-loading" role="status" aria-live="polite">
-              <LoaderCircle className="size-4 animate-spin motion-reduce:animate-none" />
-              <span>Loading workspace…</span>
+            <div className="thread-empty-loading">
+              <ActivityStatus
+                announce
+                activity={workspaceSyncActivity("loading")}
+                size={64}
+                label="Loading workspace…"
+              />
             </div>
           ) : null}
           {c.selectedEnvironmentId && (workspaceFailed || workspaceLoaded) ? (
@@ -650,7 +631,7 @@ export function OperatePage({ controller }: { controller: Controller }) {
                   </article>
                 ))}
               </div>
-            </section>
+              </section>
           ) : null}
 
           {c.harnessCatalogueSource === "snapshot-only" && c.projects.length ? (
@@ -664,32 +645,39 @@ export function OperatePage({ controller }: { controller: Controller }) {
           ) : null}
 
           {threadPendingApprovals.map((command) => (
-            <section key={command.id} className="thread-approval">
-              <div>
-                <div className="flex flex-wrap items-center gap-2">
-                  <StatusBadge tone="warning" label="Approval required" />
-                  <span className="font-mono text-[10px] text-ink-faint">{command.id}</span>
+            <LiveFrame
+              key={command.id}
+              active
+              tone="attention"
+              className="live-frame live-frame--approval"
+            >
+              <section className="thread-approval">
+                <div>
+                  <div className="flex flex-wrap items-center gap-2">
+                    <StatusBadge tone="warning" label="Approval required" />
+                    <span className="font-mono text-[10px] text-ink-faint">{command.id}</span>
+                  </div>
+                  <p className="mt-3 text-sm font-semibold capitalize">{commandType(command)}</p>
+                  <pre>{commandSummary(command)}</pre>
+                  <p className="mt-2 text-xs text-ink-muted">
+                    Risk: <span className="capitalize text-warning-strong">{command.risk ?? "unknown"}</span>
+                  </p>
                 </div>
-                <p className="mt-3 text-sm font-semibold capitalize">{commandType(command)}</p>
-                <pre>{commandSummary(command)}</pre>
-                <p className="mt-2 text-xs text-ink-muted">
-                  Risk: <span className="capitalize text-warning-strong">{command.risk ?? "unknown"}</span>
-                </p>
-              </div>
-              <div className="flex gap-2">
-                <Button
-                  variant="primary"
-                  size="sm"
-                  busy={c.busyAction === `approve-${command.id}`}
-                  onClick={() => void decideCommand(command, "approve")}
-                >
-                  <Check className="size-4" /> Approve
-                </Button>
-                <Button variant="danger-ghost" size="sm" onClick={() => void decideCommand(command, "reject")}>
-                  <X className="size-4" /> Reject
-                </Button>
-              </div>
+                <div className="flex gap-2">
+                  <Button
+                    variant="primary"
+                    size="sm"
+                    busy={c.busyAction === `approve-${command.id}`}
+                    onClick={() => void decideCommand(command, "approve")}
+                  >
+                    <Check className="size-4" /> Approve
+                  </Button>
+                  <Button variant="danger-ghost" size="sm" onClick={() => void decideCommand(command, "reject")}>
+                    <X className="size-4" /> Reject
+                  </Button>
+                </div>
             </section>
+            </LiveFrame>
           ))}
 
           {threadMessages.length ? (
@@ -699,7 +687,7 @@ export function OperatePage({ controller }: { controller: Controller }) {
                   <header>
                     <span>{message.role === "user" ? "You" : message.role === "assistant" ? "Agent" : message.role}</span>
                     <span>
-                      {message.streaming ? "Responding" : null}
+                      <ActivityOrb activity={streamingActivity(message.streaming)} />
                       {message.createdAt ? <time>{formatRelativeTime(message.createdAt)}</time> : null}
                     </span>
                   </header>
@@ -721,6 +709,9 @@ export function OperatePage({ controller }: { controller: Controller }) {
                   >
                     <p>{commandSummary(command)}</p>
                     <StatusBadge tone={statusTone(command.status)} label={command.status.replaceAll("_", " ")} />
+                    <ActivityOrb
+                      activity={commandActivity(command.status, command.intent?.type as string | undefined)}
+                    />
                     <ChevronRight className="size-4 text-ink-faint" />
                   </button>
                   {c.timelineCommand?.id === command.id && c.commandEvents.length ? (
@@ -757,24 +748,25 @@ export function OperatePage({ controller }: { controller: Controller }) {
       <div className="thread-composer-dock">
         {contextToolbar}
 
-        <ComposerShell
-          textareaId="operate-prompt"
-          label="Command or prompt"
-          value={prompt}
-          onChange={draft.setPrompt}
-          placeholder={composerMode === "shell"
-            ? "Enter a shell command, for example: npm test"
-            : c.selectedThreadId
-              ? "Ask for follow-up changes, or paste, drop, and attach context…"
-              : "Describe the first task for this new thread…"}
-          canSend={canSend}
-          onSubmit={() => void submitComposer()}
-          onFiles={composerMode === "shell" ? undefined : (files) => void attachFiles(files)}
-          attachments={
-            <AttachmentChips
-              attachments={draft.attachments}
-              onRemove={draft.removeAttachment}
-              onMove={draft.moveAttachment}
+        <LiveFrame active={turnInFlight} tone="live" variant="line" className="live-frame">
+          <ComposerShell
+            textareaId="operate-prompt"
+            label="Command or prompt"
+            value={prompt}
+            onChange={draft.setPrompt}
+            placeholder={composerMode === "shell"
+              ? "Enter a shell command, for example: npm test"
+              : c.selectedThreadId
+                ? "Ask for follow-up changes, or paste, drop, and attach context…"
+                : "Describe the first task for this new thread…"}
+            canSend={canSend}
+            onSubmit={() => void submitComposer()}
+            onFiles={composerMode === "shell" ? undefined : (files) => void attachFiles(files)}
+            attachments={
+              <AttachmentChips
+                attachments={draft.attachments}
+                onRemove={draft.removeAttachment}
+                onMove={draft.moveAttachment}
             />
           }
           actions={
@@ -803,7 +795,8 @@ export function OperatePage({ controller }: { controller: Controller }) {
               </Button>
             </>
           }
-        />
+          />
+        </LiveFrame>
 
         <div className="thread-composer-meta">
           <div className="flex gap-1">
