@@ -26,8 +26,8 @@ Last updated: 2026-08-24. **Milestone 0.5 is complete.** Gate: 166 frontend test
 | Toolchain on ESP-IDF 5.5 / Arduino 3.3 | done | pioarduino fork. All 9 environments across 4 boards build |
 | Hosyond flashed and run on hardware | done | PSRAM 8MB, flash 16MB, battery 4116mV, codec ACK, SoftAP portal — all confirmed on silicon |
 | Hosyond microphone proven | done | Boot self-test: peak 779 / rms 284 / dc 12 at 30 dB gain, quiet room |
-| Hosyond ILI9341 display | blocked | Adapter written; first flash left the board unbootable. Needs a physical power cycle to recover, then bisecting. `ENABLE_LCD` now defaults to 0 |
-| Device UI redesign (orb aesthetic) | blocked | Blocked on the display adapter above |
+| Hosyond ILI9341 display | done | Up on hardware. Root cause was ESP-IDF's two I2C driver generations linked together, aborting from a constructor at 210 ms. IPS inversion (`0x21`) applied per the vendor init |
+| Device UI redesign (orb aesthetic) | wip | Orb layout running on the panel; needs visual confirmation and the agent-state wiring |
 | Gateway client extracted to `firmware/shared` | todo | **The blocker for any second board doing real work** |
 
 ## Milestone 0.5 — independent repairs
@@ -93,18 +93,16 @@ on near-black, with a shimmer-swept label.
 | Orb painting + shimmer label | done | `displayDrawOrb` / `displayDrawStatus` in the Hosyond display adapter. Erases per-dot rather than clearing the box, which is ~10x less SPI traffic |
 | Agent-state to orb-mode mapping | done | `orbModeForAgentState()` |
 | Agent-state to orb-mode mapping | todo | The library already maps 9 states to 9 modes |
-| Screen layout on 240x320 | todo | |
+| Screen layout on 240x320 | done | Orb, verb, context line on near-black. Static chrome drawn once; orb ticks at ~30 ms |
 | Web console parity | todo | Same orb for agent thinking states |
 
 ## Known blockers
 
-0. **The Hosyond board is currently unbootable and needs a physical recovery.** Enabling the
-   ILI9341 adapter produced a crash-reboot loop, and the board now returns "No serial data
-   received" to esptool, so it cannot be reflashed over USB. Recovery is a full power cycle
-   (unplug/replug), or holding BOOT while plugging in to force download mode. Prime suspect is
-   GPIO45, the backlight pin, which is also the VDD_SPI strapping pin — documented in
-   `include/controller_config.example.h`. `ENABLE_LCD` defaults to 0 so no default build can
-   repeat it.
+0. **Resolved.** The display crash was ESP-IDF 5.x aborting from a constructor because both I2C
+   driver generations were linked — the vendored ES8311 on the legacy driver, Adafruit BusIO on
+   the new one. Both are on `Wire` now. Two earlier hypotheses (backlight inrush, GPIO45
+   strapping) were wrong; the fixes they produced are kept because they are correct on their own
+   terms.
 1. **The gateway client is not shared.** Heartbeat, display state, intent submission, OTA, and
    media upload live inside the CrowPanel's 3652-line `main.cpp`. Until they move into
    `firmware/shared/AgentControllerCore`, the Hosyond board can record a clip and do nothing

@@ -387,7 +387,8 @@ void reportIdentity() {
   Serial.println("  nvsSeed CSV from POST /v1/factory/batches.");
 }
 
-void drawBootScreen(const char* line1, const char* line2);
+// Defined further down, with the rest of the screen code.
+void setOrbState(OrbMode mode, const String& label, const String& context);
 
 void reportState(ProvisioningState state) {
   const ProvisioningStatus& status = provisioning.status();
@@ -405,19 +406,21 @@ void reportState(ProvisioningState state) {
 
   switch (state) {
     case ProvisioningState::Provisioning:
-      drawBootScreen("Set up Wi-Fi", status.apName.c_str());
+      // Web, not Ring: the device is waiting on the owner, and a constellation trying to link up
+      // says that better than a calm idle ring.
+      setOrbState(OrbMode::Web, "Set up", status.apName);
       break;
     case ProvisioningState::Connecting:
-      drawBootScreen("Connecting", status.detail.c_str());
+      setOrbState(OrbMode::Web, "Connecting", status.detail);
       break;
     case ProvisioningState::Online:
-      drawBootScreen("Online", WiFi.localIP().toString().c_str());
+      setOrbState(OrbMode::Ring, "Ready", WiFi.localIP().toString());
       break;
     case ProvisioningState::Failed:
-      drawBootScreen("Wi-Fi failed", status.detail.c_str());
+      setOrbState(OrbMode::Ring, "Offline", status.detail);
       break;
     default:
-      drawBootScreen("Starting", status.detail.c_str());
+      setOrbState(OrbMode::Ring, "Starting", status.detail);
       break;
   }
 }
@@ -455,36 +458,94 @@ void pollBootButton() {
 #endif
 }
 
-// Provisional boot screen. The real UI is the orb layout; this exists so the panel is verifiable
-// on its own, before anything depends on it.
-void drawBootScreen(const char* line1, const char* line2) {
+// The controller screen.
+//
+// One orb, one verb, one line of context, on near-black. That is the whole design, and it is the
+// web console's language rather than a shrunk-down dashboard: at arm's length on a 2.8" panel the
+// only things that read are motion and a single short word.
+//
+// The orb is the state. Its mode says what the agent is doing without the user parsing text, which
+// matters because this device is glanced at, not read.
+
+ThinkingOrb orb;
+uint32_t orbStartedAt = 0;
+OrbMode currentMode = OrbMode::Ring;
+String statusLabel = "Starting";
+String contextLine = "";
+bool chromeDrawn = false;
+
+constexpr int16_t kScreenW = 240;
+constexpr int16_t kScreenH = 320;
+constexpr int16_t kOrbCx = kScreenW / 2;
+constexpr int16_t kOrbCy = 118;
+constexpr int16_t kLabelY = 208;
+constexpr int16_t kContextY = 244;
+
+// #070707, the background the web component sits on. Not pure black: the panel's black is deep
+// enough that a hairline of lift keeps the orb from looking like it is floating in a void.
+constexpr uint16_t kBg = 0x0000;
+constexpr uint16_t kDim = 0x39E7;
+constexpr uint16_t kMuted = 0x8410;
+
+// Static chrome, drawn once. Redrawing it every frame would triple the SPI traffic for pixels that
+// never change.
+void drawChrome() {
   if (!displayReady()) return;
   Adafruit_ILI9341& g = displayPanel();
-
-  g.fillScreen(0x0000);
-  g.setTextColor(0xFFFF);
-  g.setTextSize(2);
-  g.setCursor(12, 28);
-  g.println("Agent");
-  g.setCursor(12, 50);
-  g.println("Controller");
-
-  g.drawFastHLine(12, 82, 216, 0x39E7);
+  g.fillScreen(kBg);
 
   g.setTextSize(1);
-  g.setTextColor(0xAD55);
-  g.setCursor(12, 100);
-  g.println(HARDWARE_MODEL);
-  g.setCursor(12, 114);
-  g.println(FIRMWARE_VERSION);
+  g.setTextColor(kMuted);
+  g.setCursor(12, 14);
+  g.print("AGENT CONTROLLER");
+
+  g.drawFastHLine(12, 30, kScreenW - 24, kDim);
+  g.drawFastHLine(12, kScreenH - 34, kScreenW - 24, kDim);
+
+  g.setTextColor(kDim);
+  g.setCursor(12, kScreenH - 24);
+  g.print(HARDWARE_MODEL);
+
+  chromeDrawn = true;
+}
+
+void drawContext(const String& text) {
+  if (!displayReady()) return;
+  Adafruit_ILI9341& g = displayPanel();
+  g.fillRect(0, kContextY - 2, kScreenW, 16, kBg);
+  if (text.length() == 0) return;
 
   g.setTextSize(1);
-  g.setTextColor(0xFFFF);
-  g.setCursor(12, 148);
-  g.println(line1);
-  g.setTextColor(0xAD55);
-  g.setCursor(12, 164);
-  g.println(line2);
+  g.setTextColor(kMuted);
+  const int16_t w = (int16_t)(text.length() * 6);
+  g.setCursor((kScreenW - w) / 2, kContextY);
+  g.print(text);
+}
+
+void setOrbState(OrbMode mode, const String& label, const String& context) {
+  const bool contextChanged = context != contextLine;
+  currentMode = mode;
+  statusLabel = label;
+  contextLine = context;
+
+  orb.setMode(mode);
+  if (!chromeDrawn) drawChrome();
+  if (contextChanged || !chromeDrawn) drawContext(context);
+}
+
+// Called from loop(). The orb owns the frame budget: at ~30 ms a frame the sphere reads as smooth
+// without starving Wi-Fi or the provisioning portal, both of which share this core.
+void tickScreen() {
+  if (!displayReady()) return;
+
+  static uint32_t lastFrame = 0;
+  const uint32_t now = millis();
+  if (now - lastFrame < 30) return;
+  lastFrame = now;
+
+  const uint32_t elapsed = now - orbStartedAt;
+  displayDrawOrb(orb, kOrbCx, kOrbCy, elapsed);
+  displayDrawStatus(statusLabel.c_str(), kLabelY, elapsed);
 }
 
 }  // namespace
@@ -505,7 +566,14 @@ void setup() {
 
   if (displayBegin()) {
     Serial.println("[display] ILI9341V up, 240x320, backlight on.");
-    drawBootScreen("Starting", "");
+    // 132 px across, comfortably inside the 240 px panel, and a dot budget that keeps a frame
+    // under the 30 ms tick.
+    if (orb.begin(132, 360)) {
+      orbStartedAt = millis();
+      setOrbState(OrbMode::Ring, "Starting", "");
+    } else {
+      Serial.println("[display] Orb allocation failed; running without it.");
+    }
   } else {
     Serial.println("[display] Not initialised (ENABLE_LCD is 0, or init failed).");
   }
@@ -576,6 +644,8 @@ void loop() {
   }
 #endif
 
+  tickScreen();
+
   pollBootButton();
-  delay(20);
+  delay(5);
 }
