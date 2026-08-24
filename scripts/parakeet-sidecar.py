@@ -36,6 +36,7 @@ Start it with:
 from __future__ import annotations
 
 import argparse
+import errno
 import json
 import io
 import logging
@@ -486,9 +487,26 @@ def main() -> None:
     if not args.no_warmup:
         log.info("warm-up pass took %.1fs", recognizer.warm_up())
 
-    server = ThreadingHTTPServer((args.host, args.port), build_handler(
-        recognizer, args.route, args.api_key, args.language,
-    ))
+    # Bind failures are the one startup error a person is likely to hit twice, because the usual
+    # cause is a sidecar they already started and forgot — often detached, so it is not in any
+    # window they can see. A bare OSError traceback here also wastes the model load that just
+    # succeeded, which is the most expensive part of starting up.
+    try:
+        server = ThreadingHTTPServer((args.host, args.port), build_handler(
+            recognizer, args.route, args.api_key, args.language,
+        ))
+    except OSError as exc:
+        if exc.errno != errno.EADDRINUSE:
+            raise
+        log.error("port %d on %s is already in use.", args.port, args.host)
+        log.error("Most likely another parakeet sidecar is already running — quite possibly a")
+        log.error("detached one with no terminal of its own. Find it and decide which to keep:")
+        log.error("    lsof -nP -iTCP:%d -sTCP:LISTEN", args.port)
+        log.error("If it is a healthy sidecar you can simply use it; check with:")
+        log.error("    curl http://%s:%d/healthz", args.host, args.port)
+        log.error("Otherwise stop it, or start this one elsewhere with --port <n> (and set")
+        log.error("PARAKEET_URL to match).")
+        raise SystemExit(1)
     server.daemon_threads = True
     url = f"http://{args.host}:{args.port}{args.route}"
     log.info("listening on %s", url)
