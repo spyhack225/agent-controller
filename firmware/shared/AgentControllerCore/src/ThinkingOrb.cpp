@@ -64,12 +64,6 @@ const Profile kProfiles[] = {
 
 const Profile& profileFor(OrbMode m) { return kProfiles[static_cast<uint8_t>(m)]; }
 
-struct Scratch {
-  OrbDot dot;
-  float z;
-};
-
-Scratch* scratch = nullptr;
 
 // Deterministic hash in [0,1), and smooth value noise on a 2D lattice. Web's nodes drift under
 // this rather than sitting on their lattice positions, which is the difference between a
@@ -132,6 +126,11 @@ inline int16_t toFixed(float px) {
 
 }  // namespace
 
+struct ThinkingOrb::Scratch {
+  OrbDot dot;
+  float z;
+};
+
 bool ThinkingOrb::begin(uint16_t diameter, uint16_t capacity) {
   end();
   if (diameter < 8 || capacity < 16) return false;
@@ -141,9 +140,9 @@ bool ThinkingOrb::begin(uint16_t diameter, uint16_t capacity) {
   capacity_ = capacity;
 
   dots_ = (OrbDot*)malloc(sizeof(OrbDot) * capacity_);
-  scratch = (Scratch*)malloc(sizeof(Scratch) * capacity_);
+  scratch_ = (Scratch*)malloc(sizeof(Scratch) * capacity_);
   lines_ = (OrbLine*)malloc(sizeof(OrbLine) * kMaxLines);
-  if (!dots_ || !scratch || !lines_) {
+  if (!dots_ || !scratch_ || !lines_) {
     end();
     return false;
   }
@@ -154,7 +153,7 @@ bool ThinkingOrb::begin(uint16_t diameter, uint16_t capacity) {
 
 void ThinkingOrb::end() {
   free(dots_);   dots_ = nullptr;
-  free(scratch); scratch = nullptr;
+  free(scratch_); scratch_ = nullptr;
   free(lines_);  lines_ = nullptr;
   capacity_ = 0;
   lineCount_ = 0;
@@ -228,7 +227,7 @@ void ThinkingOrb::pushDot(float px, float py, float z01, float radiusPx, float w
   const long r16 = lroundf(r * 16.0f);
   const long bounded = r16 < 5L ? 5L : (r16 > 160L ? 160L : r16);
 
-  Scratch& s = scratch[n++];
+  Scratch& s = scratch_[n++];
   s.z = z01;
   s.dot.x16 = toFixed(px);
   s.dot.y16 = toFixed(py);
@@ -701,7 +700,7 @@ uint16_t ThinkingOrb::emitMorph(float t) {
 }
 
 OrbFrame ThinkingOrb::render(uint32_t elapsedMs) {
-  if (!dots_ || !scratch) return {nullptr, 0, nullptr, 0};
+  if (!dots_ || !scratch_) return {nullptr, 0, nullptr, 0};
 
   const Profile& p = profileFor(mode_);
   const float t = (elapsedMs / 1000.0f) * p.speed * speed_;
@@ -722,8 +721,8 @@ OrbFrame ThinkingOrb::render(uint32_t elapsedMs) {
   }
 
   // Painter's order: far to near, so a near dot overwrites the one behind it.
-  std::sort(scratch, scratch + n, [](const Scratch& a, const Scratch& b) { return a.z < b.z; });
-  for (uint16_t i = 0; i < n; ++i) dots_[i] = scratch[i].dot;
+  std::sort(scratch_, scratch_ + n, [](const Scratch& a, const Scratch& b) { return a.z < b.z; });
+  for (uint16_t i = 0; i < n; ++i) dots_[i] = scratch_[i].dot;
 
   return {dots_, n, lines_, lineCount_};
 }

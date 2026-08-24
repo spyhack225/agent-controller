@@ -115,6 +115,17 @@ class ThinkingOrb {
 
   OrbDot* dots_ = nullptr;
   OrbLine* lines_ = nullptr;
+
+  // Per-instance, and that is the whole point. This was a file-scope global shared by every orb in
+  // the firmware while capacity_ stayed per-instance, so the bound check in pushDot() guarded the
+  // wrong object: ui.cpp builds a 900-dot orb and then a 180-dot one, the smaller begin() ran last
+  // and shrank the shared buffer, and the big orb went on writing 405 entries into room for 180 —
+  // 2.7 KB past the end, every frame. It landed in the internal-RAM pool the WiFi driver takes its
+  // buffers from, so the board panicked inside ieee80211/lwIP with none of our code on the stack,
+  // and heap integrity checks saw nothing because the overrun steps over block headers into
+  // payload. Defined in the .cpp; a pointer to an incomplete type is all the header needs.
+  struct Scratch;
+  Scratch* scratch_ = nullptr;
   uint16_t lineCount_ = 0;
   float cosYaw_ = 1.0f, sinYaw_ = 0.0f, cosTilt_ = 1.0f, sinTilt_ = 0.0f, scale_ = 1.0f;
   uint16_t capacity_ = 0;
