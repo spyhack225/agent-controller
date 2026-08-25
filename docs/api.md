@@ -44,7 +44,7 @@ GET /v1/device-profiles
 
 Profiles define the capabilities the policy engine will allow for a device:
 
-- `agent-controller`: prompts, media prompts, status, approvals, session control, and policy-screened shell input.
+- `agent-controller`: prompts, media prompts, status, approvals, agent questions, session control, and policy-screened shell input.
 - `read-only`: status only.
 - `power-controller`: high-trust control profile for signed-in web clients and advanced devices; dangerous shell input still requires approval.
 
@@ -1566,6 +1566,159 @@ Every answered request is broadcast to the account as `t3.approval.decided`
 (`{environmentId, threadId, requestId, decision, status, commandId, observedAt}`), so a second
 console tab stops offering buttons for a question that is no longer open.
 
+## Agent Questions (structured user input)
+
+**A third question, and not an approval of either kind.** The two sections above answer a *permission*
+question — the gateway refused to send something (`/v1/commands/:id/approve|reject`), or the agent is
+asking permission to act (`.../approvals/:requestId`). This one is different in kind: the agent needs
+you to **tell it something** — "which database should I migrate?", "pick a branch name" — and the
+answer is a **value**, not a verdict.
+
+T3 keeps them apart in its own code. A `tool_user_input` request produces **no approval activity at
+all** (`src/orchestration/Layers/ProviderRuntimeIngestion.ts:372` and `:403` return `[]` for it);
+it travels on its own activity pair, `user-input.requested` / `user-input.resolved`, and is answered
+with its own command, `thread.user-input.respond`. Three blocking kinds, three id spaces, three
+routes. They never share a list.
+
+### The question shapes
+
+A single request carries **many** questions. Each is (`packages/contracts/src/providerRuntime.ts`):
+
+```
+{ id, header, question, options: [{label, description}], multiSelect? }
+```
+
+`options` is a required array that may be empty, and that is what produces the three shapes:
+
+| shape | when | a valid answer |
+|---|---|---|
+| `single-choice` | `options` non-empty, `multiSelect` false | exactly one option **label**, as a string |
+| `multi-choice` | `options` non-empty, `multiSelect` true | a non-empty, duplicate-free array of option labels |
+| `free-text` | `options` empty | a non-empty string, at most 4000 characters |
+
+There is no "supply a file path" shape and no structured value: a question is a prompt plus a list of
+labelled options, and that is the entire vocabulary.
+
+The answer key is the **question id**, verbatim. On Claude that id *is* the full question text — the
+SDK looks answers up by question text (`src/provider/Layers/ClaudeAdapter.ts:3782-3790`) — so the
+gateway never invents a key, and never persists one either.
+
+### Validation happens before dispatch
+
+An answer is checked against the request's own questions **before anything leaves the gateway**, and
+a mismatch is a `422` naming the legal values. This is not defensive politeness: T3 accepts the
+dispatch and lets the provider deal with it, and the three providers deal with it differently and
+mostly silently.
+
+- Codex **fails** the whole response for a value that is not a string, a string array, or
+  `{answers: string[]}` (`src/provider/Layers/CodexSessionRuntime.ts:792`).
+- OpenCode **silently answers `[]`** for a value it does not recognise
+  (`src/provider/opencodeRuntime.ts:376`) — the agent gets an empty answer and carries on.
+- xAI **silently relabels** an unrecognised value as an "Other" note
+  (`src/provider/acp/XAiAcpExtension.ts:133-155`).
+
+So free text sent to a three-option question would, depending on the provider, fail loudly, vanish,
+or arrive as an annotation. Refusing it here with the options named is the only honest answer.
+
+### List
+
+```http
+GET /v1/t3/environments/env_.../threads/thread_.../user-input
+authorization: Bearer PLATFORM_TOKEN
+```
+
+```json
+{
+  "environmentId": "env_...",
+  "threadId": "thread_...",
+  "requests": [
+    {
+      "kind": "question",
+      "requestId": "req_...",
+      "threadId": "thread_...",
+      "questions": [
+        {
+          "id": "Which database should I migrate?",
+          "header": "Database",
+          "question": "Which database should I migrate?",
+          "options": [{ "label": "staging", "description": "The shared staging database" }],
+          "multiSelect": false,
+          "shape": "single-choice"
+        }
+      ],
+      "status": "pending",
+      "answerable": true,
+      "deviceAnswerable": true,
+      "answers": null,
+      "failure": null,
+      "localAnswer": null
+    }
+  ],
+  "canAnswer": true
+}
+```
+
+`status` is `pending`, `resolved` (T3 recorded an answer), or `stale` (T3 abandoned the request).
+The stale wording for a question is **not** the approval wording — T3 keeps four distinct spellings
+(`src/orchestration/decider.ts:49-52`) — so the two are matched separately.
+
+`localAnswer` is what *this gateway* already did, and it carries an `answersHash` rather than the
+answers: see below.
+
+Like provider approvals, these are derived from the thread's activity log served by
+`GET /api/orchestration/threads/:threadId`, never from `GET /api/orchestration/snapshot`.
+
+### Answer
+
+```http
+POST /v1/t3/environments/env_.../threads/thread_.../user-input/req_...
+authorization: Bearer PLATFORM_TOKEN
+content-type: application/json
+
+{ "answers": { "Which database should I migrate?": "staging" } }
+```
+
+`202` with `{request, answer, command, duplicate: false}`. The answer goes through the ordinary
+intent pipeline (`user_input_response`), so it produces a normal command record, a command event
+timeline entry and an SSE broadcast like any other write.
+
+Idempotency is keyed on a **fingerprint of the validated answers**:
+
+| case | answer |
+|---|---|
+| the same answers, twice | `200` with `duplicate: true`. The provider is answered once. |
+| different answers, second | `409`. The first answer already left for the provider. |
+| an answer that does not fit the question | `422`, before any dispatch, naming the legal values. |
+| a question not on this request | `422`. A mistyped question id would otherwise drop the real answer silently. |
+| a question left unanswered | `422`. Every question on the request must be answered. |
+| T3 already resolved it | `409`, before any dispatch. |
+| T3 abandoned it (`stale`) | `409`, before any dispatch. |
+| dispatch failed (T3 unreachable) | `502`, and the claim is released so the owner can retry. |
+
+Every answered question is broadcast to the account as `t3.user-input.answered`
+(`{environmentId, threadId, requestId, answersHash, status, commandId, observedAt}`), so a second
+console tab stops offering the form.
+
+### The answers are never persisted
+
+A question id is question text and a free-text answer is whatever the owner typed, so both are user
+content. The durable record — `providerUserInputAnswers` in every store implementation — holds a
+SHA-256 **fingerprint** of the canonicalised answer set and nothing readable. The dispatched command
+row records `{type: "thread.user-input.respond", requestId, answerCount}` with the answers stripped,
+and support diagnostics collapse a `user_input_response` intent to a count and a digest. The words
+are relayed live through the thread stream and kept nowhere.
+
+### Answering a question is a capability
+
+`user_input_response`, held by `agent-controller` and `power-controller` and not by `read-only`.
+Deliberately **one** capability rather than two: the `approval_response` / `approval_response_persistent`
+split exists because `acceptForSession` writes a standing permission rule that outlives the moment,
+and nothing here does that — an answer is consumed by the turn that asked. Free text is the most
+powerful shape and is exactly as powerful as `agent_prompt`, which every profile carrying
+`user_input_response` already has.
+
+What *is* restricted is where an answer may come from; see the device section below.
+
 ## Observability Summary
 
 Fetch a user-scoped reliability summary for dashboards and support triage:
@@ -1933,7 +2086,7 @@ content-type: application/json
 {}
 ```
 
-Devices poll one route for **both** kinds of approval, under two separate keys:
+Devices poll one route for **all three** things that can block a turn, under three separate keys:
 
 ```http
 GET /v1/device/approvals
@@ -1955,21 +2108,57 @@ x-device-secret: ...
       "requestedAt": "2026-08-24T10:00:00.000Z"
     }
   ],
-  "allowedDecisions": ["accept", "decline", "cancel"]
+  "userInputRequests": [
+    {
+      "kind": "question",
+      "requestId": "req_q",
+      "threadId": "thread_...",
+      "title": "Database",
+      "prompt": "Which database should I migrate?",
+      "questionCount": 1,
+      "shape": "single-choice",
+      "options": ["staging", "production"],
+      "questionId": "Which database should I migrate?",
+      "answerable": true,
+      "hint": null,
+      "requestedAt": "2026-08-24T10:00:00.000Z"
+    }
+  ],
+  "allowedDecisions": ["accept", "decline", "cancel"],
+  "canAnswerUserInput": true
 }
 ```
 
 `commands` is unchanged and is what firmware already reads: gateway policy holds, answered on the
-`/v1/device/approvals/cmd_.../approve|reject` routes below. `providerApprovals` is the other
-question entirely — see [Provider Approvals](#provider-approvals) — answered at
-`POST /v1/device/provider-approvals/:requestId`. `allowedDecisions` reflects the device's own
-profile: a `read-only` controller **sees** what the agent is blocked on and is offered nothing,
-because hiding the request would leave an owner walking past the device with no idea a turn had
-stopped.
+`/v1/device/approvals/cmd_.../approve|reject` routes below. `providerApprovals` is the second
+question — see [Provider Approvals](#provider-approvals) — answered at
+`POST /v1/device/provider-approvals/:requestId`. `userInputRequests` is the third — see
+[Agent Questions](#agent-questions-structured-user-input) — answered at
+`POST /v1/device/user-input/:requestId`. `allowedDecisions` and `canAnswerUserInput` reflect the
+device's own profile: a `read-only` controller **sees** what the agent is blocked on and is offered
+nothing, because hiding the request would leave an owner walking past the device with no idea a turn
+had stopped.
 
-Reading T3 is best-effort: when the host is unreachable, `providerApprovals` is empty,
-`providerApprovalsError` carries the reason, and the gateway approvals in the same response are
-still listed and still answerable.
+#### What a controller can and cannot answer
+
+**`answerable` is the field firmware must read.** A 240x320 panel with five keys and no keyboard can
+offer a short list and let someone press one. It cannot take dictation, hold a multi-part form, or
+build a subset out of eight options with two arrow keys. So exactly one shape is answerable from the
+device realm:
+
+> **one** single-choice question, with **two to four** options, each label at most **24 characters**
+> after whitespace collapsing.
+
+Everything else arrives with `answerable: false`, `options: null`, `questionId: null`, and
+`hint: "Answer this in the console."` — the exact sentence to put on screen. It is still listed,
+deliberately: an owner who can see *"the agent is asking you something, answer it in the console"* is
+far better served than one whose device says "Working" forever. Posting an unanswerable question to
+`/v1/device/user-input/:requestId` is a `422` with the same guidance, and the claim is never taken,
+so the console can still answer it.
+
+Reading T3 is best-effort: when the host is unreachable, `providerApprovals` and `userInputRequests`
+are empty, `providerApprovalsError` / `userInputError` carry the reason, and the gateway approvals in
+the same response are still listed and still answerable.
 
 ```http
 POST /v1/device/provider-approvals/req_...
@@ -1979,6 +2168,21 @@ content-type: application/json
 
 { "decision": "decline" }
 ```
+
+```http
+POST /v1/device/user-input/req_q
+x-device-id: dev_...
+x-device-secret: ...
+content-type: application/json
+
+{ "answers": { "Which database should I migrate?": "staging" } }
+```
+
+The body is `{answers}` keyed by `questionId` — echo the value the poll gave back verbatim; never
+construct one, because on Claude the id is the full question text. `threadId` may be supplied to
+override the device's bound thread. `403` for a device whose profile lacks `user_input_response`,
+`422` for a question this hardware cannot answer or an answer that does not fit it, `409` for one
+T3 has already resolved or abandoned.
 
 ```http
 POST /v1/device/approvals/cmd_.../approve
@@ -2046,6 +2250,8 @@ state.changed
 t3.snapshot
 media.job
 command.reconciled
+t3.approval.decided
+t3.user-input.answered
 t3.thread.snapshot
 t3.thread.event
 t3.thread.status

@@ -362,6 +362,32 @@ export default defineSchema({
     .index("byUserExternalId", ["userExternalId"])
     .index("byRequest", ["userExternalId", "environmentId", "threadId", "requestId"]),
 
+  // One row per agent QUESTION this gateway has answered — the third thing that can block a turn,
+  // and not an approval (src/userInput.mjs). Same keying and the same purpose as the table above:
+  // the pending request lives in T3, and this only makes a second answer idempotent instead of a
+  // second dispatch.
+  //
+  // `answersHash` and not `answers`, deliberately. A question id is the question text and a
+  // free-text answer is whatever the owner typed, so storing either would put user content in a
+  // durable row. A SHA-256 of the canonicalised answer set distinguishes "the same answer again"
+  // from "a different answer", which is all the claim needs, and carries nothing readable.
+  providerUserInputAnswers: defineTable({
+    userExternalId: v.string(),
+    environmentId: v.string(),
+    threadId: v.string(),
+    requestId: v.string(),
+    answersHash: v.string(),
+    status: v.string(),
+    actorType: v.string(),
+    actorId: v.optional(v.union(v.string(), v.null())),
+    commandId: v.optional(v.union(v.string(), v.null())),
+    error: v.optional(v.union(v.string(), v.null())),
+    createdAt: v.string(),
+    updatedAt: v.string(),
+  })
+    .index("byUserExternalId", ["userExternalId"])
+    .index("byRequest", ["userExternalId", "environmentId", "threadId", "requestId"]),
+
   commandEvents: defineTable({
     userExternalId: v.string(),
     commandId: v.id("commands"),

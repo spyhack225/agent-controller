@@ -97,6 +97,12 @@ export function createStore(seed = {}, options = {}) {
   const providerApprovalDecisions = new Map(
     (seed.providerApprovalDecisions ?? []).map((decision) => [providerApprovalKey(decision), decision]),
   );
+  // Keyed the same way, for the third thing that can block a turn: a question the agent asked.
+  // See the note on claimProviderUserInputAnswer() — the row deliberately holds a FINGERPRINT of
+  // the answers rather than the answers themselves.
+  const providerUserInputAnswers = new Map(
+    (seed.providerUserInputAnswers ?? []).map((answer) => [providerApprovalKey(answer), answer]),
+  );
   const commandEvents = new Map((seed.commandEvents ?? []).map((event) => [event.id, event]));
   const auditLogs = [...(seed.auditLogs ?? [])];
   const listeners = new Set();
@@ -129,6 +135,7 @@ export function createStore(seed = {}, options = {}) {
       deviceProfiles: [...deviceProfiles.values()],
       commands: [...commands.values()],
       providerApprovalDecisions: [...providerApprovalDecisions.values()],
+      providerUserInputAnswers: [...providerUserInputAnswers.values()],
       commandEvents: [...commandEvents.values()],
       auditLogs,
     };
@@ -1997,6 +2004,94 @@ export function createStore(seed = {}, options = {}) {
       && (!threadId || record.threadId === threadId));
   }
 
+  // -------------------------------------------------------------------------------------------
+  // Provider user-input answers (src/userInput.mjs)
+  //
+  // Same primitive as claimProviderApprovalDecision() above, for the OTHER thing T3 holds open: a
+  // question the agent asked. The race is identical — two console tabs, a console and a
+  // controller, or one impatient double-tap all compete for the same live provider callback, and
+  // T3 has no idempotency key of its own — so the claim is again the primitive, not the write.
+  //
+  // ONE DELIBERATE DIFFERENCE: this row does NOT hold the answers. A question id is the question
+  // text (Claude requires it: ClaudeAdapter.ts:3782-3790) and a free-text answer is whatever the
+  // owner typed, so both are user content, and user content in a persisted row is content a
+  // support bundle has to redact. What the claim actually needs is only the ability to tell "the
+  // same answer again" from "a different answer", and a SHA-256 fingerprint
+  // (`userInputAnswersFingerprint()`) does that exactly. So the durable record carries ids, a
+  // status and a hash, and nothing readable at all.
+  //
+  // A record whose dispatch failed is re-claimable, for the same reason as an approval: otherwise
+  // a one-second T3 outage would lock the question out of reach until the turn was restarted.
+  function claimProviderUserInputAnswer({
+    userId,
+    environmentId,
+    threadId,
+    requestId,
+    answersHash,
+    actorType = "user",
+    actorId = null,
+  }) {
+    const key = providerApprovalKey({ userId, environmentId, threadId, requestId });
+    const existing = providerUserInputAnswers.get(key);
+    if (existing && existing.status !== "failed") {
+      return { claimed: false, conflict: existing.answersHash !== answersHash, answer: existing };
+    }
+    const record = {
+      id: existing?.id ?? createId("pinput"),
+      userId,
+      environmentId,
+      threadId,
+      requestId,
+      answersHash,
+      status: "claimed",
+      actorType,
+      actorId: actorId ?? null,
+      commandId: null,
+      error: null,
+      createdAt: existing?.createdAt ?? nowIso(),
+      updatedAt: nowIso(),
+    };
+    providerUserInputAnswers.set(key, record);
+    audit({
+      userId,
+      actorType,
+      actorId,
+      action: "provider_user_input.claimed",
+      targetId: requestId,
+      // `answersHash` and not the answers: an audit row is exactly the place this must not leak.
+      metadata: { environmentId, threadId, answersHash },
+    });
+    notifyChanged();
+    return { claimed: true, conflict: false, answer: record };
+  }
+
+  function updateProviderUserInputAnswer({
+    userId,
+    environmentId,
+    threadId,
+    requestId,
+    status,
+    commandId,
+    error,
+  }) {
+    const key = providerApprovalKey({ userId, environmentId, threadId, requestId });
+    const record = providerUserInputAnswers.get(key);
+    if (!record) return null;
+    if (status !== undefined) record.status = status;
+    if (commandId !== undefined) record.commandId = commandId;
+    if (error !== undefined) record.error = error;
+    record.updatedAt = nowIso();
+    notifyChanged();
+    return record;
+  }
+
+  function listProviderUserInputAnswers({ userId, environmentId = null, threadId = null }) {
+    return [...providerUserInputAnswers.values()].filter((record) =>
+      record.userId === userId
+      && (!environmentId || record.environmentId === environmentId)
+      && (!threadId || record.threadId === threadId));
+  }
+
   function claimCommandApproval({ userId, commandId, leaseMs = 30_000 }) {
     const command = commands.get(commandId);
     if (!command || command.userId !== userId || command.status !== "approval_required") return null;
@@ -2276,6 +2371,9 @@ export function createStore(seed = {}, options = {}) {
     claimProviderApprovalDecision,
     updateProviderApprovalDecision,
     listProviderApprovalDecisions,
+    claimProviderUserInputAnswer,
+    updateProviderUserInputAnswer,
+    listProviderUserInputAnswers,
     updateCommand,
     listCommands,
     listCommandEvents,

@@ -73,6 +73,40 @@ export async function normalizeIntent(payload, context = {}) {
         ...(decision === raw.trim() ? {} : { requestedDecision: raw.trim() }),
       };
     }
+    // Answering a QUESTION T3 asked — not a permission request, and not a gateway policy hold.
+    // The answer is a value, not a verdict. See src/userInput.mjs for the contract citations.
+    //
+    // Only the SHAPE is checked here, because normalizeIntent() has no thread and therefore no
+    // questions to check against. The semantic validation — every question answered, every choice
+    // an exact option label — happens in answerUserInputRequest() before the dispatch is built.
+    // Both run before anything leaves the gateway, which is the part that matters.
+    case "user_input_response": {
+      const answers = payload.answers;
+      if (!answers || typeof answers !== "object" || Array.isArray(answers)) {
+        throw new HttpError(400, "user_input_response answers must be an object keyed by question id.");
+      }
+      if (Object.keys(answers).length === 0) {
+        throw new HttpError(400, "user_input_response answers must not be empty.");
+      }
+      // `string | string[]` is the intersection of what every T3 adapter accepts; the Codex-only
+      // `{answers: […]}` object form is deliberately not offered, because Claude hands the record
+      // to its SDK verbatim and would not understand it.
+      for (const [questionId, value] of Object.entries(answers)) {
+        const ok = typeof value === "string"
+          || (Array.isArray(value) && value.every((entry) => typeof entry === "string"));
+        if (!ok) {
+          throw new HttpError(
+            400,
+            `user_input_response answer for ${JSON.stringify(questionId)} must be a string or an array of strings.`,
+          );
+        }
+      }
+      return {
+        type,
+        requestId: requireString(payload.requestId, "requestId"),
+        answers,
+      };
+    }
     default:
       throw new HttpError(400, `Unsupported intent type: ${type}.`);
   }

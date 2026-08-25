@@ -92,7 +92,7 @@ resolved. Status claims in this file are now expected to cite the file or test t
 | 3. Voice transcription | todo | Synchronous `disabled`, `mock`, and OpenAI provider branches and manual transcription exist | CPU-hosted Parakeet adapter, durable jobs, automatic processing, raw/normalized transcript versions, correction, retry, review/auto-send, and metrics |
 | 4. Controller voice | partial | Hosyond records 16 kHz mono audio to PSRAM and proves the microphone; the display and orb UI run on hardware | Shared gateway client, upload/dispatch, device request status, touch/review controls, PWA deep link, and response/interaction projection |
 | 5. T3 environments | partial | Eight typed failure reasons, reason-specific recovery, dependency preview, idempotent removal, reference repair, and in-place environment update exist | `T3Adapter`, probed capability manifest, console-first pairing/discovery, guided handoff, tombstones, and dependency-label confirmation |
-| 6. Live T3 conversation | todo | Snapshot message normalization, one-shot WebSocket RPC, compact pending-interaction counts, and low-level approval command building exist | Persistent thread subscription, event folding, streamed responses/tools, T3 approval and user-input UI, subagent/work graph, background liveness, reconnect/backfill, and notifications |
+| 6. Live T3 conversation | partial | Persistent thread subscription with resume/dedup, event folding, streamed responses/tools, T3 approval UI with the full four-decision set, and structured user-input UI with per-shape controls and pre-dispatch validation exist | Subagent/work graph, background liveness, and notifications |
 | 7. Security, observability, testing | partial | Auth, policy, TLS controls, rate limits, media ownership/quotas, signed URLs, redaction, audit, diagnostics, and strong Milestone 0.5 tests exist | Voice-queue/live-stream metrics and audit, request/task attribution, new store parity, failure injection, and end-to-end tests for the initiative |
 
 ## Milestone progress
@@ -147,8 +147,21 @@ before dispatch, so a double-answer is idempotent, a conflicting one is refused,
 has already abandoned is refused before anything is sent. `acceptForSession` is its own capability
 and no hardware profile carries it.
 
-Outstanding, and genuinely not started: structured `user_input_response`, subagent and
-parallel-task inspection, and the work-graph view.
+Structured user input landed alongside it, as a THIRD blocking kind rather than a third approval
+decision. T3 keeps `tool_user_input` off the approval path entirely
+(`ProviderRuntimeIngestion.ts:372`), so it has its own activity pair, its own
+`thread.user-input.respond` command, its own routes, its own store table and its own SSE event.
+The three question shapes — single-choice, multi-choice, free-text — are derived from `options` and
+`multiSelect`, rendered as the control they actually are, and validated against the request's own
+questions **before** dispatch: an answer that is not an exact option label is silently dropped by
+OpenCode, silently relabelled by xAI, and a hard failure on Codex, so guessing was never an option.
+The durable row holds a SHA-256 fingerprint of the answers and nothing readable.
+
+The device realm accepts exactly one shape — a single short multiple-choice question — and shows
+every other question with the sentence to put on screen instead of an unanswerable form.
+
+Outstanding, and genuinely not started: subagent and parallel-task inspection, and the work-graph
+view.
 
 Unproven: none of this has met a live T3 instance. It is verified against T3's checked-in contract
 (read from its shipped source map) and its real Effect runtime, plus 46 frontend tests whose trap

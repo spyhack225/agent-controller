@@ -549,7 +549,7 @@ GET /v1/device-profiles
 
 Manufacturing, claim, and owner-managed updates store one profile per device. The gateway enforces that profile on every intent:
 
-- `agent-controller`: normal hardware profile for prompts, media, status, approvals, session control, and policy-screened shell input.
+- `agent-controller`: normal hardware profile for prompts, media, status, approvals, agent questions, session control, and policy-screened shell input.
 - `read-only`: status only.
 - `power-controller`: high-trust profile for web clients or advanced devices; dangerous shell input still requires approval.
 
@@ -1205,6 +1205,22 @@ content-type: application/json
 ```
 
 If `approve` or `reject` is included in the configured device menu, the current firmware acts on the first pending command in the approval queue.
+
+The same response carries two more keys — `providerApprovals` (the agent asking permission) and
+`userInputRequests` (the agent asking a **question**) — under separate keys with separate answer
+routes. See [docs/api.md](api.md#agent-questions-structured-user-input) for the full payload; the
+short version for firmware:
+
+- Each entry in `userInputRequests` carries `answerable`. When it is **true**, render `prompt` and
+  the `options` array (two to four short labels) and let the owner press one; answer with
+  `POST /v1/device/user-input/:requestId` and body
+  `{"answers": {"<questionId>": "<the label pressed>"}}`, echoing `questionId` from the poll
+  verbatim.
+- When it is **false**, render `title`/`prompt` and the `hint` string ("Answer this in the
+  console.") and offer nothing to press. A free-text question, a multi-select, or a multi-question
+  form all land here. Showing the question anyway is the point: a controller that says "Working"
+  for twenty minutes while the agent waits on a question is the failure this replaces.
+- `canAnswerUserInput` is false for a `read-only` profile; render the requests, offer nothing.
 
 ## Intent Submit
 

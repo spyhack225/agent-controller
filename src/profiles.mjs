@@ -27,6 +27,23 @@ export const DEVICE_CAPABILITIES = Object.freeze([
   // detail is clipped to a line and a half — is not the same act as making it in the console with
   // the full diff on screen, so the built-in hardware profile does not carry it.
   "approval_response_persistent",
+  // Answering a QUESTION the agent asked — "which database?", "pick a branch name". A third,
+  // separate thing from either approval: the answer is a value, not a verdict, and the legal
+  // values are supplied by the agent itself (src/userInput.mjs).
+  //
+  // ONE capability, not two, and deliberately not split the way `approval_response` was. The
+  // split there existed because `acceptForSession` writes a standing permission rule that
+  // outlives the moment it was granted in — a genuinely different act. Nothing here does that:
+  // an answer is consumed by the turn that asked and leaves nothing behind. The most powerful
+  // shape, free text, is exactly as powerful as sending the agent a message, and every profile
+  // below that carries `user_input_response` already carries `agent_prompt`. A second capability
+  // would gate nothing that is not already gated.
+  //
+  // What IS restricted is where an answer may be given from, and that is a transport rule rather
+  // than a policy one: the device realm accepts only a single short multiple-choice question,
+  // because a 240x320 panel with five keys cannot take dictation. See
+  // `isDeviceAnswerableUserInput()`.
+  "user_input_response",
   "shell_input",
   // Creating a thread in the bound project, from hardware that has no keyboard. A write to the
   // owner's T3 environment, so it is a capability rather than a selection: `read-only` browses,
@@ -44,13 +61,14 @@ const DEVICE_PROFILES = [
   {
     id: "agent-controller",
     label: "Agent controller",
-    description: "Full remote agent control for prompts, media, status, approvals, session control, thread creation, and policy-screened shell input. Provider approvals may be allowed once, declined or cancelled; \"allow for this session\" is reserved for the console.",
+    description: "Full remote agent control for prompts, media, status, approvals, agent questions, session control, thread creation, and policy-screened shell input. Provider approvals may be allowed once, declined or cancelled; \"allow for this session\" is reserved for the console.",
     capabilities: [
       "status",
       "agent_prompt",
       "media_prompt",
       "session_control",
       "approval_response",
+      "user_input_response",
       "shell_input",
       "thread_create",
     ],
@@ -58,7 +76,7 @@ const DEVICE_PROFILES = [
   {
     id: "read-only",
     label: "Read only",
-    description: "Status inspection only. Pending approvals are visible, but answering them — like prompts, media, session control, thread creation, and shell input — is blocked.",
+    description: "Status inspection only. Pending approvals and agent questions are visible, but answering them — like prompts, media, session control, thread creation, and shell input — is blocked.",
     capabilities: ["status"],
   },
   {
@@ -72,6 +90,7 @@ const DEVICE_PROFILES = [
       "session_control",
       "approval_response",
       "approval_response_persistent",
+      "user_input_response",
       "shell_input",
       "thread_create",
     ],

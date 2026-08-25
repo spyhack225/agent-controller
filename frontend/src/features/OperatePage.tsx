@@ -42,6 +42,18 @@ import {
   type ProviderApproval,
   type ProviderApprovalDecision,
 } from "../providerApprovals";
+import {
+  describeDraftGap,
+  draftAnswers,
+  draftToAnswers,
+  mergeUserInputAnswers,
+  pendingUserInputRequests,
+  setDraftChoice,
+  setDraftText,
+  type UserInputAnswers,
+  type UserInputDraft,
+  type UserInputRequest,
+} from "../userInput";
 import type { Command, JsonRecord, SavedAction, T3SessionFailure } from "../types";
 import { useWorkspaceLoader } from "../useWorkspaceLoader";
 import {
@@ -159,6 +171,18 @@ export function OperatePage({ controller }: { controller: Controller }) {
       ),
     ).filter((approval) => !approval.localDecision),
     [c.providerApprovalDecisions, live],
+  );
+  // The THIRD blocking kind: the agent is not asking permission, it is asking a question. Kept in
+  // its own list, rendered in its own card, and answered on its own route — see
+  // frontend/src/userInput.ts for why collapsing any two of the three would be a correctness bug.
+  const threadUserInputRequests = useMemo(
+    () => pendingUserInputRequests(
+      mergeUserInputAnswers(
+        live?.userInputRequests ?? [],
+        Object.values(c.userInputAnswers ?? {}),
+      ),
+    ).filter((request) => !request.localAnswer),
+    [c.userInputAnswers, live],
   );
   const threadCommands = useMemo(
     () => c.recentCommands.filter((command) =>
@@ -774,6 +798,27 @@ export function OperatePage({ controller }: { controller: Controller }) {
             />
           ))}
 
+          {threadUserInputRequests.map((request) => (
+            <UserInputCard
+              key={request.requestId}
+              request={request}
+              busyAction={c.busyAction}
+              // The console always acts as `power-controller`, which carries `user_input_response`
+              // (src/profiles.mjs) — the route hardcodes that actor. The prop exists because the
+              // card is also the thing a read-only surface would render, and it must be able to
+              // show a question it cannot answer rather than hide it.
+              canAnswer
+              onAnswer={(answers) => {
+                if (!c.selectedEnvironmentId || !c.selectedThreadId) return;
+                void c.answerUserInput?.(
+                  { environmentId: c.selectedEnvironmentId, threadId: c.selectedThreadId },
+                  request.requestId,
+                  answers,
+                );
+              }}
+            />
+          ))}
+
           {liveEntries ? (
             <div className="thread-message-list" aria-label="Thread messages" data-live="true">
               {liveEntries.map((entry) => (
@@ -1102,6 +1147,133 @@ export function ProviderApprovalCard({
             ))}
           </div>
         )}
+      </section>
+    </LiveFrame>
+  );
+}
+
+/**
+ * A QUESTION the agent is asking — the third blocking kind, and the only one answered with a value.
+ *
+ * The shape of each question decides the control, and nothing here ever falls back to a text box
+ * for a question the agent enumerated. That is not a style choice: an answer that is not an exact
+ * option label is silently dropped by OpenCode (opencodeRuntime.ts:376), silently relabelled as an
+ * "Other" note by xAI (XAiAcpExtension.ts:133-155), and a hard failure on Codex — so a free-text
+ * box next to a three-option question would be the console inviting an answer that quietly does
+ * not arrive.
+ *
+ *   single-choice   radio group over the agent's own labels
+ *   multi-choice    checkbox group over the same
+ *   free-text       a textarea, and only when the agent supplied no options at all
+ *
+ * Nothing is preselected. A question exists because the agent could not decide; a console that
+ * pre-picks an option is answering on the owner's behalf in exactly the worst place to do it.
+ */
+export function UserInputCard({
+  request,
+  busyAction,
+  canAnswer,
+  onAnswer,
+}: {
+  request: UserInputRequest;
+  busyAction: string | null;
+  canAnswer: boolean;
+  onAnswer: (answers: UserInputAnswers) => void;
+}) {
+  const [draft, setDraft] = useState<UserInputDraft>(() => draftAnswers(request));
+  // A repeated request id means the agent is asking again; the old draft belongs to the old
+  // question and must not be submitted against the new one.
+  const [draftFor, setDraftFor] = useState(request.requestId);
+  if (draftFor !== request.requestId) {
+    setDraftFor(request.requestId);
+    setDraft(draftAnswers(request));
+  }
+
+  const busy = busyAction === `user-input-${request.requestId}`;
+  const gap = describeDraftGap(request, draft);
+
+  return (
+    <LiveFrame active tone="attention" className="live-frame live-frame--approval">
+      <section className="thread-approval" data-approval-kind="question">
+        <div>
+          <div className="flex flex-wrap items-center gap-2">
+            <StatusBadge tone="warning" label="Agent has a question" />
+            <span className="font-mono text-[10px] text-ink-faint">{request.requestId}</span>
+          </div>
+          {!request.answerable ? (
+            <p className="mt-3 text-sm text-ink-muted">
+              The agent asked something this gateway cannot render. Answer it in T3 directly.
+            </p>
+          ) : (
+            <div className="mt-3 flex flex-col gap-4">
+              {request.questions.map((question) => (
+                <fieldset key={question.id} className="flex flex-col gap-2">
+                  <legend className="text-sm font-semibold">{question.header}</legend>
+                  <p className="text-xs text-ink-muted">{question.question}</p>
+
+                  {question.shape === "free-text" ? (
+                    <textarea
+                      className="w-full rounded border border-line bg-surface p-2 text-sm"
+                      rows={3}
+                      value={typeof draft[question.id] === "string" ? draft[question.id] as string : ""}
+                      disabled={!canAnswer || busy}
+                      aria-label={question.question}
+                      onChange={(event) =>
+                        setDraft((current) => setDraftText(current, question, event.target.value))}
+                    />
+                  ) : (
+                    question.options.map((option) => {
+                      const value = draft[question.id];
+                      const checked = question.shape === "multi-choice"
+                        ? Array.isArray(value) && value.includes(option.label)
+                        : value === option.label;
+                      return (
+                        <label key={option.label} className="flex items-start gap-2 text-sm">
+                          <input
+                            type={question.shape === "multi-choice" ? "checkbox" : "radio"}
+                            name={`user-input-${request.requestId}-${question.id}`}
+                            value={option.label}
+                            checked={checked}
+                            disabled={!canAnswer || busy}
+                            onChange={() =>
+                              setDraft((current) => setDraftChoice(current, question, option.label))}
+                          />
+                          <span>
+                            <span className="font-medium">{option.label}</span>
+                            {option.description && option.description !== option.label ? (
+                              <span className="block text-xs text-ink-muted">{option.description}</span>
+                            ) : null}
+                          </span>
+                        </label>
+                      );
+                    })
+                  )}
+                </fieldset>
+              ))}
+            </div>
+          )}
+          <p className="mt-2 text-xs text-ink-muted">
+            The agent stopped mid-turn to ask. It stays stopped until you answer.
+          </p>
+        </div>
+        {!canAnswer ? (
+          <p className="text-xs text-ink-muted">
+            This profile can see the agent&apos;s questions but not answer them.
+          </p>
+        ) : request.answerable ? (
+          <div className="flex flex-col gap-2">
+            <Button
+              variant="primary"
+              size="sm"
+              busy={busy}
+              disabled={gap !== null}
+              onClick={() => onAnswer(draftToAnswers(request, draft))}
+            >
+              <Check className="size-4" /> Send answer
+            </Button>
+            {gap ? <p className="text-xs text-ink-muted">{gap}</p> : null}
+          </div>
+        ) : null}
       </section>
     </LiveFrame>
   );

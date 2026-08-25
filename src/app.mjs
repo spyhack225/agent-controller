@@ -135,6 +135,13 @@ import {
   normalizeProviderApprovalDecision,
 } from "./providerApprovals.mjs";
 import {
+  collectUserInputRequests,
+  deviceUserInputView,
+  isDeviceAnswerableUserInput,
+  userInputAnswersFingerprint,
+  validateUserInputAnswers,
+} from "./userInput.mjs";
+import {
   buildT3ReleaseStatus,
   fetchLatestT3Release,
   runT3CompatibilityCheck,
@@ -1343,6 +1350,58 @@ export function createApp({
           threadId: decodeURIComponent(providerApprovalAnswerMatch[2]),
           requestId: decodeURIComponent(providerApprovalAnswerMatch[3]),
           decision: requireString(body.decision, "decision"),
+          actor: { type: "user", id: user.id, userId: user.id, profile: "power-controller" },
+          config,
+          baseUrl: requestBaseUrl(req),
+          policyContext: {
+            user,
+            networkLocation: classifyNetworkLocation(req, config),
+            ...(config.billingEnforced
+              ? { subscriptionTier: effectiveTier(await store.getUserSubscription?.(user.id)) }
+              : {}),
+          },
+        });
+        return sendJson(res, output.duplicate ? 200 : 202, output);
+      }
+
+      // Agent questions on one thread. The THIRD blocking kind — not a gateway hold and not a
+      // provider approval — kept on its own path so a client cannot answer one thinking it is
+      // answering another. A read: it fetches T3's work log and this gateway's answer rows.
+      const userInputMatch = url.pathname.match(/^\/v1\/t3\/environments\/([^/]+)\/threads\/([^/]+)\/user-input$/u);
+      if (req.method === "GET" && userInputMatch) {
+        const user = await authenticateUser(req, store, config, null, clerkAuth);
+        await enforceUserRead(req, res, rateLimiter, config, user);
+        const environment = await store.getEnvironmentForUser(user.id, userInputMatch[1]);
+        if (!environment) throw new HttpError(404, "Environment not found.");
+        assertEnvironmentTokenActive(environment);
+        const threadId = decodeURIComponent(userInputMatch[2]);
+        const requests = await readUserInputRequests({ store, userId: user.id, environment, threadId });
+        return sendJson(res, 200, {
+          environmentId: environment.id,
+          threadId,
+          requests,
+          // A read-only actor SEES the question and is offered nothing to submit with; hiding it
+          // would mean nobody knows the agent is blocked.
+          canAnswer: capabilitiesForProfile(
+            await resolveActorProfile(store, user.id, "power-controller"),
+          ).has("user_input_response"),
+        });
+      }
+
+      const userInputAnswerMatch = url.pathname.match(/^\/v1\/t3\/environments\/([^/]+)\/threads\/([^/]+)\/user-input\/([^/]+)$/u);
+      if (req.method === "POST" && userInputAnswerMatch) {
+        const user = await authenticateUser(req, store, config, null, clerkAuth);
+        await enforceUserWrite(req, res, rateLimiter, config, user);
+        const environment = await store.getEnvironmentForUser(user.id, userInputAnswerMatch[1]);
+        if (!environment) throw new HttpError(404, "Environment not found.");
+        const body = await readJson(req);
+        const output = await answerUserInputRequest({
+          store,
+          events,
+          environment,
+          threadId: decodeURIComponent(userInputAnswerMatch[2]),
+          requestId: decodeURIComponent(userInputAnswerMatch[3]),
+          answers: body.answers,
           actor: { type: "user", id: user.id, userId: user.id, profile: "power-controller" },
           config,
           baseUrl: requestBaseUrl(req),
@@ -2864,17 +2923,26 @@ export function createApp({
         const capabilities = capabilitiesForProfile(
           await resolveActorProfile(store, device.userId, device.profile),
         );
-        const provider = await readDeviceProviderApprovals({ store, device });
+        const [provider, userInput] = await Promise.all([
+          readDeviceProviderApprovals({ store, device }),
+          readDeviceUserInputRequests({ store, device }),
+        ]);
         return sendJson(res, 200, {
           commands: commands
             .filter((command) => command.status === "approval_required")
             .map((command) => ({ ...command, kind: "gateway" })),
           providerApprovals: provider.approvals,
+          // The third key, and the third question. Each entry carries `answerable`: true means the
+          // device may POST /v1/device/user-input/:requestId, false means it should render the
+          // question and the `hint` and offer no buttons. Both are better than "Working" forever.
+          userInputRequests: userInput.requests,
           // A read-only controller sees what is waiting and is offered nothing to press. Hiding
           // the request would be worse: the owner walking past the device would have no idea the
           // agent was blocked.
           allowedDecisions: allowedProviderApprovalDecisions(capabilities),
+          canAnswerUserInput: capabilities.has("user_input_response"),
           ...(provider.error ? { providerApprovalsError: provider.error } : {}),
+          ...(userInput.error ? { userInputError: userInput.error } : {}),
         });
       }
 
@@ -2901,6 +2969,36 @@ export function createApp({
           config,
           baseUrl: requestBaseUrl(req),
           policyContext: { networkLocation: classifyNetworkLocation(req, config) },
+        });
+        return sendJson(res, output.duplicate ? 200 : 202, output);
+      }
+
+      // Answering an agent question from hardware. Separate route again: a different id space
+      // (T3's requestId), a different body (`answers`, keyed by question id), and a shape
+      // restriction no other realm has — `answerUserInputRequest({deviceRealm: true})` refuses
+      // anything but a single short multiple-choice question, because a 240x320 panel with five
+      // keys cannot take dictation and must not pretend it can.
+      const deviceUserInputMatch = url.pathname.match(/^\/v1\/device\/user-input\/([^/]+)$/u);
+      if (req.method === "POST" && deviceUserInputMatch) {
+        const device = await authenticateDevice(req, store, null, config);
+        await enforceDeviceWrite(req, res, rateLimiter, config, device);
+        requireClaimedDevice(device);
+        const body = await readJson(req);
+        const environment = await boundDeviceEnvironment(store, device);
+        const threadId = optionalString(body.threadId) ?? optionalString(device.config?.threadId);
+        if (!threadId) throw new HttpError(409, "Device has no thread selected.");
+        const output = await answerUserInputRequest({
+          store,
+          events,
+          environment,
+          threadId,
+          requestId: decodeURIComponent(deviceUserInputMatch[1]),
+          answers: body.answers,
+          actor: { type: "device", id: device.id, userId: device.userId, profile: device.profile },
+          config,
+          baseUrl: requestBaseUrl(req),
+          policyContext: { networkLocation: classifyNetworkLocation(req, config) },
+          deviceRealm: true,
         });
         return sendJson(res, output.duplicate ? 200 : 202, output);
       }
@@ -4154,6 +4252,257 @@ async function answerProviderApproval({
   };
 }
 
+// ---------------------------------------------------------------------------------------------
+// STRUCTURED USER INPUT — the third thing that can block a turn
+//
+// Not a gateway hold ("you tried to run rm -rf") and not a provider approval ("Claude wants to
+// edit src/app.mjs"), but a QUESTION: the agent needs the owner to tell it something, and the
+// answer is a value rather than a verdict. Separate routes, separate store rows, separate SSE
+// event, and every record stamped `kind: "question"`.
+//
+// See src/userInput.mjs for the T3 contract and its file:line evidence.
+// ---------------------------------------------------------------------------------------------
+
+/**
+ * Every user-input request on a thread, with this gateway's own answer record folded in.
+ *
+ * Read from `GET /api/orchestration/threads/:threadId` for the same reason approvals are: the
+ * orchestration snapshot serves thread bodies empty and has no activities to derive a question
+ * from. Deliberately unwindowed — a `turnLimit` would bound the read to the newest turn, and being
+ * wrong about whether the agent is still waiting is worse than one larger response.
+ */
+async function readUserInputRequests({ store, userId, environment, threadId }) {
+  const [thread, answers] = await Promise.all([
+    fetchT3ThreadDetail(environment, threadId),
+    store.listProviderUserInputAnswers({ userId, environmentId: environment.id, threadId }),
+  ]);
+  const byRequestId = new Map((answers ?? []).map((row) => [row.requestId, row]));
+  return collectUserInputRequests(thread, { threadId }).map((request) => ({
+    ...request,
+    environmentId: environment.id,
+    deviceAnswerable: isDeviceAnswerableUserInput(request),
+    // What THIS gateway did about it, which is not the same as what T3 reports: an answer can be
+    // held here awaiting a gateway confirmation and not have reached the provider at all.
+    localAnswer: publicUserInputAnswer(byRequestId.get(request.requestId) ?? null),
+  }));
+}
+
+/**
+ * The questions waiting on the controller's own bound thread, clipped for a small screen.
+ *
+ * Never throws, for the same reason `readDeviceProviderApprovals()` does not: a device that cannot
+ * reach T3 must still be able to see and answer the GATEWAY approvals the same response carries.
+ */
+async function readDeviceUserInputRequests({ store, device }) {
+  const threadId = optionalString(device.config?.threadId);
+  if (!threadId) return { requests: [], error: null };
+  try {
+    const environment = await boundDeviceEnvironment(store, device);
+    assertEnvironmentTokenActive(environment);
+    const requests = await readUserInputRequests({
+      store,
+      userId: device.userId,
+      environment,
+      threadId,
+    });
+    return {
+      // Unanswerable questions are INCLUDED on purpose. An owner walking past a controller that
+      // says "the agent is asking you something — answer it in the console" is far better served
+      // than one whose device has said "Working" for twenty minutes.
+      requests: requests
+        .filter((request) => request.status === "pending" && !request.localAnswer)
+        .map((request) => deviceUserInputView(request)),
+      error: null,
+    };
+  } catch (error) {
+    return { requests: [], error: errorMessage(error) };
+  }
+}
+
+/**
+ * The durable record, which holds a fingerprint of the answers and never the answers.
+ *
+ * A question id is the question text and free text is whatever the owner typed; both are user
+ * content, and neither belongs in a row a support bundle can reach. `answersHash` is enough to
+ * tell a repeat from a conflict, which is the only thing the claim needs.
+ */
+function publicUserInputAnswer(record) {
+  if (!record) return null;
+  return {
+    requestId: record.requestId,
+    answersHash: record.answersHash,
+    status: record.status,
+    actorType: record.actorType,
+    commandId: record.commandId ?? null,
+    error: record.error ?? null,
+    answeredAt: record.createdAt,
+    updatedAt: record.updatedAt,
+  };
+}
+
+/**
+ * Answer one agent question, exactly once, and never with something the provider will reject.
+ *
+ * Same five-step ordering as `answerProviderApproval()`, with one extra step that does the real
+ * work here:
+ *
+ *   1. VERIFY IT IS STILL OPEN against T3's own work log, before anything is written. This catches
+ *      a question T3 has already resolved, abandoned as stale, or lost with its turn — T3 itself
+ *      would accept the dispatch and only fail later, asynchronously, as an error activity nobody
+ *      is reading.
+ *   2. VALIDATE THE ANSWER AGAINST THE QUESTION'S OWN SHAPE. This is the step approvals do not
+ *      need, because a decision is one of four words. An answer is a value, the legal values are
+ *      supplied by the agent, and the three adapters disagree about what they do with an illegal
+ *      one — Codex fails the response, OpenCode silently answers nothing, xAI silently relabels it
+ *      as a note. Sending free text where T3 expects one of three enumerated options must fail
+ *      HERE, with the options named, rather than three seconds later inside a provider.
+ *   3. CLAIM it in the store, keyed on a fingerprint of the validated answers. First caller wins;
+ *      a second caller sending the SAME answers is told it is a duplicate (200, no second
+ *      dispatch); one sending DIFFERENT answers is refused (409), because the first answer has
+ *      already left for the provider.
+ *   4. DISPATCH through the ordinary `submitIntent()` path, so the policy engine, the command
+ *      record, the command-event timeline and the SSE broadcast all behave as they do for every
+ *      other write.
+ *   5. RELEASE the claim if that failed, so a refused or unreachable dispatch does not lock the
+ *      question out of reach for the rest of the session.
+ */
+async function answerUserInputRequest({
+  store,
+  events,
+  environment,
+  threadId,
+  requestId,
+  answers,
+  actor,
+  config,
+  baseUrl = null,
+  policyContext = {},
+  deviceRealm = false,
+}) {
+  assertEnvironmentTokenActive(environment);
+
+  const requests = await readUserInputRequests({
+    store,
+    userId: actor.userId,
+    environment,
+    threadId,
+  });
+  const request = requests.find((candidate) => candidate.requestId === requestId) ?? null;
+  if (!request) {
+    throw new HttpError(404, "This thread has no record of that question.", { requestId });
+  }
+  if (request.status === "resolved") {
+    throw new HttpError(409, "T3 has already resolved this question.", { request });
+  }
+  if (request.status === "stale") {
+    // T3's own wording is "Provider callback state does not survive app restarts or recovered
+    // sessions. Restart the turn to continue." Nothing the gateway sends can revive it.
+    throw new HttpError(409, "T3 abandoned this question; it can no longer be answered.", { request });
+  }
+  if (!request.answerable) {
+    throw new HttpError(422, "This question carries no answerable content.", { request });
+  }
+  // A hardware refusal, not a policy one: the profile may hold `user_input_response` and still be
+  // unable to render this shape on five keys. Refused with the console named, never guessed at.
+  if (deviceRealm && !request.deviceAnswerable) {
+    throw new HttpError(
+      422,
+      "This question cannot be answered from a controller. Answer it in the console.",
+      { request },
+    );
+  }
+
+  const validation = validateUserInputAnswers(request.questions, answers);
+  if (!validation.valid) {
+    throw new HttpError(422, validation.reason, {
+      request,
+      ...(validation.questionId ? { questionId: validation.questionId } : {}),
+    });
+  }
+  const answersHash = userInputAnswersFingerprint(validation.answers);
+
+  const claim = await store.claimProviderUserInputAnswer({
+    userId: actor.userId,
+    environmentId: environment.id,
+    threadId,
+    requestId,
+    answersHash,
+    actorType: actor.type,
+    actorId: actor.type === "device" ? actor.id : null,
+  });
+  if (!claim.claimed) {
+    if (claim.conflict) {
+      throw new HttpError(409, "This question was already answered differently.", {
+        request,
+        answer: publicUserInputAnswer(claim.answer),
+      });
+    }
+    return {
+      request,
+      duplicate: true,
+      answer: publicUserInputAnswer(claim.answer),
+      command: claim.answer.commandId
+        ? await store.getCommandForUser(actor.userId, claim.answer.commandId)
+        : null,
+    };
+  }
+
+  let output;
+  try {
+    output = await submitIntent({
+      store,
+      environment,
+      body: {
+        threadId,
+        intent: { type: "user_input_response", requestId, answers: validation.answers },
+      },
+      actor,
+      config,
+      baseUrl,
+      policyContext,
+    });
+  } catch (error) {
+    await store.updateProviderUserInputAnswer({
+      userId: actor.userId,
+      environmentId: environment.id,
+      threadId,
+      requestId,
+      status: "failed",
+      error: errorMessage(error),
+    });
+    throw error;
+  }
+
+  const record = await store.updateProviderUserInputAnswer({
+    userId: actor.userId,
+    environmentId: environment.id,
+    threadId,
+    requestId,
+    status: output.command?.status === "dispatched" ? "dispatched" : "held",
+    commandId: output.command?.id ?? null,
+  });
+
+  // The answers are NOT in this payload. A console listening on the stream learns that the
+  // question is closed and who closed it; the words themselves reach it through the live thread,
+  // where they are relayed rather than stored.
+  events?.broadcastToUser?.(actor.userId, "t3.user-input.answered", {
+    environmentId: environment.id,
+    threadId,
+    requestId,
+    answersHash,
+    status: record?.status ?? "dispatched",
+    commandId: output.command?.id ?? null,
+    observedAt: new Date().toISOString(),
+  });
+
+  return {
+    request: { ...request, localAnswer: publicUserInputAnswer(record) },
+    duplicate: false,
+    answer: publicUserInputAnswer(record),
+    command: output.command ?? null,
+  };
+}
+
 async function resolveActorProfile(store, userId, profileId) {
   if (typeof profileId !== "string" || isKnownDeviceProfile(profileId)) return profileId;
   const custom = await store.getUserDeviceProfile?.(userId, profileId);
@@ -4196,6 +4545,16 @@ function collectMediaUploadIds(intent, body) {
 // Inline media bytes and the signed callback URL are stripped so neither media content
 // nor a live access token is retained in the command record.
 function storableT3Command(command) {
+  // An answer to an agent question is user content twice over: the KEYS are question text (Claude
+  // requires the id to equal it — ClaudeAdapter.ts:3782-3790) and a free-text value is whatever
+  // the owner typed. `thread.approval.respond` persists a four-word enum and nothing else, and
+  // this holds the same line: the command row records that a question was answered and how many
+  // questions it had, never what was said. The fingerprint on the store row is what makes a
+  // replay recognisable; the words themselves are relayed live and kept nowhere.
+  if (command?.type === "thread.user-input.respond") {
+    const { answers, ...rest } = command;
+    return { ...rest, answerCount: Object.keys(answers ?? {}).length };
+  }
   // A project launch persists two nested commands; the first turn is the one that carries media.
   if (command?.createThread || command?.startTurn) {
     return {
@@ -4910,6 +5269,10 @@ function redactIntent(intent) {
     // the owner's words exactly as much as a prompt is.
     if (["text", "command", "transcript", "description", "prompt", "title"].includes(key) && typeof value === "string") {
       output[key] = redactText(value);
+    } else if (key === "answers" && value && typeof value === "object") {
+      // A `user_input_response` intent. Both halves are user content — the keys are question text
+      // and the values may be free text — so the whole record collapses to a count and a digest.
+      output[key] = redactUserInputAnswers(value);
     } else {
       output[key] = redactSupportValue(value);
     }
@@ -4958,6 +5321,18 @@ function redactText(value) {
     redacted: true,
     length: value.length,
     sha256: createHash("sha256").update(value, "utf8").digest("hex"),
+  };
+}
+
+// Answer sets are collapsed whole rather than key by key: a question id IS the question text, so
+// preserving the keys and redacting only the values would leak exactly the half that describes
+// what the agent was asking about.
+function redactUserInputAnswers(answers) {
+  const entries = Object.entries(answers);
+  return {
+    redacted: true,
+    count: entries.length,
+    sha256: createHash("sha256").update(JSON.stringify(entries), "utf8").digest("hex"),
   };
 }
 

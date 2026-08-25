@@ -445,6 +445,45 @@ confident nonsense rather than French, so that is a configuration error and is r
 `providerMs`, `normalizeMs` and `totalMs`, plus `realtimeFactor` (compute seconds per audio second)
 when the sidecar reports the clip length — the number that decides whether a GPU is worth adding.
 
+### Three things can block a turn, and they are not the same question
+
+Two of the three predate this note; the third is `src/userInput.mjs`, and collapsing any two would
+be a correctness bug.
+
+| | what it is | answered at | answer |
+|---|---|---|---|
+| gateway hold | `evaluateIntentPolicy()` refused to dispatch something the owner asked for | `/v1/commands/:id/approve\|reject` | approve / reject |
+| provider approval | the agent stopped mid-turn asking permission (`src/providerApprovals.mjs`) | `.../threads/:id/approvals/:requestId` | T3's four `ProviderApprovalDecision` values |
+| agent question | the agent needs a **value** — "which database?" (`src/userInput.mjs`) | `.../threads/:id/user-input/:requestId` | a per-question answer set |
+
+T3 separates the last two in its own code: `ProviderRuntimeIngestion.ts:372` and `:403` return `[]`
+for a `tool_user_input` request, so it produces no approval activity at all and travels on
+`user-input.requested` / `user-input.resolved` (`:503-537`) instead, with `tone: "info"` rather than
+`"approval"`. Its stale-request phrases are four *different* strings from the approval ones
+(`decider.ts:49-52`) — reusing the approval matcher would never match and every abandoned question
+would read as pending forever.
+
+**Question shapes come from the data, not a flag.** `options` is a required array that may be empty
+(`providerRuntime.ts:450-459`), so: non-empty + `!multiSelect` = single-choice, non-empty +
+`multiSelect` = multi-choice, empty = free-text. There is no file-path shape and no structured value.
+
+**Validation happens before dispatch, for the same reason model slugs do.** An answer that is not an
+exact option label is *silently dropped* by OpenCode (`opencodeRuntime.ts:376`), *silently relabelled*
+as an "Other" note by xAI (`XAiAcpExtension.ts:133-155`), and a hard failure on Codex
+(`CodexSessionRuntime.ts:792`). The universal answer value is `string | string[]`; the
+`{answers: […]}` object form is Codex-only and is never emitted, because Claude hands the record to
+its SDK verbatim.
+
+**The answer key is the question id, and on Claude the id IS the question text**
+(`ClaudeAdapter.ts:3782-3790`). That makes both halves user content, which is why
+`providerUserInputAnswers` stores a SHA-256 fingerprint and nothing else, `storableT3Command()`
+strips `answers` down to an `answerCount`, and `redactIntent()` collapses the whole record.
+
+**The device answers exactly one shape**: a single single-choice question with two to four short
+options. Everything else is still *listed* on `GET /v1/device/approvals` with `answerable: false` and
+a `hint` — a controller that says "Working" for twenty minutes while the agent waits is the failure
+this replaces — and posting it anyway is a 422 that names the console.
+
 ### Device profiles
 
 Three built-ins live in code (`src/profiles.mjs`); custom profiles are user-scoped rows. The

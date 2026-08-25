@@ -348,3 +348,53 @@ test("the Convex media serialisers return every field written to the row", async
     assert.match(mediaBody, new RegExp(`\\b${field}\\b`, "u"), `mediaForGateway() drops ${field}.`);
   }
 });
+
+test("the two blocking-request claims are the same check-and-set on both backends", async () => {
+  const [memory, convex, schema] = await Promise.all([
+    readFile(join(ROOT, "src", "store.mjs"), "utf8"),
+    readFile(join(ROOT, "convex", "gatewayStore.ts"), "utf8"),
+    readFile(join(ROOT, "convex", "schema.ts"), "utf8"),
+  ]);
+
+  // An owner running on Convex must get the same "already answered" answer as one running on
+  // memory, or a second console tab silently sends a second answer to a live provider callback.
+  // Compared structurally rather than textually: the Convex handler is a Convex function wrapper
+  // and cannot match the .mjs body line for line, so what is asserted is that both make the SAME
+  // three decisions.
+  for (const [label, body] of [
+    ["memory", extractFunctionWithParams(memory, "claimProviderUserInputAnswer")],
+    ["convex", extractConvexHandler(convex, "claimProviderUserInputAnswer")],
+  ]) {
+    // 1. A live record blocks a re-claim; a failed one does not, or a one-second T3 outage would
+    //    lock the question out of reach for the rest of the session.
+    assert.match(body, /status\s*!==\s*"failed"/u, `${label} claim no longer allows a retry after a failed dispatch.`);
+    // 2. A different answer is a conflict, the same answer is a duplicate.
+    assert.match(body, /conflict:\s*existing\.answersHash\s*!==/u, `${label} claim no longer detects a conflicting answer.`);
+    // 3. The row records a fingerprint, never the answers.
+    assert.match(body, /answersHash/u, `${label} claim no longer stores an answer fingerprint.`);
+    // Comments stripped: the note explaining WHY the answers are absent must not read as their
+    // presence.
+    assert.doesNotMatch(
+      normalize(body),
+      /\banswers\b\s*[:,]/u,
+      `${label} claim persists the answers themselves.`,
+    );
+  }
+
+  // The audit row must not leak them either: this is exactly where user content would hide.
+  for (const [label, source] of [["memory", memory], ["convex", convex]]) {
+    const body = label === "memory"
+      ? extractFunctionWithParams(memory, "claimProviderUserInputAnswer")
+      : extractConvexHandler(convex, "claimProviderUserInputAnswer");
+    assert.match(body, /action:\s*"provider_user_input\.claimed"/u, `${label} claim writes no audit row.`);
+    assert.ok(source.length > 0);
+  }
+
+  // And the durable schema has no column that could hold them.
+  const start = schema.indexOf("providerUserInputAnswers: defineTable({");
+  assert.notEqual(start, -1, "the providerUserInputAnswers table is missing from convex/schema.ts.");
+  const table = matchBraces(schema, schema.indexOf("{", schema.indexOf("(", start)));
+  const fields = [...table.matchAll(/^\s{4}(\w+):/gmu)].map((match) => match[1]);
+  assert.ok(fields.includes("answersHash"), "the table does not carry the fingerprint.");
+  assert.ok(!fields.includes("answers"), "the table carries the answers, which are user content.");
+});

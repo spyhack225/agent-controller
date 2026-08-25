@@ -275,6 +275,16 @@ const BASELINE_RULES = Object.freeze([
     risk: "medium",
     matches: (intent) => intent.type === "approval_response" && intent.decision === "accept",
   },
+  {
+    // Answering a question is not granting a permission: the agent asked, the owner replied, and
+    // the turn continues with a value it was already waiting for. Nothing is executed and no rule
+    // is written. Free text is the most powerful shape and is exactly as powerful as
+    // `agent_prompt`, which is `baseline.default` too — so this is stated explicitly rather than
+    // left to fall through, precisely so that it is a decision on the record.
+    id: "baseline.user-input-response",
+    risk: "low",
+    matches: (intent) => intent.type === "user_input_response",
+  },
   { id: "baseline.default", risk: "low", matches: () => true },
 ]);
 
@@ -882,6 +892,10 @@ export function capabilityForIntent(intent) {
       return isPersistentProviderApprovalDecision(intent.decision)
         ? "approval_response_persistent"
         : "approval_response";
+    // Answering a question the agent asked. One capability, not two — see the note in
+    // src/profiles.mjs for why the `approval_response` split does not apply here.
+    case "user_input_response":
+      return "user_input_response";
     case "session_control":
       return "session_control";
     // Not a dispatchable intent — `normalizeIntent()` rejects it, so a device cannot post it to

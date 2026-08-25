@@ -50,6 +50,11 @@ import {
   foldApprovalActivity,
   type ProviderApproval,
 } from "./providerApprovals";
+import {
+  collectUserInputRequests,
+  foldUserInputActivity,
+  type UserInputRequest,
+} from "./userInput";
 
 export const LIVE_THREAD_SEEN_LIMIT = 512;
 
@@ -142,6 +147,15 @@ export interface LiveThreadState {
    * requestId) and there would be nothing left to answer with.
    */
   approvals: ProviderApproval[];
+  /**
+   * Agent questions — the THIRD thing that can block a turn, and not an approval of either kind.
+   * T3 keeps them off the approval path entirely (ProviderRuntimeIngestion.ts:372 returns `[]` for
+   * a `tool_user_input` request), so they arrive as their own activity kinds and are folded into
+   * their own field; see `frontend/src/userInput.ts`. Kept out of `entries` for the same reason
+   * approvals are: an entry drops the payload, and with it the questions there would be nothing
+   * left to answer with.
+   */
+  userInputRequests: UserInputRequest[];
   /** Highest sequence seen. Display and diagnostics only — dedup is `seen`. */
   sequence: number | null;
   /** The sequence the current snapshot represents; anything at or below it is already applied. */
@@ -176,6 +190,7 @@ export function createLiveThreadState({ environmentId, threadId }: LiveThreadTar
     historyTruncated: false,
     entries: [],
     approvals: [],
+    userInputRequests: [],
     sequence: null,
     baseSequence: null,
     sessionStatus: null,
@@ -249,6 +264,9 @@ export function applyThreadSnapshot(state: LiveThreadState, payload: unknown): L
     // REPLACE, like the transcript: the snapshot is the thread's approval state in full, and an
     // approval carried over from a stale transcript is a card offering to answer a dead request.
     approvals: collectProviderApprovals(thread, state.threadId),
+    // REPLACE for the same reason: a question carried over from a stale transcript is a form
+    // offering to answer something nothing is waiting on.
+    userInputRequests: collectUserInputRequests(thread, state.threadId),
     sequence: snapshotSequence,
     baseSequence: snapshotSequence,
     seen: [],
@@ -338,7 +356,17 @@ export function applyThreadEvent(state: LiveThreadState, payload: unknown): Live
     const withApprovals = approvals === next.approvals
       ? next
       : { ...next, approvals: [...approvals] };
-    return upsert(withApprovals, activityEntryFrom(activity, occurredAt));
+    // The two folds are independent: an activity is either an approval row or a user-input row,
+    // never both, and each returns its input unchanged when the activity is not its business.
+    const questions = foldUserInputActivity(
+      withApprovals.userInputRequests,
+      activity,
+      withApprovals.threadId,
+    );
+    const withQuestions = questions === withApprovals.userInputRequests
+      ? withApprovals
+      : { ...withApprovals, userInputRequests: [...questions] };
+    return upsert(withQuestions, activityEntryFrom(activity, occurredAt));
   }
   if (type === "thread.turn-diff-completed") {
     return upsert(next, turnEntryFrom(eventPayload, occurredAt));

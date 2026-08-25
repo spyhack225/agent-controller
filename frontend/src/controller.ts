@@ -6,6 +6,7 @@ import type {
   ProviderApprovalDecision,
   ProviderApprovalLocalDecision,
 } from "./providerApprovals";
+import type { UserInputAnswers, UserInputLocalAnswer } from "./userInput";
 import { useThreadWatch } from "./useThreadWatch";
 import {
   projectScope,
@@ -340,6 +341,14 @@ export function useController({ authConfig, clerk }: UseControllerOptions) {
     Record<string, ProviderApprovalLocalDecision>
   >({});
 
+  // The same idea for the third blocking kind: what this account has already answered about an
+  // agent question, keyed by T3 request id. Kept apart from the approval map because they are
+  // different questions with different answers, and a single map keyed only by request id would
+  // let one close the other's card.
+  const [userInputAnswers, setUserInputAnswers] = useState<
+    Record<string, UserInputLocalAnswer>
+  >({});
+
   const threadWatch = useThreadWatch({ api, enabled: authenticated });
   const {
     liveThread,
@@ -652,6 +661,32 @@ export function useController({ authConfig, clerk }: UseControllerOptions) {
           commandId: payload.commandId ?? null,
           error: null,
           decidedAt: payload.observedAt ?? null,
+        },
+      }));
+    });
+    // Somebody answered an agent question — this tab, another tab, or the controller on the desk.
+    // The payload deliberately carries a digest and not the answer: the words are user content and
+    // reach this tab through the live thread, where they are relayed rather than stored.
+    stream.addEventListener("t3.user-input.answered", (event) => {
+      const payload = parseEventData(event.data) as {
+        requestId?: string;
+        answersHash?: string;
+        status?: string;
+        commandId?: string | null;
+        observedAt?: string;
+      } | null;
+      if (!payload?.requestId) return;
+      const requestId = payload.requestId;
+      setUserInputAnswers((current) => ({
+        ...current,
+        [requestId]: {
+          requestId,
+          answersHash: payload.answersHash ?? "",
+          status: payload.status ?? "dispatched",
+          actorType: "user",
+          commandId: payload.commandId ?? null,
+          error: null,
+          answeredAt: payload.observedAt ?? null,
         },
       }));
     });
@@ -1003,6 +1038,43 @@ export function useController({ authConfig, clerk }: UseControllerOptions) {
     );
   }, [api, run]);
 
+  /**
+   * Answer one agent question — the third blocking kind, and the only one whose answer is a value.
+   *
+   * Validation lives in the gateway, which checks the answers against the request's own questions
+   * before anything is dispatched; a 422 here means the answer did not fit the question, not that
+   * something broke. Idempotency lives there too (the request id is claimed against a fingerprint
+   * of the answers), so this does not try to be clever about it — it just records the answer
+   * locally the moment it lands, so the form stops being offered without waiting for T3 to echo a
+   * resolution back through the stream.
+   */
+  const answerUserInput = useCallback(async (
+    target: { environmentId: string; threadId: string },
+    requestId: string,
+    answers: UserInputAnswers,
+  ) => {
+    const path = `/v1/t3/environments/${encodeURIComponent(target.environmentId)}`
+      + `/threads/${encodeURIComponent(target.threadId)}`
+      + `/user-input/${encodeURIComponent(requestId)}`;
+    return await run(
+      `user-input-${requestId}`,
+      "Answer sent to the agent.",
+      async () => {
+        const result = await api<{ answer?: UserInputLocalAnswer }>(path, {
+          method: "POST",
+          body: { answers },
+        });
+        if (result?.answer) {
+          setUserInputAnswers((current) => ({
+            ...current,
+            [requestId]: result.answer as UserInputLocalAnswer,
+          }));
+        }
+        return result;
+      },
+    );
+  }, [api, run]);
+
   const approvalNotifications = useApprovalNotifications(pendingApprovals);
 
   return {
@@ -1039,6 +1111,8 @@ export function useController({ authConfig, clerk }: UseControllerOptions) {
     pendingApprovals,
     providerApprovalDecisions,
     answerProviderApproval,
+    userInputAnswers,
+    answerUserInput,
     recentCommands,
     commandEvents,
     timelineCommand,

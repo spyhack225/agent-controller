@@ -1,6 +1,7 @@
 import { createId, nowIso } from "./ids.mjs";
 import { appendDeviceFollowUpInstruction } from "./deviceThreadOutput.mjs";
 import { collectProviderApprovals, normalizeProviderApprovalDecision } from "./providerApprovals.mjs";
+import { pendingUserInputRequests } from "./userInput.mjs";
 
 export async function exchangePairingToken({ baseUrl, pairingToken, scopes }) {
   const url = new URL("/oauth/token", baseUrl);
@@ -222,6 +223,18 @@ export function buildT3Command({ intent, threadId, attachments = [] }) {
         createdAt,
       };
     }
+    // A QUESTION being answered, not a permission being granted. Separate T3 command, separate
+    // reactor path (src/orchestration/decider.ts:1027-1050), and the answers are already validated
+    // against the request's own questions by the time they reach here — see src/userInput.mjs.
+    case "user_input_response":
+      return {
+        type: "thread.user-input.respond",
+        commandId,
+        threadId,
+        requestId: intent.requestId,
+        answers: intent.answers,
+        createdAt,
+      };
     default:
       throw new Error(`Unsupported T3 command intent: ${intent.type}`);
   }
@@ -378,22 +391,13 @@ export function pendingThreadInteractions(thread) {
   const approvals = collectProviderApprovals(thread)
     .filter((approval) => approval.status === "pending").length;
 
-  // User-input requests are a separate T3 feature with its own respond command; they are counted
-  // here only so a screen can say "an answer is waiting", never answered from this module.
-  const openUserInput = new Set();
-  const activities = Array.isArray(thread?.activities) ? [...thread.activities] : [];
-  activities.sort((left, right) => {
-    const bySequence = (Number(left?.sequence) || 0) - (Number(right?.sequence) || 0);
-    return bySequence || String(left?.createdAt ?? "").localeCompare(String(right?.createdAt ?? ""));
-  });
-  for (const activity of activities) {
-    const requestId = typeof activity?.payload?.requestId === "string" ? activity.payload.requestId : null;
-    if (!requestId) continue;
-    if (activity.kind === "user-input.requested") openUserInput.add(requestId);
-    else if (activity.kind === "user-input.resolved") openUserInput.delete(requestId);
-  }
+  // User-input requests are the third thing that can block a turn (src/userInput.mjs). Delegated
+  // for the same reason approvals are: the local copy of this loop knew nothing about
+  // `provider.user-input.respond.failed`, so a question T3 had abandoned was counted as waiting
+  // forever and the screen said "1 answer waiting" for the rest of the session.
+  const userInput = pendingUserInputRequests(thread).length;
 
-  return { approvals, userInput: openUserInput.size };
+  return { approvals, userInput };
 }
 
 function compactDisplayText(value, maximum) {
