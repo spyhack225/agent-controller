@@ -48,4 +48,11 @@ void uiBenchGoToThreads();
 bool uiBenchRunAction(const char* label);
 const char* uiBenchBoundThreadTitle();
 int uiBenchThreadRowCount();
+const char* uiBenchScreenName();
+bool uiBenchRecording();
+void uiBenchMicRect(int16_t* x, int16_t* y, int16_t* w, int16_t* h);
+void uiBenchHoldGlass(bool held);
+int uiBenchCreateStatus();
+const char* uiBenchCreateDetail();
+int uiBenchRebindFirstProject();
 #endif

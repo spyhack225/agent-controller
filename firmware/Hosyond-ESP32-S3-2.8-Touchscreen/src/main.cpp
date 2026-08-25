@@ -245,6 +245,8 @@ enum class Stage : uint8_t { Idle, Settle, TapTalk, PressMic, Holding, Release, 
 Stage stage = Stage::Idle;
 uint32_t dueAt = 0;
 uint32_t recordBeganAt = 0;
+int rowsBefore = -1;
+char boundBefore[48] = {0};
 
 constexpr uint32_t kHoldMs = 4000;
 
@@ -276,16 +278,31 @@ void tick(GatewayClient& gateway) {
 
     case Stage::Settle:
       if ((int32_t)(now - dueAt) < 0) return;
-      Serial.printf("[bench] tapping TALK at (%d,%d)\n", (int)kTalkX, (int)kActionY);
-      send(TouchGesture::Tap, kTalkX, kActionY);
+      Serial.printf("[bench] screen before: %s\n", uiBenchScreenName());
+      if (!uiBenchRunAction("TALK")) {
+        Serial.println("[bench] CAPTURE: SKIP - TALK is not offered (no microphone, or no thread bound)");
+        dueAt = now + 500;
+        stage = Stage::GoThreads;
+        return;
+      }
       dueAt = now + 900;
       stage = Stage::TapTalk;
       return;
 
     case Stage::TapTalk:
       if ((int32_t)(now - dueAt) < 0) return;
-      Serial.printf("[bench] pressing the mic capsule at (%d,%d)\n", (int)kMicX, (int)kMicY);
-      send(TouchGesture::Press, kMicX, kMicY);
+      {
+        int16_t rx = 0, ry = 0, rw = 0, rh = 0;
+        uiBenchMicRect(&rx, &ry, &rw, &rh);
+        const int16_t px = (int16_t)(rx + rw / 2);
+        const int16_t py = (int16_t)(ry + rh / 2);
+        Serial.printf("[bench] screen now: %s; mic rect {%d,%d,%d,%d}; pressing (%d,%d)\n",
+                      uiBenchScreenName(), (int)rx, (int)ry, (int)rw, (int)rh, (int)px, (int)py);
+        send(TouchGesture::Press, px, py);
+        uiBenchHoldGlass(true);
+        Serial.printf("[bench] recording armed: %s (glass held for the harness)\n",
+                      uiBenchRecording() ? "yes" : "NO");
+      }
       recordBeganAt = millis();
       dueAt = recordBeganAt + kHoldMs;
       stage = Stage::Holding;
@@ -297,6 +314,7 @@ void tick(GatewayClient& gateway) {
       // contention is the whole subject of the test.
       if ((int32_t)(now - dueAt) < 0) return;
       Serial.println("[bench] releasing");
+      uiBenchHoldGlass(false);
       send(TouchGesture::Release, kMicX, kMicY);
       dueAt = now + 400;
       stage = Stage::Report;
@@ -329,16 +347,35 @@ void tick(GatewayClient& gateway) {
 
     case Stage::GoThreads:
       if ((int32_t)(now - dueAt) < 0) return;
+      // The held clip keeps the Send screen and its DISCARD/SEND bar, so nothing else is reachable
+      // until it is dealt with. Discarded rather than sent: this run is measuring the create path,
+      // and dispatching four seconds of room tone into a real thread is not a side effect a bench
+      // run should have.
+      if (uiBenchRunAction("DISCARD")) Serial.println("[bench] discarded the bench clip");
       Serial.printf("[bench] ---- create -> splice -> adopt ----\n");
-      Serial.printf("[bench] before: %d rows, bound \"%s\"\n",
-                    uiBenchThreadRowCount(), uiBenchBoundThreadTitle());
+      rowsBefore = -1;   // taken after the rebind, below
+      strncpy(boundBefore, uiBenchBoundThreadTitle(), sizeof(boundBefore) - 1);
+      boundBefore[sizeof(boundBefore) - 1] = 0;
+      Serial.printf("[bench] before: %d rows, bound \"%s\"\n", rowsBefore, boundBefore);
+      {
+        const int rebind = uiBenchRebindFirstProject();
+        Serial.printf("[bench] rebound project -> %d (>=0 is the project count)\n", rebind);
+      }
       uiBenchGoToThreads();
+      Serial.printf("[bench] screen for create: %s\n", uiBenchScreenName());
       dueAt = now + 2500;   // let the list settle so an empty folder is genuinely empty
       stage = Stage::Create;
       return;
 
     case Stage::Create:
       if ((int32_t)(now - dueAt) < 0) return;
+      if (rowsBefore < 0) {
+        rowsBefore = uiBenchThreadRowCount();
+        strncpy(boundBefore, uiBenchBoundThreadTitle(), sizeof(boundBefore) - 1);
+        boundBefore[sizeof(boundBefore) - 1] = 0;
+        Serial.printf("[bench] baseline after rebind: %d rows, bound \"%s\"\n",
+                      rowsBefore, boundBefore);
+      }
       // Through runAction(), not a direct call: the handler is what is under test.
       if (!uiBenchRunAction("NEW THREAD")) {
         Serial.println("[bench] CREATE: FAIL - NEW THREAD was not offered");
@@ -354,12 +391,18 @@ void tick(GatewayClient& gateway) {
       const int rows = uiBenchThreadRowCount();
       const char* bound = uiBenchBoundThreadTitle();
       Serial.printf("[bench] after: %d rows, bound \"%s\"\n", rows, bound);
+      Serial.printf("[bench] create status=%d detail=\"%s\"\n",
+                    uiBenchCreateStatus(), uiBenchCreateDetail());
       // The splice must be visible without waiting for the 30 s refresh, and the adopt must have
       // moved the binding to it. Either failing separately tells us which half broke.
-      if (rows <= 0) Serial.println("[bench] CREATE: FAIL - no rows after create; the splice did not land");
-      else if (strcmp(bound, "(none)") == 0)
-        Serial.println("[bench] CREATE: FAIL - nothing bound; adoptThreadBinding did not take");
-      else Serial.println("[bench] CREATE: PASS - thread created, spliced and bound with no re-fetch");
+      // Compared against what was true BEFORE. The first version of this asserted rows > 0 and
+      // bound != none, which were already true, so it passed without the create doing anything.
+      if (rows != rowsBefore + 1)
+        Serial.printf("[bench] CREATE: FAIL - rows %d -> %d, expected %d; the splice did not land\n",
+                      rowsBefore, rows, rowsBefore + 1);
+      else if (strcmp(bound, boundBefore) == 0)
+        Serial.println("[bench] CREATE: FAIL - the binding did not move; adoptThreadBinding did not take");
+      else Serial.println("[bench] CREATE: PASS - created, spliced, and the binding moved to it");
       Serial.println("[bench] ---- run complete ----");
       stage = Stage::Done;
       return;

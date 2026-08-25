@@ -309,6 +309,9 @@ size_t lastApprovalCount = 0;
 // Push-to-talk state. `recordArmed` is the press that landed on the microphone button; the
 // recording itself runs in uiTick() so the loop keeps polling touch and can see the finger lift.
 bool recordArmed = false;
+#if BENCH_SELFTEST
+bool benchGlassHeld = false;
+#endif
 uint32_t recordPaintedAt = 0;
 uint32_t recordOrbAt = 0;
 
@@ -3226,6 +3229,63 @@ const char* uiBenchBoundThreadTitle() {
 }
 
 int uiBenchThreadRowCount() { return (int)threadRowCount(); }
+
+const char* uiBenchScreenName() {
+  switch (screen) {
+    case Screen::Status: return "Status";
+    case Screen::Home: return "Home";
+    case Screen::Threads: return "Threads";
+    case Screen::Send: return "Send";
+    case Screen::Actions: return "Actions";
+    case Screen::Response: return "Response";
+    case Screen::Approvals: return "Approvals";
+    case Screen::Environments: return "Environments";
+    case Screen::Projects: return "Projects";
+    case Screen::Device: return "Device";
+    case Screen::Gateway: return "Gateway";
+    default: return "?";
+  }
+}
+
+bool uiBenchRecording() { return recordArmed; }
+
+// The recording branch ends a clip on !touchDown(), reading the panel directly — correct, because
+// a clip ends when the glass stops being touched and that must not depend on which gesture
+// touchPoll() eventually decides the hold was. A synthesised Press cannot hold the glass, so the
+// first tick would end the clip before a sample is pumped. This substitutes for the finger and
+// nothing else.
+void uiBenchHoldGlass(bool held) { benchGlassHeld = held; }
+
+// Rebinds through the ordinary selection path. The device under test carries a projectId from
+// before folder selection existed, and the gateway correctly refuses to create into a folder that
+// is not in the live snapshot — so the happy path cannot be reached until the binding is current.
+int uiBenchRebindFirstProject() {
+  if (!browse.refreshProjects()) {
+    Serial.printf("[bench] refreshProjects failed: %s\n", browse.projectsDetail().c_str());
+    return -1;
+  }
+  Serial.printf("[bench] projects=%u boundProjectId=\"%s\"\n",
+                (unsigned)browse.projectCount(), browse.boundProjectId().c_str());
+  for (size_t i = 0; i < browse.projectCount(); ++i) {
+    const BrowseProject* pr = browse.project(i);
+    if (pr) Serial.printf("[bench]   [%u] id=\"%s\" title=\"%s\" selected=%s\n",
+                          (unsigned)i, pr->id.c_str(), pr->title.c_str(),
+                          pr->selected ? "yes" : "no");
+  }
+  if (browse.projectCount() == 0) return -2;
+  const bool ok = browse.selectProject(0);
+  Serial.printf("[bench] selectProject(0) -> %s; boundProjectId now \"%s\"\n",
+                ok ? "true" : "false", browse.boundProjectId().c_str());
+  return ok ? (int)browse.projectCount() : -3;
+}
+
+int uiBenchCreateStatus() { return browse.createStatus(); }
+const char* uiBenchCreateDetail() { return browse.createDetail().c_str(); }
+
+void uiBenchMicRect(int16_t* x, int16_t* y, int16_t* w, int16_t* h) {
+  const Rect r = micButtonRect();
+  *x = r.x; *y = r.y; *w = r.w; *h = r.h;
+}
 #endif
 
 void uiTick() {
@@ -3249,7 +3309,11 @@ void uiTick() {
     // not this loop's business: a clip ends when the glass stops being touched. Reading it here
     // also means a hold that was already consumed as something else — a long press, say — cannot
     // leave the recording running.
-    if (!touchDown()) {
+    if (!touchDown()
+#if BENCH_SELFTEST
+        && !benchGlassHeld
+#endif
+       ) {
       finishRecording();
       return;
     }
