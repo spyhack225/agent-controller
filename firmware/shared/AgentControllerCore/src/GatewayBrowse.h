@@ -42,6 +42,14 @@ struct BrowseEnvironment {
 
 // `threadCount` is the field that makes this list usable at arm's length: it says which folder has
 // anything in it before somebody pages into an empty one.
+// A row of GET /v1/device/threads, which is also exactly what POST /v1/device/threads answers with.
+struct BrowseThread {
+  String id;
+  String title;
+  String status;
+  bool selected = false;
+};
+
 struct BrowseProject {
   String id;
   String title;
@@ -76,6 +84,38 @@ class GatewayBrowse {
   bool projectsTruncated() const { return projectsTruncated_; }
 
   bool selectProject(size_t index);
+
+  // ---------------------------------------------------------------------------------------------
+  // Creating a thread
+  // ---------------------------------------------------------------------------------------------
+  //
+  // `POST /v1/device/threads` with an empty body. A project with no threads used to leave a
+  // controller with nothing to point at and no way out except the web console — which is the one
+  // place the owner is not standing when they pick the device up.
+  //
+  // Two things about the contract shape the firmware side (docs/hardware-protocol.md, "Creating a
+  // thread"):
+  //
+  //   The returned row is shaped EXACTLY like a row from GET /v1/device/threads, so it is spliced
+  //   into the list already on screen rather than waiting for a re-fetch.
+  //
+  //   CREATING ALSO SELECTS. The device is bound to the new thread by the time the 201 arrives, and
+  //   a follow-up POST /v1/device/config/thread is not merely redundant but harmful: it validates
+  //   against T3's live snapshot, which lags the dispatch, so it can 404 on a thread that certainly
+  //   exists.
+  //
+  // The title is optional and this board never sends one — there is no keyboard, and the gateway
+  // names it "<D Mon HH:MM> - <device label>" with uniqueness guaranteed. `title` is on the
+  // signature anyway because a transcript is words, and T3 only auto-retitles a thread still
+  // carrying its own default, so a name supplied here is the name the thread keeps.
+  bool createThread(const String& title = String());
+
+  // Valid after a successful createThread(). Shaped as a thread row, ready to splice.
+  const BrowseThread& createdThread() const { return created_; }
+
+  // One line a person can act on, from the error table in the protocol doc. Empty on success.
+  const String& createDetail() const { return createDetail_; }
+  int createStatus() const { return createStatus_; }
 
   // What the gateway last said is bound, which is not necessarily what this device asked for: a
   // selection that failed leaves these unchanged.
@@ -116,6 +156,9 @@ class GatewayBrowse {
 
   String boundEnvironmentId_;
   String boundProjectId_;
+  BrowseThread created_;
+  String createDetail_;
+  int createStatus_ = 0;
   bool contextCleared_ = false;
   uint32_t revision_ = 1;
 };

@@ -264,7 +264,7 @@ drawer says what is actually true of the device and doubles as the way to the sc
 | Screen | What it is for |
 |---|---|
 | **HOME** | The orb, and under it the destination: the selected thread's name, its status, and OPEN. A horizontal swipe steps through the threads and the line updates live — it is a picker, not a readout |
-| **THREADS** | The thread list, scrolled with a finger; tapping a row selects it. The breadcrumb capsule at the top shows the bound environment and folder, and opens the browser |
+| **THREADS** | The thread list, scrolled with a finger; tapping a row selects it. The breadcrumb capsule at the top shows the bound environment and folder, and opens the browser. NEW THREAD is in the action bar, and is the primary action when the folder is empty |
 | **ENVIRONMENTS** | Which paired T3 host this controller drives. Tapping a row `POST`s it and clears the folder and thread, because those ids only meant something inside the environment being left |
 | **FOLDERS** | The projects inside the bound environment, each with its thread count. There is no "all folders" row: `POST /v1/device/config/project` reads `projectId` as a required string, so widening the scope again is a console operation |
 | **SEND** | The voice screen, and nothing else: the orb, the record button, and the thread the clip is going to. Four views — ready, recording, held clip, full-page journey — and the first three are **one composition**, so nothing moves as a capture progresses |
@@ -336,6 +336,50 @@ region it draws into, which is right for a repaint and wrong for an arrival: the
 paints a capsule and an elapsed time, so it never touched the two destination lines the previous
 state had left below the capsule, and "SENDING TO" and half a thread title stayed on the glass. The
 first two variants of this were fixed per-screen, which is exactly why there was a third.
+
+### Creating a thread
+
+A project with no threads used to leave the controller with nothing to point at and no way out
+except the web console — which is the one place the owner is not standing when they pick the device
+up. `POST /v1/device/threads` fixes that, and the firmware side is one tap: no keyboard, no prompt,
+no title. The gateway names it `<D Mon HH:MM> · <device label>` with uniqueness guaranteed, and T3
+only auto-retitles a thread still carrying its own default, so that is the name the thread keeps.
+
+It is reachable from two places, and the second one is the point:
+
+- **HOME**, as a slot one past the end of the picker. Swipe to it and the button reads CREATE.
+- **THREADS**, in the action bar — **primary and enabled when the folder is empty**, which is
+  exactly the state this removes.
+
+Two things in the contract shape the implementation:
+
+**The returned row is spliced, not re-fetched.** `thread` comes back shaped exactly like a row from
+`GET /v1/device/threads`. T3 answers a dispatch as soon as the event is appended and its projection
+catches up afterwards, so a re-fetch can legitimately *not* contain a thread that certainly exists.
+`GatewayClient` owns `threads_[]` and may not be edited, so the splice is an overlay: one row past
+the end of whatever the client holds, which retires itself the moment the real list contains the
+same id. `threadRowCount()` / `threadRowAt()` are what every screen walks, so the new thread appears
+in the picker, in the THREADS list, and as the destination on SEND without anything else changing.
+
+**Creating also selects**, and a follow-up `POST /v1/device/config/thread` is not merely redundant
+but harmful — it validates against the live snapshot and can `404` on the thread that was just made.
+So the firmware does not send one. It calls `gw->adoptThreadBinding(threadId)` instead, immediately
+on the 201: the server has already bound the device, and this tells the client what is already true.
+
+That call is not cosmetic. `context_.threadId` inside `GatewayClient` only moves on its 60 s config
+poll, and until it does `postIntent()` keeps stamping the **previous** thread's id on every
+dispatch — a voice note recorded in that window lands in the wrong conversation. `adoptThreadBinding`
+also closes the open response, because that model is an answer about the conversation the user has
+just left; `closeResponse()` resets the whole `ThreadResponse`, so there is no stale `Failed` or
+`Done` for any screen to render before the next poll. The firmware clears a **finished** voice
+capture on the same reasoning, and leaves one still in flight alone: it was dispatched against the
+old thread, that is where it is going, and its completion still deserves to be reported.
+
+**A refused create changes nothing**, so every error path leaves the device on the thread it was
+already on and the highlight snaps back to it — the line never shows something that was not created.
+The messages follow the protocol doc's table: `403` names the policy dimension that refused it,
+`404` says the folder is gone, `409` distinguishes "pick a folder first" from "no model configured",
+and `502` says to start T3 Code.
 
 ### The destination line
 

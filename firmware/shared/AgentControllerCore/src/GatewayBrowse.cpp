@@ -327,3 +327,96 @@ String GatewayBrowse::projectLabel() const {
   // with its id.
   return String();
 }
+
+// ---------------------------------------------------------------------------------------------
+// Creating a thread
+// ---------------------------------------------------------------------------------------------
+
+// Turns a refused create into the one line the protocol doc's error table specifies.
+//
+// Every one of these leaves the device on the thread it was already on — a refused create changes
+// nothing — so each says what happened and none of them implies anything was created.
+static String createRemedy(int code, const String& body) {
+  JsonDocument doc;
+  String detailCode;
+  String dimension;
+  if (body.length() > 0 && !deserializeJson(doc, body)) {
+    detailCode = String(doc["error"]["details"]["code"] | "");
+    dimension = String(doc["error"]["details"]["policy"]["dimension"] | "");
+  }
+
+  switch (code) {
+    case 403:
+      // A read-only profile, or a user/environment/network/time-window rule. The dimension names
+      // which, and it is worth showing: "profile" is a different fix from "network".
+      return dimension.length() > 0 ? String("Not allowed: ") + dimension
+                                    : String("Not allowed on this device");
+    case 404:
+      return "Folder is gone; pick another";
+    case 409:
+      if (detailCode == "no_model_selection") return "No model configured for this folder";
+      return "Pick a folder first";
+    case 502:
+      return detailCode == "t3_unreachable" ? String("Start T3 Code") : String("Create failed");
+    case 429:
+      return "Rate limited; wait";
+    default:
+      return code > 0 ? String("Create failed ") + code : String("No response");
+  }
+}
+
+bool GatewayBrowse::createThread(const String& title) {
+  created_ = BrowseThread();
+  createDetail_ = "";
+  createStatus_ = 0;
+
+  // An empty body is a complete request. The device names neither the project nor the environment:
+  // the thread is always created in the config the owner bound, and every id in the answer is one
+  // the gateway chose.
+  String body = "{}";
+  if (title.length() > 0) {
+    JsonDocument doc;
+    doc["title"] = title;
+    body = "";
+    serializeJson(doc, body);
+  }
+
+  String response;
+  const int code = request("POST", "/v1/device/threads", body, response);
+  createStatus_ = code;
+  if (!ok(code)) {
+    createDetail_ = createRemedy(code, response);
+    touch();
+    return false;
+  }
+
+  JsonDocument doc;
+  if (deserializeJson(doc, response)) {
+    createDetail_ = "Bad create JSON";
+    touch();
+    return false;
+  }
+
+  JsonObject thread = doc["thread"];
+  created_.id = String(thread["id"] | doc["threadId"] | "");
+  if (created_.id.length() == 0) {
+    createDetail_ = "Gateway named no thread";
+    touch();
+    return false;
+  }
+  created_.title = String(thread["title"] | "New thread");
+  created_.status = String(thread["status"] | "idle");
+  created_.selected = true;
+
+  // The create also bound it, and `config` is the device's updated config. Recording it here keeps
+  // the breadcrumb honest without a second round trip.
+  JsonObject config = doc["config"];
+  const String env = String(config["environmentId"] | "");
+  const String project = String(config["projectId"] | "");
+  if (env.length() > 0) boundEnvironmentId_ = env;
+  if (project.length() > 0) boundProjectId_ = project;
+
+  Serial.printf("[browse] created thread %s\n", created_.id.c_str());
+  touch();
+  return true;
+}
