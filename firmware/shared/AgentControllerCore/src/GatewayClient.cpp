@@ -26,6 +26,12 @@ constexpr uint16_t kTimeoutMs = 1200;
 // Operate cadences. The display poll dominates the request budget (12/min against a device-read
 // limit of 120/min), which is what leaves room for the gesture-driven calls a person makes.
 constexpr uint32_t kDisplayIntervalMs = 5000;
+// The thread list is not a screen, it is the device's destination. HOME names the thread a message
+// or a voice note will go to, and the picker steps through them — so the list has to be warm before
+// anyone touches anything. It was previously fetched only when the THREADS screen was opened, which
+// meant HOME said "Open THREADS to load the list": the device asking the owner to go and fetch its
+// own state before it could tell them where their words were about to go.
+constexpr uint32_t kThreadsIntervalMs = 30000;
 constexpr uint32_t kControlsIntervalMs = 30000;
 // The reference firmware never polled approvals — its only signal was a dispatch answering
 // `approval_required`, so a command parked by policy afterwards was invisible until someone opened
@@ -452,6 +458,14 @@ void GatewayClient::runCycle(bool justConnected) {
   // owned resource — so an unclaimed unit sits on heartbeat plus config and nothing else.
   if (link_ != GatewayLink::Claimed) return;
 
+  // Ahead of controls and approvals: a device that cannot name its destination cannot be used at
+  // all, while a stale action row or approval badge is merely out of date.
+  if ((int32_t)(now - nextThreadsAt_) >= 0) {
+    nextThreadsAt_ = now + kThreadsIntervalMs;
+    refreshThreads();
+    return;
+  }
+
   if ((int32_t)(now - nextControlsAt_) >= 0) {
     nextControlsAt_ = now + kControlsIntervalMs;
     fetchControls();
@@ -478,6 +492,7 @@ void GatewayClient::runCycle(bool justConnected) {
 }
 
 void GatewayClient::markOperateDue(uint32_t now) {
+  nextThreadsAt_ = now;
   nextDisplayAt_ = now;
   nextControlsAt_ = now;
   nextApprovalsAt_ = now;

@@ -263,11 +263,12 @@ drawer says what is actually true of the device and doubles as the way to the sc
 
 | Screen | What it is for |
 |---|---|
-| **HOME** | The orb, the selected thread, and the last thing that happened. The orb's mode comes from `orbModeForAgentState()`, fed by the best signal the device protocol carries: a live recording, then a response still arriving, then the selected thread's status |
+| **HOME** | The orb, and under it the destination: the selected thread's name, its status, and OPEN. A horizontal swipe steps through the threads and the line updates live — it is a picker, not a readout |
 | **THREADS** | The thread list, scrolled with a finger; tapping a row selects it. The breadcrumb capsule at the top shows the bound environment and folder, and opens the browser |
 | **ENVIRONMENTS** | Which paired T3 host this controller drives. Tapping a row `POST`s it and clears the folder and thread, because those ids only meant something inside the environment being left |
 | **FOLDERS** | The projects inside the bound environment, each with its thread count. There is no "all folders" row: `POST /v1/device/config/project` reads `projectId` as a required string, so widening the scope again is a console operation |
-| **SEND** | Hold-to-talk at the top, saved actions below. There is no keyboard and there will not be one: on this device a request is voice or a choice the owner saved earlier |
+| **SEND** | The voice screen, and nothing else: the record button and the thread the clip is going to. Four views, one at a time — ready, recording, held clip, and the full-page journey |
+| **ACTIONS** | The owner's saved actions. Moved off SEND, where they were four things to press in the middle of a voice interaction; reachable from HOME's action bar |
 | **REPLY** | The assistant's answer, paged. The gateway wraps to 31 characters for a 122x250 e-ink panel; this screen re-joins and re-wraps to 19 so the text can be size 2 and read at arm's length |
 | **APPROVALS** | One held command at a time with REJECT and APPROVE. Approve goes through a second confirm, because it runs on the owner's own machine |
 | **DEVICE** / **GATEWAY** | Identity, Wi-Fi, model, URL, link and probe state, with the config portal and the provisioning reset behind them. Both stay reachable on an unclaimed unit, because they are what somebody opens when the claim screen is not working |
@@ -303,9 +304,94 @@ Holding the microphone button records into PSRAM, releasing uploads and dispatch
 runs as a state the frame loop pumps rather than a blocking `while (key down)` loop — the old
 version could not see the finger lift, and the orb stopped for the duration of the clip.
 
-On release the clip goes to `POST /v1/device/media` as base64 streamed straight into the TCP buffer,
-then to the owner's saved capture action if there is one, or to a plain `audio_prompt` on the
-selected thread if there is not.
+**Releasing does not send.** The clip is held in PSRAM and the action bar offers DISCARD and SEND.
+The old behaviour uploaded and dispatched the instant the finger lifted, which meant the only way to
+cancel a voice note recorded by accident was to let it reach the agent and then stop the turn.
+
+SEND streams it to `POST /v1/device/media` as base64 straight into the TCP buffer, then to the
+owner's saved capture action if there is one, or to a plain `audio_prompt` on the selected thread if
+there is not.
+
+### The destination line
+
+The line under the orb on HOME is the selector, not a caption. Swiping left steps to the next
+thread, right to the previous, and the line updates immediately — but **binding is a server write**
+(`POST /v1/device/config/thread`), so the highlight moves locally and the write is debounced 600 ms
+after the finger settles. Swiping past eight threads costs one request, and the device is never
+bound to something the user merely passed over. A selection that has not been committed is drawn
+differently from one that has, and a write that fails reverts the line to whatever the device is
+genuinely bound to: showing thread B while bound to thread A would send somebody's voice to the
+wrong place.
+
+**The prominent line shows the thread's NAME unless the state carries information the orb cannot
+express, in which case the state wins.** The orb has nine animations, so "Ready" beside it is
+redundant while the name is the one thing nothing else on the screen carries. But `Revoked`,
+`No gateway`, `Needs you`, `Needs review`, `Wi-Fi failed`, `Not set up`, `Claim me` and `Failed` all
+render the same calm Ring — the orb cannot tell them apart, so for those the word IS the message and
+it takes the big line. Every branch of `presentationForState()` sets a `speaks` flag explicitly and
+there is no default, so a state added later cannot quietly hide a fault behind a thread name.
+
+### Gestures
+
+Ownership is decided once, on the press, and then the axis is locked:
+
+| Where the finger landed | What it does |
+|---|---|
+| header / grabber | the drawer, in both directions |
+| inside an open drawer | scrolls its rows; closes only on overscroll |
+| page content, vertical | scrolls the page — never touches the drawer |
+| page content, horizontal | HOME: steps the destination picker. ENVIRONMENTS / FOLDERS / THREADS: moves between the three levels. REPLY: pages |
+
+Travel is accumulated on both axes and the first to pass 18 px wins and holds for the rest of the
+gesture, so a horizontal swipe can never open the drawer and a vertical scroll can never change the
+selection. Level direction follows the breadcrumb's reading order — environment / folder / thread
+runs left to right, so **swiping left goes deeper** and right comes back up. Swiping past either end
+says so rather than silently doing nothing.
+
+Moving between levels only navigates. Binding an environment or a project is destructive — changing
+environment clears the project and the thread server-side — so those stay behind a deliberate tap on
+their own screen rather than under a gesture that can be made by accident.
+
+### The journey, on the orb
+
+The gateway queues transcription itself on that POST and answers with a job id, so everything after
+the upload — ASR, normalisation, the review gate, the dispatch — happens out of sight and takes
+seconds to a minute. `GatewayVoice` polls `GET /v1/device/media/jobs/:id` for the six-milestone
+projection in `src/deviceAudio.mjs` and the orb says which one it is in:
+
+| Milestone | Orb | Word |
+|---|---|---|
+| recording (the ADC is open) | Wave | Listening, and the record button carries a travelling wave of dots |
+| uploading | Ribbon | Sending — **a still frame**, see below |
+| transcribing | Globe | Transcribing |
+| review | **Ring** | Needs review |
+| ready / sent | *deferred* | whatever the turn is actually doing |
+| failed | Ring | Voice failed |
+
+Three of those are deliberate rather than obvious. **Review is a stop**, not progress — the
+normaliser changed something a person has to look at before it is dispatched — so it gets the calm
+orb, never a busy one. **Ready and sent hand back** to the ordinary agent-state table instead of
+asserting "Working": that table will say Working when a turn really is in flight and say the truth
+when the dispatch was refused by policy. And **nothing is promoted on a milestone the device has not
+observed** — a poll that fails holds the last known stage rather than advancing hopefully.
+
+`GatewayVoice` exists at all because `GatewayClient::uploadMedia()` parses `media.id` out of the
+POST response and discards `job.jobId`, which is the identifier the poll takes. The upload is
+re-expressed there with both ids kept; the part that is actually delicate, `Base64JsonBodyStream`,
+is reused rather than reimplemented.
+
+**The uploading frame is still, and that is not papered over.** `uploadMedia()` holds the render loop
+for the whole transfer, so no orb frame runs during it. What the device does instead is paint the
+complete full-page moment — one real Ribbon frame, centred, with "Sending" under it and no buttons —
+*before* the call begins, so the picture a person is left looking at for those one to three seconds
+is the correct one. The motion arrives at the next stage: transcribing is poll-driven and therefore
+genuinely animated. Moving the upload to its own task would fix it, and was judged not worth the
+concurrency against a one-to-three-second still.
+
+The poll is the one recurring blocking call on the render loop. It runs at the very end of a frame —
+paint, then stall — costs one dropped frame about once a second while a capture is in flight, stops
+at a terminal milestone, and backs off and gives up rather than freezing the board against a gateway
+that has gone away.
 
 ## What `src/main.cpp` does today
 
@@ -340,9 +426,9 @@ In dependency order:
 2. **Gateway profiles.** The two-phase LAN/tailnet switch protocol is likewise unported, so
    `config.gatewayUrl` is read and ignored rather than persisted unprobed.
 3. **On-screen keyboard**, for correcting a transcript rather than for composing a request.
-4. **Automatic transcription of device audio.** The gateway does not currently transcribe an upload
-   that arrives from a device; that gap is Category 3 of the
-   [open-input roadmap](../../roadmap/open-input-media-voice-environments-roadmap.md).
+4. **On-device transcript correction.** The gateway transcribes a device upload automatically and
+   the board now follows the job to its milestone, but a capture that lands at `review` can only be
+   resolved in the console — there is no keyboard here to edit a transcript with.
 
 ## What is unverified
 

@@ -142,9 +142,14 @@ void capsule(const Rect& r, int16_t fill, int16_t stroke, float strokeWidth, flo
 }
 
 void button(const Rect& r, const String& label, bool primary, bool enabled, uint8_t bg) {
-  // A primary button is a filled capsule with dark ink, which is how it wins against an outline
-  // without either of them having to be bigger than the other.
-  const int16_t fill = enabled ? (primary ? (int16_t)kBright : (int16_t)kSurface) : (int16_t)kSurface;
+  // ONLY a primary button has a fill. Everything else is an outline on the page.
+  //
+  // Secondary and disabled buttons used to be filled kSurface, which is the source of the "lighter
+  // band behind DISCARD and SEND" in the CLIP READY photograph: nothing was painting a tray — the
+  // tray had already been removed — but two kSurface capsules eight pixels apart across the full
+  // width of a 240 px screen read as one band, and a disabled primary made it two. An outline
+  // composites against whatever it is standing on and adds no surface to the page at all.
+  const int16_t fill = (primary && enabled) ? (int16_t)kBright : -1;
   const int16_t stroke = enabled ? (primary ? -1 : (int16_t)kMuted) : (int16_t)kHair;
   const uint8_t ink = enabled ? (primary ? kBg : kText) : kHair;
   capsule(r, fill, stroke, 1.3f, primary ? 1.4f : 1.2f, bg);

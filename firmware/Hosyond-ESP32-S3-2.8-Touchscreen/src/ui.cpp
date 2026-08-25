@@ -87,8 +87,19 @@ constexpr uint32_t kBarSlideMs = 170;
 // The home orb, and the one that keeps a list screen from looking frozen. 148 px is the measured
 // budget; 44 px costs about a twentieth of it, which is what makes "keep animating during a list"
 // affordable rather than a trade against the list itself.
+// The COVERAGE BUFFER, allocated by main.cpp's displayBeginCanvases(148, 44). Not the size the orb
+// is drawn at.
 constexpr uint16_t kOrbPx = 148;
 constexpr uint16_t kMiniOrbPx = 44;
+
+// What is actually blitted, and it is smaller than the buffer on purpose.
+//
+// HOME carries a list of threads under the orb now, and a 148 px disc in a 206 px content area left
+// room for one row. 112 px leaves room for two with the action bar out and three without, and it is
+// CHEAPER rather than a trade: the disc blit drops from 17 200 pixels to 9 900 and the geometry from
+// 900 dots to 640, which is most of what the list costs paid for in advance.
+constexpr uint16_t kOrbDrawPx = 112;
+constexpr uint16_t kOrbDots = 640;
 
 constexpr int16_t kOrbCx = kW / 2;
 
@@ -105,14 +116,14 @@ constexpr int16_t kOrbCx = kW / 2;
 // centred in whatever space is left above the action bar — or in the full content area when there
 // is no bar.
 
-// What displayDrawOrb() actually writes: a 148 px disc.
-constexpr int16_t kOrbBlitR = (int16_t)(kOrbPx / 2);
+// What displayDrawOrb() actually writes.
+constexpr int16_t kOrbBlitR = (int16_t)(kOrbDrawPx / 2);
 
 // What the orb LOOKS like, which is not the same number. The geometry projects to radiusPx_ * 0.82
-// with a little breathing on top of that — about 64 px of the 74 px box. Centring on the box makes
-// the composition sit visibly low, because the 10 px of empty margin above the dots counts as orb
-// while the 10 below counts as gap. Centring on the ink is what makes it look deliberate.
-constexpr int16_t kOrbInkR = 64;
+// with a little breathing on top of that — about 47 px of the 56 px box. Centring on the box makes
+// the composition sit visibly low, because the empty margin above the dots counts as orb while the
+// margin below counts as gap. Centring on the ink is what makes it look deliberate.
+constexpr int16_t kOrbInkR = 47;
 
 // The label strip is a 240 px wide blit, 22 px tall, drawn from labelY - 4. It therefore must start
 // at or below the bottom of the orb's blit box or it would erase a band of the orb on every frame
@@ -126,13 +137,21 @@ constexpr int16_t kGapLine = 8;
 // Where the orb and each line of the stack ended up. Computed by the screen that is about to paint
 // and read by the frame loop, so the orb and the text it belongs with can never disagree about
 // where the composition is.
+// The action row is a 30 px band, not a text line: it carries the thread's status and the OPEN
+// button side by side, which is the one control HOME has under the orb.
+constexpr int16_t kActionRowBand = 30;
+constexpr int16_t kGapLineAction = 10;
+
 struct Stack {
-  int16_t orbCy = 130;
-  int16_t labelY = 208;
-  int16_t line1Y = 236;
-  int16_t line2Y = 252;
+  bool label = false;      // whether the shimmer strip is part of this composition
+  int16_t orbCy = 120;
+  int16_t labelY = 180;
+  int16_t line1Y = 208;
+  int16_t line2Y = 224;
+  int16_t actionY = 232;
   bool line1 = false;
   bool line2 = false;
+  bool action = false;
 };
 
 // Deliberately not tighter to the right edge: the blit is 44 px wide and centred, so a smaller cx
@@ -141,7 +160,7 @@ constexpr int16_t kMiniOrbCx = kW - 32;
 constexpr int16_t kMiniOrbCy = 22;
 
 enum class Screen : uint8_t {
-  Status, Home, Threads, Send, Response, Approvals, Environments, Projects, Device, Gateway
+  Status, Home, Threads, Send, Actions, Response, Approvals, Environments, Projects, Device, Gateway
 };
 enum class Modal : uint8_t { None, ConfirmControl, ConfirmApproval, ConfirmReprovision };
 
@@ -150,8 +169,8 @@ enum class Modal : uint8_t { None, ConfirmControl, ConfirmApproval, ConfirmRepro
 // that is what the drawer is for.
 enum class Act : uint8_t {
   None, Review, Retry, Talk, PickThread, Reload, PrevPage, NextPage, Refresh,
-  Approve, Reject, NextApproval, SendClip, DiscardClip, Portal, Reprovision,
-  ConfirmYes, ConfirmNo, OpenReply
+  Approve, Reject, NextApproval, SendClip, DiscardClip, Portal, ClosePortal, Reprovision,
+  ConfirmYes, ConfirmNo, SavedActions
 };
 
 struct Action {
@@ -197,6 +216,8 @@ OrbMode currentMode = OrbMode::Ring;
 // different facts — idle, done, revoked, failed, waiting on a person — and orbLabelForMode() calls
 // all of them "Thinking".
 const char* currentLabel = "Starting";
+// Whether that word is the whole message, or merely a caption for an animation already saying it.
+bool currentSpeaks = true;
 
 Screen screen = Screen::Status;
 Modal modal = Modal::None;
@@ -205,6 +226,31 @@ DeviceControl pendingControl;
 String pendingApprovalId;
 String pendingApprovalSummary;
 size_t approvalIndex = 0;
+
+// HOME's destination picker.
+//
+// The line under the orb is not a readout, it is the selector: a horizontal swipe steps through the
+// fetched threads and the line updates immediately. Its whole purpose is that a person can tell
+// where their voice is about to go, which drives two rules that are more important than any of the
+// visuals:
+//
+//   ONE WRITE PER GESTURE, NOT PER STEP. Binding is POST /v1/device/config/thread. The highlight
+//   moves locally and the write is debounced by kPickerCommitMs after the finger settles, so
+//   swiping past eight threads produces one request and never leaves the device bound to something
+//   the user merely passed over.
+//
+//   THE LINE NEVER LIES. A selection that has not been committed is drawn differently from one that
+//   has, and a write that FAILS reverts the highlight to whatever the device is genuinely bound to.
+//   Showing thread B while bound to thread A would send somebody's voice to the wrong place, which
+//   is worse than any amount of visual roughness.
+int pickerIndex = -1;          // into the thread list; -1 means "follow the bound thread"
+uint32_t pickerCommitAt = 0;   // 0 when there is nothing pending
+bool pickerBinding = false;    // a write is in flight this frame
+constexpr uint32_t kPickerCommitMs = 600;
+
+// Whether the thread list has ever been asked for this boot. Before that, an empty list means "not
+// loaded", not "none" — and the two must never look the same on the destination line.
+bool threadsFetched = false;
 
 int16_t threadScroll = 0;
 int16_t actionScroll = 0;
@@ -243,6 +289,7 @@ size_t lastApprovalCount = 0;
 // recording itself runs in uiTick() so the loop keeps polling touch and can see the finger lift.
 bool recordArmed = false;
 uint32_t recordPaintedAt = 0;
+uint32_t recordPulsedAt = 0;
 
 // A finished clip is HELD, not sent.
 //
@@ -302,7 +349,24 @@ bool barDirty = false;
 // user tries to scroll content up".
 enum class DragOwner : uint8_t { Content, Drawer, DrawerList };
 DragOwner dragOwner = DragOwner::Content;
-int16_t dragTravel = 0;
+
+// AXIS ARBITRATION, layered on top of that ownership.
+//
+// The device now has both a vertical language (drawer, scrolling) and a horizontal one (stepping
+// through threads, moving between levels), and one finger has to be unambiguously one or the other.
+// So travel is accumulated on BOTH axes, and the first to pass the commit distance wins and LOCKS
+// for the rest of the gesture:
+//
+//   a horizontal swipe can never open or close the drawer
+//   a vertical scroll can never change the selection or the level
+//
+// This is where "the slider closes when I scroll" came from the first time, with only one axis in
+// play. With two it would happen twice as often, and locking is the only thing that reliably stops
+// a gesture being reinterpreted halfway through.
+enum class DragAxis : uint8_t { Undecided, Vertical, Horizontal };
+DragAxis dragAxis = DragAxis::Undecided;
+int16_t dragTravel = 0;    // vertical, signed: positive is downward
+int16_t dragTravelX = 0;   // horizontal, signed: positive is rightward
 
 // Far enough that it is a gesture and not a tremor, short enough that it still feels immediate.
 constexpr int16_t kDragCommitPx = 18;
@@ -634,9 +698,21 @@ void drawChrome() {
 // still consulted, last, for a status word this table does not recognise, so that a gateway which
 // one day publishes a real agent verb lights the matching animation with no firmware change.
 
+// `speaks` is the classification that decides what gets the prominent line on HOME.
+//
+// The orb has nine animations, so in normal operation the state word beside it is redundant — the
+// thread's NAME is the thing nothing else on the screen carries, and it is what a person needs to
+// see before they speak into the device. But several states all render the calm Ring, and for those
+// the word is the entire message: the orb cannot tell "Revoked" from "Idle", and hiding that behind
+// a thread name would hide a fault behind a decoration.
+//
+// So: THE PROMINENT LINE SHOWS THE THREAD NAME UNLESS THE STATE CARRIES INFORMATION THE ORB CANNOT
+// EXPRESS, IN WHICH CASE THE STATE WINS. Every branch of the table below sets this explicitly and
+// there is no default, so a state added later cannot quietly classify itself as decorative.
 struct OrbPresentation {
   OrbMode mode;
   const char* label;
+  bool speaks;
 };
 
 // Case-insensitive compare with no allocation. The client upper-cases a thread status for display
@@ -646,41 +722,71 @@ bool stateIs(const String& value, const char* word) {
   return strcasecmp(value.c_str(), word) == 0;
 }
 
+// The one word for a thread's status, and the ONLY place that decision is made.
+//
+// The orb's label and the thread line under it are the same fact, so they come from the same
+// function — a screen that says "Working" over an orb and "RUNNING" beside the thread is describing
+// one thing two ways. Returns an empty string when the status is a word this firmware has no
+// vocabulary for, so the caller can leave the space blank rather than print something raw.
+const char* threadStatusWord(const String& status) {
+  if (status.length() == 0) return "";
+  if (stateIs(status, "running") || stateIs(status, "working"))    return "Working";
+  if (stateIs(status, "streaming"))                                return "Composing";
+  if (stateIs(status, "starting"))                                 return "Starting";
+  if (stateIs(status, "error") || stateIs(status, "failed"))       return "Failed";
+  if (stateIs(status, "completed") || stateIs(status, "complete")) return "Done";
+  if (stateIs(status, "stopped") || stateIs(status, "idle")
+      || stateIs(status, "empty"))                                 return "Idle";
+  // A word the table does not know: ask the shared mapper, in case the gateway has grown a real
+  // agent verb since this was written.
+  const OrbMode mapped = orbModeForAgentState(status);
+  return mapped != OrbMode::Ring ? orbLabelForMode(mapped) : "";
+}
+
+// The selected thread's status word, or nothing when the list has not been fetched.
+const char* selectedThreadStatusWord() {
+  if (!gw || !gw->hasThread()) return "";
+  const int index = gw->selectedThreadIndex();
+  const ThreadOption* row = gw->thread((size_t)(index < 0 ? 0 : index));
+  if (!row || !row->selected) return "";
+  return threadStatusWord(row->status);
+}
+
 OrbPresentation presentationForState() {
   // 1. The microphone, above everything. "Listening" means the ADC is open and a clip is growing —
   //    not that a screen with a microphone on it happens to be showing, and not that a finished
   //    clip is waiting to be sent. It is the one state the person is directly causing.
-  if (audio::recording()) return {OrbMode::Wave, "Listening"};
+  if (audio::recording()) return {OrbMode::Wave, "Listening", false};
 
-  if (!gw || !prov) return {OrbMode::Ring, "Starting"};
+  if (!gw || !prov) return {OrbMode::Ring, "Starting", true};
 
   // 2. Getting onto a network and onto an account. Only one of these is genuinely "connecting":
   //    a device sitting on a revoked credential or an unreachable gateway is not establishing
   //    anything, and wiring a constellation together while it is stuck was the previous
   //    behaviour's plainest lie.
   switch (prov->status().state) {
-    case ProvisioningState::Provisioning:  return {OrbMode::Ring, "Set up"};
-    case ProvisioningState::Failed:        return {OrbMode::Ring, "Wi-Fi failed"};
-    case ProvisioningState::Unprovisioned: return {OrbMode::Ring, "Not set up"};
-    case ProvisioningState::Connecting:    return {OrbMode::Web, "Joining"};
+    case ProvisioningState::Provisioning:  return {OrbMode::Ring, "Set up", true};
+    case ProvisioningState::Failed:        return {OrbMode::Ring, "Wi-Fi failed", true};
+    case ProvisioningState::Unprovisioned: return {OrbMode::Ring, "Not set up", true};
+    case ProvisioningState::Connecting:    return {OrbMode::Web, "Joining", false};
     case ProvisioningState::Online:        break;
   }
 
   switch (gw->link()) {
-    case GatewayLink::NoIdentity:  return {OrbMode::Ring, "Not set up"};
-    case GatewayLink::Revoked:     return {OrbMode::Ring, "Revoked"};
-    case GatewayLink::Unreachable: return {OrbMode::Ring, "No gateway"};
-    case GatewayLink::Unclaimed:   return {OrbMode::Ring, "Claim me"};
+    case GatewayLink::NoIdentity:  return {OrbMode::Ring, "Not set up", true};
+    case GatewayLink::Revoked:     return {OrbMode::Ring, "Revoked", true};
+    case GatewayLink::Unreachable: return {OrbMode::Ring, "No gateway", true};
+    case GatewayLink::Unclaimed:   return {OrbMode::Ring, "Claim me", true};
     // Online, and the first cycle has not come back yet. This is the real one.
     case GatewayLink::Idle:
-    case GatewayLink::Connecting:  return {OrbMode::Web, "Connecting"};
+    case GatewayLink::Connecting:  return {OrbMode::Web, "Connecting", false};
     case GatewayLink::Claimed:     break;
   }
 
   // 3. A command parked by policy outranks any amount of agent activity, because it is the only
   //    thing on this device that cannot proceed without a person. The action bar says REVIEW at
   //    the same moment for the same reason.
-  if (gw->approvalCount() > 0) return {OrbMode::Ring, "Needs you"};
+  if (gw->approvalCount() > 0) return {OrbMode::Ring, "Needs you", true};
 
   // 4. The voice note, while one is in flight.
   //
@@ -697,17 +803,17 @@ OrbPresentation presentationForState() {
       // Bytes moving. The orb cannot animate through this one — uploadMedia blocks the render loop
       // for the whole transfer — but the screen showing "Sending" is painted before the call and is
       // therefore true for the entire stall.
-      return {OrbMode::Ribbon, "Sending"};
+      return {OrbMode::Ribbon, "Sending", false};
     case VoiceStage::Transcribing:
       // The scan meridian sweeping a dotted globe is a genuinely good read for ASR working through
       // a clip, and this is the first real trigger `searching` has ever had on this device.
-      return {OrbMode::Globe, "Transcribing"};
+      return {OrbMode::Globe, "Transcribing", false};
     case VoiceStage::Review:
       // A STOP. The normaliser changed something a person has to look at before it is dispatched,
       // so this must not animate as work in progress.
-      return {OrbMode::Ring, "Needs review"};
+      return {OrbMode::Ring, "Needs review", true};
     case VoiceStage::Failed:
-      return {OrbMode::Ring, "Voice failed"};
+      return {OrbMode::Ring, "Voice failed", true};
     default:
       break;
   }
@@ -717,9 +823,9 @@ OrbPresentation presentationForState() {
   //    arriving right now, which is what "composing" means.
   if (gw->responseOpen()) {
     const ThreadResponse& r = gw->response();
-    if (stateIs(r.state, "streaming")) return {OrbMode::Ribbon, "Composing"};
-    if (stateIs(r.state, "error"))     return {OrbMode::Ring, "Failed"};
-    if (gw->responseInFlight())        return {OrbMode::Orbits, "Working"};
+    if (stateIs(r.state, "streaming")) return {OrbMode::Ribbon, "Composing", false};
+    if (stateIs(r.state, "error"))     return {OrbMode::Ring, "Failed", true};
+    if (gw->responseInFlight())        return {OrbMode::Orbits, "Working", false};
   }
 
   // 5. The selected thread's own status.
@@ -727,29 +833,33 @@ OrbPresentation presentationForState() {
   const ThreadOption* selected = gw->thread((size_t)(index < 0 ? 0 : index));
   if (selected && selected->selected && selected->status.length() > 0) {
     const String& st = selected->status;
-    if (stateIs(st, "running") || stateIs(st, "working"))     return {OrbMode::Orbits, "Working"};
-    if (stateIs(st, "streaming"))                             return {OrbMode::Ribbon, "Composing"};
+    // The animation, paired with the word threadStatusWord() gives the same status — the two are
+    // kept beside each other here precisely so they cannot drift.
+    if (stateIs(st, "running") || stateIs(st, "working"))     return {OrbMode::Orbits, "Working", false};
+    if (stateIs(st, "streaming"))                             return {OrbMode::Ribbon, "Composing", false};
     // A session coming up is establishing something, which is the honest reading of the
     // constellation. The word says which kind of coming-up it is.
-    if (stateIs(st, "starting"))                              return {OrbMode::Web, "Starting"};
-    if (stateIs(st, "error") || stateIs(st, "failed"))        return {OrbMode::Ring, "Failed"};
-    if (stateIs(st, "completed") || stateIs(st, "complete"))  return {OrbMode::Ring, "Done"};
+    if (stateIs(st, "starting"))                              return {OrbMode::Web, "Starting", false};
+    if (stateIs(st, "error") || stateIs(st, "failed"))        return {OrbMode::Ring, "Failed", true};
+    if (stateIs(st, "completed") || stateIs(st, "complete"))  return {OrbMode::Ring, "Done", false};
     if (stateIs(st, "stopped") || stateIs(st, "idle")
-        || stateIs(st, "empty"))                              return {OrbMode::Ring, "Idle"};
+        || stateIs(st, "empty"))                              return {OrbMode::Ring, "Idle", false};
     // Unrecognised. Ask the shared mapper in case the gateway has grown a verb since this table
     // was written; if it has nothing either, say so rather than picking a busy animation.
     const OrbMode mapped = orbModeForAgentState(st);
-    if (mapped != OrbMode::Ring) return {mapped, orbLabelForMode(mapped)};
-    return {OrbMode::Ring, "Ready"};
+    if (mapped != OrbMode::Ring) return {mapped, orbLabelForMode(mapped), false};
+    return {OrbMode::Ring, "Ready", false};
   }
 
   // 6. No thread selected: the account's own state, which is all the display payload carries.
   const String& shown = gw->display().state;
-  if (stateIs(shown, "setup")) return {OrbMode::Ring, "Set up"};
-  if (stateIs(shown, "boot"))  return {OrbMode::Ring, "Starting"};
-  if (stateIs(shown, "error")) return {OrbMode::Ring, "Failed"};
-  if (!gw->hasThread())        return {OrbMode::Ring, "No thread"};
-  return {OrbMode::Ring, "Ready"};
+  if (stateIs(shown, "setup")) return {OrbMode::Ring, "Set up", true};
+  if (stateIs(shown, "boot"))  return {OrbMode::Ring, "Starting", false};
+  if (stateIs(shown, "error")) return {OrbMode::Ring, "Failed", true};
+  // The picker line under the orb says this far better than a word can, so it keeps the prominent
+  // slot rather than being displaced by a caption for it.
+  if (!gw->hasThread())        return {OrbMode::Ring, "No thread", false};
+  return {OrbMode::Ring, "Ready", false};
 }
 
 void setMode(OrbMode mode) {
@@ -763,6 +873,7 @@ void setMode(OrbMode mode) {
 void applyPresentation() {
   const OrbPresentation next = presentationForState();
   currentLabel = next.label;
+  currentSpeaks = next.speaks;
   if (next.mode != currentMode) setMode(next.mode);
 }
 
@@ -786,16 +897,20 @@ String gatewayLine() {
 //
 // `bottom` is contentBottom() everywhere except the claim screen, where the claim block owns the
 // lower half and the orb centres in what is left above it.
-Stack layOutStack(bool showLabel, bool line1, bool line2, int16_t bottom) {
+Stack layOutStack(bool showLabel, bool line1, bool line2, int16_t bottom, bool action = false,
+                  bool line1Big = false) {
   Stack out;
+  out.label = showLabel;
   out.line1 = line1;
   out.line2 = line2;
 
   // How far the ink reaches BELOW the orb's centre. Everything else follows from the centre, so the
   // block's height is this plus the ink radius above it.
-  int16_t below = showLabel ? (int16_t)(kLabelDrop + kLabelInkH) : kOrbInkR;
-  if (line1) below = (int16_t)(below + kGapLabelLine + kLineH);
+  out.action = action;
+  int16_t below = showLabel ? (int16_t)(kLabelDrop + kLabelInkH) : kOrbBlitR;
+  if (line1) below = (int16_t)(below + kGapLabelLine + (line1Big ? kLabelInkH : kLineH));
   if (line2) below = (int16_t)(below + kGapLine + kLineH);
+  if (action) below = (int16_t)(below + kGapLineAction + kActionRowBand);
 
   const int16_t height = (int16_t)(kOrbInkR + below);
   const int16_t space = (int16_t)(bottom - kContentTop);
@@ -807,29 +922,111 @@ Stack layOutStack(bool showLabel, bool line1, bool line2, int16_t bottom) {
 
   out.orbCy = cy;
   out.labelY = (int16_t)(cy + kLabelDrop);
-  int16_t cursor = showLabel ? (int16_t)(out.labelY + kLabelInkH) : (int16_t)(cy + kOrbInkR);
+  // Without a label the block still has to clear the orb's BLIT, not merely its ink, or the first
+  // line lands inside the disc that gets rewritten every frame.
+  int16_t cursor = showLabel ? (int16_t)(out.labelY + kLabelInkH) : (int16_t)(cy + kOrbBlitR);
   if (line1) {
     out.line1Y = (int16_t)(cursor + kGapLabelLine);
-    cursor = (int16_t)(out.line1Y + kLineH);
+    cursor = (int16_t)(out.line1Y + (line1Big ? kLabelInkH : kLineH));
   }
   if (line2) {
     out.line2Y = (int16_t)(cursor + kGapLine);
+    cursor = (int16_t)(out.line2Y + kLineH);
   }
+  if (action) out.actionY = (int16_t)(cursor + kGapLineAction);
   return out;
 }
 
-void paintHome() {
-  // The thread's own name, or an honest stand-in. Never an id.
-  String thread;
-  if (!gw) thread = "No gateway";
-  else if (!gw->hasThread()) thread = "Select a thread";
-  else thread = threadTitle();
-  const String detail = message.length() > 0 ? message : gatewayLine();
+// ---------------------------------------------------------------------------------------------
+// HOME: the orb, and the destination
+// ---------------------------------------------------------------------------------------------
 
-  stack = layOutStack(true, thread.length() > 0, detail.length() > 0, contentBottom());
+// The OPEN control, centred under the picker line.
+Rect homeActionRect() {
+  return {(int16_t)(kW / 2 - 46), stack.actionY, 92, kActionRowBand};
+}
+
+int boundThreadIndex() {
+  if (!gw) return -1;
+  for (size_t i = 0; i < gw->threadCount(); i += 1) {
+    const ThreadOption* row = gw->thread(i);
+    if (row && row->selected) return (int)i;
+  }
+  return -1;
+}
+
+// What the line is pointing at: the local highlight while a swipe is settling, and otherwise
+// whatever the gateway says is actually bound.
+int pickerTarget() {
+  if (!gw) return -1;
+  if (pickerIndex >= 0 && (size_t)pickerIndex < gw->threadCount()) return pickerIndex;
+  return boundThreadIndex();
+}
+
+// A selection the user has made but the gateway has not yet been told about.
+bool pickerPending() {
+  return pickerCommitAt != 0 && pickerTarget() != boundThreadIndex();
+}
+
+void paintHome() {
+  const int target = pickerTarget();
+  const ThreadOption* row = (target >= 0) ? gw->thread((size_t)target) : nullptr;
+  const bool pending = pickerPending();
+
+  // The destination, by name. Never an id — see threadTitle().
+  String name;
+  if (row && row->title.length() > 0) {
+    name = row->title;
+  } else if (gw->hasThread()) {
+    // Bound, but the list has not been fetched this boot so the title is not known here. This must
+    // not read as "no thread": the device HAS a destination, it just cannot name it yet.
+    name = threadsFetched ? String("Selected thread") : String("Loading threads");
+  } else if (!threadsFetched) {
+    name = "Loading threads";
+  } else {
+    // The case that matters most. A person about to hold the microphone with nothing bound would be
+    // speaking into the void, so this says so plainly and OPEN becomes CHOOSE.
+    name = "No thread selected";
+  }
+
+  // THE RULE. See OrbPresentation::speaks: the name wins unless the state is something the orb has
+  // no animation for, in which case the word is the only way to know and it takes the big line.
+  const String prominent = currentSpeaks ? String(currentLabel) : name;
+
+  String secondary;
+  if (pickerBinding) secondary = "Selecting...";
+  else if (pending) secondary = "Swipe to choose - not sent yet";
+  else if (message.length() > 0) secondary = message;
+  else if (currentSpeaks) secondary = name;
+  else {
+    const char* word = row ? threadStatusWord(row->status) : "";
+    secondary = strlen(word) > 0 ? String(word) : String(currentLabel);
+  }
+
+  // A title longer than 19 characters drops to size 1 rather than being cut down to something that
+  // no longer identifies the thread. It is still the biggest thing on the screen after the orb.
+  const bool big = prominent.length() <= kCols2;
+  stack = layOutStack(false, true, secondary.length() > 0, contentBottom(), true, big);
+
   clearContent();
-  if (stack.line1) uip::textCentered(stack.line1Y, 1, kText, uip::fitWords(thread, kCols1));
-  if (stack.line2) uip::textCentered(stack.line2Y, 1, kMuted, uip::fitWords(detail, kCols1));
+  uip::textCentered(stack.line1Y, big ? 2 : 1, pending ? kMuted : kText,
+                    uip::fitWords(prominent, big ? kCols2 : kCols1));
+  if (stack.line2) {
+    uip::textCentered(stack.line2Y, 1, pending ? kBright : kMuted,
+                      uip::fitWords(secondary, kCols1));
+  }
+
+  const Rect action = homeActionRect();
+  const bool none = target < 0 && !gw->hasThread();
+  uip::button(action, none ? "CHOOSE" : "OPEN", true, true);
+
+  // The swipe affordance. Only drawn when there is somewhere to swipe to, because a chevron that
+  // does nothing is worse than no chevron.
+  if (gw->threadCount() > 1) {
+    const int16_t cy = (int16_t)(action.y + action.h / 2);
+    uip::chevron((int16_t)(action.x - 18), cy, 5.0f, -1, kHair, 2.0f);
+    uip::chevron((int16_t)(action.x + action.w + 18), cy, 5.0f, 1, kHair, 2.0f);
+  }
 }
 
 // The claim screen. A brand-new controller has one job: tell its owner how to take possession of
@@ -846,7 +1043,8 @@ void paintStatus() {
   if (unclaimed()) {
     // No label and no lines here — the claim block owns everything from kClaimTop down, and the orb
     // centres in the band above it.
-    stack = layOutStack(false, false, false, (int16_t)(kClaimTop - 6));
+    stack = layOutStack(true, false, false, (int16_t)(kClaimTop - 6));
+    stack.label = false;   // the claim block owns this band; the shimmer would sit on top of it
     clearContent();
     const String code = gw->claimCode();
     uip::textCentered(kClaimTop, 1, kMuted, "CLAIM THIS CONTROLLER");
@@ -1055,64 +1253,181 @@ void paintProjects() {
 // Send
 // ---------------------------------------------------------------------------------------------
 
-constexpr Rect kMicButton = {14, kContentTop + 6, kW - 28, 86};
-// Measured off the element above it, not guessed. The heading sits in the gap between the capsule
-// and the list, and the list starts below the heading — so growing the capsule moves both instead
-// of quietly overlapping them.
-constexpr int16_t kSendHeadingY = kMicButton.y + kMicButton.h + 10;
-constexpr int16_t kActionListTop = kSendHeadingY + 18;
-constexpr int16_t kActionRowH = 42;
+// ---------------------------------------------------------------------------------------------
+// SEND: the voice screen, and only the voice screen
+// ---------------------------------------------------------------------------------------------
+//
+// This screen used to carry the microphone AND the saved-actions list AND their RUN metadata, all
+// at once, through every state of a capture — so the moment a person held the button to speak, the
+// screen was still offering them four other things to press. The list has moved to its own screen
+// (reachable from HOME, which is where it belongs); what is left here is one control and one fact:
+// the record button, and the thread the recording is going to.
+//
+// Four views, one at a time:
+//
+//   Ready      the capsule, and the thread's title under it
+//   Recording  the same capsule, animated, with the elapsed seconds
+//   Held       the clip's length, and DISCARD / SEND in the action bar
+//   Journey    the full page: the orb, running the animation for the stage the gateway last
+//              reported, and no buttons at all
 
+constexpr Rect kMicButton = {14, kContentTop + 8, kW - 28, 92};
+
+// Where the pulse sits: inside the capsule's straight middle section, which is the only part of a
+// capsule whose fill is uniform and therefore the only part a strip can be erased against with one
+// flat rectangle.
+constexpr uint8_t kPulseDots = 7;
+constexpr int16_t kPulseStep = 17;
+constexpr int16_t kPulseCell = 14;
+
+enum class VoiceView : uint8_t { Ready, Recording, Held, Journey };
+
+// True while the gateway is doing something with a clip that has already left the board.
+bool voiceInJourney() {
+  switch (voice.stage()) {
+    case VoiceStage::Uploading:
+    case VoiceStage::Transcribing:
+    case VoiceStage::Review:
+    case VoiceStage::Failed:
+      return true;
+    default:
+      return false;
+  }
+}
+
+VoiceView voiceView() {
+  if (voiceInJourney()) return VoiceView::Journey;
+  if (audio::recording()) return VoiceView::Recording;
+  if (clipHeld) return VoiceView::Held;
+  return VoiceView::Ready;
+}
+
+// The full-page voice moment owns the screen: SEND, no buttons, one orb in the middle of the page.
+bool voiceOwnsScreen() {
+  return screen == Screen::Send && voiceInJourney();
+}
+
+// The travelling wave inside the record button.
+//
+// Deliberately the same idiom as everything else on this device — anti-aliased dots whose weight
+// moves — rather than a new kind of motion invented for one control. It is also the cheapest live
+// thing available: a flat strip of about 2 200 pixels erased and seven dots drawn into it, roughly
+// 0.7 ms, against a capsule repaint that is 20 000 pixels and 4 ms. The elapsed seconds stay where
+// they are and keep their own slower cadence, because the number is real information and redrawing
+// it at animation speed would only make it flicker.
+void paintMicPulse(uint32_t elapsedMs) {
+  if (!displayReady()) return;
+  const int16_t cy = (int16_t)(kMicButton.y + kMicButton.h - 22);
+  const int16_t span = (int16_t)((kPulseDots - 1) * kPulseStep + kPulseCell);
+  const int16_t x0 = (int16_t)(kW / 2 - span / 2);
+
+  // One flat erase for the whole strip, against the capsule's own fill.
+  g().fillRect(x0, (int16_t)(cy - kPulseCell / 2), span, kPulseCell, panelGrey(kSurfaceHi));
+
+  const float t = elapsedMs / 1000.0f;
+  for (uint8_t i = 0; i < kPulseDots; ++i) {
+    // A wave travelling outward from the centre rather than left to right: a bar that sweeps one
+    // way reads as progress towards something, and a recording is not progressing towards anything.
+    const float d = fabsf((float)i - (kPulseDots - 1) / 2.0f);
+    const float amp = 0.5f + 0.5f * sinf(t * 5.0f - d * 0.9f);
+    const int16_t cx = (int16_t)(x0 + kPulseCell / 2 + (int16_t)i * kPulseStep);
+    uip::dot(cx, cy, 1.8f + 2.4f * amp, (uint8_t)(110 + 145 * amp), kSurfaceHi);
+  }
+}
+
+// The capsule and its words. Redrawn on a state change, and four times a second while recording so
+// the elapsed seconds advance.
 void paintMicButton() {
   const bool have = audio::available();
   const bool live = audio::recording();
 
-  // A capsule, and at this height the radius is 43 px — there is no corner on it at all, which is
+  // A capsule, and at this height the radius is 46 px — there is no corner on it at all, which is
   // the point: the one thing on this screen a thumb lands on should not be a box.
   const int16_t fill = live ? (int16_t)kSurfaceHi : (int16_t)kSurface;
   const int16_t stroke = live ? (int16_t)kBright : (have ? (int16_t)kMuted : (int16_t)kHair);
-  uip::capsule(kMicButton, fill, stroke, live ? 2.2f : 1.4f, 1.6f);
+  uip::capsule(kMicButton, fill, stroke, live ? 2.4f : 1.4f, 1.6f);
 
   if (!have) {
-    uip::textCentered(kMicButton.y + 30, 2, kHair, "NO MIC");
-    uip::textCentered(kMicButton.y + 56, 1, kHair, "flash the -controller build");
+    uip::textCentered(kMicButton.y + 32, 2, kHair, "NO MIC");
+    uip::textCentered(kMicButton.y + 58, 1, kHair, "flash the -controller build");
     return;
   }
   if (live) {
     const uint32_t ms = audio::recordedMs();
-    uip::textCentered(kMicButton.y + 26, 2, kBright, "RECORDING");
-    char buf[24];
-    snprintf(buf, sizeof(buf), "%u.%us  release to stop", (unsigned)(ms / 1000),
-             (unsigned)((ms % 1000) / 100));
-    uip::textCentered(kMicButton.y + 56, 1, kMuted, buf);
+    uip::textCentered(kMicButton.y + 22, 2, kBright, "RECORDING");
+    char buf[16];
+    snprintf(buf, sizeof(buf), "%u.%us", (unsigned)(ms / 1000), (unsigned)((ms % 1000) / 100));
+    uip::textCentered(kMicButton.y + 46, 1, kMuted, buf);
     return;
   }
   if (clipHeld) {
-    char buf[28];
-    snprintf(buf, sizeof(buf), "%u.%us CLIP READY", (unsigned)(clipHeldMs / 1000),
+    char buf[16];
+    snprintf(buf, sizeof(buf), "%u.%us CLIP", (unsigned)(clipHeldMs / 1000),
              (unsigned)((clipHeldMs % 1000) / 100));
-    uip::textCentered(kMicButton.y + 26, 2, kBright, buf);
-    uip::textCentered(kMicButton.y + 56, 1, kMuted, "send it or discard it below");
+    uip::textCentered(kMicButton.y + 32, 2, kBright, buf);
+    uip::textCentered(kMicButton.y + 58, 1, kMuted, "send or discard below");
     return;
   }
-  uip::textCentered(kMicButton.y + 26, 2, kText, "HOLD TO TALK");
-  uip::textCentered(kMicButton.y + 56, 1, kMuted, "voice note to the selected thread");
+  uip::textCentered(kMicButton.y + 32, 2, kText, "HOLD TO TALK");
+  uip::textCentered(kMicButton.y + 58, 1, kMuted, "press and speak");
 }
 
-// Everything on SEND that does not scroll: the microphone and the heading over the list.
-void paintSendChrome() {
-  g().fillRect(0, kContentTop, kW, (int16_t)(kActionListTop - kContentTop), panelGrey(kBg));
-  paintMicButton();
-  uip::text(14, kSendHeadingY, 1, kMuted, "SAVED ACTIONS");
+// Where the clip is going. The thread's own title, so a person knows before they speak — this is
+// the second of the two things this screen is allowed to show.
+void paintMicDestination() {
+  const int16_t y = (int16_t)(kMicButton.y + kMicButton.h + 26);
+  String where;
+  uint8_t tone = kText;
+  if (!gw || !gw->hasThread()) {
+    where = "No thread selected";
+    tone = kBright;
+  } else {
+    const String title = threadTitle();
+    // Never the id. Open THREADS once and the name is known from then on.
+    where = title.length() > 0 ? title : String("Selected thread");
+  }
+  uip::textCentered((int16_t)(y - 16), 1, kHair, "SENDING TO");
+  uip::textCentered(y, 1, tone, uip::fitWords(where, kCols1));
 }
 
 void paintSend() {
+  if (voiceView() == VoiceView::Journey) {
+    // The full-page moment. The orb is drawn by the frame loop at stack.orbCy; all this has to do
+    // is lay the block out and say which stage it is.
+    const String detail = voice.detail();
+    stack = layOutStack(true, detail.length() > 0, false, kH);
+    clearContent();
+    if (stack.line1) uip::textCentered(stack.line1Y, 1, kMuted, uip::fitWords(detail, kCols1));
+    return;
+  }
+
+  clearContent();
+  paintMicButton();
+  paintMicDestination();
+}
+
+// ---------------------------------------------------------------------------------------------
+// The saved actions, on their own screen
+// ---------------------------------------------------------------------------------------------
+//
+// Moved off SEND, where they were four things to press in the middle of a voice interaction.
+// Nothing was deleted: HOME's action bar offers ACTIONS whenever the owner has assigned any.
+
+constexpr int16_t kActionListTop = kContentTop + 34;
+constexpr int16_t kActionRowH = 42;
+
+void paintActionsChrome() {
+  g().fillRect(0, kContentTop, kW, (int16_t)(kActionListTop - kContentTop), panelGrey(kBg));
+  uip::text(14, kContentTop + 8, 1, kMuted, "SAVED ACTIONS");
+}
+
+void paintActions() {
   clearListRegion(kActionListTop);
 
   const size_t count = gw->controlCount();
   if (count == 0) {
-    paintSendChrome();
-    uip::textCentered(kActionListTop + 20, 1, kHair, "None assigned - add them in the console");
+    paintActionsChrome();
+    uip::textCentered(kActionListTop + 40, 1, kHair, "None assigned - add them in the console");
     return;
   }
 
@@ -1139,7 +1454,7 @@ void paintSend() {
     if (sub.length() > 0) uip::text(14, (int16_t)(y + 20), 1, kHair, uip::fitWords(sub, 34));
     if (i + 1 < count) uip::divider(20, (int16_t)(y + kActionRowH - 6), (int16_t)(kW - 40));
   }
-  paintSendChrome();
+  paintActionsChrome();
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -1338,6 +1653,7 @@ void paintContent() {
     case Screen::Home:         paintHome(); break;
     case Screen::Threads:      paintThreads(); break;
     case Screen::Send:         paintSend(); break;
+    case Screen::Actions:      paintActions(); break;
     case Screen::Response:     paintResponse(); break;
     case Screen::Approvals:    paintApprovals(); break;
     case Screen::Environments: paintEnvironments(); break;
@@ -1514,6 +1830,16 @@ void buildActions() {
   actionCount = 0;
   if (!gw) return;
 
+  // An open config portal takes over the screen, and nothing offered a way out of it: the only
+  // exits were joining a network or pulling the power. A device in this state is usually still
+  // online and still reachable — the owner opened the portal, saw they did not need it, and simply
+  // wants their screen back. Offered before every other rule, including the modal, because being
+  // unable to leave a screen is a worse dead end than any of them.
+  if (prov && prov->configPortalActive()) {
+    addAction(Act::ClosePortal, "DONE", true);
+    return;
+  }
+
   // A modal outranks everything, including a held clip. Both want the same two buttons, and a
   // confirmation that cannot be answered because a recording is queued behind it is a dead end
   // with no way out of it.
@@ -1556,7 +1882,10 @@ void buildActions() {
         return;
       }
       if (audio::available()) addAction(Act::Talk, "TALK", true);
-      if (gw->responseOpen()) addAction(Act::OpenReply, "REPLY", false);
+      // The saved actions moved off the voice screen and this is how they stay reachable. There is
+      // deliberately no REPLY here: the OPEN button under the picker already goes into the thread,
+      // and two controls for one destination is the clutter this pass exists to remove.
+      if (gw->controlCount() > 0) addAction(Act::SavedActions, "ACTIONS", false);
       return;
     }
     case Screen::Threads:
@@ -1569,7 +1898,11 @@ void buildActions() {
       if (browse.projectCount() == 0) addAction(Act::Reload, "RELOAD", true);
       return;
     case Screen::Send:
-      return;   // the microphone and the saved actions are the screen; nothing else to press
+      // The record button IS the control, and during the journey there is nothing to press at all —
+      // offering buttons that do nothing while a clip uploads is worse than offering none.
+      return;
+    case Screen::Actions:
+      return;   // every row is its own control
     case Screen::Response: {
       if (!gw->responseOpen()) {
         addAction(Act::Refresh, "LOAD LATEST", true, gw->hasThread());
@@ -1666,6 +1999,15 @@ void showBusy(const String& title, const String& detail) {
 void goTo(Screen next) {
   closeDrawerNow();
   if (screen == next) return;
+  // Leaving the voice screen acknowledges a finished capture. Without this the orb would go on
+  // reporting "Voice failed" from HOME for the rest of the session — and because that state is
+  // classified as speaking, it would sit on the prominent line hiding the thread name behind a
+  // capture the person has already walked away from. The outcome survives in `message`.
+  if (screen == Screen::Send && voiceInJourney()
+      && (voice.stage() == VoiceStage::Failed || voice.stage() == VoiceStage::Review)) {
+    message = voice.detail();
+    voice.reset();
+  }
   screen = next;
   modal = Modal::None;
   chromeDirty = true;
@@ -1676,6 +2018,7 @@ void goBack() {
   switch (screen) {
     case Screen::Projects:     goTo(Screen::Environments); return;
     case Screen::Environments: goTo(Screen::Threads); return;
+    case Screen::Actions:      goTo(Screen::Home); return;
     // An unclaimed device's home IS the claim screen; sending it to a home it does not have would
     // land on a thread label for a thread it cannot see.
     default:                   goTo(operable() ? Screen::Home : Screen::Status); return;
@@ -1771,6 +2114,27 @@ void discardClip() {
   contentDirty = true;
 }
 
+// One complete frame of the full-page voice moment, painted synchronously. Used immediately before
+// a blocking call so the still image the person is left looking at is the correct one.
+void paintVoiceMomentNow() {
+  if (!displayReady()) return;
+  closeDrawerNow();
+  screen = Screen::Send;
+  applyPresentation();
+  statusLabel = currentLabel;
+  shownLabel = "";
+  // The bar band is cleared by hand: buildActions() will agree there is nothing to press, but that
+  // does not happen until the next frame and this one is the last for a while.
+  g().fillRect(0, (int16_t)(kH - kBarH), kW, kBarH, panelGrey(kBg));
+  barT = 0.0f;
+  barReserved = false;
+  paintSend();
+  const uint32_t elapsed = millis() - orbStartedAt;
+  if (orbReady) displayDrawOrb(orb, kOrbCx, stack.orbCy, elapsed, kOrbDrawPx);
+  if (stack.label) displayDrawStatus(currentLabel, stack.labelY, elapsed);
+  contentDirty = true;
+}
+
 // The upload-and-dispatch half of push-to-talk, now behind a deliberate press rather than behind
 // the finger lifting. Blocks for as long as the upload takes and says so on screen the entire time.
 void sendHeldClip() {
@@ -1782,10 +2146,15 @@ void sendHeldClip() {
     return;
   }
 
-  // Paint the stage, THEN block in it. The upload holds the render loop for its whole duration, so
-  // the only honest thing to do is put the right words on the glass before the stall starts.
+  // Paint the stage, THEN block in it.
+  //
+  // uploadMedia holds the render loop for the whole transfer, so the uploading frame is STILL — the
+  // orb cannot animate through it and pretending otherwise would be a lie about the device. What it
+  // can do is show the right picture before the stall begins: the full-page voice moment, with one
+  // real orb frame in Ribbon and the word "Sending" under it. The motion arrives at the next stage,
+  // transcribing, which is poll-driven and therefore genuinely animated.
   voice.setLocalStage(VoiceStage::Uploading);
-  showBusy("Sending", String(ms / 1000) + "s voice note");
+  paintVoiceMomentNow();
 
   // The WAV header is passed as its own segment so the PCM is never memmoved to make room in front
   // of it — on a megabyte clip that copy is the difference between working and not.
@@ -1817,10 +2186,20 @@ void sendHeldClip() {
     if (c->kind == "capture_audio" || c->mediaKind == "audio") { target = c; break; }
   }
 
-  showBusy("Sending", target ? target->label : String("Voice note"));
   const DispatchResult result = target
     ? gw->runAction(target->actionId, mediaId)
     : gw->sendAudioPrompt(mediaId, AUDIO_PROMPT_TEXT);
+  message = result.detail;
+
+  if (voice.tracking()) {
+    // The journey owns the screen until it ends. The response is ARMED so runCycle starts polling
+    // it, but the reply screen is not opened over the top of a capture that is still being
+    // transcribed — one thing at a time is the whole point of this screen.
+    if (result.accepted) gw->openResponse(result.responseAfter);
+    contentDirty = true;
+    return;
+  }
+  // No job to follow: an older gateway, or an upload that produced no job id. Behave as before.
   afterDispatch(result, true);
 }
 
@@ -1874,9 +2253,38 @@ void startRecording() {
   paintMicButton();
 }
 
+// Writes a pending selection through, or does nothing when there is none.
+//
+// Called from two places and it matters that it is the same code: the debounce timer, and OPEN —
+// which must commit BEFORE it opens, because selectThread() closes the open response and doing it
+// the other way round would arm the reply and then immediately discard it.
+void commitPicker() {
+  if (pickerCommitAt == 0) return;
+  pickerCommitAt = 0;
+  const int target = pickerIndex;
+  pickerIndex = -1;
+  if (target < 0 || target == boundThreadIndex()) return;
+
+  pickerBinding = true;
+  paintContent();                 // "Selecting..." on the glass before the socket
+  const bool bound = gw->selectThread((size_t)target);
+  pickerBinding = false;
+  if (!bound) {
+    // The highlight goes back to what the device is genuinely bound to. A line that kept showing
+    // the optimistic value would send the next voice note to the wrong thread.
+    message = gw->threadsDetail().length() > 0 ? gw->threadsDetail() : String("Could not select");
+  } else {
+    message = "";
+  }
+  contentDirty = true;
+  applyPresentation();
+  statusLabel = currentLabel;
+}
+
 void refreshThreads() {
   showBusy("Threads", "Asking the gateway");
   gw->refreshThreads();
+  threadsFetched = true;
   threadScroll = 0;
   message = gw->threadsDetail();
   contentDirty = true;
@@ -2008,11 +2416,11 @@ void runAction(Act id) {
     case Act::Talk:
       goTo(Screen::Send);
       return;
+    case Act::SavedActions:
+      goTo(Screen::Actions);
+      return;
     case Act::PickThread:
       goToThreads();
-      return;
-    case Act::OpenReply:
-      goTo(Screen::Response);
       return;
     case Act::Reload:
       if (screen == Screen::Environments) { refreshEnvironments(); return; }
@@ -2088,6 +2496,15 @@ void runAction(Act id) {
       contentDirty = true;
       prov->openConfigPortal();
       return;
+    case Act::ClosePortal:
+      // Closes the portal only. Wi-Fi credentials and the gateway URL are untouched, so a device
+      // that was online before the portal opened is online the moment it closes.
+      Serial.println("[provisioning] closing the config portal at the owner's request.");
+      prov->closeConfigPortal();
+      message = "";
+      contentDirty = true;
+      chromeDirty = true;
+      return;
     case Act::Reprovision:
       modal = Modal::ConfirmReprovision;
       contentDirty = true;
@@ -2160,6 +2577,29 @@ void handleDrawerTap(int16_t x, int16_t y) {
 
 void handleContentTap(int16_t x, int16_t y) {
   switch (screen) {
+    case Screen::Home: {
+      if (!uip::hit(homeActionRect(), x, y)) return;
+      // OPEN goes into the thread the line is pointing at. With nothing bound it is CHOOSE, and it
+      // takes the person somewhere they can pick one rather than leaving them on a dead line.
+      if (pickerTarget() < 0 && !gw->hasThread()) { goToThreads(); return; }
+      // Committed first, so OPEN can never open a thread the device is not actually bound to.
+      commitPicker();
+      goTo(Screen::Response);
+      if (!gw->responseOpen() && gw->hasThread()) {
+        showBusy("Reply", "Loading the latest");
+        gw->openResponse(String());
+        contentDirty = true;
+      }
+      return;
+    }
+    case Screen::Actions: {
+      const int16_t local = (int16_t)(y - kActionListTop + actionScroll);
+      if (local < 0) return;
+      const size_t index = (size_t)(local / kActionRowH);
+      const DeviceControl* c = gw->control(index);
+      if (c) runControlRow(*c);
+      return;
+    }
     case Screen::Threads: {
       if (uip::hit(kBreadcrumb, x, y)) {
         goTo(Screen::Environments);
@@ -2187,6 +2627,7 @@ void handleContentTap(int16_t x, int16_t y) {
       return;
     }
     case Screen::Send: {
+      if (voiceInJourney()) return;   // nothing on this screen is pressable while a clip is in flight
       if (uip::hit(kMicButton, x, y)) {
         if (clipHeld) {
           message = "Send or discard the clip below";
@@ -2196,13 +2637,7 @@ void handleContentTap(int16_t x, int16_t y) {
           message = "Hold the button while you speak";
         }
         contentDirty = true;
-        return;
       }
-      const int16_t local = (int16_t)(y - kActionListTop + actionScroll);
-      if (local < 0) return;
-      const size_t index = (size_t)(local / kActionRowH);
-      const DeviceControl* c = gw->control(index);
-      if (c) runControlRow(*c);
       return;
     }
     case Screen::Response: {
@@ -2220,6 +2655,62 @@ void handleContentTap(int16_t x, int16_t y) {
     default:
       return;
   }
+}
+
+// Steps HOME's destination picker. Local only — the write is debounced by the caller's timer, so
+// eight swipes cost one request and the device is never bound to something merely passed over.
+void pickerStep(int delta) {
+  const size_t count = gw->threadCount();
+  if (count == 0) {
+    message = threadsFetched ? String("No threads; start one in the console")
+                             : String("Open THREADS to load the list");
+    contentDirty = true;
+    return;
+  }
+  int at = pickerTarget();
+  if (at < 0) at = 0;
+  const int next = at + delta;
+  if (next < 0 || next >= (int)count) {
+    // A wall, said out loud. A swipe that silently does nothing is indistinguishable from one the
+    // device failed to see.
+    message = next < 0 ? "First thread" : "Last thread";
+    contentDirty = true;
+    return;
+  }
+  pickerIndex = next;
+  pickerCommitAt = millis() + kPickerCommitMs;
+  message = "";
+  contentDirty = true;
+}
+
+// Moves between the three levels of the hierarchy.
+//
+// Direction follows the breadcrumb's reading order, which runs environment / folder / thread from
+// left to right: swiping LEFT moves the content leftward and brings the next level in from the
+// right, so left goes DEEPER and right goes back UP. Only navigation happens here — binding an
+// environment or a project is destructive of the levels below it, so those stay behind a deliberate
+// tap on their own screen rather than under a gesture that can be made by accident.
+void levelStep(int delta) {
+  if (delta > 0) {
+    if (screen == Screen::Environments) {
+      goTo(Screen::Projects);
+      if (browse.projectCount() == 0) refreshProjects();
+      return;
+    }
+    if (screen == Screen::Projects) { goToThreads(); return; }
+    message = "Threads are the last level";
+    contentDirty = true;
+    return;
+  }
+  if (screen == Screen::Threads || screen == Screen::Projects) {
+    const Screen next = screen == Screen::Threads ? Screen::Projects : Screen::Environments;
+    goTo(next);
+    if (next == Screen::Projects && browse.projectCount() == 0) refreshProjects();
+    if (next == Screen::Environments && browse.environmentCount() == 0) refreshEnvironments();
+    return;
+  }
+  message = "Environments are the first level";
+  contentDirty = true;
 }
 
 void handleTap(int16_t x, int16_t y) {
@@ -2259,6 +2750,18 @@ void handleDrag(int16_t y, int16_t dy) {
 
   dragTravel = (int16_t)(dragTravel + dy);
   (void)y;
+
+  // Lock the axis the moment either one is decisive, and never revisit it.
+  if (dragAxis == DragAxis::Undecided) {
+    const int16_t ax = dragTravelX < 0 ? (int16_t)-dragTravelX : dragTravelX;
+    const int16_t ay = dragTravel < 0 ? (int16_t)-dragTravel : dragTravel;
+    if (ax >= kDragCommitPx || ay >= kDragCommitPx) {
+      dragAxis = ax > ay ? DragAxis::Horizontal : DragAxis::Vertical;
+    }
+  }
+  // A horizontal gesture is resolved on the lift, by touchPoll's swipe classification. Nothing
+  // happens while it is in progress, and in particular the drawer is not touched.
+  if (dragAxis == DragAxis::Horizontal) return;
 
   if (dragOwner == DragOwner::Drawer) {
     if (!drawerOpen && dragTravel > kDragCommitPx) openDrawer();
@@ -2305,7 +2808,7 @@ void handleDrag(int16_t y, int16_t dy) {
     if (next != projectScroll) { projectScroll = next; contentDirty = true; }
     return;
   }
-  if (screen == Screen::Send) {
+  if (screen == Screen::Actions) {
     const int16_t limit = maxScroll(gw->controlCount(), kActionRowH, kActionListTop);
     int16_t next = (int16_t)(actionScroll - dy);
     if (next < 0) next = 0;
@@ -2327,7 +2830,7 @@ bool uiBegin(GatewayClient& gateway, Provisioning& provisioning, DeviceStore& de
   browse.begin(deviceStore);
   voice.begin(deviceStore);
 
-  orbReady = orb.begin(kOrbPx - 8, 900);
+  orbReady = orb.begin(kOrbDrawPx - 8, kOrbDots);
   // A fifth of the home orb's dot budget. It is 44 px across; a denser cloud at that size reads as
   // a smudge, and the point of it is only to show that something is still happening.
   miniReady = miniOrb.begin(kMiniOrbPx - 4, 180);
@@ -2346,6 +2849,8 @@ void uiHandleTouch(const TouchEvent& event) {
     case TouchGesture::Press:
       // Ownership is decided here and nowhere else, from where the finger landed.
       dragTravel = 0;
+      dragTravelX = 0;
+      dragAxis = DragAxis::Undecided;
       if (event.y < kContentTop) dragOwner = DragOwner::Drawer;
       else if (drawerT > 0.05f) dragOwner = DragOwner::DrawerList;
       else dragOwner = DragOwner::Content;
@@ -2357,16 +2862,19 @@ void uiHandleTouch(const TouchEvent& event) {
       return;
 
     case TouchGesture::Drag:
+      dragTravelX = (int16_t)(dragTravelX + event.dx);
       handleDrag(event.y, event.dy);
       return;
 
     case TouchGesture::Release:
       dragTravel = 0;
+      dragTravelX = 0;
       if (recordArmed) finishRecording();
       return;
 
     case TouchGesture::Tap:
       dragTravel = 0;
+      dragTravelX = 0;
       if (recordArmed) { finishRecording(); return; }
       handleTap(event.x, event.y);
       return;
@@ -2374,15 +2882,33 @@ void uiHandleTouch(const TouchEvent& event) {
     case TouchGesture::SwipeLeft:
     case TouchGesture::SwipeRight: {
       dragTravel = 0;
+      dragTravelX = 0;
       if (recordArmed) { finishRecording(); return; }
+      // A gesture that already locked to the vertical axis is a scroll that happened to drift, and
+      // must not be re-read as a swipe on the way out. A flick fast enough never to produce a Drag
+      // leaves the axis Undecided, and that is a genuine swipe.
+      if (dragAxis == DragAxis::Vertical) { dragAxis = DragAxis::Undecided; return; }
+      dragAxis = DragAxis::Undecided;
       if (drawerT > 0.05f) { closeDrawer(); return; }
-      // Paging, and only paging. A swipe that changed screens would fight the list scroll and the
-      // response pages for the same gesture.
-      if (!operable() || modal != Modal::None || screen != Screen::Response) return;
-      if (!gw->responseOpen()) return;
+      if (!operable() || modal != Modal::None) return;
+      // Left is "forward": deeper into the hierarchy, later in the thread list, next page.
+      const int forward = event.gesture == TouchGesture::SwipeLeft ? 1 : -1;
+
+      // HOME's line under the orb is the destination picker.
+      if (screen == Screen::Home) { pickerStep(forward); return; }
+
+      // The three levels.
+      if (screen == Screen::Threads || screen == Screen::Projects
+          || screen == Screen::Environments) {
+        levelStep(forward);
+        return;
+      }
+
+      // Paging the reply, which is the meaning this gesture already had here.
+      if (screen != Screen::Response || !gw->responseOpen()) return;
       const ThreadResponse& r = gw->response();
       if (r.pageCount <= 1) return;
-      const int next = event.gesture == TouchGesture::SwipeLeft
+      const int next = forward > 0
         ? (r.page + 1) % r.pageCount
         : (r.page + r.pageCount - 1) % r.pageCount;
       showBusy("Reply", "Loading page");
@@ -2392,11 +2918,16 @@ void uiHandleTouch(const TouchEvent& event) {
     }
 
     case TouchGesture::LongPress:
-      if (recordArmed) return;   // a long hold on the microphone is the whole point of it
-      Serial.println("[provisioning] long press - opening the config portal.");
-      message = "Config portal open";
-      contentDirty = true;
-      prov->openConfigPortal();
+      // Deliberately does nothing now.
+      //
+      // This used to open the config portal from ANY screen, with no confirmation — and the portal
+      // had no exit, so one accidental hold locked the device on the setup screen until it was
+      // power-cycled. That is far too much consequence for a gesture a person makes by resting a
+      // thumb, especially on a screen that now also owns holds for push-to-talk and drags for the
+      // drawer and the picker.
+      //
+      // The portal is still one tap away where it belongs and where its consequences are legible:
+      // the PORTAL action on the Device and Gateway screens.
       return;
 
     default:
@@ -2434,6 +2965,13 @@ void uiTick() {
     if (now - recordPaintedAt >= 250) {
       recordPaintedAt = now;
       paintMicButton();
+    }
+    // The button is the only moving thing on the screen while a clip is being captured — the frame
+    // loop is given over to pumping I2S, so neither orb is drawn. 15 Hz is enough for a travelling
+    // wave to read as alive, and the strip costs about 0.7 ms against a 25 ms pump slice.
+    if (now - recordPulsedAt >= 66) {
+      recordPulsedAt = now;
+      paintMicPulse(now - orbStartedAt);
     }
     // A ceiling was hit while the finger is still down: stop here rather than waiting for a lift
     // that may not come for another twenty seconds.
@@ -2623,7 +3161,7 @@ void uiTick() {
   // a list screen inside the frame budget: a full list redraw costs several frames' worth of SPI
   // and happens once, when the list actually changed.
   const uint32_t elapsed = now - orbStartedAt;
-  const bool bigOrb = (screen == Screen::Home || screen == Screen::Status)
+  const bool bigOrb = (screen == Screen::Home || screen == Screen::Status || voiceOwnsScreen())
     && modal == Modal::None && drawerT <= 0.001f;
 
   // The orb and a full content repaint do not share a frame.
@@ -2639,16 +3177,19 @@ void uiTick() {
   if (repaintedContent) {
     // Nothing: the orb resumes on the next frame, 33 ms later.
   } else if (bigOrb && orbReady) {
-    displayDrawOrb(orb, kOrbCx, stack.orbCy, elapsed);
+    displayDrawOrb(orb, kOrbCx, stack.orbCy, elapsed, kOrbDrawPx);
     // The claim block starts where the label would be, and the label's strip is full width: drawing
     // both means the code is repainted over four times a second by a word.
-    if (unclaimed()) {
+    // HOME has no shimmer: its prominent line is the thread's name, and the state word — when it
+    // is worth showing at all — takes that same line. Drawing both would be the redundancy this
+    // screen was decluttered to remove, and it would also cost a 240x22 blit every frame.
+    if (!stack.label) {
       shownLabel = "";
     } else if (statusLabel != shownLabel) {
       displayClearStatus(stack.labelY);
       shownLabel = statusLabel;
     }
-    if (!unclaimed()) displayDrawStatus(statusLabel.c_str(), stack.labelY, elapsed);
+    if (stack.label) displayDrawStatus(statusLabel.c_str(), stack.labelY, elapsed);
   } else if (miniReady) {
     displayDrawMiniOrb(miniOrb, kMiniOrbCx, kMiniOrbCy, elapsed);
     shownLabel = "";
@@ -2682,6 +3223,14 @@ void uiTick() {
     lastReport = now;
   }
 
+  // HOME's pending selection, committed once the finger has settled.
+  //
+  // This is a server write (POST /v1/device/config/thread) and it runs after the frame is painted,
+  // for the same reason the poll below does. A failed write REVERTS the highlight: the line under
+  // the orb is what tells a person where their voice is going, and showing thread B while bound to
+  // thread A would send it to the wrong place.
+  if (pickerCommitAt != 0 && (int32_t)(millis() - pickerCommitAt) >= 0) commitPicker();
+
   // The voice job status, polled LAST — after everything this frame drew is already on the glass.
   //
   // This is the one recurring blocking call on the render loop and the placement is the whole of
@@ -2698,6 +3247,11 @@ void uiTick() {
       statusLabel = currentLabel;
       message = voice.detail();
       contentDirty = true;
+      // The journey has ended. Hand the screen over to the reply the dispatch opened, which is what
+      // the person was waiting for; a capture that failed or needs review stays put and says so.
+      if (!voiceInJourney() && screen == Screen::Send && gw->responseOpen()) {
+        goTo(Screen::Response);
+      }
     }
   }
 }

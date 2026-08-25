@@ -277,6 +277,7 @@ class GatewayClient {
   bool approvalOverflow_ = false;
 
   uint32_t nextDisplayAt_ = 0;
+  uint32_t nextThreadsAt_ = 0;
   uint32_t nextControlsAt_ = 0;
   uint32_t nextApprovalsAt_ = 0;
 };

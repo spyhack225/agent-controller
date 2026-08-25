@@ -220,11 +220,13 @@ bool displayBeginCanvases(uint16_t orbSize, uint16_t miniSize) {
 namespace {
 
 void blitOrb(ThinkingOrb& orb, int16_t cx, int16_t cy, uint32_t elapsedMs, uint8_t* grey,
-             int16_t dim) {
+             int16_t dim, int16_t drawDim) {
   if (!displayReady() || !grey || !dmaRow) return;
+  if (drawDim <= 0 || drawDim > dim) drawDim = dim;
 
   const OrbFrame frame = orb.render(elapsedMs);
   const int16_t mid = dim / 2;
+  const int16_t half = drawDim / 2;
 
   // Rasterised by the shared painter, so this board and every other draw the identical orb. An
   // e-paper controller and an AMOLED one should be recognisably the same product, which they will
@@ -246,26 +248,28 @@ void blitOrb(ThinkingOrb& orb, int16_t cx, int16_t cy, uint32_t elapsedMs, uint8
   // No anti-aliasing at the rim, deliberately. The geometry never reaches the inscribed circle —
   // the widest mode projects to roughly 0.9 of it — so this cuts through pixels that are already
   // zero, and feathering an edge the drawing never touches would only cost time.
-  const float r = (float)mid;
+  const float r = (float)half;
   const float r2 = r * r;
 
   Adafruit_ILI9341& g = displayPanel();
   g.startWrite();
-  for (int16_t row = 0; row < dim; ++row) {
+  for (int16_t row = 0; row < drawDim; ++row) {
     const float dy = (row - r) + 0.5f;
     const float inside = r2 - dy * dy;
     if (inside <= 0.0f) continue;
-    const int16_t half = (int16_t)sqrtf(inside);
-    int16_t from = (int16_t)(mid - half);
-    int16_t to = (int16_t)(mid + half);
+    const int16_t reach = (int16_t)sqrtf(inside);
+    int16_t from = (int16_t)(half - reach);
+    int16_t to = (int16_t)(half + reach);
     if (from < 0) from = 0;
-    if (to > dim) to = dim;
+    if (to > drawDim) to = drawDim;
     const int16_t span = (int16_t)(to - from);
     if (span <= 0) continue;
 
-    const uint8_t* src = grey + (size_t)row * dim + from;
+    // The drawn disc is centred in the coverage buffer, so the source walks the buffer's own
+    // stride from the offset the smaller disc starts at — not from the buffer's origin.
+    const uint8_t* src = grey + (size_t)(mid - half + row) * dim + (mid - half + from);
     for (int16_t col = 0; col < span; ++col) dmaRow[col] = panelGrey(src[col]);
-    g.setAddrWindow((int16_t)(cx - mid + from), (int16_t)(cy - mid + row), span, 1);
+    g.setAddrWindow((int16_t)(cx - half + from), (int16_t)(cy - half + row), span, 1);
     g.writePixels(dmaRow, span);
   }
   g.endWrite();
@@ -273,12 +277,13 @@ void blitOrb(ThinkingOrb& orb, int16_t cx, int16_t cy, uint32_t elapsedMs, uint8
 
 }  // namespace
 
-void displayDrawOrb(ThinkingOrb& orb, int16_t cx, int16_t cy, uint32_t elapsedMs) {
-  blitOrb(orb, cx, cy, elapsedMs, orbGrey, orbDim);
+void displayDrawOrb(ThinkingOrb& orb, int16_t cx, int16_t cy, uint32_t elapsedMs,
+                    uint16_t drawDiameter) {
+  blitOrb(orb, cx, cy, elapsedMs, orbGrey, orbDim, (int16_t)drawDiameter);
 }
 
 void displayDrawMiniOrb(ThinkingOrb& orb, int16_t cx, int16_t cy, uint32_t elapsedMs) {
-  blitOrb(orb, cx, cy, elapsedMs, miniGrey, miniDim);
+  blitOrb(orb, cx, cy, elapsedMs, miniGrey, miniDim, miniDim);
 }
 
 void displayClearStatus(int16_t cy) {

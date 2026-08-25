@@ -61,7 +61,13 @@ bool displayBeginCanvases(uint16_t orbSize, uint16_t miniSize = 0);
 // allocated with, so the two calls take separate ThinkingOrb instances rather than one resized
 // between screens (resizing reallocates and rebuilds the geometry, which is not a per-frame cost
 // anyone should pay).
-void displayDrawOrb(ThinkingOrb& orb, int16_t cx, int16_t cy, uint32_t elapsedMs);
+// `drawDiameter` is the disc actually pushed to the panel, centred in the coverage buffer. Pass 0
+// for the whole buffer. It exists because the buffer is allocated once at boot from main.cpp while
+// the size the orb should occupy is a composition decision that belongs to the screen — HOME wants
+// a smaller orb than a full-page voice moment does, and reallocating the buffer to switch between
+// them would rebuild the geometry every time somebody changed screen.
+void displayDrawOrb(ThinkingOrb& orb, int16_t cx, int16_t cy, uint32_t elapsedMs,
+                    uint16_t drawDiameter = 0);
 void displayDrawMiniOrb(ThinkingOrb& orb, int16_t cx, int16_t cy, uint32_t elapsedMs);
 
 // The status line under the orb, with the shimmer sweep the web component uses. `phase` advances
