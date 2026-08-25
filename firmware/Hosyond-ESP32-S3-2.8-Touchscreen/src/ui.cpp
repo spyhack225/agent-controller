@@ -1285,6 +1285,20 @@ void paintBreadcrumb() {
 // bottom rule is made against rather than the row pitch, which includes the gap below it.
 constexpr int16_t kRowInk = 34;
 
+// And the same measurement at the TOP, which is the half that was missing.
+//
+// The top rule used to skip a row only once it was ENTIRELY above kContentTop — so a row scrolled
+// most of the way out still drew, and its ink landed in the HEADER, which no list screen clears.
+// On ACTIONS that put a control's label at y+6 directly under the device name: two strings at
+// almost the same origin, stacked and unreadable. Repainting the chrome afterwards could not cover
+// it, because the chrome band starts at kContentTop and the ink was above it.
+//
+// So the rule is now the row's TOPMOST DRAWN PIXEL, and the invariant is absolute: nothing a list
+// draws ever lands above kContentTop. What disappears at the moment a row is dropped is already
+// underneath the chrome band, so nothing readable is lost.
+constexpr int16_t kChoiceRowInkTop = 2;    // the selected row's card, which starts before its text
+constexpr int16_t kActionRowInkTop = 6;    // the control's label
+
 // One row of any of the three lists. They are the same shape on purpose: an environment, a folder
 // and a thread are the same kind of choice at three depths, and a person should not have to relearn
 // the row between them.
@@ -1333,7 +1347,7 @@ void paintThreads() {
   for (size_t i = 0; i < count; ++i) {
     const int16_t y = (int16_t)(kThreadListTop + (int16_t)i * kThreadRowH - threadScroll);
     if (y + kRowInk > bottom) break;
-    if (y + kThreadRowH <= kContentTop) continue;
+    if (y + kChoiceRowInkTop < kContentTop) continue;
     const ThreadOption* row = threadRowAt(i);
     if (!row) continue;
     const bool active = row->selected && (int)i == boundThreadIndex();
@@ -1368,7 +1382,7 @@ void paintEnvironments() {
   for (size_t i = 0; i < count; ++i) {
     const int16_t y = (int16_t)(kBrowseListTop + (int16_t)i * kBrowseRowH - envScroll);
     if (y + kRowInk > bottom) break;
-    if (y + kBrowseRowH <= kContentTop) continue;
+    if (y + kChoiceRowInkTop < kContentTop) continue;
     const BrowseEnvironment* row = browse.environment(i);
     if (!row) continue;
     // An expired access token is a dead end the owner has to fix at the host, and the listing
@@ -1396,7 +1410,7 @@ void paintProjects() {
   for (size_t i = 0; i < count; ++i) {
     const int16_t y = (int16_t)(kBrowseListTop + (int16_t)i * kBrowseRowH - projectScroll);
     if (y + kRowInk > bottom) break;
-    if (y + kBrowseRowH <= kContentTop) continue;
+    if (y + kChoiceRowInkTop < kContentTop) continue;
     const BrowseProject* row = browse.project(i);
     if (!row) continue;
     // The count is what makes this list usable at arm's length: it says which folder has anything
@@ -1631,7 +1645,7 @@ void paintActions() {
     const int16_t y = (int16_t)(kActionListTop + (int16_t)i * kActionRowH - actionScroll);
     // The saved-action row's ink stops at y+28: a label, and a reason under it when it is blocked.
     if (y + 28 > bottom) break;
-    if (y + kActionRowH <= kContentTop) continue;
+    if (y + kActionRowInkTop < kContentTop) continue;
     const DeviceControl* c = gw->control(i);
     if (!c) continue;
     const bool blocked = !c->enabled || (c->requiresThread && !haveThread());
@@ -1647,7 +1661,11 @@ void paintActions() {
     uip::textRight((int16_t)(kW - 14), (int16_t)(y + 6), 1, kHair, meta);
     const String sub = blocked && c->reason.length() > 0 ? c->reason : String();
     if (sub.length() > 0) uip::text(14, (int16_t)(y + 20), 1, kHair, uip::fitWords(sub, 34));
-    if (i + 1 < count) uip::divider(20, (int16_t)(y + kActionRowH - 6), (int16_t)(kW - 40));
+    // Both the pitch and this offset come from kActionRowH, so they cannot drift apart. It is
+    // placed midway between the deepest ink this row can have (a reason line, ending at y+28) and
+    // the first ink of the next (its label, at y+kActionRowH+6), so the rhythm down the list is
+    // even whether or not a given row happens to carry a reason.
+    if (i + 1 < count) uip::divider(20, (int16_t)(y + kActionRowH - 4), (int16_t)(kW - 40));
   }
   paintActionsChrome();
 }

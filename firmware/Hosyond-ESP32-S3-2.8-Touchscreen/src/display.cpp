@@ -383,8 +383,30 @@ void displaySoftRoundRectBand(int16_t x, int16_t y, int16_t w, int16_t h, float 
                               int16_t bandBottom) {
   if (!displayReady() || !dmaRow || w <= 0 || h <= 0) return;
 
-  int16_t x0 = x, y0 = y;
-  int16_t x1 = (int16_t)(x + w), y1 = (int16_t)(y + h);
+  // A STROKE STRADDLES THE BOUNDARY, so the box it is rasterised over has to be bigger than the
+  // shape.
+  //
+  // The stroke is centred on the outline: half of it lies inside the rectangle and half outside.
+  // Rasterising over the rectangle alone therefore threw the outer half away — measured at 32% of
+  // the total stroke coverage for a 104x36 capsule. It is not lost evenly, which is what made it a
+  // visible defect rather than merely a thin line: a corner ARC curves back inside the box and
+  // keeps most of its width, while a straight top or bottom edge lies exactly on the box boundary
+  // and loses its entire outer half. The result is bright corner arcs meeting dim straight edges —
+  // an outline that looks shattered, corners not joining the edges.
+  //
+  // A FILLED shape has no such problem: its coverage outside the boundary is already zero, so
+  // clipping to the box loses nothing. That is why the filled TALK button rendered cleanly and the
+  // outlined ACTIONS button beside it did not, and why this pad is conditional on the stroke.
+  const float padF = (strokeGrey >= 0 && strokeWidth > 0.0f)
+    ? (strokeWidth * 0.5f + (feather < 0.35f ? 0.35f : feather))
+    : 0.0f;
+  const int16_t pad = (int16_t)ceilf(padF);
+
+  int16_t x0 = (int16_t)(x - pad), y0 = (int16_t)(y - pad);
+  int16_t x1 = (int16_t)(x + w + pad), y1 = (int16_t)(y + h + pad);
+  // The band still wins. displaySoftPanel() splits a tall panel into rounded caps and a flat middle
+  // and relies on the caps staying inside their own bands; it draws fill-only shapes, so the pad is
+  // zero there, but the clamp order is what guarantees that.
   if (y0 < bandTop) y0 = bandTop;
   if (y1 > bandBottom) y1 = bandBottom;
   if (x0 < 0) x0 = 0;
