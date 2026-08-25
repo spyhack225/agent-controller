@@ -250,7 +250,14 @@ constexpr uint32_t kPickerCommitMs = 600;
 
 // Whether the thread list has ever been asked for this boot. Before that, an empty list means "not
 // loaded", not "none" — and the two must never look the same on the destination line.
+//
+// Set by this screen's own fetch, but no longer the only way the list arrives: the gateway cycle
+// now refreshes threads every 30 s and on the just-connected edge, so a populated list is proof of
+// itself whoever asked for it. threadListKnown() is what the UI consults; the flag only settles the
+// one case data cannot, which is "we asked and there genuinely are none".
 bool threadsFetched = false;
+
+bool threadListKnown();
 
 int16_t threadScroll = 0;
 int16_t actionScroll = 0;
@@ -289,7 +296,7 @@ size_t lastApprovalCount = 0;
 // recording itself runs in uiTick() so the loop keeps polling touch and can see the finger lift.
 bool recordArmed = false;
 uint32_t recordPaintedAt = 0;
-uint32_t recordPulsedAt = 0;
+uint32_t recordOrbAt = 0;
 
 // A finished clip is HELD, not sent.
 //
@@ -408,15 +415,51 @@ bool unclaimed() {
   return gw != nullptr && gw->link() == GatewayLink::Unclaimed;
 }
 
-// Where the content stops. Recomputed only when the bar's presence changes, and the change is what
+bool voiceInJourney();
+
+// Whether this screen keeps the bottom 58 px clear for buttons.
+//
+// The voice screen ALWAYS does, even in the two states that have no buttons. Otherwise the capsule
+// would sit 29 px lower in "hold to talk" than in "clip ready" purely because two buttons appeared,
+// and the three states are meant to read as one object changing rather than three screens. The
+// full-page journey is the exception: it has no buttons and wants the whole page.
+bool reservesActionBand() {
+  if (screen == Screen::Send) return !voiceInJourney();
+  return barReserved;
+}
+
+// Where the content stops. Recomputed only when the band's presence changes, and the change is what
 // dirties the content — a bar that is mid-slide does not reflow a list underneath it.
-int16_t contentBottom() { return barReserved ? (int16_t)(kH - kBarH) : kH; }
+int16_t contentBottom() { return reservesActionBand() ? (int16_t)(kH - kBarH) : kH; }
 
 // Clears only as far as the content actually extends. The action bar owns the bottom band while it
 // is out, and a content repaint that erased it would fight the bar for the same pixels every time a
 // list changed underneath it.
 void clearContent() {
   g().fillRect(0, kContentTop, kW, (int16_t)(contentBottom() - kContentTop), panelGrey(kBg));
+}
+
+// ONE PLACE clears a screen transition, and this is it.
+//
+// Third variant of the residue bug, and the first two were fixed per-screen — which is why there
+// was a third. Every screen clears the region IT draws into, and that is correct for a repaint but
+// wrong for an arrival: the recording state paints a capsule and an elapsed time, so it never
+// touched the two lines the previous state had left below the capsule, and "SENDING TO" and half a
+// thread title stayed on the glass beside it.
+//
+// So arrival is not a screen's business any more. `paintedViewKey` identifies what is currently on
+// the panel — the screen, the modal, and which of the voice states, because those are four
+// different pictures inside one Screen — and any change to it clears the WHOLE content area, all
+// the way to the bottom of the panel rather than to contentBottom(), before anything is drawn.
+uint16_t paintedViewKey = 0xFFFF;
+uint16_t viewKey();
+
+void clearForArrival() {
+  g().fillRect(0, kContentTop, kW, (int16_t)(kH - kContentTop), panelGrey(kBg));
+  paintedViewKey = viewKey();
+  // The full clear took the action band with it, which is the point — nothing survives an arrival —
+  // so the bar has to be told it is no longer on the glass.
+  barDirty = true;
 }
 
 // Clears only the scrolling part of a list screen. The band above it belongs to that screen's own
@@ -743,6 +786,10 @@ const char* threadStatusWord(const String& status) {
   return mapped != OrbMode::Ring ? orbLabelForMode(mapped) : "";
 }
 
+bool threadListKnown() {
+  return (gw != nullptr && gw->threadCount() > 0) || threadsFetched;
+}
+
 // The selected thread's status word, or nothing when the list has not been fetched.
 const char* selectedThreadStatusWord() {
   if (!gw || !gw->hasThread()) return "";
@@ -968,6 +1015,34 @@ bool pickerPending() {
   return pickerCommitAt != 0 && pickerTarget() != boundThreadIndex();
 }
 
+// HOME's layout is computed from STRUCTURE. Never from content.
+//
+// This is the third variant of one bug in this file. The first two were residue — text drawn over
+// text — and this one is worse, because nothing is left behind: the whole block simply moves. Two
+// content-derived values were feeding layOutStack(), which centres whatever block it is handed:
+//
+//   `big`, from `prominent.length() <= 19`, changed the first line's reserved height between 16 px
+//   and 8 px, and
+//   `secondary.length() > 0` decided whether the second line existed at all.
+//
+// So the moment a status word changed length, or `speaks` flipped and swapped a thread name for
+// "Needs you", the measured height changed, the centring moved, and the orb, both lines AND the
+// OPEN button all walked a few pixels. Every repaint landed somewhere slightly different. That is
+// the drift in the photographs.
+//
+// HOME now always reserves the same four bands whether or not it has anything to put in them. The
+// only input is contentBottom(), which moves when the action bar appears — a genuine structural
+// change and the one case where the composition SHOULD re-centre. Content decides what is drawn
+// inside a band; it never decides where the band is.
+//
+// Deliberately not cached: the layout is a pure function of one structural input, so recomputing it
+// yields an identical answer unless the structure really changed. That is a stronger guarantee than
+// a cache, which could go stale.
+Stack homeStack() {
+  return layOutStack(/*showLabel=*/false, /*line1=*/true, /*line2=*/true, contentBottom(),
+                     /*action=*/true, /*line1Big=*/true);
+}
+
 void paintHome() {
   const int target = pickerTarget();
   const ThreadOption* row = (target >= 0) ? gw->thread((size_t)target) : nullptr;
@@ -978,10 +1053,10 @@ void paintHome() {
   if (row && row->title.length() > 0) {
     name = row->title;
   } else if (gw->hasThread()) {
-    // Bound, but the list has not been fetched this boot so the title is not known here. This must
-    // not read as "no thread": the device HAS a destination, it just cannot name it yet.
-    name = threadsFetched ? String("Selected thread") : String("Loading threads");
-  } else if (!threadsFetched) {
+    // Bound, but the list has not arrived yet, so the title is not known here. This must not read
+    // as "no thread": the device HAS a destination, it just cannot name it for another moment.
+    name = threadListKnown() ? String("Selected thread") : String("Loading threads");
+  } else if (!threadListKnown()) {
     name = "Loading threads";
   } else {
     // The case that matters most. A person about to hold the microphone with nothing bound would be
@@ -1003,18 +1078,18 @@ void paintHome() {
     secondary = strlen(word) > 0 ? String(word) : String(currentLabel);
   }
 
-  // A title longer than 19 characters drops to size 1 rather than being cut down to something that
-  // no longer identifies the thread. It is still the biggest thing on the screen after the orb.
-  const bool big = prominent.length() <= kCols2;
-  stack = layOutStack(false, true, secondary.length() > 0, contentBottom(), true, big);
-
+  stack = homeStack();
   clearContent();
-  uip::textCentered(stack.line1Y, big ? 2 : 1, pending ? kMuted : kText,
+
+  // A title too long for size 2 drops to size 1 rather than being cut down to something that no
+  // longer identifies the thread — but it is drawn CENTRED IN THE SAME BAND, so changing size moves
+  // the glyphs within the band and never moves the band.
+  const bool big = prominent.length() <= kCols2;
+  const int16_t promY = big ? stack.line1Y : (int16_t)(stack.line1Y + (kLabelInkH - kLineH) / 2);
+  uip::textCentered(promY, big ? 2 : 1, pending ? kMuted : kText,
                     uip::fitWords(prominent, big ? kCols2 : kCols1));
-  if (stack.line2) {
-    uip::textCentered(stack.line2Y, 1, pending ? kBright : kMuted,
-                      uip::fitWords(secondary, kCols1));
-  }
+  uip::textCentered(stack.line2Y, 1, pending ? kBright : kMuted,
+                    uip::fitWords(secondary, kCols1));
 
   const Rect action = homeActionRect();
   const bool none = target < 0 && !gw->hasThread();
@@ -1022,6 +1097,10 @@ void paintHome() {
 
   // The swipe affordance. Only drawn when there is somewhere to swipe to, because a chevron that
   // does nothing is worse than no chevron.
+  //
+  // A NEW THREAD affordance belongs here, as a step past the end of the list — POST /v1/device/threads
+  // is being added to the gateway and a project with no threads currently leaves this screen with
+  // nothing to point at. Nothing is wired to it yet.
   if (gw->threadCount() > 1) {
     const int16_t cy = (int16_t)(action.y + action.h / 2);
     uip::chevron((int16_t)(action.x - 18), cy, 5.0f, -1, kHair, 2.0f);
@@ -1271,14 +1350,47 @@ void paintProjects() {
 //   Journey    the full page: the orb, running the animation for the stage the gateway last
 //              reported, and no buttons at all
 
-constexpr Rect kMicButton = {14, kContentTop + 8, kW - 28, 92};
+// ONE composition, four states. The capsule does not move between them.
+//
+// It used to be a fixed rect at the top of the content area, so it sat high; and because the action
+// band only existed once there were buttons, it also sat 29 px lower in "clip ready" than in "hold
+// to talk". Nothing about a capture changes the shape of this screen, so nothing about it may move:
+// the block is measured from structure, centred once, and every state draws into the same bands.
+//
+// The orb is part of that block rather than in the header, because during a capture it IS the
+// recording indicator.
 
-// Where the pulse sits: inside the capsule's straight middle section, which is the only part of a
-// capsule whose fill is uniform and therefore the only part a strip can be erased against with one
-// flat rectangle.
-constexpr uint8_t kPulseDots = 7;
-constexpr int16_t kPulseStep = 17;
-constexpr int16_t kPulseCell = 14;
+constexpr int16_t kVoiceOrbR = (int16_t)(kMiniOrbPx / 2);
+constexpr int16_t kVoiceGapOrbCapsule = 12;
+constexpr int16_t kVoiceCapsuleH = 92;
+constexpr int16_t kVoiceGapCapsuleLabel = 20;
+constexpr int16_t kVoiceGapLabelName = 4;
+constexpr int16_t kVoiceBlockH = kVoiceOrbR * 2 + kVoiceGapOrbCapsule + kVoiceCapsuleH
+  + kVoiceGapCapsuleLabel + kLineH + kVoiceGapLabelName + kLineH;
+
+struct VoiceLayout {
+  int16_t orbCy;
+  int16_t capsuleY;
+  int16_t labelY;
+  int16_t nameY;
+};
+
+// Pure function of the panel and the reserved band, both of which are constants on this screen. It
+// therefore returns the same answer in every state, which is the whole requirement.
+VoiceLayout voiceLayout() {
+  constexpr int16_t bottom = kH - kBarH;
+  constexpr int16_t top = kContentTop + (bottom - kContentTop - kVoiceBlockH) / 2;
+  VoiceLayout out;
+  out.orbCy = top + kVoiceOrbR;
+  out.capsuleY = (int16_t)(top + kVoiceOrbR * 2 + kVoiceGapOrbCapsule);
+  out.labelY = (int16_t)(out.capsuleY + kVoiceCapsuleH + kVoiceGapCapsuleLabel);
+  out.nameY = (int16_t)(out.labelY + kLineH + kVoiceGapLabelName);
+  return out;
+}
+
+Rect micButtonRect() {
+  return {14, voiceLayout().capsuleY, (int16_t)(kW - 28), kVoiceCapsuleH};
+}
 
 enum class VoiceView : uint8_t { Ready, Recording, Held, Journey };
 
@@ -1307,75 +1419,65 @@ bool voiceOwnsScreen() {
   return screen == Screen::Send && voiceInJourney();
 }
 
-// The travelling wave inside the record button.
-//
-// Deliberately the same idiom as everything else on this device — anti-aliased dots whose weight
-// moves — rather than a new kind of motion invented for one control. It is also the cheapest live
-// thing available: a flat strip of about 2 200 pixels erased and seven dots drawn into it, roughly
-// 0.7 ms, against a capsule repaint that is 20 000 pixels and 4 ms. The elapsed seconds stay where
-// they are and keep their own slower cadence, because the number is real information and redrawing
-// it at animation speed would only make it flicker.
-void paintMicPulse(uint32_t elapsedMs) {
-  if (!displayReady()) return;
-  const int16_t cy = (int16_t)(kMicButton.y + kMicButton.h - 22);
-  const int16_t span = (int16_t)((kPulseDots - 1) * kPulseStep + kPulseCell);
-  const int16_t x0 = (int16_t)(kW / 2 - span / 2);
-
-  // One flat erase for the whole strip, against the capsule's own fill.
-  g().fillRect(x0, (int16_t)(cy - kPulseCell / 2), span, kPulseCell, panelGrey(kSurfaceHi));
-
-  const float t = elapsedMs / 1000.0f;
-  for (uint8_t i = 0; i < kPulseDots; ++i) {
-    // A wave travelling outward from the centre rather than left to right: a bar that sweeps one
-    // way reads as progress towards something, and a recording is not progressing towards anything.
-    const float d = fabsf((float)i - (kPulseDots - 1) / 2.0f);
-    const float amp = 0.5f + 0.5f * sinf(t * 5.0f - d * 0.9f);
-    const int16_t cx = (int16_t)(x0 + kPulseCell / 2 + (int16_t)i * kPulseStep);
-    uip::dot(cx, cy, 1.8f + 2.4f * amp, (uint8_t)(110 + 145 * amp), kSurfaceHi);
-  }
+// Whether the mini orb belongs in the voice composition this frame rather than in the header.
+bool voiceShowsOrb() {
+  return screen == Screen::Send && !voiceInJourney() && modal == Modal::None;
 }
 
-// The capsule and its words. Redrawn on a state change, and four times a second while recording so
-// the elapsed seconds advance.
+// The elapsed seconds, and ONLY the elapsed seconds.
+//
+// This used to repaint the whole capsule four times a second, which is 19 500 pixels of fill and
+// about 4 ms — spent between two pumps of an I2S ring that holds only tens of milliseconds. A band
+// the width of the text and a redraw at a fixed origin is 2 400 pixels and about 0.5 ms, and it
+// buys most of the budget the orb now needs.
+void paintMicTimer(uint32_t ms) {
+  const Rect capsule = micButtonRect();
+  const int16_t y = (int16_t)(capsule.y + 40);
+  g().fillRect((int16_t)(capsule.x + 20), (int16_t)(y - 2), (int16_t)(capsule.w - 40), 12,
+               panelGrey(kSurfaceHi));
+  char buf[16];
+  snprintf(buf, sizeof(buf), "%u.%us", (unsigned)(ms / 1000), (unsigned)((ms % 1000) / 100));
+  uip::textCentered(y, 1, kMuted, buf);
+}
+
+// The capsule and its words. Drawn on arrival at a state, not on a timer.
 void paintMicButton() {
   const bool have = audio::available();
   const bool live = audio::recording();
+  const Rect capsule = micButtonRect();
 
   // A capsule, and at this height the radius is 46 px — there is no corner on it at all, which is
   // the point: the one thing on this screen a thumb lands on should not be a box.
   const int16_t fill = live ? (int16_t)kSurfaceHi : (int16_t)kSurface;
   const int16_t stroke = live ? (int16_t)kBright : (have ? (int16_t)kMuted : (int16_t)kHair);
-  uip::capsule(kMicButton, fill, stroke, live ? 2.4f : 1.4f, 1.6f);
+  uip::capsule(capsule, fill, stroke, live ? 2.4f : 1.4f, 1.6f);
 
   if (!have) {
-    uip::textCentered(kMicButton.y + 32, 2, kHair, "NO MIC");
-    uip::textCentered(kMicButton.y + 58, 1, kHair, "flash the -controller build");
+    uip::textCentered((int16_t)(capsule.y + 32), 2, kHair, "NO MIC");
+    uip::textCentered((int16_t)(capsule.y + 58), 1, kHair, "flash the -controller build");
     return;
   }
   if (live) {
-    const uint32_t ms = audio::recordedMs();
-    uip::textCentered(kMicButton.y + 22, 2, kBright, "RECORDING");
-    char buf[16];
-    snprintf(buf, sizeof(buf), "%u.%us", (unsigned)(ms / 1000), (unsigned)((ms % 1000) / 100));
-    uip::textCentered(kMicButton.y + 46, 1, kMuted, buf);
+    uip::textCentered((int16_t)(capsule.y + 16), 2, kBright, "RECORDING");
+    paintMicTimer(audio::recordedMs());
+    uip::textCentered((int16_t)(capsule.y + 64), 1, kHair, "release to stop");
     return;
   }
   if (clipHeld) {
     char buf[16];
     snprintf(buf, sizeof(buf), "%u.%us CLIP", (unsigned)(clipHeldMs / 1000),
              (unsigned)((clipHeldMs % 1000) / 100));
-    uip::textCentered(kMicButton.y + 32, 2, kBright, buf);
-    uip::textCentered(kMicButton.y + 58, 1, kMuted, "send or discard below");
+    uip::textCentered((int16_t)(capsule.y + 32), 2, kBright, buf);
+    uip::textCentered((int16_t)(capsule.y + 58), 1, kMuted, "send or discard below");
     return;
   }
-  uip::textCentered(kMicButton.y + 32, 2, kText, "HOLD TO TALK");
-  uip::textCentered(kMicButton.y + 58, 1, kMuted, "press and speak");
+  uip::textCentered((int16_t)(capsule.y + 32), 2, kText, "HOLD TO TALK");
+  uip::textCentered((int16_t)(capsule.y + 58), 1, kMuted, "press and speak");
 }
 
-// Where the clip is going. The thread's own title, so a person knows before they speak — this is
-// the second of the two things this screen is allowed to show.
+// Where the clip is going. The thread's own title, so a person knows before they speak.
 void paintMicDestination() {
-  const int16_t y = (int16_t)(kMicButton.y + kMicButton.h + 26);
+  const VoiceLayout at = voiceLayout();
   String where;
   uint8_t tone = kText;
   if (!gw || !gw->hasThread()) {
@@ -1383,11 +1485,11 @@ void paintMicDestination() {
     tone = kBright;
   } else {
     const String title = threadTitle();
-    // Never the id. Open THREADS once and the name is known from then on.
+    // Never the id. The gateway cycle keeps the thread list warm, so this is the boot-window case.
     where = title.length() > 0 ? title : String("Selected thread");
   }
-  uip::textCentered((int16_t)(y - 16), 1, kHair, "SENDING TO");
-  uip::textCentered(y, 1, tone, uip::fitWords(where, kCols1));
+  uip::textCentered(at.labelY, 1, kHair, "SENDING TO");
+  uip::textCentered(at.nameY, 1, tone, uip::fitWords(where, kCols1));
 }
 
 void paintSend() {
@@ -1641,6 +1743,12 @@ void paintModal() {
                     approval ? "Runs on your machine"
                              : (reprovision ? "Identity is kept"
                                             : uip::fitWords(threadTitle(), 30)));
+}
+
+// What is currently on the panel. The voice states are part of it because they are four different
+// pictures inside one Screen, and arriving at one of them is an arrival like any other.
+uint16_t viewKey() {
+  return (uint16_t)(((uint16_t)screen << 8) | ((uint16_t)modal << 4) | (uint16_t)voiceView());
 }
 
 void paintContent() {
@@ -2248,9 +2356,18 @@ void startRecording() {
   voice.reset();
   recordArmed = true;
   audio::startRecording();
+  // Wave, and the mini orb is told about it here — the pump branch below never reaches
+  // applyPresentation().
   applyPresentation();
+  statusLabel = currentLabel;
   recordPaintedAt = 0;
-  paintMicButton();
+  recordOrbAt = 0;
+  // Arrival, through the one place that does arrivals. The pump takes the loop over on the very
+  // next pass and never reaches the frame's own transition check, so it has to happen now — and
+  // going through clearForArrival() is what stops the previous state's destination lines being left
+  // on the glass beside the capsule.
+  clearForArrival();
+  paintContent();
 }
 
 // Writes a pending selection through, or does nothing when there is none.
@@ -2267,12 +2384,26 @@ void commitPicker() {
 
   pickerBinding = true;
   paintContent();                 // "Selecting..." on the glass before the socket
-  const bool bound = gw->selectThread((size_t)target);
+  bool bound = gw->selectThread((size_t)target);
+  if (!bound) {
+    // ONE retry, and the reason is that `code=-11` is a read timeout, not a rejection.
+    //
+    // Against a Convex-backed gateway this write regularly outruns the client's 1200 ms budget, and
+    // when it does the POST may well have LANDED — only the answer was lost. Believing the failure
+    // straight away would revert the line to the previous thread and contradict a write that
+    // actually took effect, which is worse than the timeout: the next voice note would go somewhere
+    // the screen was no longer showing. The retry is idempotent, because selectThread() sends the
+    // same explicit id and the gateway resolves it against the same snapshot.
+    bound = gw->selectThread((size_t)target);
+  }
   pickerBinding = false;
   if (!bound) {
-    // The highlight goes back to what the device is genuinely bound to. A line that kept showing
-    // the optimistic value would send the next voice note to the wrong thread.
-    message = gw->threadsDetail().length() > 0 ? gw->threadsDetail() : String("Could not select");
+    // Both attempts failed, so the device does not know. The honest position is the last CONFIRMED
+    // binding — pickerIndex is already cleared, so the line falls back to it — and the wording says
+    // it is unresolved rather than claiming the selection was rejected. The gateway cycle refreshes
+    // the thread list every 30 s, so if the write did land this corrects itself without anybody
+    // touching the device.
+    message = "Not confirmed - re-checking";
   } else {
     message = "";
   }
@@ -2628,7 +2759,7 @@ void handleContentTap(int16_t x, int16_t y) {
     }
     case Screen::Send: {
       if (voiceInJourney()) return;   // nothing on this screen is pressable while a clip is in flight
-      if (uip::hit(kMicButton, x, y)) {
+      if (uip::hit(micButtonRect(), x, y)) {
         if (clipHeld) {
           message = "Send or discard the clip below";
         } else {
@@ -2662,8 +2793,8 @@ void handleContentTap(int16_t x, int16_t y) {
 void pickerStep(int delta) {
   const size_t count = gw->threadCount();
   if (count == 0) {
-    message = threadsFetched ? String("No threads; start one in the console")
-                             : String("Open THREADS to load the list");
+    message = threadListKnown() ? String("No threads; start one in the console")
+                                : String("Loading threads");
     contentDirty = true;
     return;
   }
@@ -2856,7 +2987,7 @@ void uiHandleTouch(const TouchEvent& event) {
       else dragOwner = DragOwner::Content;
       // Push-to-talk starts on contact, not on release: waiting for the lift would record nothing.
       if (operable() && modal == Modal::None && screen == Screen::Send && !clipHeld
-          && drawerT <= 0.05f && uip::hit(kMicButton, event.x, event.y)) {
+          && drawerT <= 0.05f && uip::hit(micButtonRect(), event.x, event.y)) {
         startRecording();
       }
       return;
@@ -2962,16 +3093,28 @@ void uiTick() {
     }
 
     const uint32_t now = millis();
+    // Only the digits, at a fixed origin. Repainting the whole capsule here cost about 4 ms of a
+    // 25 ms pump slice, four times a second, for a number that changes in one place.
     if (now - recordPaintedAt >= 250) {
       recordPaintedAt = now;
-      paintMicButton();
+      paintMicTimer(audio::recordedMs());
     }
-    // The button is the only moving thing on the screen while a clip is being captured — the frame
-    // loop is given over to pumping I2S, so neither orb is drawn. 15 Hz is enough for a travelling
-    // wave to read as alive, and the strip costs about 0.7 ms against a 25 ms pump slice.
-    if (now - recordPulsedAt >= 66) {
-      recordPulsedAt = now;
-      paintMicPulse(now - orbStartedAt);
+    // THE ORB, INSIDE THE PUMP'S SLICE.
+    //
+    // The mini orb, not the 112 px one, and the choice is a capture-quality decision rather than a
+    // visual one. Capture owns this loop: the I2S ring holds only tens of milliseconds and a full
+    // frame between reads is how a clip gains a gap, so whatever is drawn here is a hole in the
+    // pumping. The 112 px orb is ~640 dots, a 21 904-byte clear, and a 9 852-pixel blit — on the
+    // order of 15 ms, which is most of the ring's margin in one go. The 44 px orb is a twentieth of
+    // that dot budget and a 1 520-pixel blit, on the order of 1.5 ms.
+    //
+    // 30 Hz of a 1.5 ms draw is a 6% duty against the pump. A dropped orb frame is invisible; a
+    // dropped sample is a corrupted voice note, so the trade goes this way round every time. If the
+    // measured pump margin turns out to be tighter than this, lower the cadence here first — the
+    // animation degrades gracefully and the audio does not.
+    if (miniReady && now - recordOrbAt >= 33) {
+      recordOrbAt = now;
+      displayDrawMiniOrb(miniOrb, kOrbCx, voiceLayout().orbCy, now - orbStartedAt);
     }
     // A ceiling was hit while the finger is still down: stop here rather than waiting for a lift
     // that may not come for another twenty seconds.
@@ -3129,6 +3272,13 @@ void uiTick() {
     contentDirty = true;
   }
 
+  // Arrival first, before anything paints into the region. A screen change clears the whole content
+  // area exactly once, here, rather than each screen being trusted to cover its predecessor.
+  if (viewKey() != paintedViewKey && drawerT <= 0.001f) {
+    clearForArrival();
+    contentDirty = true;
+  }
+
   if (chromeDirty) drawChrome();
 
   // Order is load-bearing, three times over.
@@ -3191,12 +3341,16 @@ void uiTick() {
     }
     if (stack.label) displayDrawStatus(statusLabel.c_str(), stack.labelY, elapsed);
   } else if (miniReady) {
-    displayDrawMiniOrb(miniOrb, kMiniOrbCx, kMiniOrbCy, elapsed);
+    // On the voice screen the mini orb is part of the composition, not the header: it is the
+    // recording indicator, and during a capture it is the only thing on the panel that moves.
+    const bool inComposition = voiceShowsOrb();
+    displayDrawMiniOrb(miniOrb, inComposition ? kOrbCx : kMiniOrbCx,
+                       inComposition ? voiceLayout().orbCy : kMiniOrbCy, elapsed);
     shownLabel = "";
   }
-  // The header's right-hand affordance never disappears: with the big orb up there is no mini orb
-  // to be the handle, so a dot and a chevron stand in for it.
-  if (bigOrb && orbReady) drawHeaderStatusDot();
+  // The header's right-hand affordance never disappears: whenever the mini orb is not sitting in
+  // the header, a dot stands in for it so the drawer's tap target keeps its mark.
+  if ((bigOrb || voiceShowsOrb()) && orbReady) drawHeaderStatusDot();
 
   const uint32_t drawMs = millis() - drawStart;
   if (drawMs > stats.worstDrawMs) stats.worstDrawMs = drawMs;

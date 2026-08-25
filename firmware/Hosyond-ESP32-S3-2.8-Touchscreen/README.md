@@ -267,7 +267,7 @@ drawer says what is actually true of the device and doubles as the way to the sc
 | **THREADS** | The thread list, scrolled with a finger; tapping a row selects it. The breadcrumb capsule at the top shows the bound environment and folder, and opens the browser |
 | **ENVIRONMENTS** | Which paired T3 host this controller drives. Tapping a row `POST`s it and clears the folder and thread, because those ids only meant something inside the environment being left |
 | **FOLDERS** | The projects inside the bound environment, each with its thread count. There is no "all folders" row: `POST /v1/device/config/project` reads `projectId` as a required string, so widening the scope again is a console operation |
-| **SEND** | The voice screen, and nothing else: the record button and the thread the clip is going to. Four views, one at a time — ready, recording, held clip, and the full-page journey |
+| **SEND** | The voice screen, and nothing else: the orb, the record button, and the thread the clip is going to. Four views — ready, recording, held clip, full-page journey — and the first three are **one composition**, so nothing moves as a capture progresses |
 | **ACTIONS** | The owner's saved actions. Moved off SEND, where they were four things to press in the middle of a voice interaction; reachable from HOME's action bar |
 | **REPLY** | The assistant's answer, paged. The gateway wraps to 31 characters for a 122x250 e-ink panel; this screen re-joins and re-wraps to 19 so the text can be size 2 and read at arm's length |
 | **APPROVALS** | One held command at a time with REJECT and APPROVE. Approve goes through a second confirm, because it runs on the owner's own machine |
@@ -311,6 +311,31 @@ cancel a voice note recorded by accident was to let it reach the agent and then 
 SEND streams it to `POST /v1/device/media` as base64 straight into the TCP buffer, then to the
 owner's saved capture action if there is one, or to a plain `audio_prompt` on the selected thread if
 there is not.
+
+### Layout stability
+
+Three separate bugs in this firmware have been "text ends up where it should not", and they had one
+family of causes. Both halves of the discipline that fixes them are worth stating, because neither
+is obvious and both regress silently:
+
+**A layout is computed from STRUCTURE, never from content.** HOME reserves the same four bands — orb,
+prominent line, secondary line, action row — whether or not it has anything to put in them. It used
+to pass two content-derived values into the centring: whether the first line fitted at size 2, and
+whether the second line had any text. So a status word changing length, or a thread name being
+replaced by "Needs you", changed the measured block height, moved the centring, and walked the orb,
+both lines and the OPEN button a few pixels. That is text drift, and it is not residue — nothing is
+left behind, the whole composition simply moves. The only input now is `contentBottom()`, which
+changes when the action bar appears: a genuine structural change and the one case where the block
+*should* re-centre. Content decides what is drawn inside a band; it never decides where the band is.
+Long titles still drop to size 1, but they are centred *within the same 16 px band*.
+
+**Arriving at a screen clears the whole content area, in one shared place.** `clearForArrival()` is
+the only code that does this, keyed on `paintedViewKey` — the screen, the modal, and which voice
+state, because those are four different pictures inside one `Screen`. Each screen still clears the
+region it draws into, which is right for a repaint and wrong for an arrival: the recording state
+paints a capsule and an elapsed time, so it never touched the two destination lines the previous
+state had left below the capsule, and "SENDING TO" and half a thread title stayed on the glass. The
+first two variants of this were fixed per-screen, which is exactly why there was a third.
 
 ### The destination line
 
@@ -361,7 +386,7 @@ projection in `src/deviceAudio.mjs` and the orb says which one it is in:
 
 | Milestone | Orb | Word |
 |---|---|---|
-| recording (the ADC is open) | Wave | Listening, and the record button carries a travelling wave of dots |
+| recording (the ADC is open) | Wave | Listening — the orb runs inside the audio pump's slice, see below |
 | uploading | Ribbon | Sending — **a still frame**, see below |
 | transcribing | Globe | Transcribing |
 | review | **Ring** | Needs review |
@@ -379,6 +404,27 @@ observed** — a poll that fails holds the last known stage rather than advancin
 POST response and discards `job.jobId`, which is the identifier the poll takes. The upload is
 re-expressed there with both ids kept; the part that is actually delicate, `Base64JsonBodyStream`,
 is reused rather than reimplemented.
+
+### The orb during capture
+
+The orb animates while recording, and the size of it is a capture-quality decision rather than a
+visual one. Capture owns the loop: the I2S ring holds only tens of milliseconds, and a full frame
+between reads is how a clip gains a gap, so anything drawn between pumps is a hole in the pumping.
+
+- the 112 px orb is ~640 dots, a 21 904-byte clear and a 9 852-pixel blit — on the order of 15 ms,
+  which is most of the ring's margin in one go
+- the 44 px orb is a twentieth of that dot budget and a 1 520-pixel blit — on the order of 1.5 ms
+
+So the **mini orb** runs at 30 Hz inside the pump's slice, a ~6% duty. A dropped orb frame is
+invisible; a dropped sample is a corrupted voice note, so the trade goes this way round every time —
+and if the measured margin is tighter than this, the cadence comes down first, because the animation
+degrades gracefully and the audio does not. **These costs are arithmetic, not measurements.**
+
+The capsule's travelling dots are gone: the orb carries the motion now, and two competing animations
+on one small screen is what they were originally there to avoid. The elapsed seconds stay, but only
+the digits are repainted, into a fixed band — the old code redrew the whole capsule four times a
+second, which is 19 500 pixels and about 4 ms of a 25 ms pump slice for a number that changes in one
+place.
 
 **The uploading frame is still, and that is not papered over.** `uploadMedia()` holds the render loop
 for the whole transfer, so no orb frame runs during it. What the device does instead is paint the
