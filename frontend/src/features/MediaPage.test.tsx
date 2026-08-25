@@ -141,6 +141,57 @@ test("a job waiting on review offers approval and posts the reviewed version", a
   expect(c.refreshMedia).toHaveBeenCalled();
 });
 
+test("a configuration failure says so, and offers the retry that fits it", async () => {
+  const api = vi.fn(async () => ({ counts: { requeued: 1, skipped: 0 } }));
+  const c = renderMedia({
+    media: [{ ...AUDIO, processing: { transcriptionStatus: "failed", lastError: "No transcription provider is configured." } }],
+    mediaJobs: [{
+      id: "mjob_1",
+      mediaId: "media_1",
+      kind: "transcription",
+      stage: "failed",
+      failureKind: "terminal",
+      failureCause: "configuration",
+      lastError: "No transcription provider is configured.",
+      createdAt: "2026-06-14T23:00:01.000Z",
+    }],
+    api,
+  });
+
+  // The category is the actionable half; "failed" alone sent people to the server logs.
+  expect(screen.getByText(/Gateway configuration/)).toBeVisible();
+  fireEvent.click(screen.getByRole("button", { name: /Retry after fixing config/ }));
+
+  await vi.waitFor(() => expect(api).toHaveBeenCalled());
+  expect(api).toHaveBeenCalledWith("/v1/media/jobs/retry-configuration", {
+    method: "POST",
+    body: { jobIds: ["mjob_1"] },
+  });
+  expect(c.refreshMedia).toHaveBeenCalled();
+});
+
+test("a failure about the recording is explained but never offered a pointless retry", () => {
+  renderMedia({
+    media: [AUDIO],
+    mediaJobs: [{
+      id: "mjob_1",
+      mediaId: "media_1",
+      kind: "transcription",
+      stage: "failed",
+      failureKind: "terminal",
+      failureCause: "input",
+      lastError: "The parakeet sidecar does not accept audio/mpeg.",
+      createdAt: "2026-06-14T23:00:01.000Z",
+    }],
+  });
+
+  expect(screen.getByText(/retrying will not change the answer/)).toBeVisible();
+  // Twice over: the status badge already carries the raw error, and the panel repeats it under the
+  // category that explains it.
+  expect(screen.getAllByText(/does not accept audio\/mpeg/).length).toBeGreaterThan(0);
+  expect(screen.queryByRole("button", { name: /Retry after fixing config/ })).toBeNull();
+});
+
 test("the newest job describes a re-transcribed clip", () => {
   renderMedia({
     media: [AUDIO],

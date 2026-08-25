@@ -16,6 +16,8 @@ import {
   formatMediaExpiry,
   formatMediaJob,
   formatMediaProcessing,
+  mediaJobFailureLabel,
+  mediaJobRetryable,
   mediaJobTone,
 } from "../format";
 import { ActivityOrb } from "../motion";
@@ -69,6 +71,21 @@ export function MediaPage({ controller: c }: { controller: Controller }) {
       const result = await c.api(`/v1/media/${encodeURIComponent(item.id)}/transcribe`, {
         method: "POST",
         body: {},
+      });
+      await c.refreshMedia();
+      return result;
+    });
+  };
+
+  // Requeueing a job that failed on the deployment rather than on the audio. Scoped to the one job
+  // the owner is looking at, and the answer says what happens next: the gateway holds a requeued
+  // transcript for review whatever the device's auto-send grant says, because a capture from hours
+  // ago is not something anyone is still expecting an agent to act on.
+  const retryConfiguration = async (job: MediaJob) => {
+    await c.run(`retry-${job.id}`, "Queued again — the transcript will wait for your review.", async () => {
+      const result = await c.api("/v1/media/jobs/retry-configuration", {
+        method: "POST",
+        body: { jobIds: [job.id] },
       });
       await c.refreshMedia();
       return result;
@@ -198,6 +215,19 @@ export function MediaPage({ controller: c }: { controller: Controller }) {
                         Cleanup may only move spacing, punctuation and case. When it moved letters
                         instead, nothing is applied — the speaker sees both versions and picks.
                       */}
+                      {/*
+                        A failure an owner can act on, or knowingly leave alone. The category is the
+                        actionable half — "failed" alone sent people to the server logs.
+                      */}
+                      {job?.stage === "failed" ? (
+                        <div className="mt-2 rounded-lg border border-control bg-surface-inset p-2 text-xs">
+                          <p className="font-semibold text-ink">Transcription failed</p>
+                          <p className="mt-1 text-ink-muted">{mediaJobFailureLabel(job)}</p>
+                          {job.lastError ? (
+                            <p className="mt-1 font-mono text-ink-faint">{job.lastError}</p>
+                          ) : null}
+                        </div>
+                      ) : null}
                       {job?.transcriptChange?.contentPreserved === false ? (
                         <div className="mt-2 rounded-lg border border-control bg-surface-inset p-2 text-xs">
                           <p className="font-semibold text-ink">Cleanup changed the wording</p>
@@ -228,6 +258,11 @@ export function MediaPage({ controller: c }: { controller: Controller }) {
                       <Button size="sm" onClick={() => void saveTranscript(item)}>
                         <Save className="size-3.5" /> Save
                       </Button>
+                      {job && mediaJobRetryable(job) ? (
+                        <Button size="sm" onClick={() => void retryConfiguration(job)}>
+                          <RefreshCw className="size-3.5" /> Retry after fixing config
+                        </Button>
+                      ) : null}
                       {job?.stage === "review_required" ? (
                         <Button size="sm" variant="primary" onClick={() => void submitReview(item, job)}>
                           <Save className="size-3.5" /> Approve transcript

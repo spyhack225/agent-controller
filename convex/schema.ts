@@ -100,9 +100,15 @@ export default defineSchema({
     })),
     firmwarePolicy: v.optional(v.any()),
     gatewaySelection: v.optional(v.any()),
-    // The owner's standing grant for this device to auto-send a finished voice transcript.
+    // This device's auto-send answer. `ownerChoice` is the only field an owner writes — true,
+    // false, or null for "never said" — and the rest is derived from it plus whether the hardware
+    // has ever reported a microphone. Rows written before the three-state model carry only
+    // `enabled`, which is why every field but that one is optional.
     voiceAutoSend: v.optional(v.object({
       enabled: v.boolean(),
+      ownerChoice: v.optional(v.union(v.boolean(), v.null())),
+      source: v.optional(v.string()),
+      audioCapable: v.optional(v.boolean()),
       enabledBy: v.union(v.string(), v.null()),
       enabledAt: v.union(v.string(), v.null()),
     })),
@@ -215,6 +221,13 @@ export default defineSchema({
     leaseExpiresAt: v.optional(v.union(v.string(), v.null())),
     lastError: v.optional(v.union(v.string(), v.null())),
     failureKind: v.optional(v.union(v.string(), v.null())),
+    // Why a terminal failure was terminal — configuration, input, provider, unknown. Separate from
+    // failureKind, which only says whether an identical retry was worth making: this is what the
+    // owner-driven configuration-retry path selects on.
+    failureCause: v.optional(v.union(v.string(), v.null())),
+    requeueCount: v.optional(v.number()),
+    requeuedAt: v.optional(v.union(v.string(), v.null())),
+    requeuedBy: v.optional(v.union(v.string(), v.null())),
     timings: v.optional(v.any()),
     createdAt: v.string(),
     updatedAt: v.string(),

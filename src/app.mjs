@@ -56,7 +56,11 @@ import {
   threadTitlesAreStale,
 } from "./mediaNaming.mjs";
 import { deviceJobStatus, mediaJobEvent, voiceAutoSendEnabled } from "./deviceAudio.mjs";
-import { describeTranscriptChange, isTranscriptionProviderEnabled } from "./transcription.mjs";
+import {
+  createTranscriptionProvider,
+  describeTranscriptChange,
+  isTranscriptionProviderEnabled,
+} from "./transcription.mjs";
 import { buildUserObservabilitySummary } from "./observability.mjs";
 import {
   checkResourceLimit,
@@ -811,8 +815,12 @@ export function createApp({
         const user = await authenticateUser(req, store, config, null, clerkAuth);
         await enforceUserWrite(req, res, rateLimiter, config, user);
         const body = await readJson(req);
-        if (typeof body.enabled !== "boolean") {
-          throw new HttpError(400, "enabled must be a boolean.");
+        // `null` is a third answer, not a missing one: it withdraws the owner's decision and hands
+        // the device back to the default. Omitting the key is still a 400 — an absent field is a
+        // malformed request, and guessing which of three states it meant is how a grant gets
+        // changed by accident.
+        if (typeof body.enabled !== "boolean" && body.enabled !== null) {
+          throw new HttpError(400, "enabled must be true, false, or null to restore the default.");
         }
         const device = await store.setDeviceVoiceAutoSend({
           userId: user.id,
@@ -1864,6 +1872,22 @@ export function createApp({
           ...(url.searchParams.get("stage") ? { stage: url.searchParams.get("stage") } : {}),
         });
         return sendJson(res, 200, { jobs: jobs.map(withTranscriptChange) });
+      }
+
+      // The explicit retry path for jobs that failed on the deployment rather than on the audio.
+      // A POST an owner makes, and nothing else: no poller tick, no boot hook, no automatic sweep
+      // after a config change. See retryConfigurationFailures() for why that matters.
+      if (req.method === "POST" && url.pathname === "/v1/media/jobs/retry-configuration") {
+        const user = await authenticateUser(req, store, config, null, clerkAuth);
+        await enforceUserWrite(req, res, rateLimiter, config, user);
+        const body = await readJson(req);
+        return await retryConfigurationFailures({
+          store,
+          config,
+          res,
+          userId: user.id,
+          jobIds: Array.isArray(body?.jobIds) ? body.jobIds : null,
+        });
       }
 
       const mediaJobMatch = url.pathname.match(/^\/v1\/media\/jobs\/([^/]+)$/u);
@@ -3879,6 +3903,108 @@ async function enqueueDeviceTranscription({ store, config, events, device, media
 }
 
 /**
+ * Requeues the jobs that failed because of how the gateway was configured, and only those.
+ *
+ * The incident this exists for: two clips failed permanently because TRANSCRIPTION_PROVIDER was
+ * unset. Nothing about those recordings was wrong, but `failed` is terminal and never re-claimed,
+ * so fixing the deployment did not bring them back — and there was no way to tell them apart from a
+ * clip the model genuinely cannot transcribe.
+ *
+ * Two refusals, both deliberately louder than a silent no-op:
+ *
+ * - No provider configured now, or one configured without the credential it needs. Requeueing into
+ *   the identical failure would spend the jobs' fresh attempt budget to reproduce the same error
+ *   and leave the owner believing the retry was tried and lost.
+ * - Anything whose recorded cause is not `configuration` is reported as skipped, with the cause, so
+ *   "I retried and nothing happened" is answerable from the response.
+ *
+ * And the safety rule, which lives in the store because it must not be a caller's choice: every
+ * requeued job comes back with `reviewRequired`, so its transcript waits for a person. Auto-send
+ * now defaults on for a microphone device, and a bulk retry without this would let a batch of
+ * captures from hours or days ago dispatch themselves into a coding agent as instructions the owner
+ * has long stopped expecting. The grant means "send what I say as I say it" — it was never consent
+ * for what was said last Tuesday.
+ */
+async function retryConfigurationFailures({ store, config, res, userId, jobIds = null }) {
+  const provider = createTranscriptionProvider(config);
+  if (!isTranscriptionProviderEnabled(config.transcriptionProvider) || provider.available !== true) {
+    throw new HttpError(
+      409,
+      isTranscriptionProviderEnabled(config.transcriptionProvider)
+        ? `TRANSCRIPTION_PROVIDER=${config.transcriptionProvider} is selected but not usable yet`
+          + " (its credential is missing), so these jobs would fail again for the same reason."
+        : "No transcription provider is configured, so these jobs would fail again for the same"
+          + " reason. Set TRANSCRIPTION_PROVIDER first, then retry.",
+    );
+  }
+
+  // Named ids are read individually so an ineligible one can be reported as itself. Without a list
+  // the candidates are every failed job on the account — a job that is still running is not a
+  // candidate for anything, and sweeping those in would be the automatic behaviour this path is
+  // deliberately not.
+  let candidates;
+  if (jobIds) {
+    const ids = [...new Set(jobIds.map((value) => String(value)))];
+    const found = await Promise.all(ids.map((id) => store.getMediaJobForUser(userId, id)));
+    const unknown = ids.filter((_, index) => !found[index]);
+    if (unknown.length > 0) throw new HttpError(404, `Media job not found: ${unknown.join(", ")}.`);
+    candidates = found;
+  } else {
+    candidates = await store.listMediaJobs({ userId, stage: "failed" });
+  }
+
+  const requeued = [];
+  const skipped = [];
+  const skip = (job) => skipped.push({
+    jobId: job.id,
+    mediaId: job.mediaId,
+    stage: job.stage,
+    failureCause: job.failureCause ?? null,
+  });
+
+  for (const job of candidates) {
+    if (job.stage !== "failed" || job.failureCause !== "configuration") {
+      skip(job);
+      continue;
+    }
+    const updated = await store.requeueMediaJob({ userId, jobId: job.id, actorId: userId });
+    if (!updated) {
+      // The store refuses on the same rules; a disagreement here means the row moved underneath us.
+      skip(job);
+      continue;
+    }
+    // The media record still says `failed` from the run that did not work; the owner is looking at
+    // that line, not at the job row.
+    await store.updateMediaProcessing?.({
+      userId,
+      mediaId: updated.mediaId,
+      processing: {
+        transcriptionStatus: "processing",
+        transcriptSource: config.transcriptionProvider,
+        lastError: null,
+      },
+    });
+    requeued.push({
+      jobId: updated.id,
+      mediaId: updated.mediaId,
+      attempts: updated.attempts,
+      requeueCount: updated.requeueCount,
+      previousError: job.lastError ?? null,
+    });
+  }
+
+  return sendJson(res, 200, {
+    provider: config.transcriptionProvider,
+    // Stated in the response because it is a promise about what happens next, not an internal
+    // detail: nothing requeued here can auto-send, however the device's grant is set.
+    holdForReview: true,
+    requeued,
+    skipped,
+    counts: { requeued: requeued.length, skipped: skipped.length },
+  });
+}
+
+/**
  * Decides whether a finished voice transcript is sent on, and sends it.
  *
  * Called by the job worker at the moment of dispatch, never at enqueue. That ordering is the point:
@@ -3897,6 +4023,10 @@ async function dispatchVoiceTranscript({ store, config, job, transcript }) {
   const device = await store.getDeviceForUser(job.userId, job.deviceId);
   // Revoked or deleted between record and dispatch. The grant died with the pairing.
   if (!device || device.revokedAt) return null;
+  // Read here, never at enqueue, and now three-valued: an owner's explicit choice either way, or
+  // the hardware's default — on for a device that has reported a microphone. A device that stopped
+  // reporting one, or an owner who turned it off while this capture sat in the queue, both land
+  // here as `false` and the capture waits.
   if (!voiceAutoSendEnabled(device)) return null;
 
   const environmentId = job.environmentId ?? device.config?.environmentId ?? null;

@@ -114,6 +114,9 @@ export function mediaJobEvent(job, observedAt) {
     lastError: job.lastError ?? null,
     dispatchError: job.dispatchError ?? null,
     failureKind: job.failureKind ?? null,
+    // Why a terminal failure was terminal, so the console can offer the retry that fits it rather
+    // than a "try again" button that would fail identically.
+    failureCause: job.failureCause ?? null,
     observedAt,
   };
 }
@@ -121,9 +124,17 @@ export function mediaJobEvent(job, observedAt) {
 /**
  * Whether this device may send a finished transcript on without a person looking at it.
  *
- * Off unless the owner turned it on for this specific device. A blanket account-wide switch was
- * deliberately not built: auto-send is a trust decision about one microphone in one room, and a
- * device claimed later must not inherit it. `enabledBy` is the owner who made that call.
+ * Reads the answer the store already derived (`normalizeVoiceAutoSend` in src/store.mjs), which is
+ * three-valued underneath: the owner's explicit choice if they made one, and otherwise the
+ * hardware's default — on for a device that has declared a microphone on a heartbeat, off for one
+ * that never has. A controller whose purpose is to be spoken to should work when it is spoken to;
+ * a board with no microphone is never handed a licence it could not use.
+ *
+ * Still per device, never per account. Auto-send is a trust decision about one microphone in one
+ * room: an account-wide switch would extend it to the next controller the owner claims, and a
+ * device that arrives later must earn its own answer from its own hardware. `enabledBy` is the
+ * owner who granted it explicitly, and stays null for the default — a default has nobody behind it
+ * and must not be recorded as though somebody signed for it.
  */
 export function voiceAutoSendEnabled(device) {
   return device?.voiceAutoSend?.enabled === true;

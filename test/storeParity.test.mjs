@@ -183,6 +183,57 @@ test("resumeStageFor() agrees between the memory store and the Convex function",
   assert.match(convex, /const defaultMediaJobMaxAttempts = 3;/u);
 });
 
+test("the auto-send decision is resolved identically on both backends", async () => {
+  const [memory, convex] = await Promise.all([
+    readFile(join(ROOT, "src", "store.mjs"), "utf8"),
+    readFile(join(ROOT, "convex", "gatewayStore.ts"), "utf8"),
+  ]);
+
+  // Auto-send is a standing licence for a microphone to send what it hears to a coding agent. A
+  // backend that derived it differently would either withhold a grant the owner can see in the
+  // console, or issue one they never made.
+  for (const name of ["normalizeVoiceAutoSend", "normalizeVoiceAutoSendChoice", "deviceReportsMicrophone"]) {
+    assert.equal(
+      normalize(extractFunction(convex, name)),
+      normalize(extractFunction(memory, name)),
+      `${name}() has drifted between src/store.mjs and convex/gatewayStore.ts.`,
+    );
+  }
+
+  // The third state is the whole point: without it "off" cannot be told from "nobody has said",
+  // and the default would switch an owner's refusal back on at the next heartbeat.
+  for (const [label, source] of [["memory", memory], ["convex", convex]]) {
+    assert.match(
+      source,
+      /ownerChoice/u,
+      `${label} no longer records the owner's decision separately from the effective answer.`,
+    );
+  }
+});
+
+test("the media job failure causes are spelled the same way in both backends", async () => {
+  const [memory, convex, transcription] = await Promise.all([
+    readFile(join(ROOT, "src", "store.mjs"), "utf8"),
+    readFile(join(ROOT, "convex", "gatewayStore.ts"), "utf8"),
+    readFile(join(ROOT, "src", "transcription.mjs"), "utf8"),
+  ]);
+
+  const causes = (source, name) => {
+    const start = source.indexOf(name);
+    assert.notEqual(start, -1, `${name} not found.`);
+    const open = source.indexOf("[", start);
+    const close = source.indexOf("]", open);
+    return [...source.slice(open, close).matchAll(/"([a-z_]+)"/gu)].map((match) => match[1]);
+  };
+
+  // The category decides what the owner-driven retry will re-run. A backend that stored a cause the
+  // other does not recognise would drop it to null and hide a requeueable job forever.
+  const declared = causes(transcription, "export const TRANSCRIPTION_FAILURE_CAUSES");
+  assert.deepEqual(declared, ["configuration", "input", "provider", "unknown"]);
+  assert.deepEqual(causes(memory, "const MEDIA_JOB_FAILURE_CAUSES"), declared);
+  assert.deepEqual(causes(convex, "const mediaJobFailureCauses"), declared);
+});
+
 test("the media job stage machine is spelled the same way in both backends", async () => {
   const [memory, convex] = await Promise.all([
     readFile(join(ROOT, "src", "store.mjs"), "utf8"),

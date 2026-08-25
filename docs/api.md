@@ -603,12 +603,68 @@ The job keeps transcript **versions**, not one overwritten string:
 | `userEditedTranscript` | The reviewed value, when a person corrected it. Writable. |
 
 Plus `provider`, `model`, `language`, `attempts` / `maxAttempts`, `lastError`, `failureKind`
-(`retryable` or `terminal`), a `timings` map, and the lease fields. The last version present wins:
-user-edited, else normalized, else raw.
+(`retryable` or `terminal`), `failureCause`, `requeueCount` / `requeuedAt` / `requeuedBy`, a
+`timings` map, and the lease fields. The last version present wins: user-edited, else normalized,
+else raw.
 
 A retryable failure (timeout, 429, 5xx, unreadable bytes) returns the job to `queued` and costs one
 attempt; a terminal one (no provider, missing key, 4xx, empty result) fails immediately rather than
 spending the budget on an answer that will not change.
+
+`failureCause` answers the other question — what would have to change for the clip to succeed:
+
+| Cause | Meaning | Examples |
+|---|---|---|
+| `configuration` | The deployment, not the clip. | No provider selected, missing credential, sidecar not running, English-only checkpoint pointed at another language. |
+| `input` | The audio itself. | Container the sidecar does not decode, clip over the length limit, silence. |
+| `provider` | Configured and reachable, and still no transcript. | 5xx, timeout, storage having a bad minute. |
+| `unknown` | Reached the worker unlabelled. | An unexpected throw. |
+
+It is set where the error is thrown, never inferred from the message text, and it is recorded on
+every failure — a retryable failure that later burns the last attempt is failed inside the claim,
+which inherits the cause already on the row.
+
+### Retrying a configuration failure
+
+Only an owner can un-terminate a job, and only for a cause a deployment change could have fixed:
+
+```http
+POST /v1/media/jobs/retry-configuration
+authorization: Bearer PLATFORM_TOKEN
+content-type: application/json
+```
+
+```json
+{ "jobIds": ["mjob_..."] }
+```
+
+`jobIds` is optional — omit it to consider every failed job on the account. Answers:
+
+```json
+{
+  "provider": "openai",
+  "holdForReview": true,
+  "requeued": [{ "jobId": "mjob_...", "mediaId": "media_...", "attempts": 0, "requeueCount": 1, "previousError": "..." }],
+  "skipped": [{ "jobId": "mjob_...", "mediaId": "media_...", "stage": "failed", "failureCause": "input" }],
+  "counts": { "requeued": 1, "skipped": 1 }
+}
+```
+
+- Refused with `409` when no provider is configured, or when the selected one has no credential —
+  requeueing into the identical failure would spend the fresh budget reproducing it.
+- `404` when a named job id is not one of the caller's.
+- Anything that is not a failed job with cause `configuration` is reported in `skipped` with its
+  stage and cause, so "I retried and nothing happened" is answerable from the response.
+- `attempts` resets to zero: the previous attempts were spent on a fault that no longer exists.
+- Nothing runs this on boot, on a poller tick, or after a configuration change. A terminal stage
+  promises nothing happens on its own; only a person may break that promise.
+
+**`holdForReview` is not an option.** A requeued job comes back with `reviewRequired` set, so its
+transcript parks at `review_required` and waits for a person however the recording device's
+auto-send is configured. A transcript is dispatched to a coding agent as an instruction, and the
+auto-send grant means "send what I say as I say it" — it was never consent for a batch of captures
+from hours or days ago. Once someone accepts the transcript, the ordinary path resumes and the grant
+applies again, because now there is a human decision behind the send.
 
 Read jobs:
 
@@ -843,7 +899,7 @@ and timings stay on the owner-facing `/v1/media/jobs/:id`. Milestones:
 
 ### Auto-send
 
-A finished transcript **waits** by default. Sending it on is a per-device grant the owner issues:
+Auto-send has **three** states, not two, and only two of them are decisions:
 
 ```http
 PUT /v1/devices/dev_.../voice-auto-send
@@ -855,10 +911,33 @@ content-type: application/json
 { "enabled": true }
 ```
 
-Answers `{ "device": {...}, "voiceAutoSend": { "enabled": true, "enabledBy": "user_...", "enabledAt": "..." } }`.
-`GET` on the same path reads it. Turning it off clears `enabledBy`/`enabledAt` rather than leaving a
-name on a permission nobody holds. There is deliberately no account-wide switch: auto-send is a
-trust decision about one microphone in one room, and a controller claimed later must not inherit it.
+`enabled` accepts `true`, `false`, or `null` — `null` withdraws the owner's decision and hands the
+device back to its default. Omitting the field is a `400`: an absent value is a malformed request,
+not a third state expressed by silence.
+
+Answers `{ "device": {...}, "voiceAutoSend": { ... } }`, and `GET` on the same path reads it:
+
+| Field | Meaning |
+|---|---|
+| `ownerChoice` | The owner's decision: `true`, `false`, or `null` for "never said". |
+| `enabled` | The effective answer. An explicit `ownerChoice` wins; otherwise the hardware decides. |
+| `source` | `owner` when a decision exists, `default` otherwise. |
+| `audioCapable` | Whether this device has declared `microphone` in `status.features` on a heartbeat. |
+| `enabledBy` / `enabledAt` | Who granted it explicitly, and when. Both stay `null` for a default. |
+
+**The default is on for a controller that has reported a microphone**, and off for one that has not.
+A device whose purpose is to be spoken to should work when it is spoken to; a board that never
+claimed a microphone is never handed a licence it could not use. The capability is read from what
+the firmware declared on a heartbeat, not from what the hardware model is supposed to have.
+
+An owner's explicit choice beats the default in both directions and is never undone by one: a
+firmware update that re-declares the microphone, a restart, or a re-claim all leave `ownerChoice`
+alone. That is why the third state exists — with a plain boolean, "off" could not be told from
+"nobody has said", and the default would keep switching it back on. `enabledBy`/`enabledAt` are
+reserved for a real grant, so a default is never recorded as though somebody signed for it.
+
+There is deliberately no account-wide switch: auto-send is a trust decision about one microphone in
+one room, and a controller claimed later earns its own answer from its own hardware.
 
 Owner realm only — a device cannot widen its own licence to act on what it hears.
 

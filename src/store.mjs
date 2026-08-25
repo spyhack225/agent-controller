@@ -27,6 +27,10 @@ export const MEDIA_JOB_STAGES = [
 ];
 const MEDIA_JOB_STAGE_SET = new Set(MEDIA_JOB_STAGES);
 export const MEDIA_JOB_TERMINAL_STAGES = new Set(["dispatched", "failed"]);
+// Mirrors TRANSCRIPTION_FAILURE_CAUSES in src/transcription.mjs. Spelled out here rather than
+// imported so the Convex copy of this file has one list to mirror, and so the store validates what
+// it stores instead of trusting a caller.
+const MEDIA_JOB_FAILURE_CAUSES = ["configuration", "input", "provider", "unknown"];
 const DEFAULT_MEDIA_JOB_MAX_ATTEMPTS = 3;
 const DEVICE_ONLINE_THRESHOLD_MS = 90_000;
 // A claim code has to outlive warehouse-to-customer transit, because the printed label is issued at
@@ -591,24 +595,41 @@ export function createStore(seed = {}, options = {}) {
   }
 
   /**
-   * Grants or revokes this device's licence to auto-send a finished voice transcript.
+   * Records — or clears — this device's owner decision about auto-sending a voice transcript.
    *
    * Scoped to one device on purpose. Audio is captured by a particular microphone in a particular
    * room, so the trust question is about that unit — an account-wide switch would silently extend
    * the grant to the next controller the owner claims.
+   *
+   * `enabled` is a boolean for a decision and `null` to withdraw the decision entirely and go back
+   * to whatever the hardware's default is. Those are three different answers, and the stored row
+   * keeps them apart: without the third, "off" could not be told from "nobody has said", and the
+   * default would keep overriding an owner who deliberately turned this off.
    */
   function setDeviceVoiceAutoSend({ userId, deviceId, enabled, actorId = null, actorType = "user" }) {
     const device = devices.get(deviceId);
     if (!device || device.userId !== userId || device.revokedAt) return null;
+    const ownerChoice = enabled === true ? true : enabled === false ? false : null;
     device.voiceAutoSend = normalizeVoiceAutoSend(
-      enabled === true ? { enabled: true, enabledBy: actorId ?? userId, enabledAt: nowIso() } : { enabled: false },
+      {
+        ownerChoice,
+        // Only a real grant carries a name. Clearing to the default must not leave one behind,
+        // because a default has nobody behind it.
+        enabledBy: ownerChoice === true ? actorId ?? userId : null,
+        enabledAt: ownerChoice === true ? nowIso() : null,
+      },
+      deviceReportsMicrophone(device),
     );
     device.updatedAt = nowIso();
     audit({
       userId,
       actorType,
       ...(actorId ? { actorId } : {}),
-      action: enabled === true ? "device.voice_auto_send_enabled" : "device.voice_auto_send_disabled",
+      action: ownerChoice === true
+        ? "device.voice_auto_send_enabled"
+        : ownerChoice === false
+          ? "device.voice_auto_send_disabled"
+          : "device.voice_auto_send_reset",
       targetId: deviceId,
       metadata: device.voiceAutoSend,
     });
@@ -1575,6 +1596,15 @@ export function createStore(seed = {}, options = {}) {
       leaseExpiresAt: null,
       lastError: null,
       failureKind: null,
+      // Why a terminal failure was terminal. `failureKind` only says whether another identical
+      // attempt was worth making; this says what would have to change for the job to succeed, and
+      // it is the only thing the configuration-retry path is allowed to act on.
+      failureCause: null,
+      // Bookkeeping for that retry path, so a requeued job is visibly a second run rather than
+      // looking like a capture that never failed.
+      requeueCount: 0,
+      requeuedAt: null,
+      requeuedBy: null,
       timings: { queuedAt: nowIso() },
       createdAt: nowIso(),
       updatedAt: nowIso(),
@@ -1639,6 +1669,10 @@ export function createStore(seed = {}, options = {}) {
         // exhausted job from being rediscovered on every single tick.
         job.stage = "failed";
         job.failureKind = "terminal";
+        // The cause of the last attempt is the cause of the abandonment: a job that burned its
+        // budget on an unreachable sidecar failed for configuration reasons, and re-labelling it
+        // here would hide it from the only retry path that could fix it.
+        job.failureCause = job.failureCause ?? "unknown";
         job.lastError = job.lastError ?? `Media job abandoned after ${job.attempts} attempts.`;
         job.leaseOwner = null;
         job.leaseExpiresAt = null;
@@ -1689,12 +1723,78 @@ export function createStore(seed = {}, options = {}) {
     if (input.failureKind !== undefined) {
       job.failureKind = ["retryable", "terminal"].includes(input.failureKind) ? input.failureKind : null;
     }
+    if (input.failureCause !== undefined) {
+      job.failureCause = MEDIA_JOB_FAILURE_CAUSES.includes(input.failureCause) ? input.failureCause : null;
+    }
     if (input.timings !== undefined) job.timings = { ...job.timings, ...structuredClone(input.timings ?? {}) };
     if (input.releaseLease === true) {
       job.leaseOwner = null;
       job.leaseExpiresAt = null;
     }
     job.updatedAt = nowIso();
+    notifyChanged();
+    return structuredClone(job);
+  }
+
+  /**
+   * Puts one configuration-failed job back in the queue, at an owner's explicit request.
+   *
+   * Never called by a poller, a boot path or a retry timer — only by the owner-realm endpoint. A
+   * terminal stage is a promise that nothing will happen to this job on its own, and the only thing
+   * allowed to break that promise is a person deciding to.
+   *
+   * Three rules are enforced here rather than left to the caller, because they are what make the
+   * path safe rather than merely convenient:
+   *
+   * 1. Only `failed` + `failureCause === "configuration"`. An input failure would spend an
+   *    inference to produce the same refusal, and an unknown failure is unclassified, not benign.
+   * 2. The attempt budget resets. The previous attempts were spent on a fault that no longer
+   *    exists, so charging the clip for them would fail it again after one bad tick.
+   * 3. `reviewRequired` is forced on, and is not a parameter. A transcript is dispatched to a
+   *    coding agent as an instruction; the auto-send grant means "send what I say as I say it", and
+   *    a clip recorded before an incident was fixed is not that. Waking up to an agent acting on
+   *    something said last Tuesday is the failure mode this whole path could otherwise create, so a
+   *    requeued capture always waits for a person — who then sees the text before it goes.
+   */
+  function requeueMediaJob({ userId, jobId, actorId = null, actorType = "user" }) {
+    const job = mediaJobs.get(jobId);
+    if (!job || job.userId !== userId) return null;
+    if (job.stage !== "failed" || job.failureCause !== "configuration") return null;
+
+    const previousError = job.lastError;
+    job.stage = "queued";
+    job.attempts = 0;
+    job.lastError = null;
+    job.failureKind = null;
+    job.failureCause = null;
+    job.leaseOwner = null;
+    job.leaseExpiresAt = null;
+    // The previous run never dispatched anything (it never produced a transcript), so the dispatch
+    // outcome is cleared rather than carried forward as if it described this run.
+    job.autoSend = false;
+    job.dispatchStatus = null;
+    job.dispatchError = null;
+    job.commandId = null;
+    job.reviewRequired = true;
+    job.requeueCount = (job.requeueCount ?? 0) + 1;
+    job.requeuedAt = nowIso();
+    job.requeuedBy = actorId ?? userId;
+    job.timings = { ...job.timings, requeuedAt: nowIso() };
+    job.updatedAt = nowIso();
+    audit({
+      userId,
+      actorType,
+      ...(actorId ? { actorId } : {}),
+      action: "media_job.requeued",
+      targetId: job.id,
+      metadata: {
+        mediaId: job.mediaId,
+        deviceId: job.deviceId,
+        previousError,
+        requeueCount: job.requeueCount,
+        holdForReview: true,
+      },
+    });
     notifyChanged();
     return structuredClone(job);
   }
@@ -2057,6 +2157,7 @@ export function createStore(seed = {}, options = {}) {
     listMediaJobs,
     claimMediaJobs,
     updateMediaJob,
+    requeueMediaJob,
     createAction,
     getActionForUser,
     listActions,
@@ -2447,7 +2548,7 @@ function publicDevice(device) {
     firmwarePolicy: normalizeFirmwarePolicy({}, device.firmwarePolicy),
     presence: buildDevicePresence(device),
     actions: deviceActions(device),
-    voiceAutoSend: normalizeVoiceAutoSend(device.voiceAutoSend),
+    voiceAutoSend: normalizeVoiceAutoSend(device.voiceAutoSend, deviceReportsMicrophone(device)),
     claimed: Boolean(device.claimedAt),
   };
 }
@@ -2455,18 +2556,61 @@ function publicDevice(device) {
 /**
  * Whether this device may dispatch a finished voice transcript without a person looking at it.
  *
- * Always off until the owner says otherwise, and `enabledBy` records which owner that was — an
- * auto-sending microphone is a standing grant to act on whatever it happens to hear, so who issued
- * it has to survive in the record and not only in the audit log. Turning it off clears the grant
- * rather than keeping a stale name attached to a permission nobody holds any more.
+ * Three states, not two. `ownerChoice` is the only thing an owner writes — `true`, `false`, or
+ * `null` for "never said" — and `enabled` is derived from it: an explicit choice always wins, and
+ * only in its absence does the hardware decide. A controller that reports a microphone auto-sends
+ * by default, because a controller whose whole purpose is to be spoken to should not transcribe
+ * into a queue nobody drains; a board with no microphone is never granted a licence it could not
+ * use anyway.
+ *
+ * Collapsing this back to one boolean is the bug the third state exists to prevent: an owner who
+ * turns auto-send off would be indistinguishable from an owner who has not looked at the setting,
+ * and the default would switch it back on at the next heartbeat, restart or re-claim.
+ *
+ * `enabledBy`/`enabledAt` stay reserved for a real grant. A default has no human behind it, so it
+ * is reported as `source: "default"` with no name attached rather than forging one.
  */
-function normalizeVoiceAutoSend(input = null) {
-  const enabled = input?.enabled === true;
+function normalizeVoiceAutoSend(input = null, audioCapable = false) {
+  const ownerChoice = normalizeVoiceAutoSendChoice(input);
+  const capable = audioCapable === true;
+  const enabled = ownerChoice === null ? capable : ownerChoice;
+  const granted = ownerChoice === true;
   return {
     enabled,
-    enabledBy: enabled ? normalizeNullableString(input?.enabledBy) : null,
-    enabledAt: enabled ? normalizeNullableString(input?.enabledAt) : null,
+    ownerChoice,
+    source: ownerChoice === null ? "default" : "owner",
+    audioCapable: capable,
+    enabledBy: granted ? normalizeNullableString(input?.enabledBy) : null,
+    enabledAt: granted ? normalizeNullableString(input?.enabledAt) : null,
   };
+}
+
+/**
+ * The owner's decision, read out of a row that may predate the three-state model.
+ *
+ * A legacy row only ever stored `enabled`, and it cleared `enabledBy`/`enabledAt` on disable — so a
+ * stored `false` there is genuinely ambiguous between "the owner turned this off" and "nobody ever
+ * touched it", with nothing in the record to separate them. It is read as the latter, which is what
+ * lets an audio device pick up the new default; a legacy grant is preserved exactly.
+ */
+function normalizeVoiceAutoSendChoice(input) {
+  if (input?.ownerChoice === true) return true;
+  if (input?.ownerChoice === false) return false;
+  if (input?.ownerChoice === undefined && input?.enabled === true) return true;
+  return null;
+}
+
+/**
+ * Whether this device has ever told the gateway it has a microphone.
+ *
+ * Evidence, not inference: `status.features` is what the firmware declared on a heartbeat it
+ * actually sent. A hardware model that is *supposed* to have a microphone proves nothing about the
+ * unit in the room, and a default that turns itself on for a device that never claimed one would be
+ * a grant issued against a guess.
+ */
+function deviceReportsMicrophone(device) {
+  const features = device?.status?.features;
+  return Array.isArray(features) && features.includes("microphone");
 }
 
 function publicFirmwareRelease(release) {

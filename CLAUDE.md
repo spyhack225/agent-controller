@@ -243,9 +243,25 @@ A 30-second ASR call held a connection open and died with the process, leaving t
 `queued` and costs one attempt, while a missing API key fails terminally instead of burning three
 identical attempts.
 
+`failureCause` is the second axis on that error, and it is **declared at the throw site, never
+parsed out of the message**: `configuration` (no provider, missing credential, sidecar that was not
+running, English-only checkpoint pointed at French), `input` (container nothing decodes, clip over
+the length limit, silence), `provider` (a 500, a timeout, storage having a bad minute) and
+`unknown`. It is recorded on *every* failure, not only terminal ones — a retryable failure that
+later burns the last attempt is failed inside `claimMediaJobs`, which has no error to look at and
+inherits the cause left on the row.
+
 Stages: `queued → transcribing → normalizing → review_required|ready → dispatching → dispatched`,
 with `failed` terminal. `dispatched` and `failed` are never re-claimed — that is what stops a
 restart from dispatching the same transcript twice.
+
+**The one exception is an owner asking.** `POST /v1/media/jobs/retry-configuration` (owner realm)
+requeues failed jobs whose recorded cause is `configuration`, and nothing else; it refuses with 409
+when no provider is usable *now*, resets `attempts` to zero (the budget was spent on a fault that no
+longer exists), and reports every skipped job with its cause. There is deliberately no boot hook and
+no poller sweep: a terminal stage promises nothing happens on its own, and only a person may break
+that promise. `store.requeueMediaJob()` also forces `reviewRequired` on, which is not a parameter —
+see the safety rule below.
 
 Two subtleties worth keeping:
 
@@ -282,10 +298,26 @@ scoped to `job.deviceId`, not merely to the owner: two controllers on one accoun
 microphones in two rooms, and the transcript is in the response. The same projection builds the
 `media.job` SSE payload, so a console that listens and a device that polls cannot disagree.
 
-**A finished transcript waits.** Auto-send is a per-device grant (`PUT
-/v1/devices/:id/voice-auto-send`, owner realm) recording `enabledBy`/`enabledAt`. There is no
-account-wide switch on purpose — auto-send is a trust decision about one microphone, and a device
-claimed later must not inherit it.
+**Auto-send is three-valued, and defaults on for a microphone.** `device.voiceAutoSend.ownerChoice`
+is `true`, `false`, or `null` for "never said"; `enabled` is derived — an explicit choice always
+wins, and only in its absence does the hardware decide, from `status.features` including
+`microphone` (evidence the firmware sent, never the board's datasheet). A controller whose whole
+purpose is to be spoken to should work when it is spoken to; a board that never claimed a microphone
+gets nothing. The third state is load-bearing: with a plain boolean, an owner's "off" is
+indistinguishable from silence and the default would switch it back on at the next heartbeat,
+restart or re-claim. `PUT /v1/devices/:id/voice-auto-send` (owner realm) takes `true`, `false`, or
+`null` to withdraw the decision; `enabledBy`/`enabledAt` stay null for a default, because a default
+has nobody behind it and must not be recorded as a grant somebody signed. Still per device, never
+per account: a device claimed later earns its own answer from its own hardware.
+
+**A capture requeued by the configuration-retry path always waits for a person**, whatever the
+grant says. The grant means "send what I say as I say it" — it was never consent for what was said
+last Tuesday, and a bulk retry could otherwise dispatch a batch of hours-old transcripts into a
+coding agent as instructions. The rule lives in `requeueMediaJob()` (forced `reviewRequired`) and is
+enforced again in the worker, which parks a `ready`/`dispatching` job that must be reviewed and has
+no `userEditedTranscript` — necessary because `resumeStageFor()` sends a job already holding both
+transcript versions straight to `dispatching`, past the normalizing stage where review is normally
+decided.
 
 **The grant, the device and the policy are read at dispatch, never at enqueue.** A capture can sit
 through a retry budget while the owner tightens a profile or revokes the grant, and the newer rule

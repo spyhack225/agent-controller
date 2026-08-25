@@ -4,6 +4,7 @@ import { mediaJobEvent } from "./deviceAudio.mjs";
 import { MEDIA_JOB_TERMINAL_STAGES } from "./store.mjs";
 import {
   TranscriptionError,
+  classifyTranscriptionFailure,
   createTranscriptionProvider,
   describeTranscriptChange,
   normalizeTranscriptText,
@@ -95,10 +96,11 @@ export function createMediaJobRunner({
   async function processJob(job) {
     const media = await store.getMediaForUser(job.userId, job.mediaId);
     if (!media) {
-      return await abandon(job, "Media upload no longer exists.");
+      // Nothing about the deployment brings deleted bytes back.
+      return await abandon(job, "Media upload no longer exists.", "input");
     }
     if (media.kind !== "audio") {
-      return await abandon(job, "Only audio media can be transcribed.");
+      return await abandon(job, "Only audio media can be transcribed.", "input");
     }
 
     let current = job;
@@ -140,7 +142,7 @@ export function createMediaJobRunner({
       const normalized = normalize(current.rawTranscript);
       const normalizeMs = now() - startedAtMs;
       if (!normalized) {
-        return await abandon(current, "Transcription produced no usable text.");
+        return await abandon(current, "Transcription produced no usable text.", "input");
       }
       // Cleanup is allowed to move spacing, punctuation and case — nothing else. If the letters
       // moved, a "correction" changed what the user actually said, and a person has to see the
@@ -175,6 +177,27 @@ export function createMediaJobRunner({
       }
     }
 
+    // The last gate before a transcript can be sent anywhere, and the one that cannot be walked
+    // around. The normalizing stage above is where review is normally decided, but a job that
+    // already holds both transcript versions resumes straight at `dispatching` — which is exactly
+    // what a job requeued through the configuration-retry path can do. A capture that must be
+    // reviewed has no human version yet, so it waits here rather than dispatching words the owner
+    // spoke before whatever went wrong was fixed.
+    if ((current.stage === "ready" || current.stage === "dispatching")
+      && current.reviewRequired === true
+      && !current.userEditedTranscript) {
+      current = await store.updateMediaJob({
+        jobId: current.id,
+        stage: "review_required",
+        // A job waiting on a person must not keep a lease a worker would later "resume".
+        releaseLease: true,
+        timings: { ...roundedMs("totalMs", elapsedSince(current.timings?.queuedAt, now())) },
+      });
+      publish(current);
+      await writeMediaProcessing(current, "processing", null);
+      return { jobId: current.id, mediaId: current.mediaId, stage: current.stage };
+    }
+
     if (current.stage === "ready") {
       current = await store.updateMediaJob({
         jobId: current.id,
@@ -185,7 +208,7 @@ export function createMediaJobRunner({
 
     if (current.stage === "dispatching") {
       const transcript = effectiveTranscript(current);
-      if (!transcript) return await abandon(current, "No transcript version is available to dispatch.");
+      if (!transcript) return await abandon(current, "No transcript version is available to dispatch.", "unknown");
       // Writing the transcript onto the media record is the job's product and happens either way.
       // Sending it to an agent is a separate decision, made next.
       await store.updateMediaTranscript({
@@ -250,32 +273,38 @@ export function createMediaJobRunner({
     const retryable = error instanceof TranscriptionError ? error.retryable : true;
     const exhausted = job.attempts >= job.maxAttempts;
     const stage = retryable && !exhausted ? "queued" : "failed";
+    // Recorded on every failure, not only the terminal ones: a retryable failure that later burns
+    // the last attempt is failed inside claimMediaJobs, which has no error to look at and reads
+    // the cause left here instead.
+    const failureCause = classifyTranscriptionFailure(error);
 
     const updated = await store.updateMediaJob({
       jobId: job.id,
       stage,
       lastError,
       failureKind: retryable ? "retryable" : "terminal",
+      failureCause,
       releaseLease: true,
       ...(stage === "failed" ? { timings: { failedAt: iso() } } : {}),
     });
     await writeMediaProcessing(updated ?? job, stage === "failed" ? "failed" : "processing", lastError);
     publish(updated ?? job);
-    return { jobId: job.id, mediaId: job.mediaId, stage, lastError, retryable };
+    return { jobId: job.id, mediaId: job.mediaId, stage, lastError, retryable, failureCause };
   }
 
-  async function abandon(job, lastError) {
+  async function abandon(job, lastError, failureCause = "unknown") {
     const updated = await store.updateMediaJob({
       jobId: job.id,
       stage: "failed",
       lastError,
       failureKind: "terminal",
+      failureCause,
       releaseLease: true,
       timings: { failedAt: iso() },
     });
     await writeMediaProcessing(updated ?? job, "failed", lastError);
     publish(updated ?? job);
-    return { jobId: job.id, mediaId: job.mediaId, stage: "failed", lastError, retryable: false };
+    return { jobId: job.id, mediaId: job.mediaId, stage: "failed", lastError, retryable: false, failureCause };
   }
 
   async function writeMediaProcessing(job, transcriptionStatus, lastError) {

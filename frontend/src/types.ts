@@ -625,6 +625,19 @@ export interface MediaJob {
   reviewRequired?: boolean;
   lastError?: string | null;
   failureKind?: "retryable" | "terminal" | null;
+  /**
+   * Why a terminal failure was terminal, which is a different question from `failureKind`.
+   *
+   * `failureKind` only says whether another identical attempt was worth making at the time.
+   * This says what would have to change for the clip to succeed: `configuration` is the gateway's
+   * deployment (no provider, a missing credential, a sidecar that was down) and is the only cause
+   * the retry endpoint will requeue; `input` is about the audio and no setting fixes it.
+   */
+  failureCause?: "configuration" | "input" | "provider" | "unknown" | null;
+  /** How many times an owner has explicitly put this job back in the queue. */
+  requeueCount?: number;
+  requeuedAt?: string | null;
+  requeuedBy?: string | null;
   timings?: Record<string, string | number | null>;
   /**
    * What the cleanup did to the raw transcript, computed by the gateway on every read.

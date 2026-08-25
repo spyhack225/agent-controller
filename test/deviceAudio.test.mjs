@@ -99,6 +99,14 @@ async function setupLoop(t, { profile = "agent-controller" } = {}) {
       headers: authHeaders,
       body: { enabled },
     }),
+    readAutoSend: () => call(`/v1/devices/${created.device.id}/voice-auto-send`, { headers: authHeaders }),
+    // What the hardware declares about itself, which is the only evidence the default is allowed
+    // to act on.
+    heartbeat: (features = ["display", "buttons"]) => call("/v1/device/heartbeat", {
+      method: "POST",
+      headers: deviceHeaders,
+      body: { status: { features, firmwareVersion: "1.0.0" } },
+    }),
   };
 }
 
@@ -189,26 +197,125 @@ test("auto-send off leaves the transcript ready and dispatches nothing", async (
   assert.equal(media.processing.transcriptionStatus, "ready");
 });
 
-test("auto-send is off until the owner grants it, and the grant records who did", async (t) => {
+test("a device that has never claimed a microphone gets no default grant", async (t) => {
   const loop = await setupLoop(t);
 
-  const before = await loop.call(`/v1/devices/${loop.device.id}/voice-auto-send`, { headers: loop.authHeaders });
-  assert.deepEqual(before.voiceAutoSend, { enabled: false, enabledBy: null, enabledAt: null });
+  // Never heartbeated at all: nothing has told the gateway this unit can hear anything.
+  const silent = await loop.readAutoSend();
+  assert.equal(silent.voiceAutoSend.enabled, false);
+  assert.equal(silent.voiceAutoSend.source, "default");
+  assert.equal(silent.voiceAutoSend.ownerChoice, null);
+  assert.equal(silent.voiceAutoSend.audioCapable, false);
+
+  // And a heartbeat that declares a screen and buttons is still not a microphone. The default is
+  // built on evidence, not on the hardware model's datasheet.
+  await loop.heartbeat(["display", "buttons", "ota"]);
+  const after = await loop.readAutoSend();
+  assert.equal(after.voiceAutoSend.enabled, false);
+  assert.equal(after.voiceAutoSend.audioCapable, false);
+
+  const uploaded = await loop.upload();
+  await loop.mediaJobRunner.runOnce();
+  assert.deepEqual(loop.dispatches, []);
+  const status = await loop.call(`/v1/device/media/jobs/${uploaded.job.jobId}`, { headers: loop.deviceHeaders });
+  assert.equal(status.job.milestone, "ready");
+  assert.equal(status.job.autoSend, false);
+});
+
+test("a controller that reports a microphone auto-sends by default, with nobody credited", async (t) => {
+  const loop = await setupLoop(t);
+  await loop.heartbeat(["display", "buttons", "microphone"]);
+
+  const grant = await loop.readAutoSend();
+  assert.equal(grant.voiceAutoSend.enabled, true);
+  assert.equal(grant.voiceAutoSend.source, "default");
+  assert.equal(grant.voiceAutoSend.ownerChoice, null);
+  assert.equal(grant.voiceAutoSend.audioCapable, true);
+  // A default has no human behind it. Filling these in would forge a grant nobody issued.
+  assert.equal(grant.voiceAutoSend.enabledBy, null);
+  assert.equal(grant.voiceAutoSend.enabledAt, null);
+
+  const uploaded = await loop.upload();
+  await loop.mediaJobRunner.runOnce();
+
+  assert.equal(loop.dispatches.length, 1);
+  const status = await loop.call(`/v1/device/media/jobs/${uploaded.job.jobId}`, { headers: loop.deviceHeaders });
+  assert.equal(status.job.milestone, "sent");
+  assert.equal(status.job.autoSend, true);
+});
+
+test("an owner's explicit off is never undone by the default", async (t) => {
+  const loop = await setupLoop(t);
+  await loop.heartbeat(["microphone"]);
+
+  const off = await loop.enableAutoSend(false);
+  assert.equal(off.voiceAutoSend.enabled, false);
+  assert.equal(off.voiceAutoSend.ownerChoice, false);
+  assert.equal(off.voiceAutoSend.source, "owner");
+  // The device is audio-capable and the default would say yes; the owner said no and that wins.
+  assert.equal(off.voiceAutoSend.audioCapable, true);
+
+  // A firmware update that re-declares the microphone is exactly the event that would flip a
+  // two-state model back on. The decision is stored separately from the capability, so it cannot.
+  await loop.heartbeat(["display", "microphone", "camera"]);
+  const stillOff = await loop.readAutoSend();
+  assert.equal(stillOff.voiceAutoSend.enabled, false);
+  assert.equal(stillOff.voiceAutoSend.ownerChoice, false);
+
+  const uploaded = await loop.upload();
+  await loop.mediaJobRunner.runOnce();
+  assert.deepEqual(loop.dispatches, []);
+  const status = await loop.call(`/v1/device/media/jobs/${uploaded.job.jobId}`, { headers: loop.deviceHeaders });
+  assert.equal(status.job.milestone, "ready");
+  assert.equal(status.job.autoSend, false);
+});
+
+test("the owner's decision can be withdrawn, which restores the default rather than a value", async (t) => {
+  const loop = await setupLoop(t);
+  await loop.heartbeat(["microphone"]);
+  await loop.enableAutoSend(false);
+
+  const cleared = await loop.enableAutoSend(null);
+  assert.equal(cleared.voiceAutoSend.ownerChoice, null);
+  assert.equal(cleared.voiceAutoSend.source, "default");
+  // Back to what the hardware says, which for this unit is on.
+  assert.equal(cleared.voiceAutoSend.enabled, true);
+
+  const audit = await loop.call("/v1/audit", { headers: loop.authHeaders });
+  const actions = audit.events.map((event) => event.action);
+  assert.ok(actions.includes("device.voice_auto_send_disabled"));
+  assert.ok(actions.includes("device.voice_auto_send_reset"));
+});
+
+test("an explicit grant records who made it, and an unreadable answer is refused", async (t) => {
+  const loop = await setupLoop(t);
 
   const granted = await loop.enableAutoSend(true);
   assert.equal(granted.voiceAutoSend.enabled, true);
+  assert.equal(granted.voiceAutoSend.source, "owner");
+  assert.equal(granted.voiceAutoSend.ownerChoice, true);
   assert.equal(granted.voiceAutoSend.enabledBy, "user_dev");
   assert.match(granted.voiceAutoSend.enabledAt, /^\d{4}-\d{2}-\d{2}T/u);
 
   // Revoking clears the grant rather than leaving a name on a permission nobody holds.
   const revoked = await loop.enableAutoSend(false);
-  assert.deepEqual(revoked.voiceAutoSend, { enabled: false, enabledBy: null, enabledAt: null });
+  assert.equal(revoked.voiceAutoSend.enabledBy, null);
+  assert.equal(revoked.voiceAutoSend.enabledAt, null);
 
   await assert.rejects(
     () => loop.call(`/v1/devices/${loop.device.id}/voice-auto-send`, {
       method: "PUT",
       headers: loop.authHeaders,
       body: { enabled: "yes" },
+    }),
+    /400/u,
+  );
+  // An omitted field is a malformed request, not a third state expressed by silence.
+  await assert.rejects(
+    () => loop.call(`/v1/devices/${loop.device.id}/voice-auto-send`, {
+      method: "PUT",
+      headers: loop.authHeaders,
+      body: {},
     }),
     /400/u,
   );

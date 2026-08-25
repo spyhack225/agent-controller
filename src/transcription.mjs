@@ -7,6 +7,13 @@ import { readStoredMedia } from "./mediaStore.mjs";
 // The `retryable` flag on that error is the whole point of the split: a 429 or a socket reset is
 // worth another attempt on the next tick, while a missing API key or an unconfigured provider will
 // fail identically forever and must reach a terminal state instead of burning the retry budget.
+//
+// `failureCause` is the second axis, and it exists because "terminal" was hiding two unrelated
+// verdicts. A clip that failed because TRANSCRIPTION_PROVIDER was unset is not the same as a clip
+// the model cannot decode: the first becomes runnable the moment an operator fixes the deployment,
+// the second is about the audio and no amount of configuration changes it. The cause is declared
+// where the error is thrown — the thrower is the only place that knows — and never re-derived from
+// the message text, which is prose and changes.
 
 const EXTENSIONS = new Map([
   ["audio/wav", "wav"],
@@ -19,13 +26,59 @@ const EXTENSIONS = new Map([
 const MAX_TRANSCRIPT_CHARS = 12000;
 const RETRYABLE_STATUSES = new Set([408, 425, 429, 500, 502, 503, 504, 522, 524]);
 
+/**
+ * Why a transcription attempt failed, as a category an owner can act on.
+ *
+ * - `configuration` — the deployment, not the clip: no provider selected, a missing credential, a
+ *   sidecar that was not running, a checkpoint pointed at a language it cannot speak. These are the
+ *   only failures the explicit retry path will requeue, because they are the only ones where the
+ *   same bytes plausibly succeed after somebody changed a setting.
+ * - `input` — the audio itself: a container nothing here decodes, a clip past the length limit,
+ *   silence. Re-running these costs an inference and returns the same answer.
+ * - `provider` — the provider was reachable and configured and still did not produce a transcript:
+ *   a 500, a timeout, storage having a bad minute. Worth a retry *inside* the attempt budget, which
+ *   is what `retryable` already governs; not worth a bulk requeue afterwards.
+ * - `unknown` — anything that reached the worker as a plain Error. Deliberately not folded into one
+ *   of the three above: guessing would put an unclassified failure in the requeueable bucket.
+ */
+export const TRANSCRIPTION_FAILURE_CAUSES = ["configuration", "input", "provider", "unknown"];
+const FAILURE_CAUSE_SET = new Set(TRANSCRIPTION_FAILURE_CAUSES);
+
 export class TranscriptionError extends Error {
-  constructor(message, { retryable = false, status = null } = {}) {
+  constructor(message, { retryable = false, status = null, failureCause = "unknown" } = {}) {
     super(message);
     this.name = "TranscriptionError";
     this.retryable = retryable === true;
     this.status = status;
+    // Not `cause`: Error already owns that name for a wrapped error, and overloading it would make
+    // a category read like a stack.
+    this.failureCause = FAILURE_CAUSE_SET.has(failureCause) ? failureCause : "unknown";
   }
+}
+
+/**
+ * The cause to record on the job row for whatever the worker caught.
+ *
+ * Reads the flag the thrower set; it never inspects the message. A message-matching classifier
+ * would silently reclassify every failure the day a provider reworded its errors, and the retry
+ * path decides what to re-run from this value.
+ */
+export function classifyTranscriptionFailure(error) {
+  if (error instanceof TranscriptionError) return error.failureCause;
+  const declared = error?.failureCause;
+  return FAILURE_CAUSE_SET.has(declared) ? declared : "unknown";
+}
+
+/**
+ * Statuses that mean the credential or the address is wrong rather than the service being unwell.
+ *
+ * 401/403 is a key the deployment does not have; 404 is very often TRANSCRIPTION_URL pointing at
+ * something that is not the transcription endpoint. Both are fixed by an operator, not by waiting.
+ */
+const CONFIGURATION_STATUSES = new Set([401, 403, 404]);
+
+function statusFailureCause(status) {
+  return CONFIGURATION_STATUSES.has(status) ? "configuration" : "provider";
 }
 
 /**
@@ -56,7 +109,10 @@ function disabledProvider(name) {
     model: null,
     available: false,
     async transcribe() {
-      throw new TranscriptionError("No transcription provider is configured.", { retryable: false });
+      throw new TranscriptionError("No transcription provider is configured.", {
+        retryable: false,
+        failureCause: "configuration",
+      });
     },
   };
 }
@@ -88,7 +144,7 @@ function openAiProvider(config) {
         // Nothing about this improves by trying again.
         throw new TranscriptionError(
           "TRANSCRIPTION_API_KEY is required when TRANSCRIPTION_PROVIDER=openai.",
-          { retryable: false },
+          { retryable: false, failureCause: "configuration" },
         );
       }
 
@@ -98,7 +154,10 @@ function openAiProvider(config) {
         buffer = await readStoredMedia(media, config);
       } catch (error) {
         // The bytes may be on an object store having a bad minute; that is worth another attempt.
-        throw new TranscriptionError(`Stored audio could not be read: ${message(error)}`, { retryable: true });
+        throw new TranscriptionError(`Stored audio could not be read: ${message(error)}`, {
+          retryable: true,
+          failureCause: "provider",
+        });
       }
 
       const form = new FormData();
@@ -124,9 +183,18 @@ function openAiProvider(config) {
         });
       } catch (error) {
         if (error?.name === "AbortError") {
-          throw new TranscriptionError(`Transcription timed out after ${timeoutMs}ms.`, { retryable: true });
+          throw new TranscriptionError(`Transcription timed out after ${timeoutMs}ms.`, {
+            retryable: true,
+            failureCause: "provider",
+          });
         }
-        throw new TranscriptionError(`Transcription request failed: ${message(error)}`, { retryable: true });
+        // A hostname that does not resolve is a configuration mistake, but so is a provider being
+        // unreachable from here — indistinguishable at this layer, and calling both
+        // `configuration` is the answer that lets an operator retry after fixing the deployment.
+        throw new TranscriptionError(`Transcription request failed: ${message(error)}`, {
+          retryable: true,
+          failureCause: "configuration",
+        });
       } finally {
         clearTimeout(timeout);
       }
@@ -135,6 +203,7 @@ function openAiProvider(config) {
         throw new TranscriptionError(`Transcription provider returned HTTP ${response.status}.`, {
           retryable: RETRYABLE_STATUSES.has(response.status),
           status: response.status,
+          failureCause: statusFailureCause(response.status),
         });
       }
 
@@ -144,13 +213,16 @@ function openAiProvider(config) {
       } catch (error) {
         throw new TranscriptionError(`Transcription provider returned invalid JSON: ${message(error)}`, {
           retryable: true,
+          failureCause: "provider",
         });
       }
 
       const text = typeof payload?.text === "string" ? payload.text : "";
       if (text.trim().length === 0) {
+        // About the audio, not the deployment: the same silence transcribes to the same nothing.
         throw new TranscriptionError("Transcription provider returned an empty transcript.", {
           retryable: false,
+          failureCause: "input",
         });
       }
 
@@ -252,7 +324,10 @@ function parakeetProvider(config) {
         buffer = await readStoredMedia(media, config);
       } catch (error) {
         // The bytes may be on an object store having a bad minute; that is worth another attempt.
-        throw new TranscriptionError(`Stored audio could not be read: ${message(error)}`, { retryable: true });
+        throw new TranscriptionError(`Stored audio could not be read: ${message(error)}`, {
+          retryable: true,
+          failureCause: "provider",
+        });
       }
 
       // A WAV header is the one case where the gateway can measure the clip itself. Refusing an
@@ -262,7 +337,7 @@ function parakeetProvider(config) {
         throw new TranscriptionError(
           `Audio clip is ${wav.durationSeconds.toFixed(1)}s, over the ${settings.maxClipSeconds}s`
           + " limit for the parakeet sidecar. Raise PARAKEET_MAX_CLIP_SECONDS or split the recording.",
-          { retryable: false },
+          { retryable: false, failureCause: "input" },
         );
       }
 
@@ -312,13 +387,17 @@ async function callParakeet({ media, buffer, wav, settings, gateWaitMs }) {
       throw new TranscriptionError(
         `Parakeet sidecar did not answer within ${settings.timeoutMs}ms. CPU inference on a long clip`
         + " can exceed this; raise PARAKEET_TIMEOUT_MS or lower PARAKEET_MAX_CLIP_SECONDS.",
-        { retryable: true },
+        // The sidecar answered the socket and then ran out of time, so it is configured and
+        // reachable; this is capacity, and requeueing a batch of these would only burn the box again.
+        { retryable: true, failureCause: "provider" },
       );
     }
     // A sidecar that is down looks exactly like one that is restarting, so this retries.
+    // Nothing was listening. That is the deployment's state at the time, and it is exactly the
+    // case the configuration-retry path exists for: the sidecar comes back and the clip is fine.
     throw new TranscriptionError(
       `Parakeet sidecar at ${settings.url} is unreachable: ${message(error)}`,
-      { retryable: true },
+      { retryable: true, failureCause: "configuration" },
     );
   } finally {
     clearTimeout(timeout);
@@ -331,17 +410,27 @@ async function callParakeet({ media, buffer, wav, settings, gateWaitMs }) {
     const detail = sidecarDetail(payload) ?? (raw ? raw.slice(0, 200) : null);
     throw new TranscriptionError(
       `Parakeet sidecar returned HTTP ${response.status}${detail ? `: ${detail}` : "."}`,
-      { retryable: RETRYABLE_STATUSES.has(response.status), status: response.status },
+      {
+        retryable: RETRYABLE_STATUSES.has(response.status),
+        status: response.status,
+        failureCause: statusFailureCause(response.status),
+      },
     );
   }
   if (!payload) {
-    throw new TranscriptionError("Parakeet sidecar returned a body that is not JSON.", { retryable: true });
+    throw new TranscriptionError("Parakeet sidecar returned a body that is not JSON.", {
+      retryable: true,
+      failureCause: "provider",
+    });
   }
 
   const text = typeof payload.text === "string" ? payload.text : "";
   if (text.trim().length === 0) {
     // Silence, or a clip the model made nothing of. The same bytes produce the same silence.
-    throw new TranscriptionError("Parakeet sidecar returned an empty transcript.", { retryable: false });
+    throw new TranscriptionError("Parakeet sidecar returned an empty transcript.", {
+      retryable: false,
+      failureCause: "input",
+    });
   }
 
   const audioSeconds = firstNumber(payload.durationSeconds, payload.duration_seconds)
@@ -385,7 +474,7 @@ function assertParakeetLanguage(settings) {
     `${settings.model} transcribes English only, but the configured language is "${settings.language}".`
     + ` Set PARAKEET_MODEL to a multilingual checkpoint (for example ${PARAKEET_MULTILINGUAL_MODEL})`
     + " rather than expecting an English model to cope.",
-    { retryable: false },
+    { retryable: false, failureCause: "configuration" },
   );
 }
 
@@ -395,7 +484,9 @@ function assertParakeetContainer(media, settings) {
   throw new TranscriptionError(
     `The parakeet sidecar does not accept ${contentType || "an unknown content type"}.`
     + ` Accepted: ${settings.acceptedContentTypes.join(", ")}.`,
-    { retryable: false },
+    // Widening PARAKEET_ACCEPTED_CONTENT_TYPES cannot make a decoder appear, so this is about the
+    // clip: the container is what it is.
+    { retryable: false, failureCause: "input" },
   );
 }
 

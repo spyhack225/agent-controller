@@ -698,26 +698,34 @@ export const setDeviceVoiceAutoSend = gatewayMutation({
   args: {
     userId: v.string(),
     deviceId: v.id("devices"),
-    enabled: v.boolean(),
+    // `null` withdraws the decision and hands the device back to its default; it is a third answer,
+    // not a missing one.
+    enabled: v.union(v.boolean(), v.null()),
     actorId: v.optional(v.union(v.string(), v.null())),
     actorType: v.optional(v.string()),
   },
   handler: async (ctx, args) => {
     const device = await getDeviceForOwner(ctx, args.userId, args.deviceId);
     if (!device || device.revokedAt) return null;
+    const ownerChoice = args.enabled === true ? true : args.enabled === false ? false : null;
     const voiceAutoSend = normalizeVoiceAutoSend(
-      args.enabled === true
-        ? { enabled: true, enabledBy: args.actorId ?? args.userId, enabledAt: nowIso() }
-        : { enabled: false },
+      {
+        ownerChoice,
+        enabledBy: ownerChoice === true ? args.actorId ?? args.userId : null,
+        enabledAt: ownerChoice === true ? nowIso() : null,
+      },
+      deviceReportsMicrophone(device),
     );
     await ctx.db.patch(device._id, { voiceAutoSend, updatedAt: nowIso() });
     await audit(ctx, {
       userExternalId: args.userId,
       actorType: args.actorType ?? "user",
       ...(args.actorId ? { actorId: args.actorId } : {}),
-      action: args.enabled === true
+      action: ownerChoice === true
         ? "device.voice_auto_send_enabled"
-        : "device.voice_auto_send_disabled",
+        : ownerChoice === false
+          ? "device.voice_auto_send_disabled"
+          : "device.voice_auto_send_reset",
       targetId: device._id,
       metadata: voiceAutoSend,
     });
@@ -1572,6 +1580,9 @@ const mediaJobStages = [
   "failed",
 ];
 const mediaJobTerminalStages = new Set(["dispatched", "failed"]);
+// Mirrors MEDIA_JOB_FAILURE_CAUSES in src/store.mjs, itself a mirror of the transcription layer's
+// list. Validated here so the store never persists a category nothing understands.
+const mediaJobFailureCauses = ["configuration", "input", "provider", "unknown"];
 const defaultMediaJobMaxAttempts = 3;
 
 export const createMediaJob = gatewayMutation({
@@ -1631,6 +1642,11 @@ export const createMediaJob = gatewayMutation({
       leaseExpiresAt: null,
       lastError: null,
       failureKind: null,
+      // Why a terminal failure was terminal, and the bookkeeping for the owner-driven retry path.
+      failureCause: null,
+      requeueCount: 0,
+      requeuedAt: null,
+      requeuedBy: null,
       timings: { queuedAt: nowIso() },
       createdAt: nowIso(),
       updatedAt: nowIso(),
@@ -1724,6 +1740,9 @@ export const claimMediaJobs = gatewayMutation({
         await ctx.db.patch(job._id, {
           stage: "failed",
           failureKind: "terminal",
+          // The cause of the last attempt is the cause of the abandonment; re-labelling it here
+          // would hide a configuration failure from the only retry path that could fix it.
+          failureCause: job.failureCause ?? "unknown",
           lastError: job.lastError ?? `Media job abandoned after ${job.attempts} attempts.`,
           leaseOwner: null,
           leaseExpiresAt: null,
@@ -1760,6 +1779,7 @@ export const updateMediaJob = gatewayMutation({
     language: v.optional(v.union(v.string(), v.null())),
     lastError: v.optional(v.union(v.string(), v.null())),
     failureKind: v.optional(v.union(v.string(), v.null())),
+    failureCause: v.optional(v.union(v.string(), v.null())),
     autoSend: v.optional(v.boolean()),
     dispatchStatus: v.optional(v.union(v.string(), v.null())),
     dispatchError: v.optional(v.union(v.string(), v.null())),
@@ -1796,12 +1816,78 @@ export const updateMediaJob = gatewayMutation({
         ? args.failureKind
         : null;
     }
+    if (args.failureCause !== undefined) {
+      patch.failureCause = mediaJobFailureCauses.includes(args.failureCause as string)
+        ? args.failureCause
+        : null;
+    }
     if (args.timings !== undefined) patch.timings = { ...(job.timings ?? {}), ...(args.timings ?? {}) };
     if (args.releaseLease === true) {
       patch.leaseOwner = null;
       patch.leaseExpiresAt = null;
     }
     await ctx.db.patch(job._id, patch);
+    return mediaJobForGateway(await ctx.db.get(job._id));
+  },
+});
+
+/**
+ * Mirrors requeueMediaJob() in src/store.mjs.
+ *
+ * Only a `failed` job whose recorded cause is `configuration`, only at an owner's explicit request,
+ * with the attempt budget reset because the previous attempts were spent on a fault that no longer
+ * exists — and always with `reviewRequired` forced on, which is not a parameter. A transcript is
+ * dispatched to a coding agent as an instruction, and a capture recorded before an incident was
+ * fixed must not send itself hours later on the strength of an auto-send grant that meant "send
+ * what I say as I say it".
+ */
+export const requeueMediaJob = gatewayMutation({
+  args: {
+    userId: v.string(),
+    jobId: v.id("mediaJobs"),
+    actorId: v.optional(v.union(v.string(), v.null())),
+    actorType: v.optional(v.string()),
+  },
+  handler: async (ctx, args) => {
+    const job = await ctx.db.get(args.jobId);
+    if (!job || job.userExternalId !== args.userId) return null;
+    if (job.stage !== "failed" || job.failureCause !== "configuration") return null;
+
+    const previousError = job.lastError ?? null;
+    const requeueCount = (job.requeueCount ?? 0) + 1;
+    await ctx.db.patch(job._id, {
+      stage: "queued",
+      attempts: 0,
+      lastError: null,
+      failureKind: null,
+      failureCause: null,
+      leaseOwner: null,
+      leaseExpiresAt: null,
+      autoSend: false,
+      dispatchStatus: null,
+      dispatchError: null,
+      commandId: null,
+      reviewRequired: true,
+      requeueCount,
+      requeuedAt: nowIso(),
+      requeuedBy: args.actorId ?? args.userId,
+      timings: { ...(job.timings ?? {}), requeuedAt: nowIso() },
+      updatedAt: nowIso(),
+    });
+    await audit(ctx, {
+      userExternalId: args.userId,
+      actorType: args.actorType ?? "user",
+      ...(args.actorId ? { actorId: args.actorId } : {}),
+      action: "media_job.requeued",
+      targetId: job._id,
+      metadata: {
+        mediaId: job.mediaId,
+        deviceId: job.deviceId ?? null,
+        previousError,
+        requeueCount,
+        holdForReview: true,
+      },
+    });
     return mediaJobForGateway(await ctx.db.get(job._id));
   },
 });
@@ -3103,24 +3189,54 @@ function publicDevice(device: any) {
     config: publicDeviceConfig(device.config),
     gatewaySelection: normalizeGatewaySelection(device.gatewaySelection),
     actions: deviceActions(device),
-    voiceAutoSend: normalizeVoiceAutoSend(device.voiceAutoSend),
+    voiceAutoSend: normalizeVoiceAutoSend(device.voiceAutoSend, deviceReportsMicrophone(device)),
     createdAt: device.createdAt,
     claimed: Boolean(device.claimedAt),
   };
 }
 
 /**
- * Mirrors normalizeVoiceAutoSend() in src/store.mjs. Off unless the owner turned it on, and
- * `enabledBy` records which owner did — turning it off clears the grant rather than leaving a
- * stale name attached to a permission nobody holds any more.
+ * Mirrors normalizeVoiceAutoSend() in src/store.mjs.
+ *
+ * Three states: the owner's explicit choice wins in either direction, and only in its absence does
+ * the hardware decide — a device that has declared a microphone auto-sends by default, one that
+ * never has does not. `enabledBy`/`enabledAt` stay reserved for a real grant, because a default has
+ * nobody behind it. test/storeParity fails the moment this drifts from the memory store.
  */
-function normalizeVoiceAutoSend(input: any = null) {
-  const enabled = input?.enabled === true;
+function normalizeVoiceAutoSend(input: any = null, audioCapable = false) {
+  const ownerChoice = normalizeVoiceAutoSendChoice(input);
+  const capable = audioCapable === true;
+  const enabled = ownerChoice === null ? capable : ownerChoice;
+  const granted = ownerChoice === true;
   return {
     enabled,
-    enabledBy: enabled ? normalizeNullableString(input?.enabledBy) : null,
-    enabledAt: enabled ? normalizeNullableString(input?.enabledAt) : null,
+    ownerChoice,
+    source: ownerChoice === null ? "default" : "owner",
+    audioCapable: capable,
+    enabledBy: granted ? normalizeNullableString(input?.enabledBy) : null,
+    enabledAt: granted ? normalizeNullableString(input?.enabledAt) : null,
   };
+}
+
+/**
+ * Mirrors normalizeVoiceAutoSendChoice() in src/store.mjs. A legacy row stored only `enabled` and
+ * cleared the grant on disable, so its `false` cannot be told from "never touched" and is read as
+ * the latter; a legacy grant is preserved exactly.
+ */
+function normalizeVoiceAutoSendChoice(input: any) {
+  if (input?.ownerChoice === true) return true;
+  if (input?.ownerChoice === false) return false;
+  if (input?.ownerChoice === undefined && input?.enabled === true) return true;
+  return null;
+}
+
+/**
+ * Mirrors deviceReportsMicrophone() in src/store.mjs. Evidence, not inference: what the firmware
+ * declared on a heartbeat it actually sent, never what the hardware model is supposed to have.
+ */
+function deviceReportsMicrophone(device: any) {
+  const features = device?.status?.features;
+  return Array.isArray(features) && features.includes("microphone");
 }
 
 /**
@@ -3416,6 +3532,10 @@ function mediaJobForGateway(job: any) {
     leaseExpiresAt: job.leaseExpiresAt ?? null,
     lastError: job.lastError ?? null,
     failureKind: job.failureKind ?? null,
+    failureCause: job.failureCause ?? null,
+    requeueCount: job.requeueCount ?? 0,
+    requeuedAt: job.requeuedAt ?? null,
+    requeuedBy: job.requeuedBy ?? null,
     timings: job.timings ?? {},
     createdAt: job.createdAt,
     updatedAt: job.updatedAt,

@@ -142,6 +142,35 @@ export function formatMediaJob(job: MediaJob): string {
   return parts.join(" · ");
 }
 
+/**
+ * Why a failed job failed, said so an owner knows whether to act or to let it go.
+ *
+ * "Failed" on its own sent people to the logs for both halves of the same word: a clip that failed
+ * because TRANSCRIPTION_PROVIDER was unset is one setting away from working, and a clip in a
+ * container nothing decodes is not. The label states which, and whether retrying is worth anything.
+ */
+const MEDIA_JOB_FAILURE_CAUSE_LABELS: Record<string, string> = {
+  configuration: "Gateway configuration — fix the deployment, then retry",
+  input: "This recording — retrying will not change the answer",
+  provider: "The transcription provider — worth trying again later",
+  unknown: "Unclassified failure",
+};
+
+export function mediaJobFailureLabel(job: MediaJob): string | null {
+  if (job.stage !== "failed") return null;
+  return MEDIA_JOB_FAILURE_CAUSE_LABELS[job.failureCause ?? "unknown"] ?? MEDIA_JOB_FAILURE_CAUSE_LABELS.unknown;
+}
+
+/**
+ * Whether the explicit retry path applies to this job.
+ *
+ * Only a configuration failure. Offering the button on anything else would spend an inference to
+ * reproduce the same refusal, and the gateway refuses it anyway.
+ */
+export function mediaJobRetryable(job: MediaJob): boolean {
+  return job.stage === "failed" && job.failureCause === "configuration";
+}
+
 export function mediaJobTone(job: MediaJob): "danger" | "warning" | "success" {
   if (job.stage === "failed") return "danger";
   if (job.stage === "dispatched") return "success";
