@@ -226,6 +226,113 @@ void setup() {
   // -----------------------------------------------------------------------------------------
 }
 
+
+#if BENCH_SELFTEST
+// A bench-only harness, compiled out of every product environment.
+//
+// It exists because the two paths that matter most had only ever been reasoned about: recording
+// with the orb running inside the audio pump, and creating a thread. Both need a finger on the
+// glass, and the person driving this board cannot always be at it. So the board drives itself —
+// through the SAME entry points a finger reaches, never a parallel copy, because a harness that
+// calls its own reimplementation proves nothing about the code that ships.
+//
+// The number this exists to produce: a gap-free N ms clip at AUDIO_SAMPLE_RATE_HZ has a known
+// sample count. If drawing the orb inside the pump steals time, the shortfall appears there.
+namespace bench {
+
+enum class Stage : uint8_t { Idle, Settle, TapTalk, PressMic, Holding, Release, Report, Done };
+Stage stage = Stage::Idle;
+uint32_t dueAt = 0;
+uint32_t recordBeganAt = 0;
+
+constexpr uint32_t kHoldMs = 4000;
+
+// Geometry taken from ui.cpp rather than guessed: actionRect() puts a button at
+// top = kH - kBarH + 11 with height 36, and TALK is the FIRST action HOME adds.
+constexpr int16_t kActionY = 320 - 58 + 11 + 18;
+constexpr int16_t kTalkX = 12 + ((240 - 24 - 8) / 2) / 2;
+// micButtonRect() is {14, capsuleY, kW - 28, kVoiceCapsuleH}; the capsule spans y 121..213.
+constexpr int16_t kMicX = 120;
+constexpr int16_t kMicY = 167;
+
+void send(TouchGesture gesture, int16_t x, int16_t y) {
+  TouchEvent e;
+  e.gesture = gesture;
+  e.x = x;
+  e.y = y;
+  uiHandleTouch(e);
+}
+
+void tick(GatewayClient& gateway) {
+  const uint32_t now = millis();
+  switch (stage) {
+    case Stage::Idle:
+      if (gateway.link() != GatewayLink::Claimed) return;
+      Serial.println("[bench] claimed; settling before the run");
+      dueAt = now + 6000;
+      stage = Stage::Settle;
+      return;
+
+    case Stage::Settle:
+      if ((int32_t)(now - dueAt) < 0) return;
+      Serial.printf("[bench] tapping TALK at (%d,%d)\n", (int)kTalkX, (int)kActionY);
+      send(TouchGesture::Tap, kTalkX, kActionY);
+      dueAt = now + 900;
+      stage = Stage::TapTalk;
+      return;
+
+    case Stage::TapTalk:
+      if ((int32_t)(now - dueAt) < 0) return;
+      Serial.printf("[bench] pressing the mic capsule at (%d,%d)\n", (int)kMicX, (int)kMicY);
+      send(TouchGesture::Press, kMicX, kMicY);
+      recordBeganAt = millis();
+      dueAt = recordBeganAt + kHoldMs;
+      stage = Stage::Holding;
+      return;
+
+    case Stage::Holding:
+      // Deliberately does nothing: the loop keeps running, so the recording is pumped and the orb
+      // is animated by exactly the code that runs when a person is holding the button. That
+      // contention is the whole subject of the test.
+      if ((int32_t)(now - dueAt) < 0) return;
+      Serial.println("[bench] releasing");
+      send(TouchGesture::Release, kMicX, kMicY);
+      dueAt = now + 400;
+      stage = Stage::Report;
+      return;
+
+    case Stage::Report: {
+      if ((int32_t)(now - dueAt) < 0) return;
+      const uint32_t heldMs = dueAt - 400 - recordBeganAt;
+      const uint32_t ms = audio::recordedMs();
+      const size_t bytes = audio::recordedBytes();
+      const audio::ClipStats st = audio::measureClip();
+      const uint32_t expected = (uint32_t)((uint64_t)heldMs * AUDIO_SAMPLE_RATE_HZ / 1000ULL);
+      const uint32_t actual = (uint32_t)(bytes / sizeof(int16_t));
+      Serial.println("[bench] ---- capture with the orb running ----");
+      Serial.printf("[bench] held %u ms, recorded %u ms, %u bytes\n",
+                    (unsigned)heldMs, (unsigned)ms, (unsigned)bytes);
+      Serial.printf("[bench] samples expected ~%u, actual %u, shortfall %d (%.2f%%)\n",
+                    (unsigned)expected, (unsigned)actual, (int)((int32_t)expected - (int32_t)actual),
+                    expected ? (100.0 * ((double)expected - (double)actual) / (double)expected) : 0.0);
+      Serial.printf("[bench] peak %d rms %d\n", (int)st.peak, (int)st.rms);
+      if (actual == 0) Serial.println("[bench] RESULT: FAIL - no samples; the press did not start a recording");
+      else if (st.peak <= 0) Serial.println("[bench] RESULT: FAIL - silence");
+      else if (expected && actual * 100ULL < (uint64_t)expected * 97ULL)
+        Serial.println("[bench] RESULT: FAIL - more than 3% of samples missing; the orb is stealing pump time");
+      else Serial.println("[bench] RESULT: PASS - capture is intact with the orb running");
+      stage = Stage::Done;
+      return;
+    }
+
+    default:
+      return;
+  }
+}
+
+}  // namespace bench
+#endif
+
 void loop() {
   const ProvisioningState state = provisioning.poll();
   if (state != lastState) {
@@ -274,6 +381,9 @@ void loop() {
     gateway.unlockState();
   }
 
+#if BENCH_SELFTEST
+  bench::tick(gateway);
+#endif
   pollBootButton();
   uiSleepUntilNextFrame();
 }
