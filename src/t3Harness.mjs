@@ -367,7 +367,12 @@ function normalizeOptionDescriptor(raw) {
 }
 
 // T3 stores lastError as a JSON string carrying the provider's own error envelope.
-function parseProviderError(lastError) {
+/**
+ * T3's `session.lastError` is sometimes an object and sometimes a JSON string holding one. Exported
+ * so the live thread stream parses a session error exactly as the snapshot path does — two
+ * readings of the same field must not disagree about whether a turn failed.
+ */
+export function parseProviderError(lastError) {
   if (!lastError) return null;
   if (typeof lastError === "object") {
     return { message: string(lastError.message) ?? JSON.stringify(lastError), code: string(lastError.type) ?? null };

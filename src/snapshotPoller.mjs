@@ -3,7 +3,8 @@ import { createHash } from "node:crypto";
 import { compressSnapshot, fetchT3Snapshot, isEnvironmentTokenExpired } from "./t3Client.mjs";
 import { rememberSnapshotThreadTitles } from "./mediaNaming.mjs";
 import { classifyEnvironmentFailure } from "./environmentFailure.mjs";
-import { extractThreadOutcomes, reconcileCommandStatus } from "./t3Harness.mjs";
+import { extractThreadOutcomes } from "./t3Harness.mjs";
+import { createCommandArbiter } from "./commandArbiter.mjs";
 
 const DEFAULT_INTERVAL_MS = 5000;
 const DEFAULT_ACTIVE_TTL_MS = 5 * 60 * 1000;
@@ -19,6 +20,9 @@ export function createSnapshotPoller({
   intervalMs = DEFAULT_INTERVAL_MS,
   activeTtlMs = DEFAULT_ACTIVE_TTL_MS,
   fetchSnapshot = fetchT3Snapshot,
+  // Shared with the live thread stream in createApp() so the two evidence sources cannot decide
+  // the same command twice. Defaulting to a private one keeps a standalone poller self-contained.
+  arbiter = createCommandArbiter(),
   now = () => Date.now(),
   logger = console,
 } = {}) {
@@ -147,31 +151,40 @@ export function createSnapshotPoller({
       if (command.status !== "dispatched") continue;
       if (command.environmentId !== environmentId) continue;
 
-      const update = reconcileCommandStatus(command, outcomes.get(command.threadId));
-      if (!update) continue;
-
       try {
-        await store.updateCommand({
-          userId,
-          commandId: command.id,
-          status: update.status,
-          result: update.result,
-          metrics: {
-            ...(command.metrics ?? {}),
-            ...(update.status === "failed"
-              ? { failureAt: new Date(now()).toISOString() }
-              : { completedAt: new Date(now()).toISOString() }),
+        // The arbiter owns the decision. It refuses when the live thread stream already decided
+        // this command, which is the common case once a thread is being watched: polled evidence
+        // is a strictly staler copy of the same T3 facts, so the poller becomes the backstop for
+        // threads nobody is streaming rather than a second opinion on the ones that are.
+        const update = await arbiter.reconcile({
+          command,
+          outcome: outcomes.get(command.threadId),
+          source: "snapshot",
+          apply: async (decision) => {
+            await store.updateCommand({
+              userId,
+              commandId: command.id,
+              status: decision.status,
+              result: decision.result,
+              metrics: {
+                ...(command.metrics ?? {}),
+                ...(decision.status === "failed"
+                  ? { failureAt: new Date(now()).toISOString() }
+                  : { completedAt: new Date(now()).toISOString() }),
+              },
+            });
+            events?.broadcastToUser?.(userId, "command.reconciled", {
+              commandId: command.id,
+              threadId: command.threadId,
+              environmentId,
+              status: decision.status,
+              reason: decision.result.reason,
+              observedAt: new Date(now()).toISOString(),
+              source: "snapshot",
+            });
           },
         });
-        applied.push({ commandId: command.id, status: update.status });
-        events?.broadcastToUser?.(userId, "command.reconciled", {
-          commandId: command.id,
-          threadId: command.threadId,
-          environmentId,
-          status: update.status,
-          reason: update.result.reason,
-          observedAt: new Date(now()).toISOString(),
-        });
+        if (update) applied.push({ commandId: command.id, status: update.status });
       } catch (error) {
         logger?.warn?.(`snapshot poll: reconciling ${command.id} failed: ${message(error)}`);
       }

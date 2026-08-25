@@ -60,7 +60,8 @@ Last verified: **2026-08-24**, at commit `1d7ad51`.
   remain hardware-unverified.
 - **Critical product gap:** a request can be dispatched to T3 Code, but Agent Controller still
   cannot show and interact with the complete live response, provider approvals/questions,
-  subagents, or parallel work. This is Milestone 1 and it is not started.
+  subagents, or parallel work. This is Milestone 1. Its transport foundation has now landed (see
+  below); the user-visible parity work has not.
 
 The frontend build also reports a non-blocking JavaScript chunk-size warning (about 655 kB).
 Firmware compilation reports deprecated ESP32 legacy I2S/PCNT API warnings in capture/probe code.
@@ -116,13 +117,28 @@ No milestone deliverable has landed. The repository has no `RequestSubmission`,
 node model, or expanded probed capability manifest. The `/v1/intents` versus `/v1/requests` design
 decision remains open.
 
-### Milestone 1 — live conversation and interaction parity: todo
+### Milestone 1 — live conversation and interaction parity: partial
 
-No user-visible parity deliverable has landed. Agent Controller still ends the visible workflow at
-`dispatched`; it cannot stream the selected T3 thread, render provider tool activity, answer T3
-questions, route provider approvals with their full decision set, or inspect subagents and parallel
-tasks. Existing snapshot normalization and one-shot RPC helpers are prerequisites, not milestone
-completion.
+**The transport is real now.** `orchestration.subscribeThread` had been a string constant in
+`src/t3Ws.mjs` that nothing called; the gateway learned what an agent had done by refetching a
+snapshot every five seconds. `openT3ThreadStream()` (`src/t3Ws.mjs`) now holds a real
+subscription — acknowledging every `Chunk`, because effect's RpcServer parks the stream on a latch
+until it does (`effect/dist/unstable/rpc/RpcServer.js:271-291`) — and `src/threadStream.mjs`
+turns it into `t3.thread.snapshot` / `t3.thread.event` / `t3.thread.status` on the existing SSE
+broker. Subscriptions are demand-driven leases (`POST|DELETE
+/v1/t3/environments/:id/threads/:threadId/watch`, renewed automatically by a device polling
+`/v1/device/thread-output`), resume by T3's global event sequence, deduplicate the replay/live
+overlap, and reconnect on exponential backoff. A resume gap T3 refuses to replay
+(`THREAD_RESUME_MAX_GAP`) arrives as a snapshot and is published with `gap: true` rather than
+silently appended. Constructed in `createApp()`, started only from `server.mjs`, driven by
+`runOnce()` in `test/threadStream.test.mjs` (17 tests). `src/commandArbiter.mjs` makes the live
+stream and the snapshot poller share one decision per command.
+
+**What remains is the milestone itself.** Nothing renders these events: the console's
+`useController()` does not subscribe to `t3.thread.*` and no view shows a live conversation or
+provider tool activity. Provider approvals still route through the existing capability path with
+their gateway decision set rather than T3's, structured user input (`thread.user-input-response`)
+is not wired, and subagent/parallel-work inspection does not exist.
 
 ### Milestone 2 — composer and connection: substantially done
 

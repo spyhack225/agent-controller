@@ -1904,7 +1904,129 @@ The event stream emits:
 connected
 heartbeat
 state.changed
+t3.snapshot
+media.job
+command.reconciled
+t3.thread.snapshot
+t3.thread.event
+t3.thread.status
 ```
+
+## Live Thread Streams
+
+`state.changed` and `t3.snapshot` tell a client that *something* moved; the `t3.thread.*` events
+carry what the agent is actually doing, as it does it. They come from a real subscription to T3's
+`orchestration.subscribeThread` (see `src/threadStream.mjs`), not from polling.
+
+A subscription exists only while somebody says they are watching. That statement is a lease:
+
+```text
+POST   /v1/t3/environments/:environmentId/threads/:threadId/watch
+DELETE /v1/t3/environments/:environmentId/threads/:threadId/watch
+```
+
+```json
+{
+  "watch": {
+    "userId": "user_...",
+    "environmentId": "env_...",
+    "threadId": "thread_...",
+    "state": "live",
+    "sequence": 40213,
+    "expiresAt": "2026-08-24T12:01:30.000Z",
+    "failures": 0,
+    "lastError": null
+  }
+}
+```
+
+`POST` both registers and renews, so a client should call it on a timer comfortably inside the
+lease (default `THREAD_STREAM_WATCH_TTL_MS`, 90s). Stop calling it and the subscription is dropped
+within one TTL — a closed tab needs no cleanup. `DELETE` is the polite early release. A device
+polling `GET /v1/device/thread-output` renews its own watch automatically; firmware has no watch
+route to call and needs none.
+
+### The events
+
+`t3.thread.snapshot` — the whole thread, and an instruction to start from it.
+
+```json
+{
+  "environmentId": "env_...",
+  "threadId": "thread_...",
+  "reset": true,
+  "gap": false,
+  "snapshotSequence": 40200,
+  "page": null,
+  "thread": { "id": "thread_...", "messages": [], "activities": [], "session": null },
+  "observedAt": "2026-08-24T12:00:00.000Z"
+}
+```
+
+`reset` is always true: a snapshot replaces the client's view of the thread rather than merging
+into it. `gap` is the one that matters — see below.
+
+`t3.thread.event` — one T3 orchestration event, in order.
+
+```json
+{
+  "environmentId": "env_...",
+  "threadId": "thread_...",
+  "sequence": 40201,
+  "eventId": "evt_...",
+  "type": "thread.activity-appended",
+  "occurredAt": "2026-08-24T12:00:01.000Z",
+  "commandId": null,
+  "event": { "…": "the full OrchestrationEvent" },
+  "observedAt": "2026-08-24T12:00:01.000Z"
+}
+```
+
+`type` is one of the six thread-detail events T3 streams (`isThreadDetailEvent`, src/ws.ts:271):
+`thread.message-sent`, `thread.activity-appended`, `thread.proposed-plan-upserted`,
+`thread.turn-diff-completed`, `thread.reverted`, `thread.session-set`.
+
+**`thread.message-sent` with `streaming: true` carries a DELTA, not the whole message.** Append it
+to the message with the same `messageId`; a frame with `streaming: false` carries the final full
+text, or empty text meaning "keep what you have". This is T3's own projector rule
+(`src/orchestration/projector.ts:497-515`) and a client that treats a delta as the whole message
+will show the last few tokens of every reply.
+
+`t3.thread.status` — connection state, so a client can say "live" rather than guess.
+
+```json
+{ "environmentId": "env_...", "threadId": "thread_...", "state": "live", "sequence": 40201 }
+```
+
+`state` is one of `connecting`, `resuming`, `live`, `reconnecting` (with `attempt`, `retryInMs`
+and `error`), or `stopped` (with `reason`). `live` means T3 sent its completion marker: the initial
+snapshot or catch-up replay is finished and everything after this is happening now.
+
+### Ordering, resume, and a gap that cannot be filled
+
+`sequence` is T3's global event-log sequence and is the ordering key. The gateway delivers strictly
+increasing sequences per thread and drops anything at or below its cursor, so a client can apply
+events in arrival order without deduplicating them itself.
+
+On a dropped socket the gateway reconnects with backoff and resumes from its cursor, and T3 replays
+the events after it. But T3 refuses to replay more than 1000 events, and refuses a cursor ahead of
+its own head (`THREAD_RESUME_MAX_GAP`, src/ws.ts:307): in that case it sends a fresh snapshot
+instead of the replay, because a truncated replay would drop events silently.
+
+That is what `gap: true` on a `t3.thread.snapshot` means. **Nothing is lost** — the snapshot is the
+thread's current state in full — but the *intermediate history* is: the individual events between
+the old cursor and now were never delivered, only their result. A client should replace the thread
+with the snapshot rather than appending to what it had, and may tell the reader that some
+intermediate steps were skipped.
+
+### Commands settle faster, and still only once
+
+A live `thread.session-set` carrying an error, or a finished assistant message, reconciles a
+`dispatched` command immediately instead of waiting for the next poll. `command.reconciled` now
+carries `source: "stream" | "snapshot"` naming which evidence decided it. The snapshot poller still
+runs — it also serves environment health, the compressed device screen and thread titles, none of
+which a thread subscription covers — but the two share one arbiter (`src/commandArbiter.mjs`), so
+a command is decided exactly once no matter which sees the evidence first.
 
 ## Local End-To-End Demo
 

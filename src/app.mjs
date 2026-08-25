@@ -96,6 +96,8 @@ import { createRateLimiter } from "./rateLimit.mjs";
 import { configurePrivateTailscaleServe, inspectRemoteAccess } from "./remoteAccess.mjs";
 import { normalizeGatewayProfileInput, publicGatewayProfile } from "./gatewayProfiles.mjs";
 import { createSnapshotPoller } from "./snapshotPoller.mjs";
+import { createThreadStreamHub } from "./threadStream.mjs";
+import { createCommandArbiter } from "./commandArbiter.mjs";
 import { createStore, emptyEnvironmentRemoval } from "./store.mjs";
 import { assertSecureTransport } from "./transport.mjs";
 import {
@@ -183,10 +185,25 @@ export function createApp({
       events.broadcastUserChange(change.userId, { action: change.action ?? null });
     }
   });
+  // One arbiter, two evidence sources. The poller reads T3 on a timer and the thread stream reads
+  // it live; without a shared arbiter they would both decide the same dispatched command, and a
+  // live failure could be overwritten by a polled reply from the same turn. See
+  // src/commandArbiter.mjs.
+  const commandArbiter = createCommandArbiter();
   const snapshotPoller = createSnapshotPoller({
     store,
     events,
+    arbiter: commandArbiter,
     ...(config.snapshotPollIntervalMs ? { intervalMs: config.snapshotPollIntervalMs } : {}),
+  });
+  // Constructed here, started from server.mjs — same rule as the poller and the media worker, so
+  // no test opens a socket it did not ask for. Tests drive runOnce().
+  const threadStreams = createThreadStreamHub({
+    store,
+    events,
+    arbiter: commandArbiter,
+    ...(config.threadStreamIntervalMs ? { intervalMs: config.threadStreamIntervalMs } : {}),
+    ...(config.threadStreamWatchTtlMs ? { watchTtlMs: config.threadStreamWatchTtlMs } : {}),
   });
   // Constructed here, started from server.mjs. Tests drive runOnce() so nothing depends on a timer.
   const mediaJobRunner = createMediaJobRunner({
@@ -1239,6 +1256,43 @@ export function createApp({
           sessionFailures: extractSessionFailures(snapshot),
           catalogueSource,
         });
+      }
+
+      // A live thread subscription exists only while somebody says they are looking. This is that
+      // statement, and it is a LEASE rather than a registration: it expires unless renewed, so a
+      // console that crashes or a tab that is closed costs a socket for at most one TTL. The
+      // DELETE is the polite early release, not the only way out.
+      //
+      // Deliberately rate-limited as a read: a watching client renews on a timer, and this neither
+      // writes to the store nor reaches T3 — the tick in src/threadStream.mjs does that.
+      const threadWatchMatch = url.pathname.match(/^\/v1\/t3\/environments\/([^/]+)\/threads\/([^/]+)\/watch$/u);
+      if (req.method === "POST" && threadWatchMatch) {
+        const user = await authenticateUser(req, store, config, null, clerkAuth);
+        await enforceUserRead(req, res, rateLimiter, config, user);
+        const environment = await store.getEnvironmentForUser(user.id, threadWatchMatch[1]);
+        if (!environment) throw new HttpError(404, "Environment not found.");
+        assertEnvironmentTokenActive(environment);
+        // The snapshot poller still serves this user's environment health and screen, which the
+        // thread stream does not cover; watching a thread is also proof of presence.
+        snapshotPoller.trackUser(user.id);
+        const watch = threadStreams.watch({
+          userId: user.id,
+          environmentId: environment.id,
+          threadId: decodeURIComponent(threadWatchMatch[2]),
+        });
+        if (!watch) throw new HttpError(400, "A thread id is required.");
+        return sendJson(res, 200, { watch });
+      }
+
+      if (req.method === "DELETE" && threadWatchMatch) {
+        const user = await authenticateUser(req, store, config, null, clerkAuth);
+        await enforceUserRead(req, res, rateLimiter, config, user);
+        const released = threadStreams.unwatch({
+          userId: user.id,
+          environmentId: threadWatchMatch[1],
+          threadId: decodeURIComponent(threadWatchMatch[2]),
+        });
+        return sendJson(res, 200, { released });
       }
 
       const environmentThreadsMatch = url.pathname.match(/^\/v1\/t3\/environments\/([^/]+)\/threads$/u);
@@ -2447,6 +2501,12 @@ export function createApp({
         const after = optionalString(url.searchParams.get("after"));
         if (after && !Number.isFinite(Date.parse(after))) throw new HttpError(400, "after must be an ISO timestamp.");
         const environment = await boundDeviceEnvironment(store, device);
+        // A controller reading its thread IS a watcher, and it has no way to say so — there is no
+        // device-facing watch route and a few square centimetres of screen should not have to
+        // manage a lease. Renewing here means the owner's console sees the same thread stream live
+        // while the hardware is looking at it, and the subscription lapses on its own once the
+        // device stops polling.
+        threadStreams.watch({ userId: device.userId, environmentId: environment.id, threadId });
         const snapshot = await fetchDeviceSnapshot(environment);
         const thread = (Array.isArray(snapshot?.threads) ? snapshot.threads : [])
           .find((candidate) => optionalString(candidate?.id) === threadId);
@@ -2917,6 +2977,7 @@ export function createApp({
     store,
     events,
     snapshotPoller,
+    threadStreams,
     mediaJobRunner,
     server: createServer((req, res) => void handle(req, res)),
   };

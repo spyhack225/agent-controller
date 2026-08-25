@@ -125,6 +125,14 @@ export function loadConfig(env = process.env) {
     policyAllowedHours: parseAllowedHours(env.POLICY_ALLOWED_HOURS),
     snapshotPollEnabled: normalizeBoolean(env.SNAPSHOT_POLL_ENABLED, true),
     snapshotPollIntervalMs: normalizePositiveInt(env.SNAPSHOT_POLL_INTERVAL_MS, 5000),
+    // The live thread stream (src/threadStream.mjs). The tick is only a scheduler: it opens,
+    // closes and reconnects subscriptions, it never fetches, so a short interval is cheap and
+    // is what makes a watch feel immediate.
+    threadStreamEnabled: normalizeBoolean(env.THREAD_STREAM_ENABLED, true),
+    threadStreamIntervalMs: normalizePositiveInt(env.THREAD_STREAM_INTERVAL_MS, 1000),
+    // A watch is a lease. Long enough that a console renewing every 30s never flaps, short
+    // enough that a browser that simply vanished stops costing a socket within the minute.
+    threadStreamWatchTtlMs: normalizePositiveInt(env.THREAD_STREAM_WATCH_TTL_MS, 90_000),
     alertThresholds: loadAlertThresholds(env),
     rateLimits: loadRateLimitConfig(env),
     demoMode,

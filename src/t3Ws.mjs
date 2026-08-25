@@ -28,6 +28,9 @@ export const T3_WS_METHODS = Object.freeze({
 });
 
 const DEFAULT_TIMEOUT_MS = 10_000;
+// A subscription can sit silent for a long time while an agent thinks. Tunnels and reverse
+// proxies reap quiet sockets, so the client pings; T3 answers Pong (RpcServer.js:488-491).
+const DEFAULT_PING_INTERVAL_MS = 30_000;
 
 export async function requestWebSocketTicket(environment, { fetchImpl = fetch, timeoutMs = DEFAULT_TIMEOUT_MS } = {}) {
   const url = new URL("/api/auth/websocket-ticket", environment.baseUrl);
@@ -156,6 +159,228 @@ export async function fetchProviderCatalogue(environment, options = {}) {
     throw new Error("T3 server.getConfig did not return a providers array.");
   }
   return providers;
+}
+
+/**
+ * Opens a long-lived `orchestration.subscribeThread` subscription.
+ *
+ * Deliberately NOT built on `callT3Rpc`. That helper collects every chunk and resolves once, which
+ * is the right shape for `server.getConfig` and exactly the wrong shape here: a thread
+ * subscription never completes on its own, its whole value is each item arriving as it happens,
+ * and it has to survive being closed and reopened.
+ *
+ * ---------------------------------------------------------------------------------------------
+ * THE CONTRACT, READ FROM T3 RATHER THAN GUESSED
+ * ---------------------------------------------------------------------------------------------
+ *
+ * Verified against the installed T3 Code 0.0.32 (source map
+ * /opt/homebrew/lib/node_modules/t3/dist/bin.mjs.map, `sourcesContent`) plus the real Effect
+ * runtime it bundles at node_modules/effect/dist/unstable/rpc/.
+ *
+ *   packages/contracts/src/rpc.ts:747-754  WsOrchestrationSubscribeThreadRpc, `stream: true`.
+ *   packages/contracts/src/orchestration.ts:528-552  the input:
+ *       { threadId, afterSequence?, requestCompletionMarker?, turnLimit? }
+ *   packages/contracts/src/orchestration.ts:1413-1426  the output item, a THREE-way union:
+ *       { kind: "synchronized" }
+ *     | { kind: "snapshot",  snapshot: OrchestrationThreadDetailSnapshot }
+ *     | { kind: "event",     event: OrchestrationEvent }
+ *   src/auth/RpcAuthorization.ts:31  requires the `orchestration:read` scope, which standard
+ *     pairing already requests (STANDARD_T3_SCOPES in src/app.mjs) — no new scope, no re-pairing.
+ *
+ * `afterSequence` is the resume cursor, and it is the GLOBAL event-log sequence, not the
+ * per-activity `sequence` field. src/ws.ts:1317-1350 is explicit about what the server does with
+ * it: it compares the cursor to the head, and past `THREAD_RESUME_MAX_GAP` (1000,
+ * src/ws.ts:307) — or when the cursor is ahead of the head — it silently abandons the replay and
+ * sends a fresh `snapshot` frame instead, because a truncated replay would drop events without
+ * saying so. That behaviour is the gateway's answer to an unfillable gap; see src/threadStream.mjs.
+ *
+ * `requestCompletionMarker: true` asks for the `{kind:"synchronized"}` frame that separates the
+ * initial snapshot/replay from live events (src/ws.ts:1339-1345, :1380-1387). Without it a client
+ * cannot tell "still catching up" from "live".
+ *
+ * ---------------------------------------------------------------------------------------------
+ * WHY EVERY CHUNK MUST BE ACKNOWLEDGED
+ * ---------------------------------------------------------------------------------------------
+ *
+ * Not folklore — it is the server loop. effect/unstable/rpc/RpcServer.js:271-291 creates a latch
+ * per streaming request, then for every chunk does `latch.closeUnsafe(); write(Chunk); await
+ * latch`. Only an inbound `{_tag:"Ack", requestId}` opens it (RpcServer.js:103-106). So the first
+ * chunk arrives unprompted and every subsequent one is blocked until we answer. Miss one Ack and
+ * the subscription goes quiet forever while looking perfectly healthy.
+ *
+ * `{_tag:"Interrupt", requestId}` is the polite end (RpcServer.js:108-118): it interrupts the
+ * server-side fiber instead of leaving it parked on a latch nobody will ever open.
+ * `{_tag:"Ping"}` is answered with `Pong` (RpcServer.js:488-491), which is what keeps an idle
+ * subscription alive through a tunnel that reaps quiet sockets.
+ */
+export function openT3ThreadStream(environment, {
+  threadId,
+  afterSequence = null,
+  requestCompletionMarker = true,
+  turnLimit = null,
+  onItem = () => {},
+  onOpen = () => {},
+  onClose = () => {},
+} = {}, {
+  fetchImpl = fetch,
+  WebSocketImpl = globalThis.WebSocket,
+  ticketTimeoutMs = DEFAULT_TIMEOUT_MS,
+  pingIntervalMs = DEFAULT_PING_INTERVAL_MS,
+} = {}) {
+  const requestId = "1";
+  let socket = null;
+  let closedByCaller = false;
+  let settled = false;
+  let pingTimer = null;
+
+  const finish = (reason, error = null) => {
+    if (settled) return;
+    settled = true;
+    if (pingTimer) clearInterval(pingTimer);
+    pingTimer = null;
+    if (socket) {
+      // Only a caller-initiated teardown needs the Interrupt: it is the case where the server
+      // fiber is alive and parked on the chunk latch, and closing the socket underneath it is
+      // exactly what leaves it there. When T3 has already ended the stream (exit/defect) or the
+      // socket is gone (error/close), there is nothing left to interrupt.
+      if (reason === "closed") {
+        try {
+          socket.send(JSON.stringify({ _tag: "Interrupt", requestId }));
+        } catch {
+          // The socket is already gone; closing is still worth attempting.
+        }
+      }
+      try {
+        socket.close();
+      } catch {
+        // Same.
+      }
+    }
+    try {
+      onClose({ reason, error });
+    } catch {
+      // A caller that throws while being told the stream ended must not resurrect it.
+    }
+  };
+
+  const start = async () => {
+    let ticket;
+    try {
+      ticket = await requestWebSocketTicket(environment, { fetchImpl, timeoutMs: ticketTimeoutMs });
+    } catch (error) {
+      finish("ticket", error);
+      return;
+    }
+    if (closedByCaller) {
+      finish("closed");
+      return;
+    }
+    if (typeof WebSocketImpl !== "function") {
+      finish("unsupported", new Error("A WebSocket implementation is required to stream from T3."));
+      return;
+    }
+
+    try {
+      socket = new WebSocketImpl(webSocketUrlFor(environment.baseUrl, ticket));
+    } catch (error) {
+      finish("connect", error);
+      return;
+    }
+
+    socket.addEventListener("open", () => {
+      if (closedByCaller) {
+        finish("closed");
+        return;
+      }
+      const payload = { threadId };
+      // Only send the cursor when we actually have one: an absent afterSequence is what asks
+      // for the initial snapshot, and `0` is a legitimate cursor rather than "no cursor".
+      if (Number.isFinite(afterSequence)) payload.afterSequence = afterSequence;
+      if (requestCompletionMarker) payload.requestCompletionMarker = true;
+      if (Number.isFinite(turnLimit) && turnLimit > 0) payload.turnLimit = turnLimit;
+      socket.send(JSON.stringify({
+        _tag: "Request",
+        id: requestId,
+        tag: T3_WS_METHODS.orchestrationSubscribeThread,
+        payload,
+        headers: [],
+      }));
+      if (pingIntervalMs > 0) {
+        pingTimer = setInterval(() => {
+          try {
+            socket.send(JSON.stringify({ _tag: "Ping" }));
+          } catch {
+            // A dead socket will surface through close/error; the keepalive stays quiet.
+          }
+        }, pingIntervalMs);
+        pingTimer.unref?.();
+      }
+      try {
+        onOpen();
+      } catch {
+        // Same reasoning as onClose: a throwing observer must not take the stream down.
+      }
+    });
+
+    socket.addEventListener("message", (event) => {
+      let message;
+      try {
+        message = JSON.parse(String(event.data));
+      } catch {
+        return;
+      }
+      switch (message._tag) {
+        case "Chunk": {
+          if (message.requestId !== requestId) return;
+          for (const value of message.values ?? []) {
+            try {
+              onItem(value);
+            } catch {
+              // Delivering item N+1 matters more than item N's handler throwing, and the Ack
+              // below has to be sent either way or the stream stalls permanently.
+            }
+          }
+          try {
+            socket.send(JSON.stringify({ _tag: "Ack", requestId }));
+          } catch (error) {
+            finish("ack", error);
+          }
+          return;
+        }
+        case "Exit": {
+          if (message.requestId !== requestId) return;
+          const exit = message.exit ?? {};
+          if (exit._tag === "Success") {
+            finish("exit");
+            return;
+          }
+          finish("failure", new Error(`T3 subscribeThread failed: ${describeFailure(exit)}`));
+          return;
+        }
+        case "Defect":
+          finish("defect", new Error(`T3 rejected subscribeThread: ${stringify(message.defect)}`));
+          return;
+        default:
+          // Pong and anything newer T3 grows are ignored on purpose.
+      }
+    });
+
+    socket.addEventListener("error", () => finish("error", new Error("T3 websocket error while streaming a thread.")));
+    socket.addEventListener("close", (event) => {
+      finish(closedByCaller ? "closed" : "socket-closed", closedByCaller
+        ? null
+        : new Error(`T3 websocket closed while streaming (code ${event?.code ?? "unknown"}).`));
+    });
+  };
+
+  void start();
+
+  return {
+    close() {
+      closedByCaller = true;
+      finish("closed");
+    },
+  };
 }
 
 export const TERMINAL_SCOPE = "terminal:operate";

@@ -21,7 +21,7 @@ if (config.rateLimits?.redisUrl) {
   rateLimiter = createRateLimiter();
 }
 
-const { server, snapshotPoller, mediaJobRunner } = createApp({
+const { server, snapshotPoller, threadStreams, mediaJobRunner } = createApp({
   config,
   rateLimiter,
   ...(store ? { store } : {}),
@@ -41,6 +41,15 @@ server.listen(config.port, config.host, async () => {
   if (config.snapshotPollEnabled) {
     snapshotPoller.start();
     console.log(`T3 snapshot poller running every ${config.snapshotPollIntervalMs}ms`);
+  }
+  // Same reasoning as the poller: started here, not in createApp(), so no test opens a socket to
+  // T3 it did not ask for.
+  if (config.threadStreamEnabled) {
+    threadStreams.start();
+    console.log(
+      `T3 live thread streams scheduling every ${config.threadStreamIntervalMs}ms`
+      + ` (watch lease ${config.threadStreamWatchTtlMs}ms)`,
+    );
   }
   // Same reasoning as the poller: started here, not in createApp(), so tests never race a timer.
   if (config.transcriptionWorkerEnabled) {

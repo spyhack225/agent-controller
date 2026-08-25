@@ -118,6 +118,55 @@ If T3 changes this protocol, its own contract is readable at
 `/opt/homebrew/lib/node_modules/t3/dist/bin.mjs.map` (the source map ships `sourcesContent`,
 including `packages/contracts/src/rpc.ts`).
 
+### The live thread stream
+
+`orchestration.subscribeThread` was a string constant in `src/t3Ws.mjs` that nothing called; the
+console and the device learned what an agent had done by refetching a snapshot every five seconds.
+`openT3ThreadStream()` holds a real subscription and `src/threadStream.mjs` fans it out over the
+existing SSE broker as `t3.thread.snapshot`, `t3.thread.event` and `t3.thread.status`.
+
+It is deliberately not built on `callT3Rpc`, which collects chunks and resolves once. Three things
+make a subscription a different lifecycle:
+
+- **Every `Chunk` must be `Ack`ed.** Not folklore — `effect/dist/unstable/rpc/RpcServer.js:271-291`
+  does `latch.closeUnsafe(); write(Chunk); await latch` per streaming request, and only an inbound
+  `Ack` opens it. Miss one and the stream goes quiet forever while looking healthy. Closing sends
+  `Interrupt` first, or the server fiber stays parked on a latch nobody will open.
+- **The resume cursor is the event's global `sequence`** (`EventBaseFields`,
+  packages/contracts/src/orchestration.ts:1257-1267), *not* the optional per-activity `sequence` at
+  :323, which only orders activities inside a turn. A reconnect passes it as `afterSequence`;
+  anything at or below the cursor is dropped, because T3 attaches the live subscription before
+  draining the replay (src/ws.ts:1300-1306) so the overlap is by design.
+- **T3 answers an unfillable gap with a snapshot, not an error.** Past `THREAD_RESUME_MAX_GAP`
+  (1000, src/ws.ts:307) or with a cursor ahead of its head, it abandons the replay and sends a
+  fresh thread snapshot, because a truncated replay would drop events silently. The gateway
+  publishes that as `reset: true, gap: true`: nothing is lost — the snapshot is the thread in
+  full — but the intermediate history is, and a client must replace rather than append.
+
+Subscriptions are **demand-driven leases**, the same discipline as the snapshot poller one level
+finer: `POST|DELETE /v1/t3/environments/:id/threads/:threadId/watch` registers/renews, a device
+polling `/v1/device/thread-output` renews its own, and a lease that stops being renewed drops the
+socket on the next tick. Watches are in-memory on purpose — the same category of fact as the
+poller's active-user set — so no store method was added. Constructed in `createApp()`, **started
+only from `server.mjs`**, with `runOnce()` that tests drive.
+
+`thread.message-sent` with `streaming: true` carries a **delta**, not the whole message
+(T3's own projector appends it, src/orchestration/projector.ts:497-515). Treating a delta as the
+full text shows the last few tokens of every reply.
+
+### One command, one decision
+
+Two things now close the gap between `dispatched` and "the agent replied": the snapshot poller
+(polled evidence) and the thread stream (live evidence). The store has no compare-and-set, so
+"read status, then update" is a read-modify-write with an await in the middle. `src/commandArbiter.mjs`
+is the single arbiter both go through — same `reconcileCommandStatus()`, same "evidence newer than
+the dispatch" guard, but a command already decided or being written is never decided again.
+`command.reconciled` carries `source: "stream" | "snapshot"` naming who got there first.
+
+The poller was deliberately left polling: it also serves environment health, the compressed device
+screen and thread titles, none of which a thread subscription covers. It is now the backstop for
+threads nobody is watching rather than a second opinion on the ones that are.
+
 ### Terminal input (Phase 9 stage 3)
 
 `terminal_input` is a capability **no built-in profile grants** — it needs a custom profile *and* an
