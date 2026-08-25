@@ -170,7 +170,7 @@ enum class Modal : uint8_t { None, ConfirmControl, ConfirmApproval, ConfirmRepro
 enum class Act : uint8_t {
   None, Review, Retry, Talk, PickThread, Reload, PrevPage, NextPage, Refresh,
   Approve, Reject, NextApproval, SendClip, DiscardClip, Portal, ClosePortal, Reprovision,
-  ConfirmYes, ConfirmNo, SavedActions
+  ConfirmYes, ConfirmNo, SavedActions, NewThread
 };
 
 struct Action {
@@ -258,6 +258,20 @@ constexpr uint32_t kPickerCommitMs = 600;
 bool threadsFetched = false;
 
 bool threadListKnown();
+bool createdRowLive();
+size_t threadRowCount();
+const ThreadOption* threadRowAt(size_t index);
+bool haveThread();
+
+// THE THREAD THIS DEVICE JUST CREATED, held locally until the client's own list catches up.
+//
+// POST /v1/device/threads answers with a row shaped exactly like one from GET /v1/device/threads
+// and the protocol says to splice it in rather than re-fetch — T3 answers a dispatch as soon as the
+// event is appended and its projection catches up afterwards, so a re-fetch can legitimately not
+// contain a thread that certainly exists. GatewayClient owns `threads_[]` and may not be edited, so
+// the splice is an overlay: one extra row appended past the end of whatever the client holds, which
+// retires itself the moment the real list contains the same id.
+ThreadOption createdRow;
 
 int16_t threadScroll = 0;
 int16_t actionScroll = 0;
@@ -507,7 +521,11 @@ String deviceName() {
 // once. It is deliberately not fetched from here: this is called from paint functions, and a
 // blocking socket has no business on the render loop.
 String threadTitle() {
-  if (!gw || !gw->hasThread()) return String();
+  if (!gw) return String();
+  // The overlay outranks the client's own answer: the gateway bound the new thread when it created
+  // it, so while that row is live it IS the destination, whatever GatewayClient's stale config says.
+  if (createdRowLive()) return createdRow.title;
+  if (!gw->hasThread()) return String();
   const String& id = gw->context().threadId;
   for (size_t i = 0; i < gw->threadCount(); ++i) {
     const ThreadOption* row = gw->thread(i);
@@ -515,6 +533,11 @@ String threadTitle() {
     if ((row->selected || row->id == id) && row->title.length() > 0) return row->title;
   }
   return String();
+}
+
+// Whether the device has a destination at all, counting one it has just created.
+bool haveThread() {
+  return gw != nullptr && (gw->hasThread() || createdRowLive());
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -562,7 +585,7 @@ String rowValue(Row row) {
     }
     case Row::Thread: {
       if (!gw) return String("None");
-      if (!gw->hasThread()) return String("None selected");
+      if (!haveThread()) return String("None selected");
       const String title = threadTitle();
       // Bound, but the list has not been fetched, so the title is not known here. Saying so is
       // better than showing the id — and the row is a link to the screen that will resolve it.
@@ -595,7 +618,7 @@ uint8_t rowTone(Row row) {
     }
     case Row::Thread:
       if (!gw) return kHair;
-      return gw->hasThread() ? kMuted : kBright;
+      return haveThread() ? kMuted : kBright;
     default:
       if (!gw) return kHair;
       return gw->approvalCount() > 0 ? kBright : kMuted;
@@ -786,17 +809,48 @@ const char* threadStatusWord(const String& status) {
   return mapped != OrbMode::Ring ? orbLabelForMode(mapped) : "";
 }
 
-bool threadListKnown() {
-  return (gw != nullptr && gw->threadCount() > 0) || threadsFetched;
+// True while the overlay row is still the only place the new thread exists.
+bool createdRowLive() {
+  if (createdRow.id.length() == 0 || !gw) return false;
+  for (size_t i = 0; i < gw->threadCount(); i += 1) {
+    const ThreadOption* row = gw->thread(i);
+    if (row && row->id == createdRow.id) return false;   // the real list has it; retire
+  }
+  return true;
 }
 
-// The selected thread's status word, or nothing when the list has not been fetched.
-const char* selectedThreadStatusWord() {
-  if (!gw || !gw->hasThread()) return "";
+// The thread list as the screen sees it: the client's rows, plus the overlay when it is live.
+size_t threadRowCount() {
+  if (!gw) return 0;
+  return gw->threadCount() + (createdRowLive() ? 1 : 0);
+}
+
+const ThreadOption* threadRowAt(size_t index) {
+  if (!gw) return nullptr;
+  if (index < gw->threadCount()) return gw->thread(index);
+  if (createdRowLive() && index == gw->threadCount()) return &createdRow;
+  return nullptr;
+}
+
+bool threadListKnown() {
+  return threadRowCount() > 0 || threadsFetched;
+}
+
+// The row the device is actually bound to, overlay included. One place, so the orb's animation, the
+// word beside it and the destination line cannot disagree about which thread they are describing.
+const ThreadOption* boundThreadRow() {
+  if (!gw) return nullptr;
+  if (createdRowLive()) return &createdRow;
+  if (!gw->hasThread()) return nullptr;
   const int index = gw->selectedThreadIndex();
   const ThreadOption* row = gw->thread((size_t)(index < 0 ? 0 : index));
-  if (!row || !row->selected) return "";
-  return threadStatusWord(row->status);
+  return (row && row->selected) ? row : nullptr;
+}
+
+// The bound thread's status word, or nothing when the list has not been fetched.
+const char* selectedThreadStatusWord() {
+  const ThreadOption* row = boundThreadRow();
+  return row ? threadStatusWord(row->status) : "";
 }
 
 OrbPresentation presentationForState() {
@@ -876,9 +930,8 @@ OrbPresentation presentationForState() {
   }
 
   // 5. The selected thread's own status.
-  const int index = gw->selectedThreadIndex();
-  const ThreadOption* selected = gw->thread((size_t)(index < 0 ? 0 : index));
-  if (selected && selected->selected && selected->status.length() > 0) {
+  const ThreadOption* selected = boundThreadRow();
+  if (selected && selected->status.length() > 0) {
     const String& st = selected->status;
     // The animation, paired with the word threadStatusWord() gives the same status — the two are
     // kept beside each other here precisely so they cannot drift.
@@ -905,7 +958,7 @@ OrbPresentation presentationForState() {
   if (stateIs(shown, "error")) return {OrbMode::Ring, "Failed", true};
   // The picker line under the orb says this far better than a word can, so it keeps the prominent
   // slot rather than being displaced by a caption for it.
-  if (!gw->hasThread())        return {OrbMode::Ring, "No thread", false};
+  if (!haveThread())           return {OrbMode::Ring, "No thread", false};
   return {OrbMode::Ring, "Ready", false};
 }
 
@@ -995,6 +1048,9 @@ Rect homeActionRect() {
 
 int boundThreadIndex() {
   if (!gw) return -1;
+  // A thread this device just created is bound by definition — the gateway said so in the 201 —
+  // and the client's own rows still mark the previous one, so the overlay has to win here too.
+  if (createdRowLive()) return (int)gw->threadCount();
   for (size_t i = 0; i < gw->threadCount(); i += 1) {
     const ThreadOption* row = gw->thread(i);
     if (row && row->selected) return (int)i;
@@ -1002,17 +1058,32 @@ int boundThreadIndex() {
   return -1;
 }
 
-// What the line is pointing at: the local highlight while a swipe is settling, and otherwise
-// whatever the gateway says is actually bound.
-int pickerTarget() {
-  if (!gw) return -1;
-  if (pickerIndex >= 0 && (size_t)pickerIndex < gw->threadCount()) return pickerIndex;
-  return boundThreadIndex();
+// The picker's slots are the rows PLUS one past the end, which is NEW THREAD.
+//
+// Putting it there rather than on a button of its own is what makes it reachable in the state that
+// needs it most: a project with no threads has no rows, so the virtual slot is the only slot and
+// the screen opens on it already offering the way out.
+int pickerSlotCount() { return (int)threadRowCount() + 1; }
+
+int pickerSlot() {
+  const int slots = pickerSlotCount();
+  if (pickerIndex >= 0 && pickerIndex < slots) return pickerIndex;
+  const int bound = boundThreadIndex();
+  return bound >= 0 ? bound : slots - 1;
 }
 
-// A selection the user has made but the gateway has not yet been told about.
+bool pickerOnNew() { return pickerSlot() == (int)threadRowCount(); }
+
+// What the line is pointing at: a row index, or -1 when it is on the virtual slot.
+int pickerTarget() {
+  const int slot = pickerSlot();
+  return slot < (int)threadRowCount() ? slot : -1;
+}
+
+// A selection the user has made but the gateway has not yet been told about. The virtual slot is
+// never pending — there is nothing to bind until it is pressed.
 bool pickerPending() {
-  return pickerCommitAt != 0 && pickerTarget() != boundThreadIndex();
+  return pickerCommitAt != 0 && !pickerOnNew() && pickerTarget() != boundThreadIndex();
 }
 
 // HOME's layout is computed from STRUCTURE. Never from content.
@@ -1045,14 +1116,17 @@ Stack homeStack() {
 
 void paintHome() {
   const int target = pickerTarget();
-  const ThreadOption* row = (target >= 0) ? gw->thread((size_t)target) : nullptr;
+  const ThreadOption* row = (target >= 0) ? threadRowAt((size_t)target) : nullptr;
   const bool pending = pickerPending();
+  const bool onNew = pickerOnNew();
 
   // The destination, by name. Never an id — see threadTitle().
   String name;
-  if (row && row->title.length() > 0) {
+  if (onNew) {
+    name = threadRowCount() == 0 ? String("No threads yet") : String("New thread");
+  } else if (row && row->title.length() > 0) {
     name = row->title;
-  } else if (gw->hasThread()) {
+  } else if (haveThread()) {
     // Bound, but the list has not arrived yet, so the title is not known here. This must not read
     // as "no thread": the device HAS a destination, it just cannot name it for another moment.
     name = threadListKnown() ? String("Selected thread") : String("Loading threads");
@@ -1072,6 +1146,7 @@ void paintHome() {
   if (pickerBinding) secondary = "Selecting...";
   else if (pending) secondary = "Swipe to choose - not sent yet";
   else if (message.length() > 0) secondary = message;
+  else if (onNew) secondary = "Creates one and points here";
   else if (currentSpeaks) secondary = name;
   else {
     const char* word = row ? threadStatusWord(row->status) : "";
@@ -1092,16 +1167,13 @@ void paintHome() {
                     uip::fitWords(secondary, kCols1));
 
   const Rect action = homeActionRect();
-  const bool none = target < 0 && !gw->hasThread();
-  uip::button(action, none ? "CHOOSE" : "OPEN", true, true);
+  const char* verb = onNew ? "CREATE" : (row == nullptr && !haveThread() ? "CHOOSE" : "OPEN");
+  uip::button(action, verb, true, true);
 
   // The swipe affordance. Only drawn when there is somewhere to swipe to, because a chevron that
   // does nothing is worse than no chevron.
   //
-  // A NEW THREAD affordance belongs here, as a step past the end of the list — POST /v1/device/threads
-  // is being added to the gateway and a project with no threads currently leaves this screen with
-  // nothing to point at. Nothing is wired to it yet.
-  if (gw->threadCount() > 1) {
+  if (pickerSlotCount() > 1) {
     const int16_t cy = (int16_t)(action.y + action.h / 2);
     uip::chevron((int16_t)(action.x - 18), cy, 5.0f, -1, kHair, 2.0f);
     uip::chevron((int16_t)(action.x + action.w + 18), cy, 5.0f, 1, kHair, 2.0f);
@@ -1233,7 +1305,7 @@ void paintChoiceRow(int16_t y, int16_t rowH, const String& title, const String& 
 void paintThreadsChrome() {
   g().fillRect(0, kContentTop, kW, (int16_t)(kThreadListTop - kContentTop), panelGrey(kBg));
   paintBreadcrumb();
-  const size_t count = gw->threadCount();
+  const size_t count = threadRowCount();
   uip::text(14, kContentTop + 42, 1, kMuted,
             count > 0 ? String(count) + " THREADS" : String("THREADS"));
 }
@@ -1241,12 +1313,16 @@ void paintThreadsChrome() {
 void paintThreads() {
   clearListRegion(kThreadListTop);
 
-  const size_t count = gw->threadCount();
+  const size_t count = threadRowCount();
   if (count == 0) {
     paintThreadsChrome();
-    const String detail = gw->threadsDetail().length() > 0 ? gw->threadsDetail() : message;
-    uip::textCentered(kContentTop + 100, 1, kMuted,
-                      uip::fit(detail.length() > 0 ? detail : String("Nothing here yet"), kCols1));
+    // The dead end this screen used to be. NEW THREAD is in the action bar below, primary and
+    // enabled, so an empty folder is one press from having something to point at.
+    uip::textCentered(kContentTop + 92, 1, kMuted,
+                      uip::fit(gw->threadsDetail().length() > 0 ? gw->threadsDetail()
+                                                                : String("No threads in this folder"),
+                               kCols1));
+    uip::textCentered(kContentTop + 112, 1, kHair, "Create one below");
     return;
   }
 
@@ -1255,10 +1331,11 @@ void paintThreads() {
     const int16_t y = (int16_t)(kThreadListTop + (int16_t)i * kThreadRowH - threadScroll);
     if (y + kRowInk > bottom) break;
     if (y + kThreadRowH <= kContentTop) continue;
-    const ThreadOption* row = gw->thread(i);
+    const ThreadOption* row = threadRowAt(i);
     if (!row) continue;
-    const String meta = row->selected ? String("ACTIVE  ") + row->status : row->status;
-    paintChoiceRow(y, kThreadRowH, row->title, meta, row->selected, i + 1 == count);
+    const bool active = row->selected && (int)i == boundThreadIndex();
+    const String meta = active ? String("ACTIVE  ") + row->status : row->status;
+    paintChoiceRow(y, kThreadRowH, row->title, meta, active, i + 1 == count);
   }
   paintThreadsChrome();
 }
@@ -1480,7 +1557,7 @@ void paintMicDestination() {
   const VoiceLayout at = voiceLayout();
   String where;
   uint8_t tone = kText;
-  if (!gw || !gw->hasThread()) {
+  if (!haveThread()) {
     where = "No thread selected";
     tone = kBright;
   } else {
@@ -1541,13 +1618,13 @@ void paintActions() {
     if (y + kActionRowH <= kContentTop) continue;
     const DeviceControl* c = gw->control(i);
     if (!c) continue;
-    const bool blocked = !c->enabled || (c->requiresThread && !gw->hasThread());
+    const bool blocked = !c->enabled || (c->requiresThread && !haveThread());
     uip::text(14, (int16_t)(y + 6), 1, blocked ? kHair : kText, uip::fitWords(c->label, 28));
     // The right-hand word is why the row will or will not do anything, which is the only thing a
     // person needs to read before pressing it.
     String meta = "RUN";
     if (!c->enabled) meta = "LOCK";
-    else if (c->requiresThread && !gw->hasThread()) meta = "THREAD";
+    else if (c->requiresThread && !haveThread()) meta = "THREAD";
     else if (c->kind == "capture_audio" || c->mediaKind == "audio") meta = "HOLD";
     else if (c->kind == "status") meta = "VIEW";
     else if (c->requiresConfirmation || c->kind == "stop" || c->kind == "reset") meta = "CONFIRM";
@@ -1611,7 +1688,7 @@ void paintResponse() {
                  String(r.page + 1) + "/" + String(r.pageCount));
 
   for (size_t i = 0; i < r.followUpCount && i < 2; ++i) {
-    uip::button(i == 0 ? kFollowLeft : kFollowRight, r.followUps[i].label, false, gw->hasThread());
+    uip::button(i == 0 ? kFollowLeft : kFollowRight, r.followUps[i].label, false, haveThread());
   }
 }
 
@@ -1965,7 +2042,7 @@ void buildActions() {
   // anywhere, and there is exactly one pair of things to do with it.
   if (clipHeld) {
     addAction(Act::DiscardClip, "DISCARD", false);
-    addAction(Act::SendClip, "SEND", true, gw->hasThread());
+    addAction(Act::SendClip, "SEND", true, haveThread());
     return;
   }
 
@@ -1981,7 +2058,7 @@ void buildActions() {
         addAction(Act::Review, "REVIEW", true);
         return;
       }
-      if (!gw->hasThread()) {
+      if (!haveThread()) {
         addAction(Act::PickThread, "CHOOSE A THREAD", true);
         return;
       }
@@ -1997,7 +2074,9 @@ void buildActions() {
       return;
     }
     case Screen::Threads:
-      if (gw->threadCount() == 0) addAction(Act::Reload, "RELOAD", true);
+      // Reachable whether or not a list exists — an empty folder is exactly the state this removes.
+      addAction(Act::NewThread, "NEW THREAD", threadRowCount() == 0);
+      if (threadRowCount() == 0) addAction(Act::Reload, "RELOAD", false);
       return;
     case Screen::Environments:
       if (browse.environmentCount() == 0) addAction(Act::Reload, "RELOAD", true);
@@ -2013,7 +2092,7 @@ void buildActions() {
       return;   // every row is its own control
     case Screen::Response: {
       if (!gw->responseOpen()) {
-        addAction(Act::Refresh, "LOAD LATEST", true, gw->hasThread());
+        addAction(Act::Refresh, "LOAD LATEST", true, haveThread());
         return;
       }
       const ThreadResponse& r = gw->response();
@@ -2186,7 +2265,7 @@ void runControlRow(const DeviceControl& c) {
     contentDirty = true;
     return;
   }
-  if (c.requiresThread && !gw->hasThread()) {
+  if (c.requiresThread && !haveThread()) {
     message = "Select a thread first";
     contentDirty = true;
     return;
@@ -2343,7 +2422,7 @@ void startRecording() {
     contentDirty = true;
     return;
   }
-  if (!gw->hasThread()) {
+  if (!haveThread()) {
     message = "Select a thread first";
     contentDirty = true;
     return;
@@ -2427,13 +2506,20 @@ void goToThreads() {
     showBusy("Threads", "Finding the environment");
     browse.refreshEnvironments();
   }
-  if (gw->threadCount() == 0) refreshThreads();
+  if (threadRowCount() == 0) refreshThreads();
   contentDirty = true;
 }
 
 void selectThreadRow(size_t index) {
-  const ThreadOption* row = gw->thread(index);
+  const ThreadOption* row = threadRowAt(index);
   if (!row) return;
+  // The overlay row is already the bound thread — the create bound it — so there is nothing to
+  // POST, and posting would hit the very 404 the protocol warns about.
+  if (index >= gw->threadCount()) {
+    message = "Already selected";
+    goTo(Screen::Send);
+    return;
+  }
   showBusy("Selecting", uip::fitWords(row->title, kCols1));
   if (gw->selectThread(index)) {
     message = "Thread selected";
@@ -2451,6 +2537,57 @@ void selectThreadRow(size_t index) {
 // is a per-user store read on the gateway — no T3 round trip — so fetching it here costs one fast
 // request and is what stops the breadcrumb showing a raw id.
 void goToThreads();
+
+// One tap: creates a thread in the bound folder, and the gateway binds it before it answers.
+//
+// No keyboard, no prompt, no title. The gateway names it "<D Mon HH:MM> - <device label>" with
+// uniqueness guaranteed, and T3 only auto-retitles a thread still carrying its own default, so that
+// is the name the thread keeps.
+void createThreadNow() {
+  showBusy("New thread", "Asking the gateway");
+  if (!browse.createThread()) {
+    // A refused create changes NOTHING server-side: the device stays on the thread it was on. So
+    // the highlight goes back to the bound row and the line never shows something uncreated.
+    pickerIndex = -1;
+    pickerCommitAt = 0;
+    message = browse.createDetail();
+    contentDirty = true;
+    return;
+  }
+
+  // Spliced, not re-fetched. The row is shaped exactly like one from GET /v1/device/threads.
+  const BrowseThread& made = browse.createdThread();
+  createdRow = ThreadOption();
+  createdRow.id = made.id;
+  createdRow.title = made.title;
+  createdRow.status = made.status;
+  createdRow.status.toUpperCase();
+  createdRow.selected = true;
+
+  // The client is told what the gateway has ALREADY made true.
+  //
+  // The create binds server-side, but GatewayClient's own `context_.threadId` would not know until
+  // its 60 s config poll — and until it did, postIntent() would keep stamping the PREVIOUS thread's
+  // id on every dispatch, so a voice note recorded in that window would land in the wrong
+  // conversation. adoptThreadBinding() closes that synchronously with the authoritative id in hand:
+  // it is not selectThread(), which validates an index against a list that cannot yet contain this
+  // thread. It also closes the open response, because that model is an answer about the
+  // conversation the user has just left.
+  gw->adoptThreadBinding(made.id);
+
+  // A FINISHED capture also belonged to the thread that was open a moment ago. Its outcome is not a
+  // fact about this one, and leaving it would put "Voice failed" on the prominent line of a
+  // brand-new thread — state from a conversation the user has left, which is the residue bug in
+  // another form. A capture still IN FLIGHT is left alone: it was dispatched against the old
+  // thread, that is where it is going, and its completion still deserves to be reported.
+  if (voice.stage() == VoiceStage::Failed || voice.stage() == VoiceStage::Review) voice.reset();
+
+  pickerIndex = -1;
+  pickerCommitAt = 0;
+  threadsFetched = true;
+  message = "Thread created";
+  contentDirty = true;
+}
 
 void refreshEnvironments() {
   showBusy("Environments", "Asking the gateway");
@@ -2529,7 +2666,7 @@ void openCategory(Row row) {
         return;
       }
       goTo(Screen::Response);
-      if (!gw->responseOpen() && gw->hasThread()) {
+      if (!gw->responseOpen() && haveThread()) {
         showBusy("Reply", "Loading the latest");
         gw->openResponse(String());
         contentDirty = true;
@@ -2549,6 +2686,9 @@ void runAction(Act id) {
       return;
     case Act::SavedActions:
       goTo(Screen::Actions);
+      return;
+    case Act::NewThread:
+      createThreadNow();
       return;
     case Act::PickThread:
       goToThreads();
@@ -2710,13 +2850,14 @@ void handleContentTap(int16_t x, int16_t y) {
   switch (screen) {
     case Screen::Home: {
       if (!uip::hit(homeActionRect(), x, y)) return;
+      if (pickerOnNew()) { createThreadNow(); return; }
       // OPEN goes into the thread the line is pointing at. With nothing bound it is CHOOSE, and it
       // takes the person somewhere they can pick one rather than leaving them on a dead line.
-      if (pickerTarget() < 0 && !gw->hasThread()) { goToThreads(); return; }
+      if (pickerTarget() < 0 && !haveThread()) { goToThreads(); return; }
       // Committed first, so OPEN can never open a thread the device is not actually bound to.
       commitPicker();
       goTo(Screen::Response);
-      if (!gw->responseOpen() && gw->hasThread()) {
+      if (!gw->responseOpen() && haveThread()) {
         showBusy("Reply", "Loading the latest");
         gw->openResponse(String());
         contentDirty = true;
@@ -2740,7 +2881,7 @@ void handleContentTap(int16_t x, int16_t y) {
       const int16_t local = (int16_t)(y - kThreadListTop + threadScroll);
       if (local < 0) return;
       const size_t index = (size_t)(local / kThreadRowH);
-      if (index < gw->threadCount()) selectThreadRow(index);
+      if (index < threadRowCount()) selectThreadRow(index);
       return;
     }
     case Screen::Environments: {
@@ -2791,25 +2932,19 @@ void handleContentTap(int16_t x, int16_t y) {
 // Steps HOME's destination picker. Local only — the write is debounced by the caller's timer, so
 // eight swipes cost one request and the device is never bound to something merely passed over.
 void pickerStep(int delta) {
-  const size_t count = gw->threadCount();
-  if (count == 0) {
-    message = threadListKnown() ? String("No threads; start one in the console")
-                                : String("Loading threads");
-    contentDirty = true;
-    return;
-  }
-  int at = pickerTarget();
-  if (at < 0) at = 0;
-  const int next = at + delta;
-  if (next < 0 || next >= (int)count) {
+  const int slots = pickerSlotCount();
+  const int next = pickerSlot() + delta;
+  if (next < 0 || next >= slots) {
     // A wall, said out loud. A swipe that silently does nothing is indistinguishable from one the
-    // device failed to see.
-    message = next < 0 ? "First thread" : "Last thread";
+    // device failed to see. NEW THREAD is the last slot, so "last thread" is never the far end.
+    message = next < 0 ? "First thread" : "That is the end";
     contentDirty = true;
     return;
   }
   pickerIndex = next;
-  pickerCommitAt = millis() + kPickerCommitMs;
+  // The virtual slot binds nothing, so it arms no write. Stepping onto it and away again costs the
+  // gateway nothing at all.
+  pickerCommitAt = (next == (int)threadRowCount()) ? 0 : (millis() + kPickerCommitMs);
   message = "";
   contentDirty = true;
 }
@@ -2916,7 +3051,7 @@ void handleDrag(int16_t y, int16_t dy) {
   if (drawerT > 0.05f) return;
 
   if (screen == Screen::Threads) {
-    const int16_t limit = maxScroll(gw->threadCount(), kThreadRowH, kThreadListTop);
+    const int16_t limit = maxScroll(threadRowCount(), kThreadRowH, kThreadListTop);
     int16_t next = (int16_t)(threadScroll - dy);
     if (next < 0) next = 0;
     if (next > limit) next = limit;
