@@ -1676,9 +1676,10 @@ this is the endpoint summary.
 | GET | `/v1/device/projects` | Projects in the bound environment, from the T3 snapshot |
 | POST | `/v1/device/config/project` | Set the active project |
 | GET | `/v1/device/threads` | Threads in the bound environment, narrowed to the active project |
+| POST | `/v1/device/threads` | Create a thread in the active project and select it |
 | POST | `/v1/device/config/thread` | Set the active thread |
 
-All six are device realm (`x-device-id` + `x-device-secret`) and require a claimed device.
+All seven are device realm (`x-device-id` + `x-device-secret`) and require a claimed device.
 
 ```http
 GET /v1/device/environments
@@ -1753,6 +1754,65 @@ no `projectId` in the snapshot is excluded rather than guessed at.
 
 The owner-facing `PUT /v1/devices/:id/config` accepts `projectId` alongside `environmentId` and
 `threadId`. Deleting an environment clears the `projectId` of every device bound to it.
+
+#### Creating a thread from the device
+
+```http
+POST /v1/device/threads
+x-device-id: dev_...
+x-device-secret: ...
+content-type: application/json
+
+{}
+```
+
+```json
+{
+  "environmentId": "env_bound",
+  "projectId": "proj_empty",
+  "threadId": "thread_9f0c...",
+  "thread": {
+    "id": "thread_9f0c...",
+    "title": "24 Aug 19:32 · Hosyond Touch screen",
+    "status": "idle",
+    "selected": true
+  },
+  "config": { "environmentId": "env_bound", "projectId": "proj_empty", "threadId": "thread_9f0c..." },
+  "command": { "id": "cmd_...", "status": "completed", "...": "..." }
+}
+```
+
+`201` on success. The body carries an optional `title`; leave it out and the gateway mints one.
+The thread is created in the device's **currently bound project** — the device cannot name a
+project, an environment or an owner — and the device is bound to it in the same request, because
+the follow-up `POST /v1/device/config/thread` validates against the snapshot and T3's projection
+has not necessarily caught up yet.
+
+`thread` is shaped exactly like a row from `GET /v1/device/threads`, so a controller can splice it
+into the list it is already rendering.
+
+Naming, in order:
+
+1. a `title` in the request body, trimmed, whitespace-collapsed and capped at 72 characters;
+2. otherwise `"<D Mon HH:MM> · <device label>"`, e.g. `24 Aug 19:32 · Hosyond Touch screen`,
+   falling back to `Controller <short id>` for an unlabelled device.
+
+Either way the name is made unique against the environment's snapshot titles **and** the titles
+this gateway minted in the last ten minutes, with a ` (2)`, ` (3)` … suffix. The second source
+matters: T3 answers a dispatch as soon as the event is appended, so two creates seconds apart can
+both read a snapshot that mentions neither. Note that T3 only auto-retitles a thread whose title is
+its own default `"New thread"`, so the minted name is permanent — which is the point, since a
+picker of identical rows is what this endpoint exists to avoid.
+
+The model is not chosen by the device. The project's `defaultModelSelection` wins; without one the
+gateway falls back to a snapshot-derived harness for the environment.
+
+| Status | Meaning |
+|---|---|
+| `403` | The device profile (or user role, environment, network or time window) does not grant `thread_create`. `details.policy` names the dimension and rule. A `read-only` device is refused here. |
+| `404` | The bound project is no longer in the environment's snapshot. |
+| `409` | No environment bound, no project bound, or T3 reported no usable provider model (`details.code: "no_model_selection"`). |
+| `502` | `details.code: "t3_unreachable"` — the snapshot read or the dispatch failed. `details.command` carries the failed command record. The device's existing thread selection is untouched. |
 
 Devices can list and run saved macros for the claimed account:
 

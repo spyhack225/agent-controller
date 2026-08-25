@@ -219,6 +219,60 @@ export function buildT3Command({ intent, threadId, attachments = [] }) {
   }
 }
 
+/**
+ * The `thread.create` orchestration command.
+ *
+ * Verified against the installed T3 Code contract, not guessed. The source map at
+ * `/opt/homebrew/lib/node_modules/t3/dist/bin.mjs.map` ships `sourcesContent` for T3's own
+ * packages, and there:
+ *
+ *   - `packages/contracts/src/orchestration.ts:630` — `ThreadCreateCommand`, the field list below.
+ *   - `packages/contracts/src/orchestration.ts:858` / `:885` — it is a member of both
+ *     `DispatchableClientOrchestrationCommand` and `ClientOrchestrationCommand`.
+ *   - `packages/contracts/src/environmentHttp.ts:495` — `POST /api/orchestration/dispatch` takes
+ *     `ClientOrchestrationCommand` as its payload and answers `DispatchResult` (`{sequence}`).
+ *
+ * So creating a thread needs no WebSocket and no new transport: it is the ordinary dispatch the
+ * gateway already speaks, on the same route as `thread.turn.start`.
+ *
+ * Three details the schema settles and the caller must respect:
+ *
+ *   - **`threadId` is chosen by the client.** The decider only asserts the id is *absent*
+ *     (`requireThreadAbsent`, `src/orchestration/decider.ts:353`), so the new thread's id is known
+ *     before the dispatch returns and there is no projection to poll for it.
+ *   - **`modelSelection` and `runtimeMode` are required**, not optional. A thread cannot be created
+ *     without naming a provider instance and model.
+ *   - **`branch` and `worktreePath` are `NullOr`, which is nullable but not optional.** Both keys
+ *     are always written, `null` when unknown.
+ */
+export function buildT3ThreadCreateCommand({
+  project,
+  title,
+  modelSelection = project?.defaultModelSelection,
+  runtimeMode = "approval-required",
+  interactionMode = "default",
+  threadId = createId("thread"),
+  createdAt = nowIso(),
+}) {
+  if (!project?.id) throw new Error("T3 project id is required.");
+  if (!modelSelection?.instanceId || !modelSelection?.model) {
+    throw new Error("T3 project does not have a usable model selection.");
+  }
+  return {
+    type: "thread.create",
+    commandId: createId("t3cmd"),
+    threadId,
+    projectId: project.id,
+    title,
+    modelSelection,
+    runtimeMode,
+    interactionMode,
+    branch: project.branch ?? null,
+    worktreePath: null,
+    createdAt,
+  };
+}
+
 export function buildT3ProjectLaunchCommands({
   project,
   text,
@@ -228,28 +282,19 @@ export function buildT3ProjectLaunchCommands({
   threadId = createId("thread"),
   attachments = [],
 }) {
-  if (!project?.id) throw new Error("T3 project id is required.");
-  if (!modelSelection?.instanceId || !modelSelection?.model) {
-    throw new Error("T3 project does not have a usable model selection.");
-  }
-
   const createdAt = nowIso();
   const title = deriveThreadTitle(text);
   return {
     threadId,
-    createThread: {
-      type: "thread.create",
-      commandId: createId("t3cmd"),
-      threadId,
-      projectId: project.id,
+    createThread: buildT3ThreadCreateCommand({
+      project,
       title,
       modelSelection,
       runtimeMode,
       interactionMode,
-      branch: project.branch ?? null,
-      worktreePath: null,
+      threadId,
       createdAt,
-    },
+    }),
     startTurn: {
       type: "thread.turn.start",
       commandId: createId("t3cmd"),

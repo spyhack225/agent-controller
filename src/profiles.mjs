@@ -20,6 +20,10 @@ export const DEVICE_CAPABILITIES = Object.freeze([
   "session_control",
   "approval_response",
   "shell_input",
+  // Creating a thread in the bound project, from hardware that has no keyboard. A write to the
+  // owner's T3 environment, so it is a capability rather than a selection: `read-only` browses,
+  // it does not create.
+  "thread_create",
   // Direct terminal write (roadmap Phase 9 stage 3). Deliberately granted by NO built-in profile:
   // the roadmap keeps terminal:operate separate and opt-in, so it is reachable only through a
   // custom profile on an environment that was paired with the terminal:operate scope.
@@ -32,7 +36,7 @@ const DEVICE_PROFILES = [
   {
     id: "agent-controller",
     label: "Agent controller",
-    description: "Full remote agent control for prompts, media, status, approvals, session control, and policy-screened shell input.",
+    description: "Full remote agent control for prompts, media, status, approvals, session control, thread creation, and policy-screened shell input.",
     capabilities: [
       "status",
       "agent_prompt",
@@ -40,12 +44,13 @@ const DEVICE_PROFILES = [
       "session_control",
       "approval_response",
       "shell_input",
+      "thread_create",
     ],
   },
   {
     id: "read-only",
     label: "Read only",
-    description: "Status inspection only. Prompts, media, approvals, session control, and shell input are blocked.",
+    description: "Status inspection only. Prompts, media, approvals, session control, thread creation, and shell input are blocked.",
     capabilities: ["status"],
   },
   {
@@ -59,6 +64,7 @@ const DEVICE_PROFILES = [
       "session_control",
       "approval_response",
       "shell_input",
+      "thread_create",
     ],
   },
 ];

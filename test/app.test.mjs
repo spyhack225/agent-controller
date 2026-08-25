@@ -3130,8 +3130,14 @@ test("invalid device credentials cannot read or change thread selection", async 
 const ENVIRONMENT_FIXTURE_SNAPSHOTS = {
   "bound-t3.example": {
     projects: [
-      { id: "proj_alpha", title: "Alpha folder" },
+      {
+        id: "proj_alpha",
+        title: "Alpha folder",
+        defaultModelSelection: { instanceId: "codex", model: "gpt-5.6" },
+      },
       { id: "proj_beta", name: "Beta folder" },
+      // No default model selection, and no thread of its own to derive one from: the folder a
+      // controller is most likely to be pointed at, and the one that used to be a dead end.
       { id: "proj_empty", title: "Empty folder" },
     ],
     threads: [
@@ -3157,15 +3163,34 @@ const ENVIRONMENT_FIXTURE_SNAPSHOTS = {
   },
 };
 
-async function environmentSelectionFixture(t, { snapshotError = null } = {}) {
+async function environmentSelectionFixture(t, { snapshotError = null, dispatchError = null } = {}) {
   const originalFetch = globalThis.fetch;
-  globalThis.fetch = async (url) => {
+  // A per-fixture copy, so a test that creates a thread sees it in the next snapshot the way a
+  // real T3 would, without leaking the new thread into every other test in this file.
+  const snapshots = structuredClone(ENVIRONMENT_FIXTURE_SNAPSHOTS);
+  const dispatches = [];
+  globalThis.fetch = async (url, init = {}) => {
     const parsed = new URL(String(url));
     if (parsed.pathname === "/api/orchestration/snapshot") {
       if (snapshotError) throw snapshotError;
-      const snapshot = ENVIRONMENT_FIXTURE_SNAPSHOTS[parsed.hostname];
+      const snapshot = snapshots[parsed.hostname];
       if (!snapshot) return jsonResponse({ error: "unknown host" }, 404);
       return jsonResponse(snapshot, 200);
+    }
+    if (parsed.pathname === "/api/orchestration/dispatch") {
+      const command = JSON.parse(init.body);
+      dispatches.push(command);
+      if (dispatchError) return jsonResponse({ error: dispatchError }, 503);
+      const snapshot = snapshots[parsed.hostname];
+      if (snapshot && command.type === "thread.create") {
+        snapshot.threads.push({
+          id: command.threadId,
+          title: command.title,
+          projectId: command.projectId,
+          session: { status: "stopped" },
+        });
+      }
+      return jsonResponse({ sequence: dispatches.length }, 200);
     }
     return jsonResponse({ error: "not found" }, 404);
   };
@@ -3229,6 +3254,8 @@ async function environmentSelectionFixture(t, { snapshotError = null } = {}) {
     authHeaders,
     created,
     deviceHeaders,
+    dispatches,
+    snapshots,
     bound: bound.environment,
     spare: spare.environment,
     foreign: foreign.environment,
@@ -3534,6 +3561,256 @@ test("invalid credentials and unclaimed devices cannot browse environments or pr
     body: JSON.stringify({ environmentId: f.bound.id }),
   });
   assert.equal(wrote.status, 403);
+});
+
+test("a device creates a thread in its bound project and is left pointing at it", async (t) => {
+  const f = await environmentSelectionFixture(t);
+  await f.bind({ environmentId: f.bound.id, projectId: "proj_empty" });
+
+  const response = await f.originalFetch(new URL("/v1/device/threads", f.baseUrl), {
+    method: "POST",
+    headers: { ...f.deviceHeaders, "content-type": "application/json" },
+    body: JSON.stringify({}),
+  });
+  assert.equal(response.status, 201, "a create answers 201, not 200");
+  const created = await response.json();
+
+  assert.equal(created.environmentId, f.bound.id);
+  assert.equal(created.projectId, "proj_empty");
+  assert.match(created.threadId, /^thread_/u);
+  assert.equal(created.thread.id, created.threadId);
+  assert.equal(created.thread.selected, true);
+  assert.equal(created.command.status, "completed");
+
+  // The wire command is T3's own `thread.create`, with every field its schema requires.
+  assert.equal(f.dispatches.length, 1);
+  const dispatched = f.dispatches[0];
+  assert.equal(dispatched.type, "thread.create");
+  assert.equal(dispatched.threadId, created.threadId);
+  assert.equal(dispatched.projectId, "proj_empty");
+  assert.equal(dispatched.title, created.thread.title);
+  assert.equal(dispatched.runtimeMode, "approval-required");
+  assert.equal(dispatched.interactionMode, "default");
+  // `NullOr`, not optional: both keys have to be on the wire.
+  assert.equal(Object.hasOwn(dispatched, "branch"), true);
+  assert.equal(Object.hasOwn(dispatched, "worktreePath"), true);
+  assert.equal(dispatched.branch, null);
+  assert.equal(dispatched.worktreePath, null);
+  // The folder has no default of its own, so the environment's snapshot-derived harness answers.
+  assert.deepEqual(dispatched.modelSelection, { instanceId: "codex", model: "gpt-5.6", options: [] });
+  assert.match(dispatched.createdAt, /^\d{4}-\d{2}-\d{2}T/u);
+
+  // Selection is durable, and the thread the device just made is the one it is on.
+  assert.equal((await f.deviceConfig()).threadId, created.threadId);
+  const listed = await requestJson(f.originalFetch, f.baseUrl, "/v1/device/threads", {
+    headers: f.deviceHeaders,
+  });
+  assert.equal(listed.projectId, "proj_empty");
+  assert.deepEqual(listed.threads, [
+    { id: created.threadId, title: created.thread.title, status: "stopped", selected: true },
+  ]);
+});
+
+test("a created thread's name identifies the controller and the moment, and never repeats", async (t) => {
+  const f = await environmentSelectionFixture(t);
+  await f.bind({ environmentId: f.bound.id, projectId: "proj_empty" });
+
+  const first = await requestJson(f.originalFetch, f.baseUrl, "/v1/device/threads", {
+    method: "POST",
+    headers: f.deviceHeaders,
+    body: {},
+  });
+  const second = await requestJson(f.originalFetch, f.baseUrl, "/v1/device/threads", {
+    method: "POST",
+    headers: f.deviceHeaders,
+    body: {},
+  });
+  const third = await requestJson(f.originalFetch, f.baseUrl, "/v1/device/threads", {
+    method: "POST",
+    headers: f.deviceHeaders,
+    body: {},
+  });
+
+  // The device that made it is named, so a two-controller account can tell them apart.
+  assert.match(first.thread.title, /Bezel controller$/u);
+  // Two creates in the same minute — and possibly the same second — still list as two rows.
+  const titles = [first.thread.title, second.thread.title, third.thread.title];
+  assert.equal(new Set(titles).size, 3, titles.join(" | "));
+  assert.equal(second.thread.title, `${first.thread.title} (2)`);
+  assert.equal(third.thread.title, `${first.thread.title} (3)`);
+
+  const listed = await requestJson(f.originalFetch, f.baseUrl, "/v1/device/threads", {
+    headers: f.deviceHeaders,
+  });
+  assert.deepEqual(listed.threads.map((thread) => thread.title), titles);
+});
+
+test("a firmware-supplied thread title wins, and an unusable one falls back", async (t) => {
+  const f = await environmentSelectionFixture(t);
+  await f.bind({ environmentId: f.bound.id, projectId: "proj_empty" });
+
+  const named = await requestJson(f.originalFetch, f.baseUrl, "/v1/device/threads", {
+    method: "POST",
+    headers: f.deviceHeaders,
+    body: { title: "  Fix   the   build\n " },
+  });
+  assert.equal(named.thread.title, "Fix the build");
+
+  // Blank, whitespace-only and non-string titles are not errors: the gateway always has a name.
+  for (const title of ["   ", "", 42, null]) {
+    const fallback = await requestJson(f.originalFetch, f.baseUrl, "/v1/device/threads", {
+      method: "POST",
+      headers: f.deviceHeaders,
+      body: { title },
+    });
+    assert.match(fallback.thread.title, /Bezel controller/u);
+  }
+
+  // Even a title the device chose cannot duplicate one already in the environment.
+  const repeated = await requestJson(f.originalFetch, f.baseUrl, "/v1/device/threads", {
+    method: "POST",
+    headers: f.deviceHeaders,
+    body: { title: "Fix the build" },
+  });
+  assert.equal(repeated.thread.title, "Fix the build (2)");
+});
+
+test("thread creation is refused without a bound project or a bound environment", async (t) => {
+  const f = await environmentSelectionFixture(t);
+
+  // No environment at all.
+  const unbound = await f.originalFetch(new URL("/v1/device/threads", f.baseUrl), {
+    method: "POST",
+    headers: { ...f.deviceHeaders, "content-type": "application/json" },
+    body: JSON.stringify({}),
+  });
+  assert.equal(unbound.status, 409);
+  assert.match((await unbound.json()).error.message, /environment/iu);
+
+  // An environment, but no folder to create in.
+  await f.bind({ environmentId: f.bound.id });
+  const noProject = await f.originalFetch(new URL("/v1/device/threads", f.baseUrl), {
+    method: "POST",
+    headers: { ...f.deviceHeaders, "content-type": "application/json" },
+    body: JSON.stringify({}),
+  });
+  assert.equal(noProject.status, 409);
+  assert.match((await noProject.json()).error.message, /project/iu);
+  assert.equal(f.dispatches.length, 0, "a refused create must not reach T3");
+});
+
+test("thread creation reports a bound T3 host outage as an actionable gateway error", async (t) => {
+  const unreadable = await environmentSelectionFixture(t, { snapshotError: new Error("connect ECONNREFUSED") });
+  await unreadable.bind({ environmentId: unreadable.bound.id, projectId: "proj_empty" });
+  const response = await unreadable.originalFetch(new URL("/v1/device/threads", unreadable.baseUrl), {
+    method: "POST",
+    headers: { ...unreadable.deviceHeaders, "content-type": "application/json" },
+    body: JSON.stringify({}),
+  });
+  assert.equal(response.status, 502);
+  const body = await response.json();
+  assert.equal(body.error.details.code, "t3_unreachable");
+  assert.equal(body.error.details.environmentId, unreadable.bound.id);
+});
+
+test("a T3 that reads but refuses the dispatch fails the create without binding the device", async (t) => {
+  const f = await environmentSelectionFixture(t, { dispatchError: "temporary outage" });
+  await f.bind({ environmentId: f.bound.id, projectId: "proj_alpha", threadId: "thread_a" });
+
+  const response = await f.originalFetch(new URL("/v1/device/threads", f.baseUrl), {
+    method: "POST",
+    headers: { ...f.deviceHeaders, "content-type": "application/json" },
+    body: JSON.stringify({}),
+  });
+  assert.equal(response.status, 502);
+  const body = await response.json();
+  assert.equal(body.error.details.code, "t3_unreachable");
+  assert.equal(body.error.details.command.status, "failed");
+  assert.equal(typeof body.error.details.command.metrics.dispatchDurationMs, "number");
+
+  // The thread the device was already on is untouched: a failed create moves nothing.
+  assert.equal((await f.deviceConfig()).threadId, "thread_a");
+});
+
+test("a read-only device may browse threads but may not create one", async (t) => {
+  const f = await environmentSelectionFixture(t);
+
+  const observer = await requestJson(f.originalFetch, f.baseUrl, "/v1/devices", {
+    method: "POST",
+    headers: f.authHeaders,
+    body: { label: "Wall display", profile: "read-only" },
+  });
+  const observerHeaders = {
+    "x-device-id": observer.device.id,
+    "x-device-secret": observer.secret,
+  };
+  await requestJson(f.originalFetch, f.baseUrl, `/v1/devices/${observer.device.id}/config`, {
+    method: "PUT",
+    headers: f.authHeaders,
+    body: { environmentId: f.bound.id, projectId: "proj_alpha" },
+  });
+
+  // Reading is untouched — this profile has always been allowed to look.
+  const listed = await requestJson(f.originalFetch, f.baseUrl, "/v1/device/threads", {
+    headers: observerHeaders,
+  });
+  assert.equal(listed.threads.length, 2);
+
+  const response = await f.originalFetch(new URL("/v1/device/threads", f.baseUrl), {
+    method: "POST",
+    headers: { ...observerHeaders, "content-type": "application/json" },
+    body: JSON.stringify({}),
+  });
+  assert.equal(response.status, 403);
+  const body = await response.json();
+  assert.equal(body.error.details.policy.dimension, "device");
+  assert.equal(f.dispatches.length, 0, "a blocked profile must not reach T3");
+
+  // The agent-controller device on the same account is unaffected.
+  await f.bind({ environmentId: f.bound.id, projectId: "proj_alpha" });
+  await requestJson(f.originalFetch, f.baseUrl, "/v1/device/threads", {
+    method: "POST",
+    headers: f.deviceHeaders,
+    body: {},
+  });
+  assert.equal(f.dispatches.length, 1);
+});
+
+test("thread creation refuses bad credentials and unclaimed hardware", async (t) => {
+  const f = await environmentSelectionFixture(t);
+  await f.bind({ environmentId: f.bound.id, projectId: "proj_alpha" });
+
+  const badCredentials = await f.originalFetch(new URL("/v1/device/threads", f.baseUrl), {
+    method: "POST",
+    headers: {
+      "x-device-id": f.created.device.id,
+      "x-device-secret": "wrong-secret",
+      "content-type": "application/json",
+    },
+    body: JSON.stringify({}),
+  });
+  assert.equal(badCredentials.status, 401);
+
+  const { server } = createApp({ config: { factoryToken: "factory-secret", demoMode: false } });
+  await listen(server);
+  t.after(() => server.close());
+  const factoryBaseUrl = `http://127.0.0.1:${server.address().port}`;
+  const provisioned = await requestJson(f.originalFetch, factoryBaseUrl, "/v1/factory/devices", {
+    method: "POST",
+    headers: { authorization: "Bearer factory-secret" },
+    body: { label: "Unclaimed", profile: "agent-controller" },
+  });
+  const unclaimed = await f.originalFetch(new URL("/v1/device/threads", factoryBaseUrl), {
+    method: "POST",
+    headers: {
+      "x-device-id": provisioned.device.id,
+      "x-device-secret": provisioned.secret,
+      "content-type": "application/json",
+    },
+    body: JSON.stringify({}),
+  });
+  assert.equal(unclaimed.status, 403);
+  assert.equal(f.dispatches.length, 0);
 });
 
 test("the device display payload carries the owner's configured menu, not a generic one", async (t) => {

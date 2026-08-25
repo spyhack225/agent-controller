@@ -3,6 +3,7 @@ import test from "node:test";
 
 import { evaluateIntentPolicy, POLICY_DIMENSIONS } from "../src/policy.mjs";
 import {
+  DEVICE_CAPABILITIES,
   capabilitiesForProfile,
   listDeviceProfiles,
   resolveDeviceProfile,
@@ -404,4 +405,58 @@ test("custom profiles resolve without a built-in id", () => {
 
   // Unresolvable profiles fall back to the read-only capability set, never an open one.
   assert.deepEqual([...capabilitiesForProfile({ id: "broken", capabilities: "nope" })], ["status"]);
+});
+
+test("thread creation is a real capability, gated like a write and not like a selection", () => {
+  const intent = { type: "thread_create" };
+
+  // It is derived from DEVICE_CAPABILITIES, not a hardcoded copy, so the deny lists that build
+  // themselves from that list pick it up without being edited.
+  assert.equal(DEVICE_CAPABILITIES.includes("thread_create"), true);
+
+  const allowed = evaluateIntentPolicy({ device: agentController, intent });
+  assert.equal(allowed.allowed, true);
+  // Nothing about creating an empty thread is dangerous on its own; the prompt that follows it is
+  // screened on its own terms.
+  assert.equal(allowed.risk, "low");
+  assert.equal(allowed.requiresApproval, undefined);
+
+  const blocked = evaluateIntentPolicy({ device: { profile: "read-only" }, intent });
+  assert.equal(blocked.allowed, false);
+  assert.equal(blocked.risk, "blocked");
+  assert.equal(blocked.dimension, POLICY_DIMENSIONS.DEVICE);
+
+  // A viewer cannot create one from hardware that otherwise could.
+  const viewer = evaluateIntentPolicy({
+    device: agentController,
+    intent,
+    user: { id: "usr_1", role: "viewer" },
+  });
+  assert.equal(viewer.allowed, false);
+  assert.equal(viewer.matchedRule, "user.role.viewer");
+
+  // Neither can anyone, inside an environment the owner marked read-only.
+  const readOnlyEnvironment = evaluateIntentPolicy({
+    device: agentController,
+    intent,
+    environment: { id: "env_1", readOnly: true },
+  });
+  assert.equal(readOnlyEnvironment.allowed, false);
+  assert.equal(readOnlyEnvironment.dimension, POLICY_DIMENSIONS.ENVIRONMENT);
+});
+
+test("thread creation is granted by the control profiles and withheld from read-only", () => {
+  const granted = listDeviceProfiles()
+    .filter((profile) => profile.capabilities.includes("thread_create"))
+    .map((profile) => profile.id);
+  assert.deepEqual(granted, ["agent-controller", "power-controller"]);
+  assert.equal(capabilitiesForProfile("read-only").has("thread_create"), false);
+
+  // A custom profile may grant it, and the name is spelled the way the engine expects.
+  const custom = validateCustomProfile({ id: "creator", capabilities: ["status", "thread_create"] });
+  assert.equal(custom.valid, true);
+  assert.equal(
+    evaluateIntentPolicy({ device: { profile: custom.profile }, intent: { type: "thread_create" } }).allowed,
+    true,
+  );
 });

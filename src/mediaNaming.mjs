@@ -183,7 +183,15 @@ function meaningfulUploadName(originalName) {
 }
 
 /** `24 Aug 19:32`, or `3 Feb 2025 08:05` once the year stops being obvious. */
-function formatCapturedAt(createdAt, now) {
+const formatCapturedAt = formatShortLocalTime;
+
+/**
+ * `24 Aug 19:32`, or `3 Feb 2025 08:05` once the year stops being obvious.
+ *
+ * Exported because a name minted for a *thread* has to read as the same kind of string as a name
+ * derived for a capture — one gateway, one way of writing an instant. See `src/threadNaming.mjs`.
+ */
+export function formatShortLocalTime(createdAt, now = new Date()) {
   const at = new Date(createdAt ?? "");
   if (!Number.isFinite(at.getTime())) return null;
   const reference = now instanceof Date && Number.isFinite(now.getTime()) ? now : new Date();
@@ -191,6 +199,11 @@ function formatCapturedAt(createdAt, now) {
   const hours = String(at.getHours()).padStart(2, "0");
   const minutes = String(at.getMinutes()).padStart(2, "0");
   return `${at.getDate()} ${MONTHS[at.getMonth()]}${year} ${hours}:${minutes}`;
+}
+
+/** Enough of an id to tell two of them apart, without spending a row on a uuid. */
+export function shortEntityId(id) {
+  return shortId(id);
 }
 
 /** Enough of an id to tell two of them apart, without spending a row on a uuid. */

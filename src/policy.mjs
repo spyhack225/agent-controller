@@ -304,7 +304,14 @@ export const USER_ROLE_RULES = Object.freeze({
   member: { id: "user.role.member", deny: [], approval: ["shell_input"] },
   viewer: {
     id: "user.role.viewer",
-    deny: ["agent_prompt", "media_prompt", "shell_input", "session_control", "approval_response"],
+    deny: [
+      "agent_prompt",
+      "media_prompt",
+      "shell_input",
+      "session_control",
+      "approval_response",
+      "thread_create",
+    ],
     approval: [],
   },
 });
@@ -857,6 +864,11 @@ export function capabilityForIntent(intent) {
       return "approval_response";
     case "session_control":
       return "session_control";
+    // Not a dispatchable intent — `normalizeIntent()` rejects it, so a device cannot post it to
+    // /v1/device/intents. It exists so POST /v1/device/threads can ask the same eight-dimension
+    // question every other write asks, instead of inventing a second, weaker check.
+    case "thread_create":
+      return "thread_create";
     default:
       return "unknown";
   }

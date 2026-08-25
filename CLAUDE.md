@@ -543,6 +543,23 @@ Two limits are real: changing environment clears the project and thread server-s
 `POST /v1/device/config/project` reads `projectId` as a **required** string — so a device can narrow
 to a folder but cannot widen back out to "all folders" without the console.
 
+A board can also **create** a thread: `POST /v1/device/threads` creates one in the bound project and
+selects it in the same request. Creating and not selecting would be half the job — T3 answers a
+dispatch as soon as the event is appended, so a follow-up `POST /v1/device/config/thread` can 404 on
+a thread that certainly exists. It needs no new T3 transport: `thread.create` is a member of
+`ClientOrchestrationCommand`, the payload schema of the ordinary `POST /api/orchestration/dispatch`
+(contract citations live on `buildT3ThreadCreateCommand()` in `src/t3Client.mjs`). It is gated by a
+real capability, `thread_create` — `read-only` browses, it does not create.
+
+**The name is the hard part, and `src/threadNaming.mjs` owns it.** A device has no keyboard, so
+`title` is optional and the gateway mints `"<D Mon HH:MM> · <device label>"` when it is absent —
+time first, unlike a media name, because every thread one controller makes carries that same
+label. Uniqueness is enforced against the snapshot *and* against titles minted in the last ten
+minutes, since the projection the snapshot reads lags the dispatch. The minted name is permanent:
+T3's `canReplaceThreadTitle` only regenerates a title that is still its own default `"New thread"`
+or exactly equal to a `titleSeed`, and the device dispatch sends neither — which is the right trade,
+because a picker of identical `New thread` rows is the dead end this endpoint removes.
+
 **Every ESP32-S3 board is BLE-only** — no Bluetooth Classic, so no HFP headset microphone, and no LE Audio.
 Bluetooth earbuds cannot be a microphone source on any current or planned board. On-board mics or a phone
 companion are the two real paths.

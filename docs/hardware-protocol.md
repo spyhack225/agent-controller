@@ -1031,6 +1031,86 @@ OK on a visible row calls the POST endpoint and updates the active marker only a
 failed or empty fetch, OK retries the list request instead of becoming a no-op. A
 protocol-v1 `thread` control retains its direct next-thread cycling fallback.
 
+### Creating a thread
+
+Listing and selecting are not enough. A project with no threads leaves a controller with
+nothing to point at, and the only way out used to be the web console — which is the one
+place the owner is not standing when they pick the device up.
+
+```http
+POST /v1/device/threads
+x-device-id: dev_...
+x-device-secret: ...
+content-type: application/json
+```
+
+```json
+{}
+```
+
+```json
+{
+  "environmentId": "env_bound",
+  "projectId": "proj_empty",
+  "threadId": "thread_9f0c...",
+  "thread": {
+    "id": "thread_9f0c...",
+    "title": "24 Aug 19:32 · Hosyond Touch screen",
+    "status": "idle",
+    "selected": true
+  },
+  "config": {
+    "environmentId": "env_bound",
+    "projectId": "proj_empty",
+    "threadId": "thread_9f0c..."
+  },
+  "command": { "id": "cmd_...", "status": "completed" }
+}
+```
+
+**What the firmware sends.** An empty body is a complete request. The only field read is an
+optional `title`; the device names neither the project, nor the environment, nor the owner —
+the thread is always created in `device.config.projectId` inside `device.config.environmentId`,
+and every id in the response is one the gateway chose.
+
+**What the firmware gets back.** `201`, with `thread` shaped exactly like a row from
+`GET /v1/device/threads` — splice it into the list already on screen rather than re-fetching.
+`config` is the device's updated config: **the create also selects**. That is deliberate. The
+device asked for a thread because it had none, and the alternative — a follow-up
+`POST /v1/device/config/thread` — validates against the live snapshot, while T3 answers a dispatch
+as soon as the event is appended and its projection catches up afterwards. That follow-up call can
+therefore `404` on a thread that certainly exists. Binding here removes a race the firmware has no
+way to resolve.
+
+**The title.** A keyboard-less board is not expected to supply one, so it is optional:
+
+| Source | Result |
+|---|---|
+| `title` in the body | trimmed, whitespace-collapsed, capped at 72 characters |
+| omitted, blank, or not a string | `"<D Mon HH:MM> · <device label>"`, e.g. `24 Aug 19:32 · Hosyond Touch screen`; an unlabelled unit becomes `Controller <short id>` |
+
+Either way the gateway makes the name unique — against the environment's snapshot titles *and*
+against titles it minted in the last ten minutes — by appending ` (2)`, ` (3)` … A firmware that
+later has words to offer (a voice transcript, say) should send them: T3 only auto-retitles a thread
+whose title is its own default `"New thread"`, so whatever name this call produces is the name the
+thread keeps.
+
+**Errors.**
+
+| Status | Meaning | What the screen should say |
+|---|---|---|
+| `403` | The device profile does not grant `thread_create` (a `read-only` device), or a user role, environment, network or time-window rule refused it. `details.policy` names the dimension and rule. | "Not allowed on this device" |
+| `404` | The bound project is gone from the environment. | Re-open the project picker |
+| `409` | No environment bound, no project bound, or no usable provider model (`details.code: "no_model_selection"`) | "Pick a folder first" / "No model configured" |
+| `502` | `details.code: "t3_unreachable"` — snapshot read or dispatch failed | "Start T3 Code", offer Retry |
+
+A refused create changes nothing: the thread the device was already on stays selected.
+
+**What the device does not choose.** The model. `thread.create` requires a `modelSelection`, and
+the gateway supplies it from the project's own `defaultModelSelection`, falling back to a
+harness derived from the environment's snapshot. A bezel has no business picking a model, and
+`409 no_model_selection` is the honest answer when neither source has one.
+
 ### Selected-thread response pages
 
 ```http

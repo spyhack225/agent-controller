@@ -23,6 +23,7 @@ import {
   sendError,
   sendJson,
 } from "./http.mjs";
+import { createId } from "./ids.mjs";
 import { normalizeIntent } from "./intent.mjs";
 import {
   buildDeviceFollowUpInstruction,
@@ -55,6 +56,7 @@ import {
   rememberSnapshotThreadTitles,
   threadTitlesAreStale,
 } from "./mediaNaming.mjs";
+import { mintDeviceThreadTitle, normalizeTitle } from "./threadNaming.mjs";
 import { deviceJobStatus, mediaJobEvent, voiceAutoSendEnabled } from "./deviceAudio.mjs";
 import {
   createTranscriptionProvider,
@@ -113,6 +115,7 @@ import {
 import {
   buildT3Command,
   buildT3ProjectLaunchCommands,
+  buildT3ThreadCreateCommand,
   compressSnapshot,
   dispatchT3Command,
   exchangePairingToken,
@@ -2248,6 +2251,157 @@ export function createApp({
         });
       }
 
+      // Creating a thread inside the bound project, from hardware that has no keyboard.
+      //
+      // Listing and selecting were never enough. A project with no threads left the controller
+      // with nothing to point at and no way out except the web console, which is the one place
+      // the owner is not standing when they pick the device up.
+      //
+      // T3 needs no new transport for this: `thread.create` is a member of
+      // `ClientOrchestrationCommand`, the payload schema of the same
+      // `POST /api/orchestration/dispatch` the gateway already speaks — see the contract citations
+      // on `buildT3ThreadCreateCommand()` in `src/t3Client.mjs`.
+      if (req.method === "POST" && url.pathname === "/v1/device/threads") {
+        const device = await authenticateDevice(req, store, url, config);
+        await enforceDeviceWrite(req, res, rateLimiter, config, device);
+        requireClaimedDevice(device);
+        const body = await readJson(req);
+        const requestedTitle = normalizeTitle(body.title);
+        const environment = await boundDeviceEnvironment(store, device);
+        // A thread has to be created *somewhere*. Unlike thread selection, which can fall back to
+        // the whole environment, there is no defensible default folder to invent — so the same 409
+        // the project routes answer with, rather than a guess.
+        const projectId = optionalString(device.config?.projectId);
+        if (!projectId) throw new HttpError(409, "Device has no project selected.");
+
+        // Creating a thread writes to the owner's T3 environment, so it is gated like a dispatch
+        // rather than like a selection: `read-only` hardware browses, it does not create. Running
+        // the full engine rather than a lone capability check means a viewer role, a blocked
+        // network and a read-only environment all keep meaning what they mean everywhere else.
+        const policy = evaluateIntentPolicy({
+          device: { profile: await resolveActorProfile(store, device.userId, device.profile) },
+          intent: { type: "thread_create" },
+          environment,
+          networkLocation: classifyNetworkLocation(req, config),
+          ...(config.policyAllowedHours ? { allowedHours: config.policyAllowedHours } : {}),
+        });
+        if (!policy.allowed) {
+          // Deliberately refused rather than parked for approval. A thread that exists only once
+          // an owner walks to a browser is a thread the device still cannot select, which is the
+          // dead end this route was added to remove — so a policy that will not allow the create
+          // says so now, with its reason, instead of leaving the hardware waiting on nothing.
+          throw new HttpError(403, "Thread creation blocked by policy.", {
+            policy: policyResult(policy),
+            ...(policy.requiresApproval ? { requiresApproval: true } : {}),
+          });
+        }
+
+        const snapshot = await fetchDeviceSnapshot(environment);
+        const project = (Array.isArray(snapshot?.projects) ? snapshot.projects : [])
+          .find((candidate) => optionalString(candidate?.id) === projectId);
+        // Validated against the live snapshot for the same reason selection is: the bound project
+        // id is stored state, and a folder deleted in T3 since must not become a create target.
+        if (!project) throw new HttpError(404, "Project not found in the bound environment.");
+
+        // `thread.create` requires a model selection, and a bezel has no business choosing one.
+        // The project's own default is the owner's answer to that question; snapshot-derived
+        // harnesses are the fallback for a project that never set one. Deliberately no live
+        // catalogue read — `resolveEnvironmentHarnesses()` opens a WebSocket with an eight-second
+        // timeout, which is not something to put in front of a battery-powered controller when the
+        // snapshot already in hand answers the question in the overwhelming majority of cases.
+        const modelSelection = normalizeT3ModelSelection(project.defaultModelSelection)
+          ?? resolveModelSelection({ harnesses: extractHarnesses(snapshot) });
+        if (!modelSelection) {
+          throw new HttpError(409, "T3 did not report an available provider model.", {
+            code: "no_model_selection",
+            environmentId: environment.id,
+            projectId,
+          });
+        }
+
+        const threadId = createId("thread");
+        const title = mintDeviceThreadTitle({
+          environmentId: environment.id,
+          device,
+          snapshot,
+          requestedTitle,
+          threadId,
+        });
+        const createThread = buildT3ThreadCreateCommand({
+          project,
+          title,
+          modelSelection,
+          threadId,
+        });
+        const intent = { type: "thread_create", projectId, title, ...(requestedTitle ? { titleSource: "device" } : { titleSource: "gateway" }) };
+        const startedAt = Date.now();
+        const dispatchStartedAt = Date.now();
+        let result;
+        try {
+          result = await dispatchT3Command(environment, createThread);
+        } catch (error) {
+          const command = await store.createCommand({
+            userId: device.userId,
+            deviceId: device.id,
+            environmentId: environment.id,
+            threadId,
+            intent,
+            normalized: storableT3Command(createThread),
+            status: "failed",
+            risk: policy.risk,
+            result: t3FailureResult(error),
+            metrics: commandMetrics({ startedAt, dispatchStartedAt, failure: true }),
+          });
+          // The same error contract every other device route that reaches T3 answers with, so the
+          // firmware branches on one code rather than four.
+          throw new HttpError(502, "T3 environment is unavailable.", {
+            code: "t3_unreachable",
+            environmentId: environment.id,
+            cause: errorMessage(error),
+            command,
+          });
+        }
+
+        // Creating and not selecting would be half the job: the device asked for a thread because
+        // it had none, and the only other way to bind one is POST /v1/device/config/thread, which
+        // validates against the live snapshot — and T3's dispatch returns as soon as the event is
+        // appended, before the projection the snapshot reads from has caught up. That follow-up
+        // call can therefore 404 on a thread that certainly exists. Binding here sidesteps a race
+        // the firmware has no way to resolve, and matches what the console's project launch does.
+        const updated = await store.updateDeviceConfig({
+          userId: device.userId,
+          deviceId: device.id,
+          config: { threadId },
+          actorType: "device",
+          actorId: device.id,
+        });
+        if (!updated) throw new HttpError(404, "Device not found.");
+
+        const command = await store.createCommand({
+          userId: device.userId,
+          deviceId: device.id,
+          environmentId: environment.id,
+          threadId,
+          intent,
+          normalized: storableT3Command(createThread),
+          status: "completed",
+          risk: policy.risk,
+          result: result ?? { accepted: true },
+          metrics: commandMetrics({ startedAt, dispatchStartedAt, completed: true }),
+        });
+
+        return sendJson(res, 201, {
+          environmentId: environment.id,
+          projectId,
+          threadId,
+          // Shaped exactly like a row from GET /v1/device/threads so the firmware can splice it
+          // into the list it already renders instead of re-fetching to learn what it just made.
+          thread: { id: threadId, title, status: "idle", selected: true },
+          config: updated.config,
+          command,
+        });
+      }
+
       // The environments the owner holds. Unlike every other device route that reaches T3
       // this one answers with no environment bound — a device that has none is exactly the
       // device that needs the list, so a 409 here would be a locked door with the key inside.
@@ -4357,7 +4511,9 @@ function redactIntent(intent) {
   if (!intent || typeof intent !== "object") return intent;
   const output = {};
   for (const [key, value] of Object.entries(intent)) {
-    if (["text", "command", "transcript", "description", "prompt"].includes(key) && typeof value === "string") {
+    // `title` is here because a thread_create intent may carry one the firmware supplied, which is
+    // the owner's words exactly as much as a prompt is.
+    if (["text", "command", "transcript", "description", "prompt", "title"].includes(key) && typeof value === "string") {
       output[key] = redactText(value);
     } else {
       output[key] = redactSupportValue(value);
@@ -4371,6 +4527,12 @@ function redactT3Command(command) {
   const output = redactSupportValue(command);
   if (output?.message?.text && typeof output.message.text === "string") {
     output.message.text = redactText(output.message.text);
+  }
+  // A thread title is user content on a `thread.create`, and on the nested one a project launch
+  // stores. Handled here rather than in redactSupportValue() so the generic walker keeps leaving
+  // titles alone everywhere else it is used.
+  for (const nested of [output, output?.createThread]) {
+    if (typeof nested?.title === "string") nested.title = redactText(nested.title);
   }
   return output;
 }
