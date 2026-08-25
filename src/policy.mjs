@@ -28,6 +28,7 @@
  */
 
 import { DEVICE_CAPABILITIES, capabilitiesForProfile, resolveDeviceProfile } from "./profiles.mjs";
+import { isPersistentProviderApprovalDecision } from "./providerApprovals.mjs";
 
 /** Policy dimension identifiers, in evaluation order. */
 export const POLICY_DIMENSIONS = Object.freeze({
@@ -257,9 +258,22 @@ const BASELINE_RULES = Object.freeze([
     matches: (intent) => intent.type === "shell_input",
   },
   {
-    id: "baseline.approval-approve",
+    // Granting a provider a permission that outlives the question is a higher-risk act than
+    // answering the question. Under any `maxAutoRisk` ceiling of medium or below — the free tier,
+    // an untrusted network, a time window that is closing — it escalates to an owner confirmation
+    // instead of dispatching, which is the point: a standing grant is the one approval decision
+    // that should be hard to make by accident.
+    id: "baseline.approval-accept-for-session",
+    risk: "high",
+    matches: (intent) => intent.type === "approval_response"
+      && isPersistentProviderApprovalDecision(intent.decision),
+  },
+  {
+    // Allowing one request. Declining and cancelling fall through to `baseline.default` (low):
+    // refusing an agent is never the risky direction.
+    id: "baseline.approval-accept",
     risk: "medium",
-    matches: (intent) => intent.type === "approval_response" && intent.decision === "approve",
+    matches: (intent) => intent.type === "approval_response" && intent.decision === "accept",
   },
   { id: "baseline.default", risk: "low", matches: () => true },
 ]);
@@ -310,6 +324,7 @@ export const USER_ROLE_RULES = Object.freeze({
       "shell_input",
       "session_control",
       "approval_response",
+      "approval_response_persistent",
       "thread_create",
     ],
     approval: [],
@@ -860,8 +875,13 @@ export function capabilityForIntent(intent) {
       return "shell_input";
     case "terminal_input":
       return "terminal_input";
+    // Two capabilities, one intent type. `acceptForSession` is T3's allow-always: it leaves a
+    // standing permission rule behind rather than answering one question, so it is gated
+    // separately and the built-in hardware profile does not carry it. See src/profiles.mjs.
     case "approval_response":
-      return "approval_response";
+      return isPersistentProviderApprovalDecision(intent.decision)
+        ? "approval_response_persistent"
+        : "approval_response";
     case "session_control":
       return "session_control";
     // Not a dispatchable intent — `normalizeIntent()` rejects it, so a device cannot post it to

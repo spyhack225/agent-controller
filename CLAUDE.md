@@ -167,6 +167,44 @@ The poller was deliberately left polling: it also serves environment health, the
 screen and thread titles, none of which a thread subscription covers. It is now the backstop for
 threads nobody is watching rather than a second opinion on the ones that are.
 
+### Two kinds of approval
+
+They are different questions and the code keeps them apart everywhere.
+
+A **gateway approval** is `evaluateIntentPolicy()` refusing to dispatch something the owner asked
+for. It is a `command` row with status `approval_required`, answered at
+`POST /v1/commands/:id/approve|reject`. Nothing has left the gateway.
+
+A **provider approval** is T3 stopping mid-turn because the agent wants permission. It lives in T3
+as a live provider callback, expires with the session, and the gateway neither owns nor can extend
+it. `src/providerApprovals.mjs` carries the contract with file:line citations into T3 0.0.32's own
+sources; the three facts that matter:
+
+- **The decision set is four, not two** — `accept` | `acceptForSession` | `decline` | `cancel`
+  (`ProviderApprovalDecision`). `acceptForSession` is "allow always": the Claude adapter returns
+  `updatedPermissions`, so it writes a rule rather than answering a question. `buildT3Command()`
+  used to fold everything to accept/decline, which made two of the four unreachable.
+- **Pending approvals are NOT in the orchestration snapshot** (thread bodies empty). They are
+  derived from `threads[].activities[]` — `approval.requested` opens, `approval.resolved` closes,
+  and `provider.approval.respond.failed` closes it **only** when the detail marks the request
+  stale/unknown. That last clause is T3's own rule (`hasOpenBlockingRequest` in its decider) and
+  omitting it leaves a card on screen for a request nothing is waiting on.
+- **T3 accepts a response to a dead request and fails later, asynchronously.** So the gateway
+  verifies the approval is still open before it dispatches, rather than discovering the problem as
+  an error activity nobody reads.
+
+`answerProviderApproval()` in `app.mjs` claims the request id in the store *before* dispatching
+(`claimProviderApprovalDecision`, all three store backends). Same decision twice is a 200 duplicate
+with one dispatch; a different decision is a 409, because the first answer has already left. A
+failed dispatch releases the claim — otherwise one second of T3 downtime would lock the approval
+out of reach for the rest of the session.
+
+Policy: `approval_response_persistent` is its own capability, held by `power-controller` (the
+console) and not by `agent-controller`. A standing grant made from a 240x320 panel, where the
+request detail is clipped, is not the same act as making it in the console. Under a `maxAutoRisk`
+ceiling of medium or lower it escalates to a gateway confirmation instead of dispatching.
+`read-only` **sees** pending approvals — listing is a read — and is offered no decision at all.
+
 ### Terminal input (Phase 9 stage 3)
 
 `terminal_input` is a capability **no built-in profile grants** — it needs a custom profile *and* an

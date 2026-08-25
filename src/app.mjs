@@ -87,6 +87,7 @@ import { classifyNetworkLocation } from "./networkTrust.mjs";
 import { buildOnboardingReadiness, normalizeOnboarding } from "./onboarding.mjs";
 import { evaluateIntentPolicy } from "./policy.mjs";
 import {
+  capabilitiesForProfile,
   isKnownDeviceProfile,
   listDeviceProfiles,
   normalizeDeviceProfile,
@@ -126,6 +127,13 @@ import {
   isEnvironmentTokenExpired,
 } from "./t3Client.mjs";
 import { refineThreadStatus } from "./agentVerb.mjs";
+import {
+  PROVIDER_APPROVAL_DECISION_CATALOGUE,
+  allowedProviderApprovalDecisions,
+  collectProviderApprovals,
+  deviceProviderApprovalView,
+  normalizeProviderApprovalDecision,
+} from "./providerApprovals.mjs";
 import {
   buildT3ReleaseStatus,
   fetchLatestT3Release,
@@ -1293,6 +1301,60 @@ export function createApp({
           threadId: decodeURIComponent(threadWatchMatch[2]),
         });
         return sendJson(res, 200, { released });
+      }
+
+      // Provider approvals on one thread. A read: it fetches T3's work log and this gateway's own
+      // decision rows, and writes nothing. Kept off /v1/commands entirely — a gateway policy hold
+      // and a provider request are different questions with different consequences, and the one
+      // place they appear together (the device poll) keeps them under separate keys.
+      const providerApprovalsMatch = url.pathname.match(/^\/v1\/t3\/environments\/([^/]+)\/threads\/([^/]+)\/approvals$/u);
+      if (req.method === "GET" && providerApprovalsMatch) {
+        const user = await authenticateUser(req, store, config, null, clerkAuth);
+        await enforceUserRead(req, res, rateLimiter, config, user);
+        const environment = await store.getEnvironmentForUser(user.id, providerApprovalsMatch[1]);
+        if (!environment) throw new HttpError(404, "Environment not found.");
+        assertEnvironmentTokenActive(environment);
+        const threadId = decodeURIComponent(providerApprovalsMatch[2]);
+        const approvals = await readProviderApprovals({ store, userId: user.id, environment, threadId });
+        return sendJson(res, 200, {
+          environmentId: environment.id,
+          threadId,
+          approvals,
+          // The console must offer what T3 actually accepts, not a binary reduction of it, and it
+          // must not offer a button the acting profile would be refused for.
+          decisions: PROVIDER_APPROVAL_DECISION_CATALOGUE,
+          allowedDecisions: allowedProviderApprovalDecisions(
+            capabilitiesForProfile(await resolveActorProfile(store, user.id, "power-controller")),
+          ),
+        });
+      }
+
+      const providerApprovalAnswerMatch = url.pathname.match(/^\/v1\/t3\/environments\/([^/]+)\/threads\/([^/]+)\/approvals\/([^/]+)$/u);
+      if (req.method === "POST" && providerApprovalAnswerMatch) {
+        const user = await authenticateUser(req, store, config, null, clerkAuth);
+        await enforceUserWrite(req, res, rateLimiter, config, user);
+        const environment = await store.getEnvironmentForUser(user.id, providerApprovalAnswerMatch[1]);
+        if (!environment) throw new HttpError(404, "Environment not found.");
+        const body = await readJson(req);
+        const output = await answerProviderApproval({
+          store,
+          events,
+          environment,
+          threadId: decodeURIComponent(providerApprovalAnswerMatch[2]),
+          requestId: decodeURIComponent(providerApprovalAnswerMatch[3]),
+          decision: requireString(body.decision, "decision"),
+          actor: { type: "user", id: user.id, userId: user.id, profile: "power-controller" },
+          config,
+          baseUrl: requestBaseUrl(req),
+          policyContext: {
+            user,
+            networkLocation: classifyNetworkLocation(req, config),
+            ...(config.billingEnforced
+              ? { subscriptionTier: effectiveTier(await store.getUserSubscription?.(user.id)) }
+              : {}),
+          },
+        });
+        return sendJson(res, output.duplicate ? 200 : 202, output);
       }
 
       const environmentThreadsMatch = url.pathname.match(/^\/v1\/t3\/environments\/([^/]+)\/threads$/u);
@@ -2781,14 +2843,66 @@ export function createApp({
         return events.connect({ userId: device.userId, res });
       }
 
+      // Both kinds of approval a controller can be blocked by, under two separate keys.
+      //
+      // `commands` is what this route has always returned: GATEWAY holds, answered at
+      // /v1/device/approvals/:commandId/approve|reject. Firmware in the field reads exactly that
+      // key and keeps working unchanged.
+      //
+      // `providerApprovals` is new and is a different question — T3 stopped mid-turn and the agent
+      // is waiting — answered at /v1/device/provider-approvals/:requestId with T3's own decision
+      // vocabulary. Merging the two into one list would put "you tried to run rm -rf" and "Claude
+      // wants to edit main.mjs" behind the same two buttons, and they are not the same two buttons.
+      //
+      // Reading T3 is best-effort by construction: the gateway holds the gateway approvals itself,
+      // and a controller must still be able to see and answer those when the T3 host is asleep.
       if (req.method === "GET" && url.pathname === "/v1/device/approvals") {
         const device = await authenticateDevice(req, store, url, config);
         await enforceDeviceRead(req, res, rateLimiter, config, device);
         requireClaimedDevice(device);
         const commands = await store.listCommands(device.userId);
+        const capabilities = capabilitiesForProfile(
+          await resolveActorProfile(store, device.userId, device.profile),
+        );
+        const provider = await readDeviceProviderApprovals({ store, device });
         return sendJson(res, 200, {
-          commands: commands.filter((command) => command.status === "approval_required"),
+          commands: commands
+            .filter((command) => command.status === "approval_required")
+            .map((command) => ({ ...command, kind: "gateway" })),
+          providerApprovals: provider.approvals,
+          // A read-only controller sees what is waiting and is offered nothing to press. Hiding
+          // the request would be worse: the owner walking past the device would have no idea the
+          // agent was blocked.
+          allowedDecisions: allowedProviderApprovalDecisions(capabilities),
+          ...(provider.error ? { providerApprovalsError: provider.error } : {}),
         });
+      }
+
+      // Answering a T3 provider approval from hardware. Separate route from the gateway-approval
+      // pair above on purpose: different id space (T3's requestId, not a gateway command id) and
+      // a different, four-valued decision vocabulary.
+      const deviceProviderApprovalMatch = url.pathname.match(/^\/v1\/device\/provider-approvals\/([^/]+)$/u);
+      if (req.method === "POST" && deviceProviderApprovalMatch) {
+        const device = await authenticateDevice(req, store, null, config);
+        await enforceDeviceWrite(req, res, rateLimiter, config, device);
+        requireClaimedDevice(device);
+        const body = await readJson(req);
+        const environment = await boundDeviceEnvironment(store, device);
+        const threadId = optionalString(body.threadId) ?? optionalString(device.config?.threadId);
+        if (!threadId) throw new HttpError(409, "Device has no thread selected.");
+        const output = await answerProviderApproval({
+          store,
+          events,
+          environment,
+          threadId,
+          requestId: decodeURIComponent(deviceProviderApprovalMatch[1]),
+          decision: requireString(body.decision, "decision"),
+          actor: { type: "device", id: device.id, userId: device.userId, profile: device.profile },
+          config,
+          baseUrl: requestBaseUrl(req),
+          policyContext: { networkLocation: classifyNetworkLocation(req, config) },
+        });
+        return sendJson(res, output.duplicate ? 200 : 202, output);
       }
 
       const deviceApprovalMatch = url.pathname.match(/^\/v1\/device\/approvals\/([^/]+)\/(approve|reject)$/u);
@@ -3820,6 +3934,226 @@ function toPublicProfile(profile) {
  * Resolves a device's profile reference for policy evaluation. A custom profile must be looked up
  * per user and handed to the engine as an object, or it would silently fall back to read-only.
  */
+// ---------------------------------------------------------------------------------------------
+// Provider approvals — the questions T3 asks, as opposed to the ones the gateway asks.
+//
+// The two never merge. A gateway approval is a `command` row this gateway is holding; a provider
+// approval is a live callback inside T3 that the gateway does not own and cannot extend. They are
+// surfaced under different keys, answered on different routes, and every record carries an
+// explicit `kind` so a client cannot confuse them even by accident.
+//
+// See src/providerApprovals.mjs for the T3 contract and its file:line evidence.
+// ---------------------------------------------------------------------------------------------
+
+/**
+ * Every provider approval on a thread, with this gateway's own decision record folded in.
+ *
+ * Read from `GET /api/orchestration/threads/:threadId` — NOT from the orchestration snapshot,
+ * which serves thread bodies empty and therefore has no activities to derive an approval from.
+ * Deliberately unwindowed: `turnLimit` would bound the read to the newest turn, and being wrong
+ * about whether something is still waiting for the owner is worse than one larger response.
+ */
+async function readProviderApprovals({ store, userId, environment, threadId }) {
+  const [thread, decisions] = await Promise.all([
+    fetchT3ThreadDetail(environment, threadId),
+    store.listProviderApprovalDecisions({ userId, environmentId: environment.id, threadId }),
+  ]);
+  const byRequestId = new Map((decisions ?? []).map((row) => [row.requestId, row]));
+  return collectProviderApprovals(thread, { threadId }).map((approval) => ({
+    ...approval,
+    environmentId: environment.id,
+    // What THIS gateway did about it, which is not the same as what T3 reports: a decision can be
+    // held here awaiting a gateway confirmation and not have reached the provider at all.
+    localDecision: publicProviderApprovalDecision(byRequestId.get(approval.requestId) ?? null),
+  }));
+}
+
+/**
+ * The provider approvals waiting on the controller's own bound thread, clipped for a small screen.
+ *
+ * Never throws. A device that cannot reach T3 must still be able to see and answer the GATEWAY
+ * approvals the same response carries — those are held here and have nothing to do with T3's
+ * reachability — so a failure is reported alongside them rather than instead of them.
+ */
+async function readDeviceProviderApprovals({ store, device }) {
+  const threadId = optionalString(device.config?.threadId);
+  if (!threadId) return { approvals: [], error: null };
+  try {
+    const environment = await boundDeviceEnvironment(store, device);
+    assertEnvironmentTokenActive(environment);
+    const approvals = await readProviderApprovals({
+      store,
+      userId: device.userId,
+      environment,
+      threadId,
+    });
+    return {
+      approvals: approvals
+        .filter((approval) => approval.status === "pending" && !approval.localDecision)
+        .map((approval) => deviceProviderApprovalView(approval)),
+      error: null,
+    };
+  } catch (error) {
+    return { approvals: [], error: errorMessage(error) };
+  }
+}
+
+function publicProviderApprovalDecision(record) {
+  if (!record) return null;
+  return {
+    requestId: record.requestId,
+    decision: record.decision,
+    status: record.status,
+    actorType: record.actorType,
+    commandId: record.commandId ?? null,
+    error: record.error ?? null,
+    decidedAt: record.createdAt,
+    updatedAt: record.updatedAt,
+  };
+}
+
+/**
+ * Answer one provider approval, exactly once.
+ *
+ * Ordering is the whole design:
+ *
+ *   1. CANONICALIZE the decision, so `approve` from old firmware and `accept` from the console
+ *      claim the same thing and cannot be recorded as two different answers.
+ *   2. VERIFY IT IS STILL OPEN against T3's own work log, before anything is written. This is what
+ *      catches an approval T3 has already resolved, abandoned as stale, or lost with its turn —
+ *      T3 itself would accept the dispatch and only fail later, asynchronously, as an error
+ *      activity nobody is reading.
+ *   3. CLAIM it in the store. First caller wins; a second caller asking the SAME thing is told it
+ *      is a duplicate (200, no second dispatch), and one asking for a DIFFERENT thing is refused
+ *      (409), because the first answer has already left for the provider.
+ *   4. DISPATCH through the ordinary `submitIntent()` path, so the policy engine, the command
+ *      record, the command-event timeline and the SSE broadcast all behave as they do for every
+ *      other write. Answering an approval is a dispatch; it does not get its own private path.
+ *   5. RELEASE the claim if that failed, so a refused or unreachable dispatch does not lock the
+ *      approval out of reach for the rest of the session.
+ */
+async function answerProviderApproval({
+  store,
+  events,
+  environment,
+  threadId,
+  requestId,
+  decision: requestedDecision,
+  actor,
+  config,
+  baseUrl = null,
+  policyContext = {},
+}) {
+  const decision = normalizeProviderApprovalDecision(requestedDecision);
+  if (!decision) {
+    throw new HttpError(
+      400,
+      `decision must be one of ${PROVIDER_APPROVAL_DECISION_CATALOGUE.map((entry) => entry.decision).join(", ")}.`,
+    );
+  }
+  assertEnvironmentTokenActive(environment);
+
+  const approvals = await readProviderApprovals({
+    store,
+    userId: actor.userId,
+    environment,
+    threadId,
+  });
+  const approval = approvals.find((candidate) => candidate.requestId === requestId) ?? null;
+  if (!approval) {
+    throw new HttpError(404, "This thread has no record of that approval request.", { requestId });
+  }
+  if (approval.status === "resolved") {
+    throw new HttpError(409, "T3 has already resolved this approval request.", { approval });
+  }
+  if (approval.status === "stale") {
+    // T3's own wording for this is "Provider callback state does not survive app restarts or
+    // recovered sessions. Restart the turn to continue." Nothing the gateway sends can revive it.
+    throw new HttpError(409, "T3 abandoned this approval request; it can no longer be answered.", {
+      approval,
+    });
+  }
+
+  const claim = await store.claimProviderApprovalDecision({
+    userId: actor.userId,
+    environmentId: environment.id,
+    threadId,
+    requestId,
+    decision,
+    actorType: actor.type,
+    actorId: actor.type === "device" ? actor.id : null,
+  });
+  if (!claim.claimed) {
+    if (claim.conflict) {
+      throw new HttpError(409, "This approval was already answered with a different decision.", {
+        approval,
+        decision: publicProviderApprovalDecision(claim.decision),
+      });
+    }
+    return {
+      approval,
+      duplicate: true,
+      decision: publicProviderApprovalDecision(claim.decision),
+      command: claim.decision.commandId
+        ? await store.getCommandForUser(actor.userId, claim.decision.commandId)
+        : null,
+    };
+  }
+
+  let output;
+  try {
+    output = await submitIntent({
+      store,
+      environment,
+      body: { threadId, intent: { type: "approval_response", requestId, decision } },
+      actor,
+      config,
+      baseUrl,
+      policyContext,
+    });
+  } catch (error) {
+    await store.updateProviderApprovalDecision({
+      userId: actor.userId,
+      environmentId: environment.id,
+      threadId,
+      requestId,
+      status: "failed",
+      error: errorMessage(error),
+    });
+    throw error;
+  }
+
+  // `dispatched` means it reached T3. `approval_required` means the gateway's own policy escalated
+  // it — a controller that asked for a standing grant from an untrusted network, say — and the
+  // decision is held here until the owner confirms the command. Either way the claim stands: the
+  // decision has been made, and a second client must not be able to make a different one.
+  const record = await store.updateProviderApprovalDecision({
+    userId: actor.userId,
+    environmentId: environment.id,
+    threadId,
+    requestId,
+    status: output.command?.status === "dispatched" ? "dispatched" : "held",
+    commandId: output.command?.id ?? null,
+  });
+
+  events?.broadcastToUser?.(actor.userId, "t3.approval.decided", {
+    environmentId: environment.id,
+    threadId,
+    requestId,
+    decision,
+    status: record?.status ?? "dispatched",
+    commandId: output.command?.id ?? null,
+    observedAt: new Date().toISOString(),
+  });
+
+  return {
+    approval: { ...approval, localDecision: publicProviderApprovalDecision(record) },
+    duplicate: false,
+    decision: publicProviderApprovalDecision(record),
+    command: output.command ?? null,
+  };
+}
+
 async function resolveActorProfile(store, userId, profileId) {
   if (typeof profileId !== "string" || isKnownDeviceProfile(profileId)) return profileId;
   const custom = await store.getUserDeviceProfile?.(userId, profileId);

@@ -92,6 +92,11 @@ export function createStore(seed = {}, options = {}) {
     (seed.deviceProfiles ?? []).map((profile) => [`${profile.userId}:${profile.profileId}`, profile]),
   );
   const commands = new Map((seed.commands ?? []).map((command) => [command.id, command]));
+  // Keyed by user + environment + thread + T3 request id: the request id is the provider's, and
+  // scoping it to the owner is what stops one account's answer from resolving another's.
+  const providerApprovalDecisions = new Map(
+    (seed.providerApprovalDecisions ?? []).map((decision) => [providerApprovalKey(decision), decision]),
+  );
   const commandEvents = new Map((seed.commandEvents ?? []).map((event) => [event.id, event]));
   const auditLogs = [...(seed.auditLogs ?? [])];
   const listeners = new Set();
@@ -123,6 +128,7 @@ export function createStore(seed = {}, options = {}) {
       macroRuns: [...macroRuns.values()],
       deviceProfiles: [...deviceProfiles.values()],
       commands: [...commands.values()],
+      providerApprovalDecisions: [...providerApprovalDecisions.values()],
       commandEvents: [...commandEvents.values()],
       auditLogs,
     };
@@ -1904,6 +1910,93 @@ export function createStore(seed = {}, options = {}) {
     return command;
   }
 
+  // -------------------------------------------------------------------------------------------
+  // Provider approval decisions (src/providerApprovals.mjs)
+  //
+  // A pending provider approval lives in T3, not here. What lives here is the record that THIS
+  // gateway answered it, and that record exists for exactly one reason: a decision cannot be
+  // taken twice. Two console tabs, a console and a controller, or one impatient double-tap all
+  // race for the same live provider callback, and T3 has no idempotency key of its own — a second
+  // dispatch either resolves a request the first already answered or fails asynchronously with a
+  // stale-request activity nobody asked for.
+  //
+  // So the claim is the primitive, not the write. `claimProviderApprovalDecision` is a
+  // check-and-set: the first caller gets `claimed: true` and owns the dispatch; everyone after
+  // gets the existing record and, when they asked for a DIFFERENT decision, `conflict: true` —
+  // because the first answer has already reached the provider and cannot be taken back.
+  //
+  // A record whose dispatch failed is re-claimable. Otherwise a T3 outage of one second would
+  // lock an approval out of reach permanently, and the owner's only recourse would be to restart
+  // the turn.
+  function claimProviderApprovalDecision({
+    userId,
+    environmentId,
+    threadId,
+    requestId,
+    decision,
+    actorType = "user",
+    actorId = null,
+  }) {
+    const key = providerApprovalKey({ userId, environmentId, threadId, requestId });
+    const existing = providerApprovalDecisions.get(key);
+    if (existing && existing.status !== "failed") {
+      return { claimed: false, conflict: existing.decision !== decision, decision: existing };
+    }
+    const record = {
+      id: existing?.id ?? createId("papproval"),
+      userId,
+      environmentId,
+      threadId,
+      requestId,
+      decision,
+      status: "claimed",
+      actorType,
+      actorId: actorId ?? null,
+      commandId: null,
+      error: null,
+      createdAt: existing?.createdAt ?? nowIso(),
+      updatedAt: nowIso(),
+    };
+    providerApprovalDecisions.set(key, record);
+    audit({
+      userId,
+      actorType,
+      actorId,
+      action: "provider_approval.claimed",
+      targetId: requestId,
+      metadata: { environmentId, threadId, decision },
+    });
+    notifyChanged();
+    return { claimed: true, conflict: false, decision: record };
+  }
+
+  function updateProviderApprovalDecision({
+    userId,
+    environmentId,
+    threadId,
+    requestId,
+    status,
+    commandId,
+    error,
+  }) {
+    const key = providerApprovalKey({ userId, environmentId, threadId, requestId });
+    const record = providerApprovalDecisions.get(key);
+    if (!record) return null;
+    if (status !== undefined) record.status = status;
+    if (commandId !== undefined) record.commandId = commandId;
+    if (error !== undefined) record.error = error;
+    record.updatedAt = nowIso();
+    notifyChanged();
+    return record;
+  }
+
+  function listProviderApprovalDecisions({ userId, environmentId = null, threadId = null }) {
+    return [...providerApprovalDecisions.values()].filter((record) =>
+      record.userId === userId
+      && (!environmentId || record.environmentId === environmentId)
+      && (!threadId || record.threadId === threadId));
+  }
+
   function claimCommandApproval({ userId, commandId, leaseMs = 30_000 }) {
     const command = commands.get(commandId);
     if (!command || command.userId !== userId || command.status !== "approval_required") return null;
@@ -2180,12 +2273,19 @@ export function createStore(seed = {}, options = {}) {
     createCommand,
     getCommandForUser,
     claimCommandApproval,
+    claimProviderApprovalDecision,
+    updateProviderApprovalDecision,
+    listProviderApprovalDecisions,
     updateCommand,
     listCommands,
     listCommandEvents,
     listAuditLogs,
     getDisplaySummary,
   };
+}
+
+function providerApprovalKey({ userId, environmentId, threadId, requestId }) {
+  return [userId, environmentId, threadId, requestId].join("\u0000");
 }
 
 function createHumanCode() {

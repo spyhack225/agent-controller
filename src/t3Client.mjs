@@ -1,5 +1,6 @@
 import { createId, nowIso } from "./ids.mjs";
 import { appendDeviceFollowUpInstruction } from "./deviceThreadOutput.mjs";
+import { collectProviderApprovals, normalizeProviderApprovalDecision } from "./providerApprovals.mjs";
 
 export async function exchangePairingToken({ baseUrl, pairingToken, scopes }) {
   const url = new URL("/oauth/token", baseUrl);
@@ -205,15 +206,22 @@ export function buildT3Command({ intent, threadId, attachments = [] }) {
         interactionMode: "default",
         createdAt,
       };
-    case "approval_response":
+    // `decision` is already canonical: normalizeIntent() folds the legacy approve/reject spelling
+    // onto T3's own four-value ProviderApprovalDecision before it gets here. Translating again —
+    // which is what this did while the vocabulary was binary — is how `acceptForSession` and
+    // `cancel` became unreachable.
+    case "approval_response": {
+      const decision = normalizeProviderApprovalDecision(intent.decision);
+      if (!decision) throw new Error(`Unsupported provider approval decision: ${intent.decision}`);
       return {
         type: "thread.approval.respond",
         commandId,
         threadId,
         requestId: intent.requestId,
-        decision: intent.decision === "approve" ? "accept" : "decline",
+        decision,
         createdAt,
       };
+    }
     default:
       throw new Error(`Unsupported T3 command intent: ${intent.type}`);
   }
@@ -359,27 +367,33 @@ export function compressSnapshot(snapshot, threadId = null) {
   };
 }
 
+/**
+ * How many questions this thread is blocked on, split by who is asking.
+ *
+ * Approvals are delegated to `collectProviderApprovals()` so this and the approval routes cannot
+ * disagree about what is still open — in particular about a request T3 abandoned, which the
+ * previous local copy of this loop counted as pending forever.
+ */
 export function pendingThreadInteractions(thread) {
-  const open = new Map();
+  const approvals = collectProviderApprovals(thread)
+    .filter((approval) => approval.status === "pending").length;
+
+  // User-input requests are a separate T3 feature with its own respond command; they are counted
+  // here only so a screen can say "an answer is waiting", never answered from this module.
+  const openUserInput = new Set();
   const activities = Array.isArray(thread?.activities) ? [...thread.activities] : [];
   activities.sort((left, right) => {
-    const sequence = (Number(left?.sequence) || 0) - (Number(right?.sequence) || 0);
-    return sequence || String(left?.createdAt ?? "").localeCompare(String(right?.createdAt ?? ""));
+    const bySequence = (Number(left?.sequence) || 0) - (Number(right?.sequence) || 0);
+    return bySequence || String(left?.createdAt ?? "").localeCompare(String(right?.createdAt ?? ""));
   });
   for (const activity of activities) {
     const requestId = typeof activity?.payload?.requestId === "string" ? activity.payload.requestId : null;
     if (!requestId) continue;
-    if (activity.kind === "approval.requested") open.set(requestId, "approval");
-    else if (activity.kind === "user-input.requested") open.set(requestId, "user-input");
-    else if (activity.kind === "approval.resolved" || activity.kind === "user-input.resolved") open.delete(requestId);
+    if (activity.kind === "user-input.requested") openUserInput.add(requestId);
+    else if (activity.kind === "user-input.resolved") openUserInput.delete(requestId);
   }
-  let approvals = 0;
-  let userInput = 0;
-  for (const kind of open.values()) {
-    if (kind === "approval") approvals += 1;
-    if (kind === "user-input") userInput += 1;
-  }
-  return { approvals, userInput };
+
+  return { approvals, userInput: openUserInput.size };
 }
 
 function compactDisplayText(value, maximum) {

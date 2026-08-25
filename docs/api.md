@@ -1466,6 +1466,106 @@ authorization: Bearer PLATFORM_TOKEN
 
 Only commands with status `approval_required` can be approved or rejected. Approving dispatches the stored normalized intent to the paired T3 Code environment; rejecting records the decision without dispatching to T3.
 
+## Provider Approvals
+
+**A different question from the one above.** `/v1/commands/:id/approve|reject` answers a *gateway*
+hold: policy refused to dispatch something you asked for, and the gateway is holding it. A provider
+approval is the opposite direction — a turn is already running inside T3 and the agent has stopped
+mid-turn to ask permission ("Claude wants to edit `src/app.mjs`"). It is a live callback inside T3,
+not a gateway record: it expires with the session, and the gateway cannot extend it.
+
+The two never share a list. Provider approvals have their own routes, their own id space (T3's
+`requestId`, not a gateway command id), and their own four-valued decision set.
+
+### The decisions
+
+T3's `ProviderApprovalDecision` (`packages/contracts/src/orchestration.ts`, T3 Code 0.0.32):
+
+| decision | meaning |
+|---|---|
+| `accept` | Allow once. The agent asks again next time. |
+| `acceptForSession` | Allow always, for this session — the provider records a standing permission rule. |
+| `decline` | Refuse this request. The agent is told and keeps working. |
+| `cancel` | Refuse and stop what the agent was doing. |
+
+`approve` and `reject` are accepted as aliases for `accept` and `decline` so firmware in the field
+keeps working; they are canonicalised before anything is recorded or dispatched.
+
+`acceptForSession` is gated by its own capability, `approval_response_persistent`. Of the built-in
+profiles only `power-controller` (the console) carries it: a standing grant made by tapping a button
+on a 240x320 panel, where the request detail is clipped to a line and a half, is not the same act as
+making it in the console with the request in full on screen.
+
+### List
+
+```http
+GET /v1/t3/environments/env_.../threads/thread_.../approvals
+authorization: Bearer PLATFORM_TOKEN
+```
+
+```json
+{
+  "environmentId": "env_...",
+  "threadId": "thread_...",
+  "approvals": [
+    {
+      "kind": "provider",
+      "requestId": "req_...",
+      "threadId": "thread_...",
+      "requestKind": "file-change",
+      "requestType": "file_change_approval",
+      "detail": "src/app.mjs",
+      "summary": "File-change approval requested",
+      "status": "pending",
+      "decision": null,
+      "failure": null,
+      "localDecision": null
+    }
+  ],
+  "decisions": [{ "decision": "accept", "label": "Allow once", "persistent": false, "allows": true }],
+  "allowedDecisions": ["accept", "acceptForSession", "decline", "cancel"]
+}
+```
+
+`status` is `pending`, `resolved` (T3 recorded a decision), or `stale` (T3 abandoned the request —
+the provider callback did not survive a restart or a recovered session, and no answer can revive
+it). `localDecision` is what *this gateway* already did about the request, which is not the same
+fact: a decision can be held here awaiting a gateway policy confirmation and never have reached the
+provider.
+
+Approvals are derived from the thread's activity log served by
+`GET /api/orchestration/threads/:threadId`. They are **not** in `GET /api/orchestration/snapshot`,
+which serves thread bodies empty.
+
+### Answer
+
+```http
+POST /v1/t3/environments/env_.../threads/thread_.../approvals/req_...
+authorization: Bearer PLATFORM_TOKEN
+content-type: application/json
+
+{ "decision": "acceptForSession" }
+```
+
+`202` with `{approval, decision, command, duplicate: false}` when the answer was dispatched. The
+answer goes through the ordinary intent pipeline, so it produces a normal command record, a command
+event timeline entry and an SSE broadcast like any other write.
+
+Answering is **idempotent and race-safe**:
+
+| case | answer |
+|---|---|
+| same decision, twice | `200` with `duplicate: true`. The provider is answered once. |
+| a different decision, second | `409`. The first answer already left for the provider and cannot be recalled. |
+| T3 already resolved it | `409`, before any dispatch. |
+| T3 abandoned it (`stale`) | `409`, before any dispatch. T3 would have accepted the dispatch and failed asynchronously. |
+| dispatch failed (T3 unreachable) | `502`, and the claim is released so the owner can retry. |
+| an unknown decision | `400` naming the four real ones. |
+
+Every answered request is broadcast to the account as `t3.approval.decided`
+(`{environmentId, threadId, requestId, decision, status, commandId, observedAt}`), so a second
+console tab stops offering buttons for a question that is no longer open.
+
 ## Observability Summary
 
 Fetch a user-scoped reliability summary for dashboards and support triage:
@@ -1833,12 +1933,51 @@ content-type: application/json
 {}
 ```
 
-Devices can list and act on pending approval-required commands:
+Devices poll one route for **both** kinds of approval, under two separate keys:
 
 ```http
 GET /v1/device/approvals
 x-device-id: dev_...
 x-device-secret: ...
+```
+
+```json
+{
+  "commands": [{ "kind": "gateway", "id": "cmd_...", "status": "approval_required" }],
+  "providerApprovals": [
+    {
+      "kind": "provider",
+      "requestId": "req_...",
+      "threadId": "thread_...",
+      "requestKind": "command",
+      "title": "Run a command",
+      "detail": "npm test",
+      "requestedAt": "2026-08-24T10:00:00.000Z"
+    }
+  ],
+  "allowedDecisions": ["accept", "decline", "cancel"]
+}
+```
+
+`commands` is unchanged and is what firmware already reads: gateway policy holds, answered on the
+`/v1/device/approvals/cmd_.../approve|reject` routes below. `providerApprovals` is the other
+question entirely — see [Provider Approvals](#provider-approvals) — answered at
+`POST /v1/device/provider-approvals/:requestId`. `allowedDecisions` reflects the device's own
+profile: a `read-only` controller **sees** what the agent is blocked on and is offered nothing,
+because hiding the request would leave an owner walking past the device with no idea a turn had
+stopped.
+
+Reading T3 is best-effort: when the host is unreachable, `providerApprovals` is empty,
+`providerApprovalsError` carries the reason, and the gateway approvals in the same response are
+still listed and still answerable.
+
+```http
+POST /v1/device/provider-approvals/req_...
+x-device-id: dev_...
+x-device-secret: ...
+content-type: application/json
+
+{ "decision": "decline" }
 ```
 
 ```http

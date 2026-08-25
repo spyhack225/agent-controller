@@ -2537,6 +2537,102 @@ export const claimCommandApproval = gatewayMutation({
   },
 });
 
+// Provider approval decisions. See the long note on claimProviderApprovalDecision() in
+// src/store.mjs — this is the same check-and-set, and the two must not diverge: an owner whose
+// deployment runs on Convex must get the same "already answered" answer as one running on memory.
+export const claimProviderApprovalDecision = gatewayMutation({
+  args: {
+    userId: v.string(),
+    environmentId: v.string(),
+    threadId: v.string(),
+    requestId: v.string(),
+    decision: v.string(),
+    actorType: v.optional(v.string()),
+    actorId: v.optional(v.union(v.string(), v.null())),
+  },
+  handler: async (ctx, args) => {
+    const actorType = args.actorType ?? "user";
+    const existing = await providerApprovalRow(ctx, args);
+    if (existing && existing.status !== "failed") {
+      return {
+        claimed: false,
+        conflict: existing.decision !== args.decision,
+        decision: publicProviderApprovalDecision(existing),
+      };
+    }
+    const patch = {
+      userExternalId: args.userId,
+      environmentId: args.environmentId,
+      threadId: args.threadId,
+      requestId: args.requestId,
+      decision: args.decision,
+      status: "claimed",
+      actorType,
+      actorId: args.actorId ?? null,
+      commandId: null,
+      error: null,
+      createdAt: existing?.createdAt ?? nowIso(),
+      updatedAt: nowIso(),
+    };
+    const id = existing ? existing._id : await ctx.db.insert("providerApprovalDecisions", patch);
+    if (existing) await ctx.db.patch(existing._id, patch);
+    await audit(ctx, {
+      userExternalId: args.userId,
+      actorType,
+      actorId: args.actorId ?? undefined,
+      action: "provider_approval.claimed",
+      targetId: args.requestId,
+      metadata: { environmentId: args.environmentId, threadId: args.threadId, decision: args.decision },
+    });
+    return {
+      claimed: true,
+      conflict: false,
+      decision: publicProviderApprovalDecision(await ctx.db.get(id)),
+    };
+  },
+});
+
+export const updateProviderApprovalDecision = gatewayMutation({
+  args: {
+    userId: v.string(),
+    environmentId: v.string(),
+    threadId: v.string(),
+    requestId: v.string(),
+    status: v.optional(v.string()),
+    commandId: v.optional(v.union(v.string(), v.null())),
+    error: v.optional(v.union(v.string(), v.null())),
+  },
+  handler: async (ctx, args) => {
+    const existing = await providerApprovalRow(ctx, args);
+    if (!existing) return null;
+    const patch: any = { updatedAt: nowIso() };
+    if (args.status !== undefined) patch.status = args.status;
+    if (args.commandId !== undefined) patch.commandId = args.commandId;
+    if (args.error !== undefined) patch.error = args.error;
+    await ctx.db.patch(existing._id, patch);
+    return publicProviderApprovalDecision(await ctx.db.get(existing._id));
+  },
+});
+
+export const listProviderApprovalDecisions = gatewayQuery({
+  args: {
+    userId: v.string(),
+    environmentId: v.optional(v.union(v.string(), v.null())),
+    threadId: v.optional(v.union(v.string(), v.null())),
+  },
+  handler: async (ctx, args) => {
+    const rows = await ctx.db
+      .query("providerApprovalDecisions")
+      .withIndex("byUserExternalId", (q: any) => q.eq("userExternalId", args.userId))
+      .collect();
+    return rows
+      .filter((row: any) =>
+        (!args.environmentId || row.environmentId === args.environmentId)
+        && (!args.threadId || row.threadId === args.threadId))
+      .map(publicProviderApprovalDecision);
+  },
+});
+
 export const updateCommand = gatewayMutation({
   args: {
     userId: v.string(),
@@ -2796,6 +2892,37 @@ function normalizeProfileCapabilities(value: any) {
     if (!capabilities.includes(capability)) capabilities.push(capability);
   }
   return capabilities;
+}
+
+async function providerApprovalRow(ctx: any, args: any) {
+  return await ctx.db
+    .query("providerApprovalDecisions")
+    .withIndex("byRequest", (q: any) =>
+      q
+        .eq("userExternalId", args.userId)
+        .eq("environmentId", args.environmentId)
+        .eq("threadId", args.threadId)
+        .eq("requestId", args.requestId))
+    .unique();
+}
+
+function publicProviderApprovalDecision(row: any) {
+  if (!row) return null;
+  return {
+    id: row._id,
+    userId: row.userExternalId,
+    environmentId: row.environmentId,
+    threadId: row.threadId,
+    requestId: row.requestId,
+    decision: row.decision,
+    status: row.status,
+    actorType: row.actorType,
+    actorId: row.actorId ?? null,
+    commandId: row.commandId ?? null,
+    error: row.error ?? null,
+    createdAt: row.createdAt,
+    updatedAt: row.updatedAt,
+  };
 }
 
 async function audit(ctx: any, input: any) {

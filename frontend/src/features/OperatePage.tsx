@@ -34,6 +34,14 @@ import {
   type LiveThreadStatus,
 } from "../liveThread";
 import { ActivityOrb, ActivityStatus, LiveFrame } from "../motion";
+import {
+  mergeProviderApprovalDecisions,
+  offeredProviderApprovalDecisions,
+  pendingProviderApprovals,
+  providerApprovalTitle,
+  type ProviderApproval,
+  type ProviderApprovalDecision,
+} from "../providerApprovals";
 import type { Command, JsonRecord, SavedAction, T3SessionFailure } from "../types";
 import { useWorkspaceLoader } from "../useWorkspaceLoader";
 import {
@@ -136,6 +144,21 @@ export function OperatePage({ controller }: { controller: Controller }) {
       && (!command.environmentId || command.environmentId === c.selectedEnvironmentId)
     ),
     [c.pendingApprovals, c.selectedEnvironmentId, c.selectedThreadId],
+  );
+  // The OTHER kind of approval: T3 stopped mid-turn and the agent is waiting on an answer. Derived
+  // from the live stream's activity rows rather than fetched, because the stream already carries
+  // them and a poll would show a stale question. Rendered as its own block, never merged into the
+  // gateway approval list above — see frontend/src/providerApprovals.ts.
+  const threadProviderApprovals = useMemo(
+    () => pendingProviderApprovals(
+      mergeProviderApprovalDecisions(
+        live?.approvals ?? [],
+        // A controller assembled without this map (older callers, test fixtures) has decided
+        // nothing, which is exactly what an empty map means.
+        Object.values(c.providerApprovalDecisions ?? {}),
+      ),
+    ).filter((approval) => !approval.localDecision),
+    [c.providerApprovalDecisions, live],
   );
   const threadCommands = useMemo(
     () => c.recentCommands.filter((command) =>
@@ -735,6 +758,22 @@ export function OperatePage({ controller }: { controller: Controller }) {
             </LiveFrame>
           ))}
 
+          {threadProviderApprovals.map((approval) => (
+            <ProviderApprovalCard
+              key={approval.requestId}
+              approval={approval}
+              busyAction={c.busyAction}
+              onDecide={(decision) => {
+                if (!c.selectedEnvironmentId || !c.selectedThreadId) return;
+                void c.answerProviderApproval?.(
+                  { environmentId: c.selectedEnvironmentId, threadId: c.selectedThreadId },
+                  approval.requestId,
+                  decision,
+                );
+              }}
+            />
+          ))}
+
           {liveEntries ? (
             <div className="thread-message-list" aria-label="Thread messages" data-live="true">
               {liveEntries.map((entry) => (
@@ -996,6 +1035,75 @@ function LiveThreadBanner({
         <small className="thread-live-status__error">{state.sessionError}</small>
       ) : null}
     </div>
+  );
+}
+
+/**
+ * A question the AGENT is asking, mid-turn.
+ *
+ * Deliberately labelled and styled apart from the gateway approval card above it. That one says
+ * "the gateway refused to send this"; this one says "the agent is stopped and waiting on you", and
+ * the answers are T3's four, not two. `acceptForSession` is set apart because it is the only
+ * decision that leaves a standing rule behind — the console says so rather than hiding it behind
+ * a button that reads like the one next to it.
+ */
+export function ProviderApprovalCard({
+  approval,
+  busyAction,
+  allowedDecisions,
+  onDecide,
+}: {
+  approval: ProviderApproval;
+  busyAction: string | null;
+  allowedDecisions?: readonly string[];
+  onDecide: (decision: ProviderApprovalDecision) => void;
+}) {
+  const busy = busyAction === `provider-approval-${approval.requestId}`;
+  const offered = offeredProviderApprovalDecisions(allowedDecisions);
+  return (
+    <LiveFrame active tone="attention" className="live-frame live-frame--approval">
+      <section className="thread-approval" data-approval-kind="provider">
+        <div>
+          <div className="flex flex-wrap items-center gap-2">
+            <StatusBadge tone="warning" label="Agent is waiting" />
+            <span className="font-mono text-[10px] text-ink-faint">{approval.requestId}</span>
+          </div>
+          <p className="mt-3 text-sm font-semibold">{providerApprovalTitle(approval)}</p>
+          {approval.detail ? <pre>{approval.detail}</pre> : null}
+          <p className="mt-2 text-xs text-ink-muted">
+            The agent stopped mid-turn to ask. It stays stopped until you answer.
+          </p>
+        </div>
+        {offered.length === 0 ? (
+          <p className="text-xs text-ink-muted">
+            This profile can see approvals but not answer them.
+          </p>
+        ) : (
+          <div className="flex flex-col gap-2">
+            {offered.map((entry) => (
+              <Button
+                key={entry.decision}
+                variant={entry.decision === "accept"
+                  ? "primary"
+                  : entry.allows ? "ghost" : "danger-ghost"}
+                size="sm"
+                busy={busy}
+                title={entry.description}
+                onClick={() => onDecide(entry.decision)}
+              >
+                {entry.allows ? <Check className="size-4" /> : <X className="size-4" />}
+                {entry.label}
+                {entry.persistent ? (
+                  <span className="text-[10px] uppercase tracking-wide text-ink-faint">
+                    stays on
+                  </span>
+                ) : null}
+              </Button>
+            ))}
+          </div>
+        )}
+      </section>
+    </LiveFrame>
   );
 }
 

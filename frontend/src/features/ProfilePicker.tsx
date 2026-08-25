@@ -13,7 +13,8 @@ const CAPABILITY_LABELS: Record<string, string> = {
   agent_prompt: "Send agent prompts",
   media_prompt: "Attach image and audio context",
   session_control: "Stop and interrupt sessions",
-  approval_response: "Approve or reject pending commands",
+  approval_response: "Answer approvals — the gateway's holds, and the agent's own requests",
+  approval_response_persistent: "Grant an agent a permission for the whole session (\"allow always\")",
   shell_input: "Run shell commands (dangerous ones still need approval)",
 };
 

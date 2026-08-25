@@ -134,8 +134,21 @@ gives the polled and live paths one decision point, so they cannot double-decide
 accumulated rather than replaced, dedup on a bounded ring, and a connection claim that reports
 `reconnecting` rather than a stale `live`.
 
-Outstanding, and genuinely not started: provider-approval routing with its full decision set,
-structured `user_input_response`, subagent and parallel-task inspection, and the work-graph view.
+Provider-approval routing has since landed. `src/providerApprovals.mjs` establishes the contract
+from T3 0.0.32's own sources: the decision set is four values (`accept`, `acceptForSession`,
+`decline`, `cancel`), not the binary approve/reject `buildT3Command()` had been folding everything
+into — which made allow-always and cancel unreachable. Pending requests are derived from the
+thread's activity log (the orchestration snapshot serves thread bodies empty), applying T3's own
+clearing rule including the stale-failure case. Owner routes at
+`/v1/t3/environments/:id/threads/:threadId/approvals`, a device route at
+`/v1/device/provider-approvals/:requestId`, and the device poll now carries gateway holds and
+provider requests under two separate keys rather than one list. Answers are claimed in the store
+before dispatch, so a double-answer is idempotent, a conflicting one is refused, and an approval T3
+has already abandoned is refused before anything is sent. `acceptForSession` is its own capability
+and no hardware profile carries it.
+
+Outstanding, and genuinely not started: structured `user_input_response`, subagent and
+parallel-task inspection, and the work-graph view.
 
 Unproven: none of this has met a live T3 instance. It is verified against T3's checked-in contract
 (read from its shipped source map) and its real Effect runtime, plus 46 frontend tests whose trap

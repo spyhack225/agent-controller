@@ -1,5 +1,9 @@
 import { HttpError, requireString } from "./http.mjs";
 import { normalizeMediaIntent, normalizeMediaUploadIds } from "./media.mjs";
+import {
+  PROVIDER_APPROVAL_DECISIONS,
+  normalizeProviderApprovalDecision,
+} from "./providerApprovals.mjs";
 
 export async function normalizeIntent(payload, context = {}) {
   const type = requireString(payload.type, "type");
@@ -48,15 +52,25 @@ export async function normalizeIntent(payload, context = {}) {
       }
       return { type, action };
     }
+    // Answering a question T3 asked, not one the gateway asked. The decision set is T3's own
+    // four-value `ProviderApprovalDecision` (see src/providerApprovals.mjs for the contract
+    // citations); `approve`/`reject` are kept as aliases because firmware in the field posts them.
     case "approval_response": {
-      const decision = requireString(payload.decision, "decision");
-      if (!["approve", "reject"].includes(decision)) {
-        throw new HttpError(400, "approval_response decision must be approve or reject.");
+      const raw = requireString(payload.decision, "decision");
+      const decision = normalizeProviderApprovalDecision(raw);
+      if (!decision) {
+        throw new HttpError(
+          400,
+          `approval_response decision must be one of ${PROVIDER_APPROVAL_DECISIONS.join(", ")}.`,
+        );
       }
       return {
         type,
         requestId: requireString(payload.requestId, "requestId"),
         decision,
+        // The pre-canonical spelling, kept only when it differs, so an audit row shows what the
+        // caller actually said rather than what the gateway translated it into.
+        ...(decision === raw.trim() ? {} : { requestedDecision: raw.trim() }),
       };
     }
     default:

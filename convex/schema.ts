@@ -340,6 +340,28 @@ export default defineSchema({
     updatedAt: v.string(),
   }).index("byUserExternalId", ["userExternalId"]),
 
+  // One row per provider approval this gateway has answered. The pending approval itself lives in
+  // T3; this is only the "we already decided" record that makes a second answer idempotent instead
+  // of a second dispatch. `environmentId` is a plain string rather than v.id("environments"):
+  // the row is keyed by an opaque triple and never joined, and an approval record must survive the
+  // environment being unpaired so a replayed answer is still recognised as a duplicate.
+  providerApprovalDecisions: defineTable({
+    userExternalId: v.string(),
+    environmentId: v.string(),
+    threadId: v.string(),
+    requestId: v.string(),
+    decision: v.string(),
+    status: v.string(),
+    actorType: v.string(),
+    actorId: v.optional(v.union(v.string(), v.null())),
+    commandId: v.optional(v.union(v.string(), v.null())),
+    error: v.optional(v.union(v.string(), v.null())),
+    createdAt: v.string(),
+    updatedAt: v.string(),
+  })
+    .index("byUserExternalId", ["userExternalId"])
+    .index("byRequest", ["userExternalId", "environmentId", "threadId", "requestId"]),
+
   commandEvents: defineTable({
     userExternalId: v.string(),
     commandId: v.id("commands"),

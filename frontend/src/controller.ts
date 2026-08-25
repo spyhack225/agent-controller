@@ -2,6 +2,10 @@ import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 
 import { ApiError, downloadJson, requestJson, type ApiOptions } from "./api";
 import { useApprovalNotifications } from "./notifications";
+import type {
+  ProviderApprovalDecision,
+  ProviderApprovalLocalDecision,
+} from "./providerApprovals";
 import { useThreadWatch } from "./useThreadWatch";
 import {
   projectScope,
@@ -325,6 +329,17 @@ export function useController({ authConfig, clerk }: UseControllerOptions) {
   // set through `watchThread` rather than derived from `selectedThreadId`. Selecting a thread in
   // the sidebar is not the same as looking at it, and a watch nobody is looking at is a WebSocket
   // held open against T3 for nothing.
+  // What this account has already decided about a provider approval, keyed by T3 request id.
+  //
+  // It is not derived from the transcript: T3 only records a resolution once the provider has
+  // acted on it, and between the answer leaving here and that landing there is a window in which
+  // a second tab — or an impatient second tap — would happily send a second, different decision.
+  // The gateway refuses that with a 409, but the console should not offer the button at all. Fed
+  // by this tab's own answers and by the `t3.approval.decided` broadcast for every other client.
+  const [providerApprovalDecisions, setProviderApprovalDecisions] = useState<
+    Record<string, ProviderApprovalLocalDecision>
+  >({});
+
   const threadWatch = useThreadWatch({ api, enabled: authenticated });
   const {
     liveThread,
@@ -614,6 +629,31 @@ export function useController({ authConfig, clerk }: UseControllerOptions) {
     });
     stream.addEventListener("t3.thread.status", (event) => {
       applyThreadStatusEvent(parseEventData(event.data));
+    });
+    // Somebody answered a provider approval — this tab, another tab, or the controller on the
+    // desk. Whoever it was, the question is no longer open to this account.
+    stream.addEventListener("t3.approval.decided", (event) => {
+      const payload = parseEventData(event.data) as {
+        requestId?: string;
+        decision?: string;
+        status?: string;
+        commandId?: string | null;
+        observedAt?: string;
+      } | null;
+      if (!payload?.requestId || !payload.decision) return;
+      const requestId = payload.requestId;
+      setProviderApprovalDecisions((current) => ({
+        ...current,
+        [requestId]: {
+          requestId,
+          decision: payload.decision as string,
+          status: payload.status ?? "dispatched",
+          actorType: "user",
+          commandId: payload.commandId ?? null,
+          error: null,
+          decidedAt: payload.observedAt ?? null,
+        },
+      }));
     });
     stream.onerror = () => {
       setConnection("reconnecting");
@@ -928,6 +968,41 @@ export function useController({ authConfig, clerk }: UseControllerOptions) {
     [devices, selectedDeviceId],
   );
 
+  /**
+   * Answer one provider approval — a question T3 is holding open, not a gateway policy hold.
+   *
+   * Idempotency lives in the gateway (it claims the request id before dispatching), so this does
+   * not try to be clever about it. What it does do is record the answer locally the moment it
+   * lands, so the buttons stop being offered without waiting for T3 to echo a resolution back
+   * through the stream.
+   */
+  const answerProviderApproval = useCallback(async (
+    target: { environmentId: string; threadId: string },
+    requestId: string,
+    decision: ProviderApprovalDecision,
+  ) => {
+    const path = `/v1/t3/environments/${encodeURIComponent(target.environmentId)}`
+      + `/threads/${encodeURIComponent(target.threadId)}`
+      + `/approvals/${encodeURIComponent(requestId)}`;
+    return await run(
+      `provider-approval-${requestId}`,
+      "Answer sent to the agent.",
+      async () => {
+        const result = await api<{ decision?: ProviderApprovalLocalDecision }>(path, {
+          method: "POST",
+          body: { decision },
+        });
+        if (result?.decision) {
+          setProviderApprovalDecisions((current) => ({
+            ...current,
+            [requestId]: result.decision as ProviderApprovalLocalDecision,
+          }));
+        }
+        return result;
+      },
+    );
+  }, [api, run]);
+
   const approvalNotifications = useApprovalNotifications(pendingApprovals);
 
   return {
@@ -962,6 +1037,8 @@ export function useController({ authConfig, clerk }: UseControllerOptions) {
     devices,
     commands,
     pendingApprovals,
+    providerApprovalDecisions,
+    answerProviderApproval,
     recentCommands,
     commandEvents,
     timelineCommand,

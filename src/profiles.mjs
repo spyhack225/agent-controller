@@ -19,6 +19,14 @@ export const DEVICE_CAPABILITIES = Object.freeze([
   "media_prompt",
   "session_control",
   "approval_response",
+  // Answering a provider approval with `acceptForSession` — T3's "allow-always" (see
+  // src/providerApprovals.mjs for the adapter citations). Split out from `approval_response`
+  // because it is not the same decision: allow-once answers one question, while allow-always
+  // writes a standing permission rule into the provider session that outlives the moment it was
+  // granted in. A durable grant made by tapping a button on a 240x320 panel — where the request
+  // detail is clipped to a line and a half — is not the same act as making it in the console with
+  // the full diff on screen, so the built-in hardware profile does not carry it.
+  "approval_response_persistent",
   "shell_input",
   // Creating a thread in the bound project, from hardware that has no keyboard. A write to the
   // owner's T3 environment, so it is a capability rather than a selection: `read-only` browses,
@@ -36,7 +44,7 @@ const DEVICE_PROFILES = [
   {
     id: "agent-controller",
     label: "Agent controller",
-    description: "Full remote agent control for prompts, media, status, approvals, session control, thread creation, and policy-screened shell input.",
+    description: "Full remote agent control for prompts, media, status, approvals, session control, thread creation, and policy-screened shell input. Provider approvals may be allowed once, declined or cancelled; \"allow for this session\" is reserved for the console.",
     capabilities: [
       "status",
       "agent_prompt",
@@ -50,19 +58,20 @@ const DEVICE_PROFILES = [
   {
     id: "read-only",
     label: "Read only",
-    description: "Status inspection only. Prompts, media, approvals, session control, thread creation, and shell input are blocked.",
+    description: "Status inspection only. Pending approvals are visible, but answering them — like prompts, media, session control, thread creation, and shell input — is blocked.",
     capabilities: ["status"],
   },
   {
     id: "power-controller",
     label: "Power controller",
-    description: "High-trust control profile used by signed-in web clients and advanced devices; dangerous shell input still requires approval.",
+    description: "High-trust control profile used by signed-in web clients and advanced devices; dangerous shell input still requires approval. The only built-in profile that may grant a provider permission for a whole session.",
     capabilities: [
       "status",
       "agent_prompt",
       "media_prompt",
       "session_control",
       "approval_response",
+      "approval_response_persistent",
       "shell_input",
       "thread_create",
     ],

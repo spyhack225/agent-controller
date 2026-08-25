@@ -45,6 +45,12 @@
  *    snapshot), and as a horizon older than the ring can remember.
  */
 
+import {
+  collectProviderApprovals,
+  foldApprovalActivity,
+  type ProviderApproval,
+} from "./providerApprovals";
+
 export const LIVE_THREAD_SEEN_LIMIT = 512;
 
 /** The five states `t3.thread.status` reports, plus the one before anything has been said. */
@@ -128,6 +134,14 @@ export interface LiveThreadState {
   /** True when the snapshot was windowed and older history was never sent. */
   historyTruncated: boolean;
   entries: LiveThreadEntry[];
+  /**
+   * Provider approvals — the questions T3 asks mid-turn, not the gateway policy holds. Derived
+   * from the same activity rows the transcript is built from, because a pending approval IS an
+   * activity; see `frontend/src/providerApprovals.ts`. Kept as its own field rather than filtered
+   * out of `entries` at render time, because an entry drops the payload (and with it the
+   * requestId) and there would be nothing left to answer with.
+   */
+  approvals: ProviderApproval[];
   /** Highest sequence seen. Display and diagnostics only — dedup is `seen`. */
   sequence: number | null;
   /** The sequence the current snapshot represents; anything at or below it is already applied. */
@@ -161,6 +175,7 @@ export function createLiveThreadState({ environmentId, threadId }: LiveThreadTar
     historyGap: false,
     historyTruncated: false,
     entries: [],
+    approvals: [],
     sequence: null,
     baseSequence: null,
     sessionStatus: null,
@@ -231,6 +246,9 @@ export function applyThreadSnapshot(state: LiveThreadState, payload: unknown): L
     historyTruncated: page?.hasMore === true,
     entries: built.entries,
     order: built.order,
+    // REPLACE, like the transcript: the snapshot is the thread's approval state in full, and an
+    // approval carried over from a stale transcript is a card offering to answer a dead request.
+    approvals: collectProviderApprovals(thread, state.threadId),
     sequence: snapshotSequence,
     baseSequence: snapshotSequence,
     seen: [],
@@ -315,7 +333,12 @@ export function applyThreadEvent(state: LiveThreadState, payload: unknown): Live
 
   if (type === "thread.message-sent") return applyMessageSent(next, eventPayload, occurredAt);
   if (type === "thread.activity-appended") {
-    return upsert(next, activityEntryFrom(eventPayload?.activity, occurredAt));
+    const activity = eventPayload?.activity;
+    const approvals = foldApprovalActivity(next.approvals, activity, next.threadId);
+    const withApprovals = approvals === next.approvals
+      ? next
+      : { ...next, approvals: [...approvals] };
+    return upsert(withApprovals, activityEntryFrom(activity, occurredAt));
   }
   if (type === "thread.turn-diff-completed") {
     return upsert(next, turnEntryFrom(eventPayload, occurredAt));
