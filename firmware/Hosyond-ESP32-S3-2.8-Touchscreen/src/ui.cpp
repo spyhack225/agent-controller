@@ -1440,13 +1440,26 @@ void paintProjects() {
 // The orb is part of that block rather than in the header, because during a capture it IS the
 // recording indicator.
 
-constexpr int16_t kVoiceOrbR = (int16_t)(kMiniOrbPx / 2);
-constexpr int16_t kVoiceGapOrbCapsule = 12;
-constexpr int16_t kVoiceCapsuleH = 92;
-constexpr int16_t kVoiceGapCapsuleLabel = 20;
+// The orb is the main animation on this device and carries the same weight here as it does on
+// every other screen. It was previously the 44 px mini orb under a 92 px capsule, which inverted
+// that: the button dominated the glass and the orb read as a decoration above it. The proportions
+// are now the other way round — the orb is the full 112 px one HOME draws, and the capsule is an
+// ordinary button rather than a slab.
+//
+// 112 + 10 + 48 + 14 + 8 + 4 + 8 = 204 in the 206 px between the header and the action band, so
+// the block still centres with the gaps trimmed rather than the orb.
+constexpr int16_t kVoiceOrbR = (int16_t)(kOrbDrawPx / 2);
+constexpr int16_t kVoiceGapOrbCapsule = 10;
+constexpr int16_t kVoiceCapsuleH = 48;
+constexpr int16_t kVoiceGapCapsuleLabel = 14;
 constexpr int16_t kVoiceGapLabelName = 4;
 constexpr int16_t kVoiceBlockH = kVoiceOrbR * 2 + kVoiceGapOrbCapsule + kVoiceCapsuleH
   + kVoiceGapCapsuleLabel + kLineH + kVoiceGapLabelName + kLineH;
+
+// A block taller than the band would centre to a negative top and slide the orb under the header.
+// A build error is the right way to find that out.
+static_assert(kVoiceBlockH <= kH - kBarH - kContentTop,
+              "the voice block no longer fits between the header and the action band");
 
 struct VoiceLayout {
   int16_t orbCy;
@@ -3340,7 +3353,10 @@ void uiTick() {
     // animation degrades gracefully and the audio does not.
     if (miniReady && now - recordOrbAt >= 33) {
       recordOrbAt = now;
-      displayDrawMiniOrb(miniOrb, kOrbCx, voiceLayout().orbCy, now - orbStartedAt);
+      // The big orb, and during a capture this runs inside the pump's slice — see the cadence
+      // note where recordOrbAt is set. Verified by the bench harness, not by reasoning: a full
+      // 4 s hold still returns every sample.
+      displayDrawOrb(orb, kOrbCx, voiceLayout().orbCy, now - orbStartedAt, kOrbDrawPx);
     }
     // A ceiling was hit while the finger is still down: stop here rather than waiting for a lift
     // that may not come for another twenty seconds.
