@@ -38,3 +38,14 @@ void uiTick();
 
 // Sleeps until the next frame is actually due, rather than having the caller spin on delay(1).
 void uiSleepUntilNextFrame();
+
+#if BENCH_SELFTEST
+// Bench only, compiled out of every product build. Navigation is a shortcut so the harness is
+// deterministic; the action itself is dispatched through the ordinary runAction() path, because
+// the create -> splice -> adopt sequence is the thing under test and a harness that reimplements
+// it proves nothing.
+void uiBenchGoToThreads();
+bool uiBenchRunAction(const char* label);
+const char* uiBenchBoundThreadTitle();
+int uiBenchThreadRowCount();
+#endif

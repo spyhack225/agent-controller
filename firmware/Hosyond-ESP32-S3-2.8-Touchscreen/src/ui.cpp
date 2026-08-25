@@ -3201,6 +3201,33 @@ void uiHandleTouch(const TouchEvent& event) {
   }
 }
 
+#if BENCH_SELFTEST
+void uiBenchGoToThreads() { goToThreads(); }
+
+bool uiBenchRunAction(const char* label) {
+  buildActions();
+  for (uint8_t i = 0; i < actionCount; ++i) {
+    if (strcmp(actions[i].label, label) != 0) continue;
+    if (!actions[i].enabled) {
+      Serial.printf("[bench] action \"%s\" is present but disabled\n", label);
+      return false;
+    }
+    runAction(actions[i].id);
+    return true;
+  }
+  Serial.printf("[bench] action \"%s\" is not offered on this screen (%u actions)\n",
+                label, (unsigned)actionCount);
+  return false;
+}
+
+const char* uiBenchBoundThreadTitle() {
+  const ThreadOption* row = boundThreadRow();
+  return row ? row->title.c_str() : "(none)";
+}
+
+int uiBenchThreadRowCount() { return (int)threadRowCount(); }
+#endif
+
 void uiTick() {
   if (!displayReady()) return;
   // setup() returns early when NVS is unavailable — a wrong partition table — without ever calling

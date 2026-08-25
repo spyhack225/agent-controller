@@ -240,7 +240,8 @@ void setup() {
 // sample count. If drawing the orb inside the pump steals time, the shortfall appears there.
 namespace bench {
 
-enum class Stage : uint8_t { Idle, Settle, TapTalk, PressMic, Holding, Release, Report, Done };
+enum class Stage : uint8_t { Idle, Settle, TapTalk, PressMic, Holding, Release, Report,
+                            GoThreads, Create, CreateCheck, Done };
 Stage stage = Stage::Idle;
 uint32_t dueAt = 0;
 uint32_t recordBeganAt = 0;
@@ -316,11 +317,50 @@ void tick(GatewayClient& gateway) {
                     (unsigned)expected, (unsigned)actual, (int)((int32_t)expected - (int32_t)actual),
                     expected ? (100.0 * ((double)expected - (double)actual) / (double)expected) : 0.0);
       Serial.printf("[bench] peak %d rms %d\n", (int)st.peak, (int)st.rms);
-      if (actual == 0) Serial.println("[bench] RESULT: FAIL - no samples; the press did not start a recording");
-      else if (st.peak <= 0) Serial.println("[bench] RESULT: FAIL - silence");
+      if (actual == 0) Serial.println("[bench] CAPTURE: FAIL - no samples; the press did not start a recording");
+      else if (st.peak <= 0) Serial.println("[bench] CAPTURE: FAIL - silence");
       else if (expected && actual * 100ULL < (uint64_t)expected * 97ULL)
-        Serial.println("[bench] RESULT: FAIL - more than 3% of samples missing; the orb is stealing pump time");
-      else Serial.println("[bench] RESULT: PASS - capture is intact with the orb running");
+        Serial.println("[bench] CAPTURE: FAIL - more than 3% of samples missing; the orb is stealing pump time");
+      else Serial.println("[bench] CAPTURE: PASS - capture is intact with the orb running");
+      dueAt = now + 1500;
+      stage = Stage::GoThreads;
+      return;
+    }
+
+    case Stage::GoThreads:
+      if ((int32_t)(now - dueAt) < 0) return;
+      Serial.printf("[bench] ---- create -> splice -> adopt ----\n");
+      Serial.printf("[bench] before: %d rows, bound \"%s\"\n",
+                    uiBenchThreadRowCount(), uiBenchBoundThreadTitle());
+      uiBenchGoToThreads();
+      dueAt = now + 2500;   // let the list settle so an empty folder is genuinely empty
+      stage = Stage::Create;
+      return;
+
+    case Stage::Create:
+      if ((int32_t)(now - dueAt) < 0) return;
+      // Through runAction(), not a direct call: the handler is what is under test.
+      if (!uiBenchRunAction("NEW THREAD")) {
+        Serial.println("[bench] CREATE: FAIL - NEW THREAD was not offered");
+        stage = Stage::Done;
+        return;
+      }
+      dueAt = now + 1200;
+      stage = Stage::CreateCheck;
+      return;
+
+    case Stage::CreateCheck: {
+      if ((int32_t)(now - dueAt) < 0) return;
+      const int rows = uiBenchThreadRowCount();
+      const char* bound = uiBenchBoundThreadTitle();
+      Serial.printf("[bench] after: %d rows, bound \"%s\"\n", rows, bound);
+      // The splice must be visible without waiting for the 30 s refresh, and the adopt must have
+      // moved the binding to it. Either failing separately tells us which half broke.
+      if (rows <= 0) Serial.println("[bench] CREATE: FAIL - no rows after create; the splice did not land");
+      else if (strcmp(bound, "(none)") == 0)
+        Serial.println("[bench] CREATE: FAIL - nothing bound; adoptThreadBinding did not take");
+      else Serial.println("[bench] CREATE: PASS - thread created, spliced and bound with no re-fetch");
+      Serial.println("[bench] ---- run complete ----");
       stage = Stage::Done;
       return;
     }
