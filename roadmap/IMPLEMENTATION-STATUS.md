@@ -5,7 +5,7 @@ Canonical progress ledger for
 This file records what the repository can do now; the roadmap records the target and sequence.
 Anything not marked **done** is not complete.
 
-Last verified: **2026-08-24**, at commit `1d7ad51`.
+Last verified: **2026-08-24**, at commit `4d06ff2`.
 
 ## Verified baseline
 
@@ -119,26 +119,27 @@ decision remains open.
 
 ### Milestone 1 — live conversation and interaction parity: partial
 
-**The transport is real now.** `orchestration.subscribeThread` had been a string constant in
-`src/t3Ws.mjs` that nothing called; the gateway learned what an agent had done by refetching a
-snapshot every five seconds. `openT3ThreadStream()` (`src/t3Ws.mjs`) now holds a real
-subscription — acknowledging every `Chunk`, because effect's RpcServer parks the stream on a latch
-until it does (`effect/dist/unstable/rpc/RpcServer.js:271-291`) — and `src/threadStream.mjs`
-turns it into `t3.thread.snapshot` / `t3.thread.event` / `t3.thread.status` on the existing SSE
-broker. Subscriptions are demand-driven leases (`POST|DELETE
-/v1/t3/environments/:id/threads/:threadId/watch`, renewed automatically by a device polling
-`/v1/device/thread-output`), resume by T3's global event sequence, deduplicate the replay/live
-overlap, and reconnect on exponential backoff. A resume gap T3 refuses to replay
-(`THREAD_RESUME_MAX_GAP`) arrives as a snapshot and is published with `gap: true` rather than
-silently appended. Constructed in `createApp()`, started only from `server.mjs`, driven by
-`runOnce()` in `test/threadStream.test.mjs` (17 tests). `src/commandArbiter.mjs` makes the live
-stream and the snapshot poller share one decision per command.
+Corrected: previously `todo`. The foundation has landed and the headline gap is closed —
+`orchestration.subscribeThread` was a string constant that had never been called, and everything
+the product knew about a running agent came from a five-second snapshot poll.
 
-**What remains is the milestone itself.** Nothing renders these events: the console's
-`useController()` does not subscribe to `t3.thread.*` and no view shows a live conversation or
-provider tool activity. Provider approvals still route through the existing capability path with
-their gateway decision set rather than T3's, structured user input (`thread.user-input-response`)
-is not wired, and subagent/parallel-work inspection does not exist.
+Done: `src/threadStream.mjs` opens a real long-lived subscription with Chunk acknowledgement
+(Effect's RpcServer closes a latch per chunk and only an inbound Ack reopens it, so a reader that
+does not ack stalls the stream — pinned by a test that stalls). Resume uses T3's own
+`afterSequence`, keyed on the global event-log sequence rather than the activity's optional
+per-turn one. An unfillable gap resolves as a fresh snapshot with `reset`+`gap`, so a client
+replaces rather than appends. Watches are demand-driven 90 s leases. `src/commandArbiter.mjs`
+gives the polled and live paths one decision point, so they cannot double-decide a command.
+`frontend/src/liveThread.ts` + `useThreadWatch.ts` render it in Operate, with streaming deltas
+accumulated rather than replaced, dedup on a bounded ring, and a connection claim that reports
+`reconnecting` rather than a stale `live`.
+
+Outstanding, and genuinely not started: provider-approval routing with its full decision set,
+structured `user_input_response`, subagent and parallel-task inspection, and the work-graph view.
+
+Unproven: none of this has met a live T3 instance. It is verified against T3's checked-in contract
+(read from its shipped source map) and its real Effect runtime, plus 46 frontend tests whose trap
+handling was confirmed by mutation.
 
 ### Milestone 2 — composer and connection: substantially done
 
