@@ -361,6 +361,24 @@ String GatewayClient::selectedThreadLabel() const {
   return String("~") + id.substring(id.length() - 11);
 }
 
+void GatewayClient::adoptThreadBinding(const String& threadId) {
+  StateLock guard(this);
+  if (threadId.length() == 0 || context_.threadId == threadId) return;
+  context_.threadId = threadId;
+  // The response model belongs to the thread that was open a moment ago, so it is not an answer
+  // about this one. Closed rather than left to be reinterpreted against a different conversation.
+  closeResponse();
+  // Point the cached list at the new row if it happens to be there already; the caller's own
+  // overlay covers the ordinary case where it is not, and the next refresh reconciles both.
+  selectedThreadIndex_ = -1;
+  for (size_t i = 0; i < threadCount_; i += 1) {
+    threads_[i].selected = (threads_[i].id == threadId);
+    if (threads_[i].selected) selectedThreadIndex_ = (int)i;
+  }
+  revision_ += 1;
+  Serial.printf("[gateway] now pointing at thread %s\n", threadId.c_str());
+}
+
 bool GatewayClient::refreshThreads() {
   StateLock guard(this);
   threadCount_ = 0;

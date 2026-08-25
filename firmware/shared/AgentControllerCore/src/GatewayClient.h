@@ -141,6 +141,19 @@ class GatewayClient {
   int selectedThreadIndex() const { return selectedThreadIndex_; }
   String selectedThreadLabel() const;
   bool selectThread(size_t index);
+
+  // Adopts a binding the GATEWAY has already made, without asking it again.
+  //
+  // POST /v1/device/threads creates a thread and binds the device to it in one call, so by the time
+  // the 201 arrives the server-side binding is a fact. context_ is what postIntent() stamps on every
+  // outgoing intent, and it otherwise only moves on the 60 s config poll — so without this a voice
+  // note recorded in that window would be dispatched with the PREVIOUS thread's id, explicitly, and
+  // land in the wrong conversation. That is a correctness bug, not staleness.
+  //
+  // Deliberately not selectThread(): that one validates an index against a list which cannot yet
+  // contain the new thread, and re-fetching to make it valid means guessing how long T3's
+  // projection takes to catch up. The caller already holds the authoritative answer.
+  void adoptThreadBinding(const String& threadId);
   const String& threadsDetail() const { return threadsDetail_; }
 
   // Sending. All three shapes go through POST /v1/device/intents with the device envelope; a saved
