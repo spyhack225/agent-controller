@@ -529,6 +529,29 @@ activity, settings). `api.ts` is the thin fetch wrapper (`ApiError`, `requestJso
 fresh per request and **never** written to `localStorage`. Builds to `dist/web`, which the gateway serves statically;
 The pre-React dashboard has been removed; the React build is the only client.
 
+#### The live thread transcript
+
+`liveThread.ts` is a pure reducer over the three `t3.thread.*` SSE events; `useThreadWatch.ts` owns
+the lease and the fan-in; `useController()` composes both and `OperatePage` renders it. Splitting it
+that way is what makes the three traps testable without a T3:
+
+- **A `thread.message-sent` with `streaming: true` is a DELTA.** It is accumulated onto the entry
+  with the same `messageId`. Only a terminal frame replaces the body, and an *empty* terminal frame
+  means "keep what you have".
+- **A snapshot replaces; it never appends.** `gap: true` additionally means the intermediate events
+  were never delivered, which `historyGap` says out loud rather than showing a seamless transcript.
+- **The same event arrives twice by design** (the replay/live overlap). Dedup is a bounded ring of
+  `sequence` keys falling back to `eventId` — not a "greater than the cursor" test, because arrival
+  order is not assumed monotonic. The cursor is trusted only as the snapshot floor and as a horizon
+  older than the ring.
+
+The watch is registered because a thread is **on screen**, not because one is selected, and it is a
+lease: `POST .../watch` renews every 30s inside the 90s TTL, `DELETE` is the polite release on
+unmount and navigation, and a closing tab gets one best-effort `keepalive` release on `pagehide`.
+The lease, not that handler, is the guarantee — a leaked watch costs one TTL. The polled snapshot
+path is untouched: live entries render only once a snapshot has arrived, and `selectedThread.messages`
+still renders for anyone not watching.
+
 ## Conventions
 
 - Server code is `.mjs` ESM with no build step and no dependencies beyond `@clerk/backend` — keep it that way.

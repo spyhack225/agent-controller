@@ -2,6 +2,7 @@ import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 
 import { ApiError, downloadJson, requestJson, type ApiOptions } from "./api";
 import { useApprovalNotifications } from "./notifications";
+import { useThreadWatch } from "./useThreadWatch";
 import {
   projectScope,
   threadScope,
@@ -174,6 +175,16 @@ export function normalizeThread(thread: JsonRecord, projects: T3Project[]): T3Th
   };
 }
 
+/** SSE payloads are JSON text. A frame the gateway could not have sent is simply ignored. */
+function parseEventData(data: unknown): unknown {
+  if (typeof data !== "string") return null;
+  try {
+    return JSON.parse(data);
+  } catch {
+    return null;
+  }
+}
+
 export function dedupeEnvironments(environments: Environment[]): Environment[] {
   const unique = new Map<string, Environment>();
   for (const environment of environments) {
@@ -308,6 +319,20 @@ export function useController({ authConfig, clerk }: UseControllerOptions) {
       setBusyAction(null);
     }
   }, [busyAction]);
+
+  // The live thread subscription. State and the lease timer live here with the rest of the app
+  // state; the *demand* comes from whichever view is showing a thread, which is why the target is
+  // set through `watchThread` rather than derived from `selectedThreadId`. Selecting a thread in
+  // the sidebar is not the same as looking at it, and a watch nobody is looking at is a WebSocket
+  // held open against T3 for nothing.
+  const threadWatch = useThreadWatch({ api, enabled: authenticated });
+  const {
+    liveThread,
+    watchThread,
+    applyThreadSnapshotEvent,
+    applyThreadEventEvent,
+    applyThreadStatusEvent,
+  } = threadWatch;
 
   const refreshAll = useCallback(async () => {
     if (!authenticated) return;
@@ -578,6 +603,18 @@ export function useController({ authConfig, clerk }: UseControllerOptions) {
         void refreshAll();
       }, 750);
     });
+    // The live thread stream. Three separate events on the same broker as everything above, and
+    // deliberately NOT a refetch trigger: they carry the content itself, so a `t3.thread.event`
+    // must not cost thirteen HTTP requests the way `state.changed` does.
+    stream.addEventListener("t3.thread.snapshot", (event) => {
+      applyThreadSnapshotEvent(parseEventData(event.data));
+    });
+    stream.addEventListener("t3.thread.event", (event) => {
+      applyThreadEventEvent(parseEventData(event.data));
+    });
+    stream.addEventListener("t3.thread.status", (event) => {
+      applyThreadStatusEvent(parseEventData(event.data));
+    });
     stream.onerror = () => {
       setConnection("reconnecting");
       setConnectionDetail("Live stream reconnecting");
@@ -589,7 +626,13 @@ export function useController({ authConfig, clerk }: UseControllerOptions) {
         refreshTimerRef.current = null;
       }
     };
-  }, [authenticated, refreshAll]);
+  }, [
+    applyThreadEventEvent,
+    applyThreadSnapshotEvent,
+    applyThreadStatusEvent,
+    authenticated,
+    refreshAll,
+  ]);
 
   useEffect(() => {
     if (environments.length === 0) {
@@ -946,6 +989,10 @@ export function useController({ authConfig, clerk }: UseControllerOptions) {
     selectedProject,
     selectedThreadId,
     setSelectedThreadId,
+    /** The live transcript for the thread currently being watched, or null when none is. */
+    liveThread,
+    /** Declare the thread on screen. Registers a lease, renews it, and releases it on teardown. */
+    watchThread,
     selectedDeviceId,
     setSelectedDeviceId,
     selectedDevice,

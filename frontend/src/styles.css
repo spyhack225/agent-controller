@@ -5444,6 +5444,148 @@ html:not(.dark)[data-theme="light"] {
     white-space: pre-wrap;
   }
 
+  /* The live thread stream: connection honesty first, then the entries it delivers. */
+  .thread-live-status {
+    display: flex;
+    align-items: center;
+    gap: 0.55rem;
+    flex-wrap: wrap;
+    margin-bottom: 0.9rem;
+    border: 1px solid var(--ac-border);
+    border-radius: 0.6rem;
+    background: var(--ac-surface);
+    padding: 0.5rem 0.7rem;
+    color: var(--ac-ink-muted);
+    font-size: 0.74rem;
+  }
+
+  .thread-live-status[data-state="reconnecting"] {
+    border-color: color-mix(in srgb, var(--ac-warning) 30%, var(--ac-border));
+    background: color-mix(in srgb, var(--ac-warning) 6%, var(--ac-surface));
+  }
+
+  .thread-live-status[data-state="stopped"] {
+    border-color: color-mix(in srgb, var(--ac-danger) 30%, var(--ac-border));
+    background: color-mix(in srgb, var(--ac-danger) 6%, var(--ac-surface));
+  }
+
+  .thread-live-status__error {
+    flex-basis: 100%;
+    color: var(--ac-danger);
+    font-family: var(--font-mono);
+    font-size: 0.66rem;
+  }
+
+  .thread-gap-notice {
+    display: flex;
+    align-items: flex-start;
+    gap: 0.55rem;
+    margin-bottom: 0.9rem;
+    border: 1px solid color-mix(in srgb, var(--ac-warning) 24%, var(--ac-border));
+    border-radius: 0.6rem;
+    background: color-mix(in srgb, var(--ac-warning) 5%, var(--ac-surface));
+    padding: 0.6rem 0.7rem;
+    color: var(--ac-ink-muted);
+    font-size: 0.74rem;
+  }
+
+  .thread-gap-notice p {
+    margin: 0;
+  }
+
+  .thread-activity {
+    display: flex;
+    align-items: baseline;
+    gap: 0.55rem;
+    width: 100%;
+    border-left: 2px solid var(--ac-border-strong);
+    padding: 0.2rem 0.7rem;
+    color: var(--ac-ink-muted);
+    font-size: 0.75rem;
+  }
+
+  .thread-activity[data-tone="error"] {
+    border-left-color: var(--ac-danger);
+    color: var(--ac-danger);
+  }
+
+  .thread-activity[data-tone="approval"] {
+    border-left-color: var(--ac-warning);
+  }
+
+  .thread-activity__kind {
+    flex: none;
+    color: var(--ac-ink-faint);
+    font-family: var(--font-mono);
+    font-size: 0.62rem;
+  }
+
+  .thread-activity p {
+    margin: 0;
+    min-width: 0;
+    overflow-wrap: anywhere;
+  }
+
+  .thread-activity time,
+  .thread-turn time {
+    margin-left: auto;
+    flex: none;
+    color: var(--ac-ink-faint);
+    font-family: var(--font-mono);
+    font-size: 0.62rem;
+  }
+
+  .thread-turn {
+    display: flex;
+    align-items: baseline;
+    gap: 0.55rem;
+    width: 100%;
+    border-top: 1px solid var(--ac-border);
+    padding: 0.5rem 0 0;
+    color: var(--ac-ink-muted);
+    font-size: 0.75rem;
+  }
+
+  .thread-turn__label,
+  .thread-plan__label {
+    flex: none;
+    color: var(--ac-ink);
+    font-size: 0.7rem;
+    font-weight: 600;
+  }
+
+  .thread-turn p {
+    margin: 0;
+  }
+
+  .thread-plan {
+    width: 100%;
+    border: 1px solid var(--ac-border);
+    border-radius: 0.6rem;
+    background: var(--ac-surface);
+    padding: 0.6rem 0.7rem;
+  }
+
+  .thread-plan pre {
+    max-height: 14rem;
+    overflow: auto;
+    margin: 0.4rem 0 0;
+    font-family: var(--font-mono);
+    font-size: 0.7rem;
+    white-space: pre-wrap;
+  }
+
+  .thread-note {
+    width: 100%;
+    color: var(--ac-ink-muted);
+    font-size: 0.74rem;
+    font-style: italic;
+  }
+
+  .thread-note p {
+    margin: 0;
+  }
+
   .thread-message-list {
     display: grid;
     align-content: end;

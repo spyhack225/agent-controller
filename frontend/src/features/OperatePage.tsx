@@ -27,6 +27,12 @@ import {
 } from "../activity";
 import type { Controller } from "../controller";
 import { commandSummary, commandType, formatRelativeTime, renderEventResult } from "../format";
+import {
+  liveThreadTurnInFlight,
+  type LiveThreadEntry,
+  type LiveThreadState,
+  type LiveThreadStatus,
+} from "../liveThread";
 import { ActivityOrb, ActivityStatus, LiveFrame } from "../motion";
 import type { Command, JsonRecord, SavedAction, T3SessionFailure } from "../types";
 import { useWorkspaceLoader } from "../useWorkspaceLoader";
@@ -95,6 +101,35 @@ export function OperatePage({ controller }: { controller: Controller }) {
     [c.selectedProjectId, c.threads],
   );
   const threadMessages = selectedThread?.messages ?? [];
+
+  // A watch is a lease against T3's socket, so it is registered because a thread is ON SCREEN —
+  // not because one is selected — and released the moment this view goes away.
+  useEffect(() => {
+    if (!c.selectedEnvironmentId || !c.selectedThreadId) {
+      c.watchThread(null);
+      return;
+    }
+    c.watchThread({ environmentId: c.selectedEnvironmentId, threadId: c.selectedThreadId });
+    return () => c.watchThread(null);
+  }, [c.selectedEnvironmentId, c.selectedThreadId, c.watchThread]);
+
+  // Only the live state for the thread actually on screen counts. A payload that arrived a moment
+  // before the operator switched threads must never be drawn over the new one.
+  const live = c.liveThread
+    && c.liveThread.environmentId === c.selectedEnvironmentId
+    && c.liveThread.threadId === c.selectedThreadId
+    ? c.liveThread
+    : null;
+  // The thread subscription rides the same SSE connection as everything else, so a broker that is
+  // reconnecting means this transcript may already be behind — whatever the last status said.
+  const streamDegraded = c.connection === "reconnecting" || c.connection === "error";
+  const liveStatus: LiveThreadStatus = !live
+    ? "idle"
+    : streamDegraded && live.status === "live" ? "reconnecting" : live.status;
+  // An empty snapshot is a real answer ("this thread has nothing in it"), but it is not something
+  // to render over the polled view, so the fallback below still applies.
+  const liveEntries = live?.hasSnapshot && live.entries.length > 0 ? live.entries : null;
+
   const threadPendingApprovals = useMemo(
     () => c.pendingApprovals.filter((command) =>
       command.threadId === c.selectedThreadId
@@ -113,10 +148,11 @@ export function OperatePage({ controller }: { controller: Controller }) {
   // still arriving. `dispatched` is explicitly included: it means T3 accepted the command, not that
   // the agent replied, and that gap is exactly the interval the composer should look occupied.
   const turnInFlight = useMemo(
-    () => threadMessages.some((message) => message.streaming)
+    () => liveThreadTurnInFlight(live)
+      || threadMessages.some((message) => message.streaming)
       || threadCommands.some((command) =>
         command.status === "dispatched" || command.status === "running"),
-    [threadCommands, threadMessages],
+    [live, threadCommands, threadMessages],
   );
   const threadFailures = useMemo(
     () => c.sessionFailures.filter((failure) => failure.threadId === c.selectedThreadId),
@@ -644,6 +680,25 @@ export function OperatePage({ controller }: { controller: Controller }) {
             </div>
           ) : null}
 
+          <LiveThreadBanner state={live} status={liveStatus} />
+
+          {live?.historyGap ? (
+            <div className="thread-gap-notice" role="note">
+              <History className="size-4" aria-hidden="true" />
+              <p>
+                The live connection came back after a gap T3 could not replay. This is the thread in
+                full as it stands now — the individual steps in between were never recorded.
+              </p>
+            </div>
+          ) : null}
+
+          {live?.historyTruncated ? (
+            <div className="thread-gap-notice" role="note">
+              <History className="size-4" aria-hidden="true" />
+              <p>Older messages in this thread are not loaded. This view starts partway in.</p>
+            </div>
+          ) : null}
+
           {threadPendingApprovals.map((command) => (
             <LiveFrame
               key={command.id}
@@ -680,7 +735,13 @@ export function OperatePage({ controller }: { controller: Controller }) {
             </LiveFrame>
           ))}
 
-          {threadMessages.length ? (
+          {liveEntries ? (
+            <div className="thread-message-list" aria-label="Thread messages" data-live="true">
+              {liveEntries.map((entry) => (
+                <LiveThreadEntryView key={entry.key} entry={entry} />
+              ))}
+            </div>
+          ) : threadMessages.length ? (
             <div className="thread-message-list" aria-label="Thread messages">
               {threadMessages.map((message) => (
                 <article key={message.id} className="thread-message" data-role={message.role}>
@@ -849,6 +910,155 @@ export function OperatePage({ controller }: { controller: Controller }) {
           </details>
         </div>
       </div>
+    </div>
+  );
+}
+
+// -----------------------------------------------------------------------------------------------
+// The live transcript
+//
+// Two rules govern everything below. First, the view never claims to be current unless the gateway
+// said `live`: `connecting` and `resuming` are catch-up, and `reconnecting` means the reader is
+// looking at the last state received and has to be able to tell. Second, a streaming message body
+// is whatever the reducer has ACCUMULATED — the component never sees a delta, because a component
+// that did would be one refactor away from rendering it as the whole reply.
+// -----------------------------------------------------------------------------------------------
+
+interface LiveStatusDescriptor {
+  tone: "neutral" | "live" | "warning" | "danger";
+  label: string;
+  detail: string;
+}
+
+export function describeLiveThreadStatus(
+  state: LiveThreadState,
+  status: LiveThreadStatus,
+): LiveStatusDescriptor | null {
+  switch (status) {
+    case "connecting":
+      return {
+        tone: "neutral",
+        label: "Connecting",
+        detail: "Opening a live connection to this thread.",
+      };
+    case "resuming":
+      return {
+        tone: "neutral",
+        label: "Catching up",
+        detail: "Replaying what happened while this view was away.",
+      };
+    case "live":
+      return {
+        tone: "live",
+        label: "Live",
+        detail: "Messages and tool activity appear as the agent works.",
+      };
+    case "reconnecting":
+      return {
+        tone: "warning",
+        label: "Reconnecting",
+        detail: `${state.statusError ?? "The live connection dropped."} Showing the last state received — it may be out of date.`
+          + (state.attempt > 0 ? ` Attempt ${state.attempt}.` : ""),
+      };
+    case "stopped":
+      return {
+        tone: "danger",
+        label: "Not live",
+        detail: state.stoppedReason === "environment-missing"
+          ? "This environment is no longer paired, so the thread cannot be streamed."
+          : `${state.statusError ?? "Live updates stopped."} The polled workspace view still refreshes.`,
+      };
+    default:
+      return null;
+  }
+}
+
+function LiveThreadBanner({
+  state,
+  status,
+}: {
+  state: LiveThreadState | null;
+  status: LiveThreadStatus;
+}) {
+  if (!state) return null;
+  const descriptor = describeLiveThreadStatus(state, status);
+  if (!descriptor) return null;
+  return (
+    <div
+      className="thread-live-status"
+      role="status"
+      aria-label="Live thread stream"
+      data-state={status}
+    >
+      <StatusBadge tone={descriptor.tone} label={descriptor.label} pulse={status === "live"} />
+      <span>{descriptor.detail}</span>
+      {state.sessionError ? (
+        <small className="thread-live-status__error">{state.sessionError}</small>
+      ) : null}
+    </div>
+  );
+}
+
+function LiveThreadEntryView({ entry }: { entry: LiveThreadEntry }) {
+  if (entry.kind === "message") {
+    return (
+      <article
+        className="thread-message"
+        data-role={entry.role}
+        data-streaming={entry.streaming ? "true" : undefined}
+      >
+        <header>
+          <span>
+            {entry.role === "user" ? "You" : entry.role === "assistant" ? "Agent" : entry.role}
+          </span>
+          <span>
+            <ActivityOrb activity={streamingActivity(entry.streaming)} />
+            {entry.at ? <time>{formatRelativeTime(entry.at)}</time> : null}
+          </span>
+        </header>
+        <p>{entry.text}</p>
+      </article>
+    );
+  }
+
+  if (entry.kind === "activity") {
+    return (
+      <div className="thread-activity" data-tone={entry.tone}>
+        <span className="thread-activity__kind">{entry.activityKind}</span>
+        <p>{entry.summary}</p>
+        {entry.at ? <time>{formatRelativeTime(entry.at)}</time> : null}
+      </div>
+    );
+  }
+
+  if (entry.kind === "turn") {
+    const additions = entry.files.reduce((total, file) => total + file.additions, 0);
+    const deletions = entry.files.reduce((total, file) => total + file.deletions, 0);
+    return (
+      <div className="thread-turn" data-status={entry.status}>
+        <span className="thread-turn__label">Turn finished</span>
+        <p>
+          {entry.files.length === 0
+            ? "No files changed"
+            : `${entry.files.length} ${entry.files.length === 1 ? "file" : "files"} changed · +${additions} −${deletions}`}
+        </p>
+        {entry.at ? <time>{formatRelativeTime(entry.at)}</time> : null}
+      </div>
+    );
+  }
+
+  if (entry.kind === "plan") {
+    return (
+      <div className="thread-plan">
+        <span className="thread-plan__label">Proposed plan</span>
+        <pre>{entry.planMarkdown}</pre>
+      </div>
+    );
+  }
+
+  return (
+    <div className="thread-note">
+      <p>{entry.summary}</p>
     </div>
   );
 }

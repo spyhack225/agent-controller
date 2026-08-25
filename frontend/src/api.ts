@@ -19,6 +19,11 @@ export interface ApiOptions {
   auth?: boolean;
   body?: unknown;
   signal?: AbortSignal;
+  /**
+   * Let the browser finish this request after the document goes away. Only used by the thread
+   * watch release on `pagehide`, where the alternative is waiting out a 90s lease.
+   */
+  keepalive?: boolean;
 }
 
 export async function requestJson<T>(path: string, options: ApiOptions = {}): Promise<T> {
@@ -33,6 +38,7 @@ export async function requestJson<T>(path: string, options: ApiOptions = {}): Pr
     headers,
     body: options.body === undefined ? undefined : JSON.stringify(options.body),
     signal: options.signal,
+    ...(options.keepalive ? { keepalive: true } : {}),
   });
 
   const contentType = response.headers.get("content-type") ?? "";

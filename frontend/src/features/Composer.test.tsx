@@ -41,6 +41,10 @@ function controller(overrides: Record<string, unknown> = {}) {
     setSelectedProjectId: vi.fn(),
     setSelectedThreadId: vi.fn(),
     api: vi.fn(async () => ({ command: { id: "cmd_1" } })),
+    // The Operate view leases a live thread watch while a thread is on screen; without these the
+    // page throws in an effect before a single assertion runs.
+    liveThread: null,
+    watchThread: vi.fn(),
     refreshAll: vi.fn(),
     refreshMedia: vi.fn(),
     uploadMedia: vi.fn(async () => ({ id: "media_new", kind: "image", contentType: "image/png" })),
