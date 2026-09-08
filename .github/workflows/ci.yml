@@ -118,7 +118,13 @@ jobs:
         with:
           node-version: "22.21.1"
           cache: npm
-          cache-dependency-path: cloudflare/package-lock.json
+          cache-dependency-path: |
+            package-lock.json
+            cloudflare/package-lock.json
+      - name: Install locked root dependencies
+        run: npm ci --no-audit --no-fund
+      - name: Build console for the Static Assets binding
+        run: npm run build:app
       - name: Install locked edge dependencies
         run: npm ci --prefix cloudflare --no-audit --no-fund
       - name: Typecheck edge Worker and Durable Objects

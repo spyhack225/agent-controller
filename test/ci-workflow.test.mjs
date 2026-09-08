@@ -70,16 +70,20 @@ describe("hermetic GitHub CI workflow", () => {
       ]],
       ["server", [
         "npm ci --no-audit --no-fund",
+        "npm run build:app",
         "npm run typecheck:convex",
         "npm run test:server",
         "npm run test:workflow",
       ]],
       ["cloud-edge", [
+        "npm ci --no-audit --no-fund",
+        "npm run build:app",
         "npm ci --prefix cloudflare --no-audit --no-fund",
         "npm run typecheck:cloud",
         "npm run test:cloud",
       ]],
       ["cloud-control-plane", [
+        "npm ci --no-audit --no-fund",
         "npm ci --prefix cloudflare-control-plane --no-audit --no-fund",
         "npm run typecheck:cloud-control-plane",
         "npm run test:cloud-control-plane",
