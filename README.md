@@ -1,5 +1,8 @@
 # Agent Controller
 
+[![Hermetic CI](https://github.com/spyhack225/agent-controller/actions/workflows/ci.yml/badge.svg)](https://github.com/spyhack225/agent-controller/actions/workflows/ci.yml)
+[![License: Apache-2.0](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
+
 Agent Controller is a cloud control plane between remote controller hardware, a phone/web console,
 and [T3 Code](https://github.com/pingdotgg/t3code) environments running on users' machines. The
 production server should run in the cloud—preferably on Cloudflare—while T3 Code and Tailscale stay
@@ -33,6 +36,17 @@ The current product includes:
 The same action may cross the console, gateway, T3 transport, storage, and controller firmware.
 Contributors should read [AGENTS.md](AGENTS.md) for the complete-change checklist and
 [CLAUDE.md](CLAUDE.md) for detailed architecture and protocol invariants.
+
+## Open source and project status
+
+Agent Controller is open source under the [Apache License 2.0](LICENSE). The gateway, web console,
+connector CLI, and four firmware targets are implemented and covered by the hermetic repository
+gate (`npm test`, the secret scan, and the documentation link gate), but no managed cloud
+deployment, npm publication, or live-T3 qualification has been performed yet. Read
+[roadmap/IMPLEMENTATION-STATUS.md](roadmap/IMPLEMENTATION-STATUS.md) before trusting any claim
+about what works: it records what has been proven, where, and what has not. Contributions are
+welcome; see [CONTRIBUTING.md](CONTRIBUTING.md). Report vulnerabilities privately as described in
+[SECURITY.md](SECURITY.md), never in a public issue.
 
 ## Product architecture priorities
 
@@ -489,7 +503,7 @@ Example for the local Tacs test:
 ```bash
 npm run setup:t3 -- \
   --yes \
-  --project /Users/example/Documents/Claude/Projects/Tacs \
+  --project /path/to/your/project \
   --provider openai \
   --tunnel local \
   --gateway-url http://127.0.0.1:3996 \
@@ -644,3 +658,9 @@ See [docs/api.md](docs/api.md) for endpoint examples and the local end-to-end fl
 progress is tracked in
 [roadmap/open-input-media-voice-environments-roadmap.md](roadmap/open-input-media-voice-environments-roadmap.md),
 with current verified state in [roadmap/IMPLEMENTATION-STATUS.md](roadmap/IMPLEMENTATION-STATUS.md).
+
+## License
+
+Copyright the Agent Controller contributors. Licensed under the [Apache License, Version 2.0](LICENSE).
+Vendor hardware documentation kits are not redistributed with this repository; each board's `docs/`
+folder explains where to download them.

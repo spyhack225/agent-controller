@@ -5,9 +5,9 @@ Canonical progress ledger for
 This file records what the repository can do now; the roadmap records the target and sequence.
 Anything not marked **done** is not complete.
 
-Last verified: **2026-09-02** in the current working tree. The earlier `4d06ff2` evidence remains the
-baseline for the open-input/media initiative; the cloud workstream below is uncommitted and has not
-been deployed.
+Last verified: **2026-09-08** in the current working tree. The earlier `674a8f9` evidence remains
+the baseline for the open-input/media initiative; the cloud workstream below is committed but has
+not been deployed anywhere.
 
 ## Cloud control-plane and local connector workstream
 
@@ -114,7 +114,7 @@ Firmware compilation reports deprecated ESP32 legacy I2S/PCNT API warnings in ca
 
 ## Correction notice
 
-Milestone numbering clashes between artefacts: commit `49caa52` calls the Parakeet/voice work
+Milestone numbering clashes between artefacts: commit `321ae1d` calls the Parakeet/voice work
 "Milestone 2" while the roadmap calls it Milestone 3. The roadmap's numbering is authoritative
 here. Earlier revisions of this file recorded Milestones 2 and 3 as `todo` when both were largely
 implemented, and listed "shared firmware gateway client" as an active blocker after it had been

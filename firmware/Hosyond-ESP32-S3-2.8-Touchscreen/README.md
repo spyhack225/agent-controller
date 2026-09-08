@@ -1,6 +1,6 @@
 # Hosyond / LCDWIKI ES3C28P — 2.8" IPS ESP32-S3 touchscreen
 
-Vendor materials live in [`docs/`](docs/) — schematic, specification, datasheets, and a 30-example
+Vendor materials belong in [`docs/`](docs/README.md) (download instructions there; the kit itself is not committed) — schematic, specification, datasheets, and a 30-example
 Arduino pack. This board's pin map and audio driver both come from there, not from guesswork.
 
 **Status: hardware-proven prototype with a full touch UI; five environments compile.** The board has

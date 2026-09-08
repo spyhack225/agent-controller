@@ -41,10 +41,11 @@ test("repository secret scan blocks runtime data and private credential files", 
 });
 
 test("repository secret scan reports signatures without retaining matched values", () => {
+  // Assembled at runtime so this test file does not itself trip the tracked-file scan.
   const findings = scanText("fixture.txt", [
-    "-----BEGIN PRIVATE KEY-----",
-    "sk_live_1234567890abcdefghijkl",
-    "ghp_123456789012345678901234567890",
+    ["-----BEGIN ", "PRIVATE KEY-----"].join(""),
+    ["sk_", "live_", "1234567890abcdefghijkl"].join(""),
+    ["ghp", "_123456789012345678901234567890"].join(""),
   ].join("\n"));
   assert.deepEqual(findings, [
     { path: "fixture.txt", rule: "private-key-material" },

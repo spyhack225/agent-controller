@@ -4,6 +4,15 @@
   "private": true,
   "type": "module",
   "description": "Cloud control plane for remote agent controller devices and T3 Code environments.",
+  "license": "Apache-2.0",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/spyhack225/agent-controller.git"
+  },
+  "homepage": "https://github.com/spyhack225/agent-controller#readme",
+  "bugs": {
+    "url": "https://github.com/spyhack225/agent-controller/issues"
+  },
   "scripts": {
     "prestart": "npm run build:app",
     "start": "node --env-file-if-exists=.env --env-file-if-exists=.env.local src/server.mjs",

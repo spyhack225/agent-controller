@@ -64,7 +64,7 @@ The remaining qualification gaps for Phases 3, 6, and 8 are tracked in
 - QR encoder checked byte-for-byte against two independent encoders and decoded by OpenCV.
 - SigV4 checked against official AWS vectors and round-tripped through MinIO.
 - Partition table confirmed byte-for-byte against the attached ESP32-S3.
-- Original local E2E on `/Users/example/Documents/Claude/Projects/Tacs` remains valid.
+- Original local E2E on `/Users/you/Documents/Claude/Projects/Tacs` remains valid.
 
 ## Target Architecture
 

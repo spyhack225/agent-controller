@@ -2,6 +2,16 @@
   "name": "@agent-controller/connector",
   "version": "0.1.0",
   "description": "Outbound bridge between a local T3 Code environment and Agent Controller",
+  "license": "Apache-2.0",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/spyhack225/agent-controller.git",
+    "directory": "packages/connector"
+  },
+  "homepage": "https://github.com/spyhack225/agent-controller#readme",
+  "bugs": {
+    "url": "https://github.com/spyhack225/agent-controller/issues"
+  },
   "type": "module",
   "bin": {
     "agent-controller-connect": "./bin/agent-controller-connect.mjs"
@@ -26,7 +36,6 @@
     "t3-code",
     "connector"
   ],
-  "license": "UNLICENSED",
   "publishConfig": {
     "access": "public"
   }
