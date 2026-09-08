@@ -1,4 +1,6 @@
 import {
+  Archive,
+  ArchiveRestore,
   ArrowLeft,
   ArrowRight,
   Cable,
@@ -12,7 +14,10 @@ import {
   KeyRound,
   Link2,
   Loader2,
+  Laptop,
+  Monitor,
   Network,
+  Pencil,
   RefreshCw,
   Router,
   Save,
@@ -28,8 +33,10 @@ import { useCallback, useEffect, useRef, useState, type ReactNode } from "react"
 import { createPortal } from "react-dom";
 
 import type { Controller } from "../controller";
+import { connectorForEnvironment, environmentHealthLayers } from "../connectorHealth";
 import { formatRelativeTime } from "../format";
 import type {
+  Connector,
   ConnectSession,
   ConnectSessionMint,
   Device,
@@ -39,16 +46,20 @@ import type {
   RemoteAccessStatus,
 } from "../types";
 import { Button, Field, StatusBadge, cn, type StatusTone, useConfirm } from "../ui";
+import { EnvironmentActionCluster } from "./FeatureActionClusters";
 
 interface EnvironmentsPageProps {
   controller: Controller;
   connectOpen?: boolean;
   onConnectOpenChange?: (open: boolean) => void;
+  editEnvironmentId?: string | null;
+  onEditEnvironmentHandled?: () => void;
 }
 
 type CredentialType = "pairingToken" | "accessToken";
 type EnvironmentTab = "connection" | "gateways" | "credential" | "health" | "workspace";
 type EnvironmentAccessMode = "local" | "tailscale" | "online";
+type EnvironmentComputerTarget = "this-computer" | "another-computer";
 
 interface EnvironmentGateway {
   id: string;
@@ -96,9 +107,9 @@ function environmentUrlPlaceholder(mode: EnvironmentAccessMode) {
   return "http://127.0.0.1:3773";
 }
 
-function inferEnvironmentAccessMode(baseUrl: string): EnvironmentAccessMode {
+function inferEnvironmentAccessMode(baseUrl: string | null | undefined): EnvironmentAccessMode {
   try {
-    const parsed = new URL(baseUrl);
+    const parsed = new URL(baseUrl ?? "");
     const hostname = parsed.hostname.toLowerCase();
     if (hostname.endsWith(".ts.net")) return "tailscale";
     if (
@@ -138,7 +149,14 @@ function credentialExpired(environment: Environment): boolean {
   );
 }
 
-function environmentStatus(environment: Environment): { label: string; tone: StatusTone } {
+function environmentStatus(environment: Environment, connector: Connector | null): { label: string; tone: StatusTone } {
+  if ((environment.transportMode ?? "direct") === "connector") {
+    if (connector?.revokedAt || connector?.status === "revoked") return { label: "connector revoked", tone: "danger" };
+    if (connector?.status === "online" && environment.freshness !== "stale") return { label: "connector online", tone: "success" };
+    if (connector?.status === "offline") return { label: "connector offline", tone: "danger" };
+    if (connector?.status === "reconnecting" || environment.freshness === "stale") return { label: "stale · reconnecting", tone: "warning" };
+    return { label: "waiting for connector", tone: "warning" };
+  }
   if (credentialExpired(environment)) return { label: "token expired", tone: "danger" };
   if (environment.status === "reachable") return { label: "reachable", tone: "success" };
   if (environment.status === "unreachable" || environment.health?.lastError) {
@@ -261,6 +279,8 @@ export function EnvironmentsPage({
   controller: c,
   connectOpen = false,
   onConnectOpenChange,
+  editEnvironmentId = null,
+  onEditEnvironmentHandled,
 }: EnvironmentsPageProps) {
   const confirm = useConfirm();
   const [internalConnectOpen, setInternalConnectOpen] = useState(false);
@@ -269,6 +289,7 @@ export function EnvironmentsPage({
   // session carries this environment's id so the redemption updates it in place.
   const [repairEnvironment, setRepairEnvironment] = useState<Environment | null>(null);
   const activeConnectOpen = onConnectOpenChange ? connectOpen : internalConnectOpen;
+  const archivedEnvironments = c.archivedEnvironments ?? [];
 
   useEffect(() => {
     if (!editingEnvironment) return;
@@ -287,6 +308,13 @@ export function EnvironmentsPage({
     setEditingEnvironment(environment);
   };
 
+  useEffect(() => {
+    if (!editEnvironmentId) return;
+    const environment = c.environments.find((candidate) => candidate.id === editEnvironmentId);
+    if (environment) openEnvironment(environment);
+    onEditEnvironmentHandled?.();
+  }, [editEnvironmentId]);
+
   const checkEnvironment = async (environment: Environment) => {
     await c.run(`check-environment-${environment.id}`, "Reachability check complete.", async () => {
       const result = await c.api(`/v1/t3/environments/${encodeURIComponent(environment.id)}/check`, {
@@ -304,8 +332,8 @@ export function EnvironmentsPage({
     await c.run(`environment-snapshot-${environment.id}`, "Workspace snapshot loaded.", () => c.loadSnapshot(environment.id));
   };
 
-  const removeEnvironment = async (environment: Environment) => {
-    // Read the impact before asking: removing an environment also disables every saved action and
+  const archiveEnvironment = async (environment: Environment) => {
+    // Read the impact before asking: archiving also disables every saved action and
     // macro aimed at it, which the owner cannot see from this screen.
     let dependencies: EnvironmentDependencies | null = null;
     try {
@@ -314,14 +342,54 @@ export function EnvironmentsPage({
       dependencies = null;
     }
     const accepted = await confirm({
-      title: `Remove ${environment.label}?`,
-      description: describeEnvironmentRemoval(dependencies),
-      confirmLabel: "Remove environment",
+      title: `Archive ${environment.label}?`,
+      description: describeEnvironmentArchive(dependencies),
+      confirmLabel: "Archive environment",
     });
     if (!accepted) return;
-    await c.run("remove-environment", "Environment removed.", async () => {
-      const result = await c.api(`/v1/t3/environments/${encodeURIComponent(environment.id)}`, { method: "DELETE" });
+    await c.run("archive-environment", "Environment archived and disconnected.", async () => {
+      const result = await c.api(`/v1/t3/environments/${encodeURIComponent(environment.id)}/archive`, {
+        method: "POST",
+        body: {},
+      });
       setEditingEnvironment(null);
+      await c.refreshAll();
+      return result;
+    });
+  };
+
+  const deleteEnvironment = async (environment: Environment) => {
+    let dependencies: EnvironmentDependencies | null = null;
+    if (!environment.archivedAt) {
+      try {
+        dependencies = await c.api(`/v1/t3/environments/${encodeURIComponent(environment.id)}/dependencies`) as EnvironmentDependencies;
+      } catch {
+        dependencies = null;
+      }
+    }
+    const accepted = await confirm({
+      title: `Remove ${environment.label}?`,
+      description: describeEnvironmentDeletion(environment, dependencies),
+      confirmLabel: "Remove environment",
+      ...(dependencies && (dependencies.counts.devices + dependencies.counts.actions + dependencies.counts.macros + dependencies.counts.onboarding) > 0
+        ? { requiredText: environment.label }
+        : {}),
+    });
+    if (!accepted) return;
+    await c.run(`delete-environment-${environment.id}`, "Environment removed. You can restore it during retention.", async () => {
+      const result = await c.api(`/v1/t3/environments/${encodeURIComponent(environment.id)}`, {
+        method: "DELETE",
+        body: { confirmationLabel: environment.label },
+      });
+      setEditingEnvironment(null);
+      await c.refreshAll();
+      return result;
+    });
+  };
+
+  const restoreEnvironment = async (environment: Environment) => {
+    await c.run(`restore-environment-${environment.id}`, "Environment restored. Re-pair its connector to resume control.", async () => {
+      const result = await c.api(`/v1/t3/environments/${encodeURIComponent(environment.id)}/restore`, { method: "POST", body: {} });
       await c.refreshAll();
       return result;
     });
@@ -354,11 +422,19 @@ export function EnvironmentsPage({
             <EnvironmentTile
               key={environment.id}
               environment={environment}
+              connector={connectorForEnvironment(c.connectors, environment)}
+              cloudConnection={c.connection}
+              proofReady={Boolean(
+                c.onboarding?.environmentId === environment.id
+                && c.onboardingReadiness?.checks.firstRunCompleted,
+              )}
               gateways={environmentGatewayInventory(environment.id, c.devices ?? [], c.gatewayProfiles ?? [], c.remoteAccess ?? null)}
               busyAction={c.busyAction}
               onOpen={() => openEnvironment(environment)}
               onCheck={() => void checkEnvironment(environment)}
               onLoad={() => void loadSnapshot(environment)}
+              onArchive={() => void archiveEnvironment(environment)}
+              onDelete={() => void deleteEnvironment(environment)}
             />
           ))}
         </section>
@@ -371,7 +447,7 @@ export function EnvironmentsPage({
           <p className="eyebrow">No T3 hosts paired</p>
           <h3 id="empty-environments-title" className="font-display text-xl font-semibold">Where does your agent work run?</h3>
           <p className="mt-2 max-w-lg text-sm leading-relaxed text-ink-muted">
-            Connect a local workstation, Tailnet host, or secured tunnel endpoint. Credentials stay encrypted and are never returned by the API.
+            Run one short-lived connector command on the computer where T3 Code runs. No inbound port, public T3 URL, or cloud-stored T3 token is required.
           </p>
           <div className="mt-5 flex flex-wrap justify-center gap-2">
             <Button variant="primary" onClick={() => setConnectOpen(true)}><Cable className="size-4" /> Connect T3 Code</Button>
@@ -379,6 +455,37 @@ export function EnvironmentsPage({
           </div>
         </section>
       )}
+
+      {archivedEnvironments.length ? (
+        <section className="environment-archive" aria-labelledby="archived-environments-heading">
+          <div className="environment-archive__heading">
+            <div>
+              <p className="eyebrow">Disconnected</p>
+              <h3 id="archived-environments-heading" className="font-display text-base font-semibold">Archived environments</h3>
+            </div>
+            <StatusBadge label={`${archivedEnvironments.length} archived`} />
+          </div>
+          <div className="environment-archive__list">
+            {archivedEnvironments.map((environment) => (
+              <article key={environment.id} className="environment-archive__row">
+                <span className="environment-archive__icon" aria-hidden="true"><Archive className="size-4" /></span>
+                <span className="environment-archive__copy">
+                  <strong>{environment.label}</strong>
+                  <span>Removed {formatRelativeTime(environment.deletedAt ?? environment.archivedAt)} · recoverable until {formatRelativeTime(environment.purgeAfter)}</span>
+                </span>
+                <Button
+                  size="sm"
+                  variant="secondary"
+                  busy={c.busyAction === `restore-environment-${environment.id}`}
+                  onClick={() => void restoreEnvironment(environment)}
+                >
+                  <ArchiveRestore className="size-3.5" /> Restore
+                </Button>
+              </article>
+            ))}
+          </div>
+        </section>
+      ) : null}
 
       <ConnectEnvironmentDialog
         controller={c}
@@ -396,7 +503,8 @@ export function EnvironmentsPage({
         onClose={() => setEditingEnvironment(null)}
         onCheck={() => editingEnvironment && void checkEnvironment(editingEnvironment)}
         onLoad={() => editingEnvironment && void loadSnapshot(editingEnvironment, true)}
-        onRemove={() => editingEnvironment && void removeEnvironment(editingEnvironment)}
+        onArchive={() => editingEnvironment && void archiveEnvironment(editingEnvironment)}
+        onRemove={() => editingEnvironment && void deleteEnvironment(editingEnvironment)}
         onRepair={() => {
           setRepairEnvironment(editingEnvironment);
           setEditingEnvironment(null);
@@ -406,8 +514,8 @@ export function EnvironmentsPage({
   );
 }
 
-function describeEnvironmentRemoval(preview: EnvironmentDependencies | null): string {
-  const credential = "Removing deletes the stored T3 credential.";
+function describeEnvironmentArchive(preview: EnvironmentDependencies | null): string {
+  const credential = "Archiving permanently deletes the stored T3 credential, stops live workspace loading, and moves the environment to Archive.";
   if (!preview) return `${credential} Devices, saved actions, macros, and onboarding that point at it will be cleared or disabled.`;
   const impacts: string[] = [];
   if (preview.counts.devices) impacts.push(countLabel(preview.counts.devices, "device default", "device defaults"));
@@ -421,6 +529,13 @@ function describeEnvironmentRemoval(preview: EnvironmentDependencies | null): st
   return `${credential} It also clears ${joinList(impacts)}.${disabled}`;
 }
 
+function describeEnvironmentDeletion(environment: Environment, preview: EnvironmentDependencies | null): string {
+  if (environment.archivedAt) {
+    return "This environment is already removed and remains recoverable until its retention deadline.";
+  }
+  return `${describeEnvironmentArchive(preview)} The credential-free record is retained temporarily so you can restore and re-pair it.`;
+}
+
 function countLabel(count: number, singular: string, plural: string): string {
   return `${count} ${count === 1 ? singular : plural}`;
 }
@@ -430,50 +545,48 @@ function joinList(items: string[]): string {
   return `${items.slice(0, -1).join(", ")} and ${items.at(-1)}`;
 }
 
-export function EnvironmentActionCluster({
-  onConnect,
-  className,
-}: {
-  onConnect: () => void;
-  className?: string;
-}) {
-  return (
-    <div className={cn("environment-action-cluster", className)}>
-      <Button size="sm" variant="primary" onClick={onConnect}><Cable className="size-3.5" /> Connect environment</Button>
-    </div>
-  );
-}
-
 function EnvironmentTile({
   environment,
+  connector,
+  cloudConnection,
+  proofReady,
   gateways,
   busyAction,
   onOpen,
   onCheck,
   onLoad,
+  onArchive,
+  onDelete,
 }: {
   environment: Environment;
+  connector: Connector | null;
+  cloudConnection: Controller["connection"];
+  proofReady: boolean;
   gateways: EnvironmentGateway[];
   busyAction: string | null;
   onOpen: () => void;
   onCheck: () => void;
   onLoad: () => void;
+  onArchive: () => void;
+  onDelete: () => void;
 }) {
-  const status = environmentStatus(environment);
+  const status = environmentStatus(environment, connector);
   const stop = (callback: () => void) => (event: React.MouseEvent) => {
     event.stopPropagation();
     callback();
   };
   return (
     <article className="device-tile environment-tile" onClick={onOpen}>
-      <button type="button" className="device-tile__header" aria-label={`Edit ${environment.label}`} onClick={stop(onOpen)}>
+      <button type="button" className="device-tile__header" aria-label={`Open ${environment.label}`} onClick={stop(onOpen)}>
         <div className="device-tile__glyph environment-tile__glyph"><Server className="size-5" /></div>
         <div className="min-w-0 flex-1">
           <div className="flex min-w-0 flex-wrap items-center gap-2">
             <h3 className="truncate font-display text-base font-semibold">{environment.label}</h3>
             <StatusBadge tone={status.tone} label={status.label} />
           </div>
-          <p className="mt-1 truncate text-xs text-ink-muted">{environment.baseUrl}</p>
+          <p className="mt-1 truncate text-xs text-ink-muted">
+            {(environment.transportMode ?? "direct") === "connector" ? "Outbound connector" : environment.baseUrl}
+          </p>
         </div>
         <ArrowRight className="device-tile__open size-4" />
       </button>
@@ -482,11 +595,13 @@ function EnvironmentTile({
         <EnvironmentMetric label="Last checked" value={formatRelativeTime(environment.health?.lastCheckedAt)} />
         <EnvironmentMetric label="Last reachable" value={formatRelativeTime(environment.health?.lastReachableAt)} />
         <EnvironmentMetric
-          label="Credential"
-          value={environment.accessTokenExpiresAt ? formatRelativeTime(environment.accessTokenExpiresAt) : "No known expiry"}
-          tone={credentialExpired(environment) ? "danger" : undefined}
+          label={(environment.transportMode ?? "direct") === "connector" ? "Connector seen" : "Credential"}
+          value={(environment.transportMode ?? "direct") === "connector"
+            ? formatRelativeTime(connector?.lastSeenAt ?? environment.lastConnectorSeenAt)
+            : environment.accessTokenExpiresAt ? formatRelativeTime(environment.accessTokenExpiresAt) : "No known expiry"}
+          tone={(environment.transportMode ?? "direct") === "direct" && credentialExpired(environment) ? "danger" : undefined}
         />
-        <EnvironmentMetric label="Snapshot age" value={formatRelativeTime(environment.health?.lastCheckedAt)} />
+        <EnvironmentMetric label="Projection" value={`${environment.freshness ?? "unknown"} · ${formatRelativeTime(environment.lastProjectionAt ?? environment.health?.lastCheckedAt)}`} />
         <EnvironmentMetric label="Projects" value={environment.health?.snapshot?.line1 ?? "Not loaded"} />
         <EnvironmentMetric label="Sessions" value={environment.health?.snapshot?.line2 ?? "Not loaded"} />
       </dl>
@@ -494,6 +609,14 @@ function EnvironmentTile({
       {environment.health?.lastError ? (
         <p className="environment-tile__error" title={environment.health.lastError}>{environment.health.lastError}</p>
       ) : null}
+
+      <EnvironmentHealthStack
+        environment={environment}
+        connector={connector}
+        cloudConnection={cloudConnection}
+        proofReady={proofReady}
+        compact
+      />
 
       <EnvironmentGatewaySummary gateways={gateways} />
 
@@ -512,6 +635,28 @@ function EnvironmentTile({
         >
           <RefreshCw className="size-3.5" /> Check
         </Button>
+        <div className="environment-tile__management-actions">
+          <Button size="sm" aria-label={`Edit ${environment.label}`} onClick={stop(onOpen)}>
+            <Pencil className="size-3.5" /> Edit
+          </Button>
+          <Button
+            size="sm"
+            aria-label={`Archive ${environment.label}`}
+            busy={busyAction === "archive-environment"}
+            onClick={stop(onArchive)}
+          >
+            <Archive className="size-3.5" /> Archive
+          </Button>
+          <Button
+            size="sm"
+            variant="danger-ghost"
+            aria-label={`Delete ${environment.label}`}
+            busy={busyAction === `delete-environment-${environment.id}`}
+            onClick={stop(onDelete)}
+          >
+            <Trash2 className="size-3.5" /> Delete
+          </Button>
+        </div>
       </div>
     </article>
   );
@@ -570,6 +715,47 @@ function EnvironmentMetric({ label, value, tone }: { label: string; value: React
   );
 }
 
+export function EnvironmentHealthStack({
+  environment,
+  connector,
+  cloudConnection,
+  proofReady = false,
+  compact = false,
+}: {
+  environment: Environment;
+  connector: Connector | null;
+  cloudConnection: Controller["connection"];
+  proofReady?: boolean;
+  compact?: boolean;
+}) {
+  const layers = environmentHealthLayers({ environment, connector, cloudConnection, proofReady });
+  return (
+    <section className={cn("environment-health-stack", compact && "environment-health-stack--compact")} aria-label="Connection health">
+      <div className="environment-health-stack__heading">
+        <span>Connection path</span>
+        <small>{environment.freshness === "stale" ? "Cached projection" : "Layered evidence"}</small>
+      </div>
+      <div className="environment-health-stack__layers">
+        {layers.map((item) => (
+          <div key={item.key} className="environment-health-layer" data-tone={item.tone} data-stale={item.stale || undefined}>
+            <span className="environment-health-layer__dot" aria-hidden="true" />
+            <span>
+              <strong>{item.label}</strong>
+              <small>{item.state}{item.stale ? " · stale" : ""}</small>
+            </span>
+            {!compact ? (
+              <span className="environment-health-layer__detail">
+                {item.detail}
+                {item.observedAt ? ` Last observed ${formatRelativeTime(item.observedAt)}.` : ""}
+              </span>
+            ) : null}
+          </div>
+        ))}
+      </div>
+    </section>
+  );
+}
+
 // How often the console asks the gateway whether the host has redeemed the code yet. The first poll
 // fires immediately after minting, so a host that was already waiting resolves without a delay.
 const CONNECT_POLL_INTERVAL_MS = 2500;
@@ -579,28 +765,32 @@ const CONNECT_POLL_INTERVAL_MS = 2500;
  *
  * The old flow ended by asking the browser for a credential the user had to carry over from another
  * machine. This one never does: the console mints an enrollment code, shows the single command it
- * belongs to, and waits. `POST /v1/t3/environments` survives as the manual fallback for a T3 host
- * with no outbound route to the gateway.
+ * belongs to, and waits. Self-hosted deployments retain `POST /v1/t3/environments` as the manual
+ * fallback for a T3 host with no outbound route to the gateway; managed cloud never renders it.
  *
  * Passing `environment` turns this into a re-pair. The session then carries that environment's id,
  * so redeeming updates the row in place — a host that moved to a new URL must not become a second
  * environment.
  */
-function ConnectEnvironmentDialog({
+export function ConnectEnvironmentDialog({
   controller: c,
   open,
   environment = null,
   onClose,
+  onConnected,
 }: {
   controller: Controller;
   open: boolean;
   environment?: Environment | null;
   onClose: () => void;
+  onConnected?: (environment: Environment) => void;
 }) {
   const repairing = Boolean(environment);
+  const cloudDeployment = c.authConfig?.deploymentMode === "cloud";
   const [step, setStep] = useState(0);
   const [label, setLabel] = useState("Mac T3 Code");
-  const [accessMode, setAccessMode] = useState<EnvironmentAccessMode>("local");
+  const [computerTarget, setComputerTarget] = useState<EnvironmentComputerTarget>("this-computer");
+  const [directAccessMode, setDirectAccessMode] = useState<EnvironmentAccessMode>("local");
   const [mint, setMint] = useState<ConnectSessionMint | null>(null);
   const [session, setSession] = useState<ConnectSession | null>(null);
   const [mintError, setMintError] = useState<string | null>(null);
@@ -610,7 +800,7 @@ function ConnectEnvironmentDialog({
   const [credentialType, setCredentialType] = useState<CredentialType>("pairingToken");
   const [result, setResult] = useState<Environment | null>(null);
   const mintedForRef = useRef<string | null>(null);
-  const steps = ["Purpose", "Access", "Connect"];
+  const steps = ["Purpose", "Computer", "Connect"];
 
   useEffect(() => {
     if (!open) return;
@@ -618,7 +808,8 @@ function ConnectEnvironmentDialog({
     // pre-fills both from the environment rather than asking again.
     setStep(repairing ? 2 : 0);
     setLabel(environment?.label ?? "Mac T3 Code");
-    setAccessMode(environment ? inferEnvironmentAccessMode(environment.baseUrl) : "local");
+    setComputerTarget("this-computer");
+    setDirectAccessMode(environment ? inferEnvironmentAccessMode(environment.baseUrl) : "local");
     setMint(null);
     setSession(null);
     setMintError(null);
@@ -631,14 +822,13 @@ function ConnectEnvironmentDialog({
   }, [open, environment?.id]);
 
   const startSession = useCallback(async () => {
-    const key = `${label.trim()}|${accessMode}|${environment?.id ?? ""}`;
+    const key = `${label.trim()}|${computerTarget}|${environment?.id ?? ""}`;
     mintedForRef.current = key;
     setMintError(null);
     setSession(null);
     try {
       const created = await c.createConnectSession({
         label: label.trim() || "T3 Code",
-        accessMode,
         environmentId: environment?.id ?? null,
       });
       setMint(created);
@@ -646,19 +836,19 @@ function ConnectEnvironmentDialog({
     } catch (error) {
       mintedForRef.current = null;
       setMint(null);
-      // Minting is the only thing that can fail before the user has done anything, so it opens the
-      // manual path rather than dead-ending them on an error.
+      // Self-hosted deployments can fall back to direct credentials. Managed cloud deliberately
+      // keeps that trust boundary closed, so a mint failure remains an actionable connector error.
       setMintError(error instanceof Error ? error.message : "Could not create a connect command.");
-      setManual(true);
+      if (!cloudDeployment) setManual(true);
     }
-  }, [c, label, accessMode, environment?.id]);
+  }, [c, label, computerTarget, environment?.id, cloudDeployment]);
 
   useEffect(() => {
     if (!open || step !== 2 || result) return;
-    const key = `${label.trim()}|${accessMode}|${environment?.id ?? ""}`;
+    const key = `${label.trim()}|${computerTarget}|${environment?.id ?? ""}`;
     if (mintedForRef.current === key) return;
     void startSession();
-  }, [open, step, result, label, accessMode, environment?.id, startSession]);
+  }, [open, step, result, label, computerTarget, environment?.id, startSession]);
 
   const waiting = Boolean(mint) && (session?.status === "pending" || session?.status === "redeeming");
 
@@ -675,6 +865,7 @@ function ConnectEnvironmentDialog({
           c.setSelectedEnvironmentId(polled.environment.id);
           c.markEnvironmentCredentialChanged();
           await c.refreshAll();
+          onConnected?.(polled.environment);
         }
       } catch {
         // A transient poll failure is not worth surfacing; the next tick retries.
@@ -686,14 +877,15 @@ function ConnectEnvironmentDialog({
       active = false;
       window.clearInterval(timer);
     };
-  }, [open, step, result, mint?.session.id, waiting]);
+  }, [open, step, result, mint?.session.id, waiting, onConnected]);
 
   if (!open) return null;
 
-  const manualValid = Boolean(label.trim() && environmentUrlValid(baseUrl, accessMode) && credential.trim());
+  const manualValid = Boolean(label.trim() && environmentUrlValid(baseUrl, directAccessMode) && credential.trim());
   const canContinue = step === 1 ? Boolean(label.trim()) : true;
 
   const connectManually = async () => {
+    if (cloudDeployment) return;
     const saved = await c.run("pair-environment", "T3 environment connected.", async () => {
       const body = {
         label: label.trim() || "T3 Code",
@@ -714,26 +906,53 @@ function ConnectEnvironmentDialog({
     if (saved) setResult(saved.environment);
   };
 
+  const currentResultEnvironment = result
+    ? c.environments.find((candidate) => candidate.id === result.id) ?? result
+    : null;
+  const currentResultConnector = currentResultEnvironment
+    ? connectorForEnvironment(c.connectors, currentResultEnvironment)
+    : null;
+  const resultProofReady = Boolean(
+    result
+      && c.onboarding?.environmentId === result.id
+      && c.onboardingReadiness?.checks.firstRunCompleted,
+  );
+  const resultLayers = currentResultEnvironment
+    ? environmentHealthLayers({
+        environment: currentResultEnvironment,
+        connector: currentResultConnector,
+        cloudConnection: c.connection,
+        proofReady: resultProofReady,
+      })
+    : [];
+  const resultReady = resultLayers.length > 0 && resultLayers.every((layer) => (
+    !layer.stale && ["operational", "online", "direct", "ready", "complete"].includes(layer.state)
+  ));
   const title = result
-    ? (repairing ? "Environment re-paired" : "Environment connected")
+    ? (resultReady ? "Environment ready" : repairing ? "Environment re-enrolled" : "Connector enrolled")
     : (repairing ? `Re-pair ${environment?.label}` : "Connect T3 Code");
 
   return (
     <EnvironmentModalShell
       open
       title={title}
-      eyebrow={result ? "Connection ready" : repairing ? "Environment recovery" : "Environment onboarding"}
-      description={result ? result.baseUrl : "Pair the host that owns your projects and agent sessions."}
+      eyebrow={result ? (resultReady ? "End-to-end proof complete" : "Enrollment complete") : repairing ? "Environment recovery" : "Environment onboarding"}
+      description={result
+        ? ((result.transportMode ?? "direct") === "connector" ? "Outbound connector enrolled" : result.baseUrl ?? "Direct environment connected")
+        : "Pair the computer that owns your projects and agent sessions."}
       onClose={onClose}
       footer={result ? (
-        <Button variant="primary" onClick={onClose}><Check className="size-4" /> Done</Button>
+        <Button variant="primary" onClick={onClose}>
+          {resultReady ? <Check className="size-4" /> : <ArrowRight className="size-4" />}
+          {resultReady ? "Done" : "Continue setup"}
+        </Button>
       ) : (
         <>
           <Button variant="ghost" onClick={step === 0 ? onClose : () => setStep((current) => current - 1)}>
             {step === 0 ? "Cancel" : <><ArrowLeft className="size-4" /> Back</>}
           </Button>
           {step === steps.length - 1 ? (
-            manual ? (
+            manual && !cloudDeployment ? (
               <Button
                 variant="primary"
                 busy={c.busyAction === "pair-environment"}
@@ -754,15 +973,28 @@ function ConnectEnvironmentDialog({
       {result ? (
         <div className="device-flow__result">
           <div className="device-flow__result-check"><Check className="size-6" /></div>
-          <h3>Host paired successfully</h3>
-          <p>Agent Controller can now health-check this host and load its T3 projects and sessions.</p>
+          <h3>{resultReady
+            ? "Cloud-to-agent path verified"
+            : (result.transportMode ?? "direct") === "connector" ? "Connector credential enrolled" : "Host credential saved"}</h3>
+          <p>{(result.transportMode ?? "direct") === "connector"
+            ? (resultReady
+                ? "The connector, local T3 provider, and first agent action have all supplied current evidence."
+                : "Enrollment is only the first layer. Keep the command running, then verify local T3, a provider, and the first agent action before treating setup as ready.")
+            : (resultReady
+                ? "The direct host and first agent action have supplied current readiness evidence."
+                : "The credential is saved. Verify T3, a provider, and the first agent action before treating setup as ready.")}</p>
           <dl>
             <EnvironmentReviewRow label="Environment" value={result.label} />
             <EnvironmentReviewRow label="Environment ID" value={result.id} mono />
-            {/* Learned from the endpoint the host actually reported, not from the guess made earlier. */}
-            <EnvironmentReviewRow label="Access path" value={environmentAccessLabel(inferEnvironmentAccessMode(result.baseUrl))} />
-            <EnvironmentReviewRow label="Endpoint" value={result.baseUrl} mono />
+            <EnvironmentReviewRow label="Transport" value={(result.transportMode ?? "direct") === "connector" ? "Outbound connector" : "Advanced direct mode"} />
+            {result.baseUrl ? <EnvironmentReviewRow label="Endpoint" value={result.baseUrl} mono /> : null}
           </dl>
+          <EnvironmentHealthStack
+            environment={currentResultEnvironment ?? result}
+            connector={currentResultConnector}
+            cloudConnection={c.connection}
+            proofReady={resultProofReady}
+          />
         </div>
       ) : (
         <>
@@ -772,14 +1004,13 @@ function ConnectEnvironmentDialog({
             {step === 1 ? (
               <div className="environment-flow__access">
                 <div>
-                  <h3 className="font-display text-base font-semibold">Choose how the gateway reaches T3</h3>
-                  <p className="mt-1 text-sm text-ink-muted">The access path scopes the command you run on the host.</p>
+                  <h3 className="font-display text-base font-semibold">Where will you run the connector?</h3>
+                  <p className="mt-1 text-sm text-ink-muted">Both choices create the same secure outbound connection. Only the handoff instructions differ.</p>
                 </div>
                 <Field label="Environment label" htmlFor="connect-environment-label">
                   <input id="connect-environment-label" autoFocus value={label} onChange={(event) => setLabel(event.target.value)} />
                 </Field>
-                <EnvironmentAccessSelector value={accessMode} onChange={setAccessMode} />
-                <EnvironmentAccessGuidance mode={accessMode} controller={c} />
+                <EnvironmentComputerSelector value={computerTarget} onChange={setComputerTarget} />
               </div>
             ) : null}
             {step === 2 ? (
@@ -789,19 +1020,24 @@ function ConnectEnvironmentDialog({
                   session={session}
                   error={mintError}
                   repairing={repairing}
+                  computerTarget={computerTarget}
                   onRetry={() => void startSession()}
                 />
-                <ConnectManualFallback
-                  open={manual}
-                  onToggle={() => setManual((current) => !current)}
-                  accessMode={accessMode}
-                  baseUrl={baseUrl}
-                  onBaseUrlChange={setBaseUrl}
-                  credential={credential}
-                  onCredentialChange={setCredential}
-                  credentialType={credentialType}
-                  onCredentialTypeChange={setCredentialType}
-                />
+                {!cloudDeployment ? (
+                  <ConnectManualFallback
+                    controller={c}
+                    open={manual}
+                    onToggle={() => setManual((current) => !current)}
+                    accessMode={directAccessMode}
+                    onAccessModeChange={setDirectAccessMode}
+                    baseUrl={baseUrl}
+                    onBaseUrlChange={setBaseUrl}
+                    credential={credential}
+                    onCredentialChange={setCredential}
+                    credentialType={credentialType}
+                    onCredentialTypeChange={setCredentialType}
+                  />
+                ) : null}
               </div>
             ) : null}
           </div>
@@ -816,12 +1052,14 @@ function ConnectHandoff({
   session,
   error,
   repairing,
+  computerTarget,
   onRetry,
 }: {
   mint: ConnectSessionMint | null;
   session: ConnectSession | null;
   error: string | null;
   repairing: boolean;
+  computerTarget: EnvironmentComputerTarget;
   onRetry: () => void;
 }) {
   const status = session?.status ?? "pending";
@@ -855,11 +1093,11 @@ function ConnectHandoff({
       <div className="environment-connect-handoff__heading">
         <Terminal className="size-4" />
         <div>
-          <strong>Run this on the T3 host</strong>
+          <strong>{computerTarget === "this-computer" ? "Run this on this computer" : "Run this on the other computer"}</strong>
           <span>
             {repairing
-              ? "It exchanges a fresh credential and updates this environment in place."
-              : "It installs and starts T3 Code if needed, then finishes the pairing for you."}
+              ? "It replaces the revoked or stale connector binding and updates this environment in place."
+              : "It enrolls the published connector and opens an outbound connection to Agent Controller."}
           </span>
         </div>
       </div>
@@ -874,20 +1112,28 @@ function ConnectHandoff({
           <Button size="sm" onClick={onRetry}><RefreshCw className="size-3.5" /> Get a new command</Button>
         </>
       ) : (
-        <p className="environment-connect-handoff__waiting" role="status">
-          <Loader2 className="size-3.5 animate-spin" aria-hidden="true" />
-          {status === "redeeming" ? "Host found. Finishing the pairing…" : "Waiting for the T3 host…"}
-        </p>
+        <div className="environment-connect-handoff__waiting">
+          <p role="status">
+            <Loader2 className="size-3.5 animate-spin motion-reduce:animate-none" aria-hidden="true" />
+            {status === "redeeming" ? "Connector found. Finishing enrollment…" : "Waiting for the connector…"}
+          </p>
+          <Button size="sm" variant="ghost" onClick={onRetry}><RefreshCw className="size-3.5" /> Regenerate command</Button>
+        </div>
       )}
-      <small>The code is single use and expires in 15 minutes. Nothing needs to be pasted back here.</small>
+      <small>
+        Enrollment code: {mint.code} · Expires {formatRelativeTime(mint.session.expiresAt)}. The code is single use;
+        T3 and provider credentials stay on this computer and are never sent to Agent Controller.
+      </small>
     </section>
   );
 }
 
 function ConnectManualFallback({
+  controller,
   open,
   onToggle,
   accessMode,
+  onAccessModeChange,
   baseUrl,
   onBaseUrlChange,
   credential,
@@ -895,9 +1141,11 @@ function ConnectManualFallback({
   credentialType,
   onCredentialTypeChange,
 }: {
+  controller: Controller;
   open: boolean;
   onToggle: () => void;
   accessMode: EnvironmentAccessMode;
+  onAccessModeChange: (value: EnvironmentAccessMode) => void;
   baseUrl: string;
   onBaseUrlChange: (value: string) => void;
   credential: string;
@@ -908,11 +1156,16 @@ function ConnectManualFallback({
   return (
     <section className="environment-connect-manual">
       <button type="button" aria-expanded={open} onClick={onToggle}>
-        <KeyRound className="size-3.5" /> Paste a credential manually instead
+        <KeyRound className="size-3.5" /> Advanced: connect directly with a URL and token
       </button>
       {open ? (
         <div className="environment-connect-manual__body">
-          <p>Use this when the T3 host cannot reach this gateway outbound. Run the pairing wizard there and copy what it prints.</p>
+          <p>
+            Direct mode stores a T3 credential in Agent Controller and requires the gateway to reach the host.
+            This compatibility path is available only for local development and deliberate self-hosting.
+          </p>
+          <EnvironmentAccessSelector value={accessMode} onChange={onAccessModeChange} />
+          <EnvironmentAccessGuidance mode={accessMode} controller={controller} />
           <Field label="T3 base URL" htmlFor="connect-environment-url" hint={environmentEndpointHint(accessMode)}>
             <input
               id="connect-environment-url"
@@ -940,6 +1193,57 @@ function ConnectManualFallback({
         </div>
       ) : null}
     </section>
+  );
+}
+
+function EnvironmentComputerSelector({
+  value,
+  onChange,
+}: {
+  value: EnvironmentComputerTarget;
+  onChange: (value: EnvironmentComputerTarget) => void;
+}) {
+  const options: Array<{
+    id: EnvironmentComputerTarget;
+    label: string;
+    description: string;
+    icon: typeof Monitor;
+  }> = [
+    {
+      id: "this-computer",
+      label: "Connect this computer",
+      description: "Run the command in a terminal on the computer where this console is open.",
+      icon: Monitor,
+    },
+    {
+      id: "another-computer",
+      label: "Connect another computer",
+      description: "Copy the same enrollment command to the Mac or Linux computer that runs T3.",
+      icon: Laptop,
+    },
+  ];
+  return (
+    <div className="environment-access-grid environment-access-grid--computers" role="radiogroup" aria-label="T3 computer">
+      {options.map((option) => {
+        const Icon = option.icon;
+        const selected = value === option.id;
+        return (
+          <button
+            key={option.id}
+            type="button"
+            className="environment-access-card"
+            data-active={selected || undefined}
+            role="radio"
+            aria-checked={selected}
+            onClick={() => onChange(option.id)}
+          >
+            <span className="environment-access-card__icon"><Icon className="size-4" /></span>
+            <strong>{option.label}</strong>
+            <span>{option.description}</span>
+          </button>
+        );
+      })}
+    </div>
   );
 }
 
@@ -1101,13 +1405,13 @@ function EnvironmentIntro() {
   return (
     <div className="device-flow__intro">
       <div className="device-flow__hero-icon"><Server className="size-6" /></div>
-      <StatusBadge tone="info" label="Scoped T3 access" />
+      <StatusBadge tone="info" label="Outbound connector" />
       <h3>Connect the machine where T3 Code runs</h3>
-      <p>The gateway uses this connection to discover projects, load sessions, and dispatch approved agent work.</p>
+      <p>Run one short-lived command on that computer. The connector dials out to Agent Controller and keeps local T3 and provider credentials on the host.</p>
       <ul>
-        <li><CheckCircle2 className="size-4" /> Supports local, Tailnet, and tunnel endpoints</li>
-        <li><CheckCircle2 className="size-4" /> Encrypts the resulting access token at rest</li>
-        <li><CheckCircle2 className="size-4" /> Tracks reachability and credential expiry</li>
+        <li><CheckCircle2 className="size-4" /> No inbound port or public T3 URL</li>
+        <li><CheckCircle2 className="size-4" /> Single-use enrollment code with a visible expiry</li>
+        <li><CheckCircle2 className="size-4" /> Separate cloud, connector, T3, provider, and proof health</li>
       </ul>
     </div>
   );
@@ -1146,6 +1450,7 @@ function EnvironmentEditorDialog({
   onCheck,
   onLoad,
   onRemove,
+  onArchive,
   onRepair,
 }: {
   controller: Controller;
@@ -1154,6 +1459,7 @@ function EnvironmentEditorDialog({
   onCheck: () => void;
   onLoad: () => void;
   onRemove: () => void;
+  onArchive: () => void;
   onRepair: () => void;
 }) {
   const [tab, setTab] = useState<EnvironmentTab>("connection");
@@ -1167,15 +1473,19 @@ function EnvironmentEditorDialog({
     if (!environment) return;
     setTab("connection");
     setLabel(environment.label);
-    setBaseUrl(environment.baseUrl);
+    setBaseUrl(environment.baseUrl ?? "");
     setAccessMode(inferEnvironmentAccessMode(environment.baseUrl));
     setCredential("");
     setCredentialType("accessToken");
   }, [environment?.id]);
 
   if (!environment) return null;
-  const status = environmentStatus(environment);
-  const validConnection = Boolean(label.trim() && environmentUrlValid(baseUrl, accessMode));
+  const connector = connectorForEnvironment(c.connectors, environment);
+  const connectorMode = (environment.transportMode ?? "direct") === "connector";
+  const cloudDeployment = c.authConfig?.deploymentMode === "cloud";
+  const legacyDirectInCloud = cloudDeployment && !connectorMode;
+  const status = environmentStatus(environment, connector);
+  const validConnection = Boolean(label.trim() && (connectorMode || cloudDeployment || environmentUrlValid(baseUrl, accessMode)));
   const gateways = environmentGatewayInventory(environment.id, c.devices ?? [], c.gatewayProfiles ?? [], c.remoteAccess ?? null);
 
   const save = async () => {
@@ -1183,11 +1493,13 @@ function EnvironmentEditorDialog({
     const saved = await c.run("update-environment", "Environment settings updated.", async () => {
       const result = await c.api(`/v1/t3/environments/${encodeURIComponent(environment.id)}`, {
         method: "PUT",
-        body: {
-          label: label.trim(),
-          baseUrl: baseUrl.trim(),
-          ...(credential.trim() ? { [credentialType]: credential.trim() } : {}),
-        },
+        body: connectorMode || cloudDeployment
+          ? { label: label.trim() }
+          : {
+              label: label.trim(),
+              baseUrl: baseUrl.trim(),
+              ...(credential.trim() ? { [credentialType]: credential.trim() } : {}),
+            },
       });
       setCredential("");
       if (credential.trim()) c.markEnvironmentCredentialChanged();
@@ -1227,19 +1539,52 @@ function EnvironmentEditorDialog({
               <Field label="Environment label" htmlFor="edit-environment-label" hint="Shown in the resource rail, commands, and health alerts.">
                 <input id="edit-environment-label" value={label} onChange={(event) => setLabel(event.target.value)} />
               </Field>
-              <div className="environment-editor__access">
-                <div>
-                  <p className="text-xs font-semibold text-ink">Access path</p>
-                  <p className="mt-1 text-xs text-ink-muted">Changing the path does not alter the endpoint until you save.</p>
+              {connectorMode ? (
+                <>
+                  <div className="environment-access-guide" data-tone="info">
+                    <div className="environment-access-guide__heading">
+                      <Cable className="size-4" />
+                      <div>
+                        <strong>Outbound connector</strong>
+                        <span>This environment does not expose T3 to the internet or store its token in the cloud.</span>
+                      </div>
+                    </div>
+                  </div>
+                  <EnvironmentHealthStack
+                    environment={environment}
+                    connector={connector}
+                    cloudConnection={c.connection}
+                    proofReady={Boolean(c.onboarding?.environmentId === environment.id && c.onboardingReadiness?.checks.firstRunCompleted)}
+                  />
+                </>
+              ) : legacyDirectInCloud ? (
+                <div className="environment-access-guide" data-tone="warning">
+                  <div className="environment-access-guide__heading">
+                    <Cable className="size-4" />
+                    <div>
+                      <strong>Direct connection unavailable in managed cloud</strong>
+                      <span>This legacy record cannot route work. Enroll the outbound connector to replace its URL-and-token transport without exposing T3.</span>
+                    </div>
+                  </div>
+                  <Button size="sm" onClick={onRepair}><Cable className="size-3.5" /> Enroll outbound connector</Button>
                 </div>
-                <EnvironmentAccessSelector value={accessMode} onChange={setAccessMode} />
-                <EnvironmentAccessGuidance mode={accessMode} controller={c} />
-              </div>
-              <Field label="T3 base URL" htmlFor="edit-environment-url" hint={environmentEndpointHint(accessMode)}>
-                <input id="edit-environment-url" type="url" value={baseUrl} onChange={(event) => setBaseUrl(event.target.value)} placeholder={environmentUrlPlaceholder(accessMode)} />
-              </Field>
+              ) : (
+                <>
+                  <div className="environment-editor__access">
+                    <div>
+                      <p className="text-xs font-semibold text-ink">Advanced direct access path</p>
+                      <p className="mt-1 text-xs text-ink-muted">Changing the path does not alter the endpoint until you save.</p>
+                    </div>
+                    <EnvironmentAccessSelector value={accessMode} onChange={setAccessMode} />
+                    <EnvironmentAccessGuidance mode={accessMode} controller={c} />
+                  </div>
+                  <Field label="T3 base URL" htmlFor="edit-environment-url" hint={environmentEndpointHint(accessMode)}>
+                    <input id="edit-environment-url" type="url" value={baseUrl} onChange={(event) => setBaseUrl(event.target.value)} placeholder={environmentUrlPlaceholder(accessMode)} />
+                  </Field>
+                </>
+              )}
               <dl className="device-editor__facts">
-                <EnvironmentReviewRow label="Access path" value={environmentAccessLabel(accessMode)} />
+                <EnvironmentReviewRow label="Transport" value={connectorMode ? "Outbound connector" : legacyDirectInCloud ? "Legacy direct · migration required" : `Advanced direct · ${environmentAccessLabel(accessMode)}`} />
                 <EnvironmentReviewRow label="Environment ID" value={environment.id} mono />
                 <EnvironmentReviewRow label="Created" value={formatRelativeTime(environment.createdAt)} />
                 <EnvironmentReviewRow label="Last updated" value={formatRelativeTime(environment.updatedAt)} />
@@ -1251,7 +1596,34 @@ function EnvironmentEditorDialog({
             <EnvironmentGatewayDetails gateways={gateways} />
           ) : null}
 
-          {tab === "credential" ? (
+          {tab === "credential" ? connectorMode ? (
+            <div className="environment-editor__section">
+              <div className="flex flex-wrap items-start justify-between gap-3">
+                <div>
+                  <p className="font-display text-base font-semibold">Connector enrollment</p>
+                  <p className="mt-1 text-sm leading-relaxed text-ink-muted">The connector secret and T3 credential stay on the workspace computer. A revoked secret cannot be displayed or reused.</p>
+                </div>
+                <Button size="sm" onClick={onRepair}><Cable className="size-3.5" /> Create new enrollment</Button>
+              </div>
+              <dl className="device-editor__facts">
+                <EnvironmentReviewRow label="Connector" value={connector?.label ?? "Waiting for enrollment"} />
+                <EnvironmentReviewRow label="Status" value={status.label} />
+                <EnvironmentReviewRow label="Version" value={connector?.connectorVersion ? `v${connector.connectorVersion}` : "Not reported"} />
+                <EnvironmentReviewRow label="Platform" value={connector?.platform ?? "Not reported"} />
+                <EnvironmentReviewRow label="Last seen" value={formatRelativeTime(connector?.lastSeenAt ?? environment.lastConnectorSeenAt)} />
+              </dl>
+            </div>
+          ) : legacyDirectInCloud ? (
+            <div className="environment-editor__section">
+              <div className="flex flex-wrap items-start justify-between gap-3">
+                <div>
+                  <p className="font-display text-base font-semibold">Replace the legacy direct connection</p>
+                  <p className="mt-1 text-sm leading-relaxed text-ink-muted">Managed cloud does not accept or retain a T3 URL or token. Enroll the connector on the workspace computer to restore this environment.</p>
+                </div>
+                <Button size="sm" onClick={onRepair}><Cable className="size-3.5" /> Enroll outbound connector</Button>
+              </div>
+            </div>
+          ) : (
             <div className="environment-editor__section">
               <div className="flex flex-wrap items-start justify-between gap-3">
                 <div>
@@ -1290,13 +1662,22 @@ function EnvironmentEditorDialog({
                 <EnvironmentReviewRow label="Snapshot" value={environment.health?.snapshot?.line1 ?? "Not loaded"} />
                 <EnvironmentReviewRow label="Sessions" value={environment.health?.snapshot?.line2 ?? "Not loaded"} />
               </dl>
+              <EnvironmentHealthStack
+                environment={environment}
+                connector={connector}
+                cloudConnection={c.connection}
+                proofReady={Boolean(c.onboarding?.environmentId === environment.id && c.onboardingReadiness?.checks.firstRunCompleted)}
+              />
               {environment.health?.lastError ? <p className="environment-editor__error" role="alert">{environment.health.lastError}</p> : null}
               <section className="device-editor__danger" aria-labelledby="environment-danger-title">
                 <div>
                   <p id="environment-danger-title" className="font-display text-sm font-semibold text-danger">Connection danger zone</p>
-                  <p className="mt-1 text-xs text-ink-muted">Removing deletes the credential, clears this default from attached devices and from onboarding, and disables saved actions and macros that target it.</p>
+                  <p className="mt-1 text-xs text-ink-muted">Archiving disconnects this host and keeps its record in Archive. Deleting removes the record permanently. Both clear attached device defaults and disable saved actions and macros that target it.</p>
                 </div>
-                <Button size="sm" variant="danger-ghost" onClick={onRemove}><Trash2 className="size-3.5" /> Remove environment</Button>
+                <div className="flex flex-wrap gap-2">
+                  <Button size="sm" onClick={onArchive}><Archive className="size-3.5" /> Archive environment</Button>
+                  <Button size="sm" variant="danger-ghost" onClick={onRemove}><Trash2 className="size-3.5" /> Delete environment</Button>
+                </div>
               </section>
             </div>
           ) : null}

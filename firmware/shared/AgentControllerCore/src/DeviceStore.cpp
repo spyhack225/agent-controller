@@ -2,11 +2,18 @@
 
 #include <ArduinoJson.h>
 
+#include "GatewayTls.h"
+
 namespace {
 // NVS keys are capped at 15 characters, which is why these are abbreviated rather than spelled out.
 constexpr const char* kNamespace = "agentctl";
 constexpr const char* kKeyDeviceId = "dev_id";
 constexpr const char* kKeyDeviceSecret = "dev_secret";
+constexpr const char* kKeyCredentialVersion = "cred_ver";
+constexpr const char* kKeyPendingDeviceSecret = "cred_psec";
+constexpr const char* kKeyPendingRotationId = "cred_rid";
+constexpr const char* kKeyPendingCredentialVersion = "cred_pver";
+constexpr const char* kKeyPendingCredentialPurpose = "cred_purp";
 constexpr const char* kKeyGatewayUrl = "gw_url";
 constexpr const char* kKeyGatewayProfiles = "gw_profiles";
 constexpr const char* kKeyGatewayRevision = "gw_rev";
@@ -21,6 +28,8 @@ constexpr const char* kKeyWifiPass = "wifi_pass";
 constexpr const char* kKeyClaimCode = "claim_code";
 constexpr const char* kKeyClaimExpiry = "claim_exp";
 constexpr const char* kKeyConfigCache = "cfg_cache";
+constexpr const char* kKeyPendingRequestId = "req_id";
+constexpr const char* kKeyPendingRequestHash = "req_hash";
 constexpr const char* kKeyOtaSource = "ota_from";
 constexpr const char* kKeyOtaTarget = "ota_target";
 constexpr const char* kKeyOtaBoots = "ota_boots";
@@ -37,6 +46,15 @@ bool DeviceStore::begin() {
 
   deviceId_ = readString(kKeyDeviceId);
   deviceSecret_ = readString(kKeyDeviceSecret);
+  credentialVersion_ = prefs_.getUInt(kKeyCredentialVersion, 1);
+  pendingDeviceSecret_ = readString(kKeyPendingDeviceSecret);
+  pendingCredentialRotationId_ = readString(kKeyPendingRotationId);
+  pendingCredentialVersion_ = prefs_.getUInt(kKeyPendingCredentialVersion, 0);
+  pendingCredentialPurpose_ = readString(kKeyPendingCredentialPurpose);
+  if (pendingCredentialRotationId_.length() == 0 || pendingDeviceSecret_.length() == 0
+      || pendingCredentialVersion_ <= credentialVersion_) {
+    rollbackPendingDeviceSecret();
+  }
   gatewayUrl_ = readString(kKeyGatewayUrl);
   gatewayRevision_ = prefs_.getUInt(kKeyGatewayRevision, 0);
   activeGatewayProfileId_ = readString(kKeyGatewayActive);
@@ -46,6 +64,18 @@ bool DeviceStore::begin() {
   gatewaySwitchState_ = readString(kKeyGatewayState);
   if (gatewaySwitchState_.length() == 0) gatewaySwitchState_ = "stable";
   gatewaySwitchDetail_ = readString(kKeyGatewayError);
+
+  // Old images accepted arbitrary schemes into NVS. Do not let a persisted plaintext/public URL
+  // bypass the new socket boundary after an OTA: discard it before any gateway client can read it.
+  auto discardInvalidGatewayUrl = [this](String& value, const char* key) {
+    if (value.length() == 0 || gateway_tls::gatewayUrlAllowed(value)) return;
+    Serial.printf("[store] discarded insecure or invalid gateway URL from %s\n", key);
+    value = "";
+    prefs_.remove(key);
+  };
+  discardInvalidGatewayUrl(gatewayUrl_, kKeyGatewayUrl);
+  discardInvalidGatewayUrl(pendingGatewayUrl_, kKeyGatewayPendingUrl);
+  discardInvalidGatewayUrl(previousGatewayUrl_, kKeyGatewayPrevious);
 
   const String profilesJson = readString(kKeyGatewayProfiles);
   if (profilesJson.length() > 0) {
@@ -59,7 +89,7 @@ bool DeviceStore::begin() {
         output.label = String(profile["label"] | "");
         output.mode = String(profile["mode"] | "custom");
         output.url = String(profile["url"] | "");
-        if (output.id.length() == 0 || output.url.length() == 0) continue;
+        if (output.id.length() == 0 || !gateway_tls::gatewayUrlAllowed(output.url)) continue;
         gatewayProfileCount_ += 1;
       }
     } else {
@@ -71,6 +101,8 @@ bool DeviceStore::begin() {
   claimCode_ = readString(kKeyClaimCode);
   claimCodeExpiresAt_ = readString(kKeyClaimExpiry);
   configCache_ = readString(kKeyConfigCache);
+  pendingRequestId_ = readString(kKeyPendingRequestId);
+  pendingRequestHash_ = readString(kKeyPendingRequestHash);
   otaSourceVersion_ = readString(kKeyOtaSource);
   otaTargetVersion_ = readString(kKeyOtaTarget);
 
@@ -101,12 +133,84 @@ bool DeviceStore::putString(const char* key, const String& value) {
   return prefs_.putString(key, value) > 0;
 }
 
+bool DeviceStore::setPendingRequest(const String& requestId, const String& requestHash) {
+  if (requestId.length() == 0 || requestHash.length() == 0) return false;
+  if (!putString(kKeyPendingRequestHash, requestHash)) return false;
+  if (!putString(kKeyPendingRequestId, requestId)) return false;
+  pendingRequestHash_ = requestHash;
+  pendingRequestId_ = requestId;
+  return true;
+}
+
+bool DeviceStore::clearPendingRequest() {
+  const bool idCleared = putString(kKeyPendingRequestId, "");
+  const bool hashCleared = putString(kKeyPendingRequestHash, "");
+  if (idCleared) pendingRequestId_ = "";
+  if (hashCleared) pendingRequestHash_ = "";
+  return idCleared && hashCleared;
+}
+
 bool DeviceStore::setIdentity(const String& id, const String& secret) {
   if (!putString(kKeyDeviceId, id)) return false;
   if (!putString(kKeyDeviceSecret, secret)) return false;
+  if (prefs_.putUInt(kKeyCredentialVersion, 1) == 0) return false;
   deviceId_ = id;
   deviceSecret_ = secret;
+  credentialVersion_ = 1;
+  rollbackPendingDeviceSecret();
   return true;
+}
+
+bool DeviceStore::stagePendingDeviceSecret(
+  const String& secret,
+  const String& rotationId,
+  uint32_t credentialVersion,
+  const String& purpose
+) {
+  if (!opened_ || secret.length() < 32 || rotationId.length() == 0
+      || credentialVersion <= credentialVersion_
+      || (purpose != "rotate" && purpose != "transfer")) return false;
+
+  // Write the material first and the rotation id last. Its presence is the commit marker read by
+  // begin(), so an interrupted write is rolled back instead of being sent or promoted.
+  if (!putString(kKeyPendingDeviceSecret, secret)
+      || prefs_.putUInt(kKeyPendingCredentialVersion, credentialVersion) == 0
+      || !putString(kKeyPendingCredentialPurpose, purpose)
+      || !putString(kKeyPendingRotationId, rotationId)) {
+    rollbackPendingDeviceSecret();
+    return false;
+  }
+  pendingDeviceSecret_ = secret;
+  pendingCredentialVersion_ = credentialVersion;
+  pendingCredentialPurpose_ = purpose;
+  pendingCredentialRotationId_ = rotationId;
+  return true;
+}
+
+bool DeviceStore::promotePendingDeviceSecret(const String& rotationId, uint32_t credentialVersion) {
+  if (!hasPendingDeviceSecret() || rotationId != pendingCredentialRotationId_
+      || credentialVersion != pendingCredentialVersion_) return false;
+
+  // The active write comes first. If power fails before cleanup, both slots contain the promoted
+  // secret and the next boot safely replays the idempotent ACK before clearing the pending slot.
+  if (!putString(kKeyDeviceSecret, pendingDeviceSecret_)) return false;
+  if (prefs_.putUInt(kKeyCredentialVersion, pendingCredentialVersion_) == 0) return false;
+  deviceSecret_ = pendingDeviceSecret_;
+  credentialVersion_ = pendingCredentialVersion_;
+  return rollbackPendingDeviceSecret();
+}
+
+bool DeviceStore::rollbackPendingDeviceSecret() {
+  if (!opened_) return false;
+  const bool secretCleared = putString(kKeyPendingDeviceSecret, "");
+  const bool idCleared = putString(kKeyPendingRotationId, "");
+  const bool purposeCleared = putString(kKeyPendingCredentialPurpose, "");
+  const bool versionCleared = prefs_.remove(kKeyPendingCredentialVersion) || true;
+  if (secretCleared) pendingDeviceSecret_ = "";
+  if (idCleared) pendingCredentialRotationId_ = "";
+  if (purposeCleared) pendingCredentialPurpose_ = "";
+  if (versionCleared) pendingCredentialVersion_ = 0;
+  return secretCleared && idCleared && purposeCleared && versionCleared;
 }
 
 bool DeviceStore::seedIdentityIfEmpty(const char* id, const char* secret, const char* gatewayUrl) {
@@ -131,6 +235,10 @@ bool DeviceStore::setGatewayUrl(const String& url) {
   String trimmed = url;
   trimmed.trim();
   while (trimmed.endsWith("/")) trimmed.remove(trimmed.length() - 1);
+  if (trimmed.length() > 0 && !gateway_tls::gatewayUrlAllowed(trimmed)) {
+    Serial.println("[store] refused insecure or invalid gateway URL");
+    return false;
+  }
   if (gatewayUrl_ == trimmed) return true;
   if (!putString(kKeyGatewayUrl, trimmed)) return false;
   gatewayUrl_ = trimmed;
@@ -155,6 +263,12 @@ bool DeviceStore::replaceGatewayProfiles(
   const String& activeProfileId
 ) {
   if (!opened_ || profiles == nullptr || count == 0 || count > kMaxGatewayProfiles) return false;
+  for (size_t index = 0; index < count; index += 1) {
+    if (profiles[index].id.length() == 0 || !gateway_tls::gatewayUrlAllowed(profiles[index].url)) {
+      Serial.println("[store] refused gateway profile with insecure or invalid URL");
+      return false;
+    }
+  }
 
   JsonDocument doc;
   JsonArray output = doc.to<JsonArray>();
@@ -184,7 +298,7 @@ bool DeviceStore::replaceGatewayProfiles(
 }
 
 bool DeviceStore::stageGatewaySwitch(const GatewayProfile& profile, uint32_t revision) {
-  if (!opened_ || profile.id.length() == 0 || profile.url.length() == 0) return false;
+  if (!opened_ || profile.id.length() == 0 || !gateway_tls::gatewayUrlAllowed(profile.url)) return false;
   const String previous = gatewayUrl_;
   if (!putString(kKeyGatewayPrevious, previous)) return false;
   if (!putString(kKeyGatewayPending, profile.id)) return false;
@@ -333,7 +447,8 @@ bool DeviceStore::resetForProvisioning() {
   const bool wifiCleared = setWifiCredentials("", "");
   const bool cacheCleared = setConfigCache("");
   const bool codeCleared = clearClaimCode();
-  return wifiCleared && cacheCleared && codeCleared;
+  const bool requestCleared = clearPendingRequest();
+  return wifiCleared && cacheCleared && codeCleared && requestCleared;
 }
 
 bool DeviceStore::wipeToFactoryState() {

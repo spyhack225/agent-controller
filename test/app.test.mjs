@@ -7,6 +7,10 @@ import test from "node:test";
 import { createApp } from "../src/app.mjs";
 import { createMemoryStore } from "../src/store.mjs";
 
+const PNG_BASE64 =
+  "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg==";
+const WEBM_BASE64 = Buffer.from([0x1a, 0x45, 0xdf, 0xa3]).toString("base64");
+
 test("device intent endpoint authenticates device and dispatches to T3", async (t) => {
   const originalFetch = globalThis.fetch;
   const dispatches = [];
@@ -636,6 +640,9 @@ test("web users can launch the first T3 thread with any provider instance", asyn
       accessToken: "launch-token",
     },
   });
+  const eventResponse = await originalFetch(new URL("/v1/events", baseUrl), { headers: authHeaders });
+  assert.equal(eventResponse.status, 200);
+  const createdEvent = readStreamUntil(eventResponse.body, '"action":"created"');
 
   const launched = await requestJson(
     originalFetch,
@@ -665,6 +672,101 @@ test("web users can launch the first T3 thread with any provider instance", asyn
   assert.equal(dispatches[0].modelSelection.instanceId, "claudeAgent");
   assert.equal(dispatches[1].type, "thread.turn.start");
   assert.equal(dispatches[1].threadId, launched.threadId);
+  const stream = await createdEvent;
+  assert.match(stream, /event: threads\.changed/u);
+  assert.match(stream, new RegExp(`"threadId":"${launched.threadId}"`, "u"));
+});
+
+test("web users can rename, archive, and delete their T3 threads", async (t) => {
+  const originalFetch = globalThis.fetch;
+  const dispatches = [];
+  globalThis.fetch = async (url, init = {}) => {
+    const parsed = new URL(String(url));
+    if (parsed.pathname === "/api/orchestration/dispatch") {
+      dispatches.push(JSON.parse(init.body));
+      return jsonResponse({ accepted: true }, 200);
+    }
+    return jsonResponse({ error: "not found" }, 404);
+  };
+  t.after(() => {
+    globalThis.fetch = originalFetch;
+  });
+
+  const { server } = createApp({ config: { demoMode: false } });
+  await listen(server);
+  t.after(() => server.close());
+  const baseUrl = `http://127.0.0.1:${server.address().port}`;
+  const authHeaders = await createAuthHeaders(originalFetch, baseUrl);
+  const environment = await requestJson(originalFetch, baseUrl, "/v1/t3/environments", {
+    method: "POST",
+    headers: authHeaders,
+    body: {
+      label: "Managed T3",
+      baseUrl: "https://managed-t3.example",
+      accessToken: "managed-token",
+    },
+  });
+  const controllers = await Promise.all(["Desk controller", "Kitchen controller"].map((label) =>
+    requestJson(originalFetch, baseUrl, "/v1/devices", {
+      method: "POST",
+      headers: authHeaders,
+      body: { label, profile: "agent-controller" },
+    })));
+  await Promise.all(controllers.map(({ device }) =>
+    requestJson(originalFetch, baseUrl, `/v1/devices/${device.id}/config`, {
+      method: "PUT",
+      headers: authHeaders,
+      body: { environmentId: environment.environment.id, threadId: "thread_managed" },
+    })));
+  const eventResponses = await Promise.all(controllers.map(({ device, secret }) =>
+    originalFetch(new URL("/v1/device/events", baseUrl), {
+      headers: { "x-device-id": device.id, "x-device-secret": secret },
+    })));
+  const deviceEvents = eventResponses.map((response) => {
+    assert.equal(response.status, 200);
+    return readStreamUntil(response.body, '"action":"deleted"');
+  });
+  const prefix = `/v1/t3/environments/${environment.environment.id}/threads/thread_managed`;
+
+  const renamed = await requestJson(originalFetch, baseUrl, prefix, {
+    method: "PATCH",
+    headers: authHeaders,
+    body: { title: "  Release   checklist  " },
+  });
+  const archived = await requestJson(originalFetch, baseUrl, `${prefix}/archive`, {
+    method: "POST",
+    headers: authHeaders,
+  });
+  const deleted = await requestJson(originalFetch, baseUrl, prefix, {
+    method: "DELETE",
+    headers: authHeaders,
+  });
+
+  assert.equal(renamed.action, "renamed");
+  assert.equal(renamed.title, "Release checklist");
+  assert.equal(archived.action, "archived");
+  assert.equal(deleted.action, "deleted");
+  assert.deepEqual(dispatches.map((command) => command.type), [
+    "thread.meta.update",
+    "thread.archive",
+    "thread.delete",
+  ]);
+  assert.equal(dispatches[0].title, "Release checklist");
+  assert.equal(dispatches[0].threadId, "thread_managed");
+  assert.match(dispatches[0].commandId, /^t3cmd_/u);
+
+  for (const stream of await Promise.all(deviceEvents)) {
+    assert.equal((stream.match(/event: threads\.changed/gu) ?? []).length, 3);
+    assert.match(stream, /"action":"renamed","title":"Release checklist"/u);
+    assert.match(stream, /"action":"archived","clearedDeviceCount":2/u);
+    assert.match(stream, /"action":"deleted"/u);
+  }
+  for (const { device } of controllers) {
+    const config = await requestJson(originalFetch, baseUrl, `/v1/devices/${device.id}/config`, {
+      headers: authHeaders,
+    });
+    assert.equal(config.config.threadId, null);
+  }
 });
 
 test("expired T3 access tokens are blocked before snapshot or dispatch", async (t) => {
@@ -813,7 +915,7 @@ test("T3 environments can be updated and removed", async (t) => {
   const deleted = await requestJson(originalFetch, baseUrl, `/v1/t3/environments/${environment.environment.id}`, {
     method: "DELETE",
     headers: authHeaders,
-    body: {},
+    body: { confirmationLabel: "Updated T3" },
   });
   assert.equal(deleted.environment.id, environment.environment.id);
 
@@ -821,7 +923,8 @@ test("T3 environments can be updated and removed", async (t) => {
     method: "GET",
     headers: authHeaders,
   });
-  assert.deepEqual(environments.environments, []);
+  assert.equal(environments.environments.length, 1);
+  assert.match(environments.environments[0].purgeAfter, /^\d{4}-\d{2}-\d{2}T/u);
 
   const config = await requestJson(originalFetch, baseUrl, `/v1/devices/${device.device.id}/config`, {
     method: "GET",
@@ -878,21 +981,21 @@ test("device can upload image media and reference it in a camera prompt", async 
     body: {
       kind: "image",
       contentType: "image/png",
-      dataBase64: Buffer.from("not-really-a-png").toString("base64"),
+      dataBase64: PNG_BASE64,
       originalName: "snapshot.png",
     },
   });
 
   assert.equal(mediaUpload.media.kind, "image");
   assert.equal(mediaUpload.media.storagePath, undefined);
-  assert.equal(mediaUpload.media.sizeBytes, 16);
+  assert.equal(mediaUpload.media.sizeBytes, Buffer.from(PNG_BASE64, "base64").length);
 
   const fetchedMedia = await originalFetch(new URL(`/v1/media/${mediaUpload.media.id}`, baseUrl), {
     headers: authHeaders,
   });
   assert.equal(fetchedMedia.status, 200);
   assert.equal(fetchedMedia.headers.get("content-type"), "image/png");
-  assert.equal(await fetchedMedia.text(), "not-really-a-png");
+  assert.equal(Buffer.from(await fetchedMedia.arrayBuffer()).toString("base64"), PNG_BASE64);
 
   const dispatched = await requestJson(originalFetch, baseUrl, "/v1/device/intents", {
     method: "POST",
@@ -958,7 +1061,7 @@ test("audio media transcripts can be stored, updated, and used by audio prompts"
     body: {
       kind: "audio",
       contentType: "audio/webm",
-      dataBase64: Buffer.from("audio-bytes").toString("base64"),
+      dataBase64: WEBM_BASE64,
       originalName: "prompt.webm",
       transcript: "Initial audio transcript.",
     },
@@ -1051,7 +1154,7 @@ test("audio media can be transcribed through the configured provider", async (t)
     body: {
       kind: "audio",
       contentType: "audio/webm",
-      dataBase64: Buffer.from("audio-needing-transcript").toString("base64"),
+      dataBase64: WEBM_BASE64,
       originalName: "needs-transcript.webm",
     },
   });
@@ -1104,7 +1207,7 @@ test("audio media can be transcribed through the configured provider", async (t)
   assert.match(dispatches[0].message.text, /Mock transcript for audio needs-transcript\.webm/u);
 });
 
-test("user can delete uploaded media metadata and stored bytes", async (t) => {
+test("deleting equal uploads removes only the selected metadata and stored bytes", async (t) => {
   const mediaDir = await mkdtemp(join(tmpdir(), "agent-controller-delete-media-"));
   t.after(() => rm(mediaDir, { recursive: true, force: true }));
 
@@ -1120,13 +1223,24 @@ test("user can delete uploaded media metadata and stored bytes", async (t) => {
     body: {
       kind: "image",
       contentType: "image/png",
-      dataBase64: Buffer.from("delete-me").toString("base64"),
+      dataBase64: PNG_BASE64,
       originalName: "delete-me.png",
+    },
+  });
+  const duplicateUpload = await requestJson(fetch, baseUrl, "/v1/media", {
+    method: "POST",
+    headers: authHeaders,
+    body: {
+      kind: "image",
+      contentType: "image/png",
+      dataBase64: PNG_BASE64,
+      originalName: "keep-me.png",
     },
   });
 
   assert.equal(mediaUpload.media.kind, "image");
-  assert.equal((await readdir(join(mediaDir, "user_dev"))).length, 1);
+  assert.equal(mediaUpload.media.sha256, duplicateUpload.media.sha256);
+  assert.equal((await readdir(join(mediaDir, "user_dev"))).length, 2);
 
   const deleted = await requestJson(fetch, baseUrl, `/v1/media/${mediaUpload.media.id}`, {
     method: "DELETE",
@@ -1139,13 +1253,24 @@ test("user can delete uploaded media metadata and stored bytes", async (t) => {
     method: "GET",
     headers: authHeaders,
   });
-  assert.deepEqual(mediaList.media, []);
-  assert.deepEqual(await readdir(join(mediaDir, "user_dev")), []);
+  assert.deepEqual(mediaList.media.map((media) => media.id), [duplicateUpload.media.id]);
+  assert.equal((await readdir(join(mediaDir, "user_dev"))).length, 1);
 
   const fetchedAfterDelete = await fetch(new URL(`/v1/media/${mediaUpload.media.id}`, baseUrl), {
     headers: authHeaders,
   });
   assert.equal(fetchedAfterDelete.status, 404);
+
+  const retainedDuplicate = await fetch(new URL(`/v1/media/${duplicateUpload.media.id}`, baseUrl), {
+    headers: authHeaders,
+  });
+  assert.equal(retainedDuplicate.status, 200);
+
+  await requestJson(fetch, baseUrl, `/v1/media/${duplicateUpload.media.id}`, {
+    method: "DELETE",
+    headers: authHeaders,
+  });
+  assert.deepEqual(await readdir(join(mediaDir, "user_dev")), []);
 });
 
 test("privacy settings apply media retention and purge expired stored bytes", async (t) => {
@@ -1180,7 +1305,7 @@ test("privacy settings apply media retention and purge expired stored bytes", as
     body: {
       kind: "image",
       contentType: "image/png",
-      dataBase64: Buffer.from("keep-me").toString("base64"),
+      dataBase64: PNG_BASE64,
       originalName: "keep-me.png",
     },
   });
@@ -1210,9 +1335,9 @@ test("privacy settings apply media retention and purge expired stored bytes", as
   assert.equal(purged.count, 1);
   assert.equal(purged.purged[0].id, expired.id);
   assert.equal(purged.purged[0].storagePath, undefined);
-  assert.deepEqual(await readdir(userMediaDir), [
-    `${freshUpload.media.sha256}.png`,
-  ]);
+  const retainedFiles = await readdir(userMediaDir);
+  assert.equal(retainedFiles.length, 1);
+  assert.match(retainedFiles[0], new RegExp(`^${freshUpload.media.sha256}-[0-9a-f-]+\\.png$`, "u"));
 
   const expiredAfterPurge = await fetch(new URL(`/v1/media/${expired.id}`, baseUrl), {
     headers: authHeaders,
@@ -1283,7 +1408,7 @@ test("support diagnostics bundle redacts prompts, shell commands, and secrets", 
     body: {
       kind: "image",
       contentType: "image/png",
-      dataBase64: Buffer.from("diagnostics-image").toString("base64"),
+      dataBase64: PNG_BASE64,
       originalName: "diagnostics.png",
     },
   });
@@ -1293,7 +1418,7 @@ test("support diagnostics bundle redacts prompts, shell commands, and secrets", 
     body: {
       kind: "audio",
       contentType: "audio/webm",
-      dataBase64: Buffer.from("diagnostics-audio").toString("base64"),
+      dataBase64: WEBM_BASE64,
       originalName: "diagnostics.webm",
       transcript: "diagnostic transcript secret text",
     },
@@ -1406,6 +1531,7 @@ test("auth config exposes only public Clerk browser settings", async (t) => {
   assert.deepEqual(config, {
     authProvider: "clerk",
     demoMode: false,
+    deploymentMode: "self-hosted",
     developmentTokens: {
       enabled: false,
     },
@@ -1507,7 +1633,7 @@ test("user-authenticated web clients can upload media and dispatch prompts", asy
     body: {
       kind: "image",
       contentType: "image/png",
-      dataBase64: Buffer.from("web-image").toString("base64"),
+      dataBase64: PNG_BASE64,
     },
   });
 
@@ -2093,9 +2219,75 @@ test("factory preprovisioned devices must be claimed before control and support 
     headers: authHeaders,
     body: {},
   });
-  assert.notEqual(rotated.secret, preprovisioned.secret);
+  assert.equal(rotated.secret, undefined);
+  assert.equal(rotated.rotation.state, "pending");
+  assert.equal(rotated.rotation.pendingCredentialVersion, 2);
 
-  const oldSecretHeartbeat = await fetch(new URL("/v1/device/heartbeat", baseUrl), {
+  const oldSecretHeartbeat = await requestJson(fetch, baseUrl, "/v1/device/heartbeat", {
+    method: "POST",
+    headers: {
+      "x-device-id": preprovisioned.device.id,
+      "x-device-secret": preprovisioned.secret,
+    },
+    body: {},
+  });
+  assert.equal(oldSecretHeartbeat.device.credentialRotation.state, "pending");
+
+  const replacementSecret = "replacement_device_secret_0123456789abcdef";
+  const staged = await requestJson(fetch, baseUrl, "/v1/device/credentials/stage", {
+    method: "POST",
+    headers: {
+      "x-device-id": preprovisioned.device.id,
+      "x-device-secret": preprovisioned.secret,
+    },
+    body: {
+      rotationId: rotated.rotation.id,
+      credentialVersion: rotated.rotation.pendingCredentialVersion,
+      secret: replacementSecret,
+    },
+  });
+  assert.equal(staged.staged, true);
+  assert.equal(JSON.stringify(staged).includes(replacementSecret), false);
+
+  const pendingCannotHeartbeat = await fetch(new URL("/v1/device/heartbeat", baseUrl), {
+    method: "POST",
+    headers: {
+      "x-device-id": preprovisioned.device.id,
+      "x-device-secret": replacementSecret,
+      "content-type": "application/json",
+    },
+    body: "{}",
+  });
+  assert.equal(pendingCannotHeartbeat.status, 401);
+
+  const acknowledged = await requestJson(fetch, baseUrl, "/v1/device/credentials/ack", {
+    method: "POST",
+    headers: {
+      "x-device-id": preprovisioned.device.id,
+      "x-device-secret": replacementSecret,
+    },
+    body: {
+      rotationId: rotated.rotation.id,
+      credentialVersion: rotated.rotation.pendingCredentialVersion,
+    },
+  });
+  assert.equal(acknowledged.promoted, true);
+  assert.equal(acknowledged.replayed, false);
+
+  const replayed = await requestJson(fetch, baseUrl, "/v1/device/credentials/ack", {
+    method: "POST",
+    headers: {
+      "x-device-id": preprovisioned.device.id,
+      "x-device-secret": replacementSecret,
+    },
+    body: {
+      rotationId: rotated.rotation.id,
+      credentialVersion: rotated.rotation.pendingCredentialVersion,
+    },
+  });
+  assert.equal(replayed.replayed, true);
+
+  const supersededHeartbeat = await fetch(new URL("/v1/device/heartbeat", baseUrl), {
     method: "POST",
     headers: {
       "x-device-id": preprovisioned.device.id,
@@ -2104,7 +2296,7 @@ test("factory preprovisioned devices must be claimed before control and support 
     },
     body: "{}",
   });
-  assert.equal(oldSecretHeartbeat.status, 401);
+  assert.equal(supersededHeartbeat.status, 401);
 
   await requestJson(fetch, baseUrl, `/v1/devices/${preprovisioned.device.id}/revoke`, {
     method: "POST",
@@ -2116,7 +2308,7 @@ test("factory preprovisioned devices must be claimed before control and support 
     method: "POST",
     headers: {
       "x-device-id": preprovisioned.device.id,
-      "x-device-secret": rotated.secret,
+      "x-device-secret": replacementSecret,
       "content-type": "application/json",
     },
     body: "{}",
@@ -2145,26 +2337,70 @@ test("owners can reset claimed devices for transfer to a new account", async (t)
   assert.equal(reset.device.id, created.device.id);
   assert.equal(reset.device.claimed, false);
   assert.equal(reset.device.userId, null);
-  assert.ok(reset.claimCode);
-  assert.ok(reset.secret);
-  assert.notEqual(reset.secret, created.secret);
+  assert.equal(reset.claimCode, undefined);
+  assert.equal(reset.secret, undefined);
+  assert.equal(reset.rotation.purpose, "transfer");
+  assert.equal(reset.rotation.state, "pending");
 
-  const oldSecretHeartbeat = await fetch(new URL("/v1/device/heartbeat", baseUrl), {
+  const oldSecretHeartbeat = await requestJson(fetch, baseUrl, "/v1/device/heartbeat", {
     method: "POST",
     headers: {
       "x-device-id": created.device.id,
       "x-device-secret": created.secret,
-      "content-type": "application/json",
     },
-    body: "{}",
+    body: {},
   });
-  assert.equal(oldSecretHeartbeat.status, 401);
+  assert.equal(oldSecretHeartbeat.device.credentialRotation.purpose, "transfer");
+
+  const blockedConfig = await fetch(new URL("/v1/device/config", baseUrl), {
+    headers: {
+      "x-device-id": created.device.id,
+      "x-device-secret": created.secret,
+    },
+  });
+  assert.equal(blockedConfig.status, 409);
 
   const ownerDevices = await requestJson(fetch, baseUrl, "/v1/devices", {
     method: "GET",
     headers: ownerHeaders,
   });
   assert.deepEqual(ownerDevices.devices, []);
+
+  const transferSecret = "transfer_device_secret_0123456789abcdef";
+  await requestJson(fetch, baseUrl, "/v1/device/credentials/stage", {
+    method: "POST",
+    headers: {
+      "x-device-id": created.device.id,
+      "x-device-secret": created.secret,
+    },
+    body: {
+      rotationId: reset.rotation.id,
+      credentialVersion: reset.rotation.pendingCredentialVersion,
+      secret: transferSecret,
+    },
+  });
+  const transferAck = await requestJson(fetch, baseUrl, "/v1/device/credentials/ack", {
+    method: "POST",
+    headers: {
+      "x-device-id": created.device.id,
+      "x-device-secret": transferSecret,
+    },
+    body: {
+      rotationId: reset.rotation.id,
+      credentialVersion: reset.rotation.pendingCredentialVersion,
+    },
+  });
+  assert.equal(transferAck.resetForTransfer, true);
+
+  const setup = await requestJson(fetch, baseUrl, "/v1/device/setup-code", {
+    method: "POST",
+    headers: {
+      "x-device-id": created.device.id,
+      "x-device-secret": transferSecret,
+    },
+    body: { rotate: true },
+  });
+  assert.ok(setup.claimCode);
 
   const newOwner = await requestJson(fetch, baseUrl, "/v1/users/dev", {
     method: "POST",
@@ -2175,7 +2411,7 @@ test("owners can reset claimed devices for transfer to a new account", async (t)
   const claimed = await requestJson(fetch, baseUrl, "/v1/devices/claim", {
     method: "POST",
     headers: newOwnerHeaders,
-    body: { claimCode: reset.claimCode, label: "New owner controller" },
+    body: { claimCode: setup.claimCode, label: "New owner controller" },
   });
   assert.equal(claimed.device.id, created.device.id);
   assert.equal(claimed.device.claimed, true);
@@ -2186,7 +2422,7 @@ test("owners can reset claimed devices for transfer to a new account", async (t)
     method: "POST",
     headers: {
       "x-device-id": created.device.id,
-      "x-device-secret": reset.secret,
+      "x-device-secret": transferSecret,
     },
     body: { firmwareVersion: "0.1.8" },
   });
@@ -2259,6 +2495,15 @@ test("factory batch provisioning returns flash configs and firmware manifests ar
     body: { claimCode: batch.devices[0].claimCode, label: "Claimed batch controller" },
   });
 
+  const firmwareStream = await fetch(new URL("/v1/device/events", baseUrl), {
+    headers: {
+      "x-device-id": batch.devices[0].device.id,
+      "x-device-secret": batch.devices[0].secret,
+    },
+  });
+  assert.equal(firmwareStream.status, 200);
+  const firmwareChanged = readStreamUntil(firmwareStream.body, "firmware.changed");
+
   const release = await requestJson(fetch, baseUrl, "/v1/factory/firmware/releases", {
     method: "POST",
     headers: { authorization: "Bearer factory-secret" },
@@ -2277,6 +2522,9 @@ test("factory batch provisioning returns flash configs and firmware manifests ar
   assert.equal(release.manifest.version, "0.2.0");
   assert.equal(release.manifest.channel, "stable");
   assert.match(release.manifest.signature, /^[a-f0-9]{64}$/u);
+  const firmwareEventText = await firmwareChanged;
+  assert.match(firmwareEventText, /event: firmware\.changed/u);
+  assert.match(firmwareEventText, /"hardwareModel":"e213-esp32-s3r8"/u);
 
   await requestJson(fetch, baseUrl, "/v1/factory/firmware/releases", {
     method: "POST",
@@ -2649,9 +2897,18 @@ test("removing a T3 environment previews, repairs, and reports every dependency"
   assert.deepEqual(preview.dependencies.devices, [{ id: device.device.id, label: "Dependency controller" }]);
   assert.equal(preview.dependencies.onboarding, true);
 
+  const mismatchedConfirmation = await originalFetch(new URL(`/v1/t3/environments/${environmentId}`, baseUrl), {
+    method: "DELETE",
+    headers: { ...headers, "content-type": "application/json" },
+    body: JSON.stringify({ confirmationLabel: "Doomed t3" }),
+  });
+  assert.equal(mismatchedConfirmation.status, 409);
+  assert.equal((await mismatchedConfirmation.json()).error.details.reason, "environment_label_confirmation_required");
+
   const removed = await requestJson(originalFetch, baseUrl, `/v1/t3/environments/${environmentId}`, {
     method: "DELETE",
     headers,
+    body: { confirmationLabel: "Doomed T3" },
   });
   assert.equal(removed.environment.id, environmentId);
   assert.equal(removed.alreadyRemoved, false);
@@ -2667,6 +2924,8 @@ test("removing a T3 environment previews, repairs, and reports every dependency"
     headers,
   });
   assert.equal(config.config.environmentId, null);
+  assert.equal(config.config.projectId, null);
+  assert.equal(config.config.threadId, null);
 
   const orphanedAction = await requestJson(originalFetch, baseUrl, `/v1/actions/${action.action.id}`, {
     method: "GET",
@@ -2707,7 +2966,7 @@ test("removing a T3 environment previews, repairs, and reports every dependency"
     method: "DELETE",
     headers,
   });
-  assert.equal(repeated.environment, null);
+  assert.equal(repeated.environment.id, environmentId);
   assert.equal(repeated.alreadyRemoved, true);
   assert.deepEqual(repeated.removed, { devices: [], actions: [], macros: [], onboarding: false });
 
@@ -2719,6 +2978,79 @@ test("removing a T3 environment previews, repairs, and reports every dependency"
   });
   assert.equal(rescued.action.disabled, false);
   assert.equal(rescued.action.disabledReason, null);
+});
+
+test("archiving a T3 environment fully disconnects it, keeps it listed, and allows permanent deletion", async (t) => {
+  const { server } = createApp({ config: { demoMode: false } });
+  await listen(server);
+  t.after(() => server.close());
+  const baseUrl = `http://127.0.0.1:${server.address().port}`;
+  const headers = await createAuthHeaders(fetch, baseUrl);
+
+  const device = await requestJson(fetch, baseUrl, "/v1/devices", {
+    method: "POST",
+    headers,
+    body: { label: "Archive controller", profile: "agent-controller" },
+  });
+  const created = await requestJson(fetch, baseUrl, "/v1/t3/environments", {
+    method: "POST",
+    headers,
+    body: { label: "Archive T3", baseUrl: "https://archive-t3.example", accessToken: "archive-token" },
+  });
+  const environmentId = created.environment.id;
+  await requestJson(fetch, baseUrl, `/v1/devices/${device.device.id}/config`, {
+    method: "PUT",
+    headers,
+    body: { environmentId, threadId: "thread_archive" },
+  });
+
+  const archived = await requestJson(fetch, baseUrl, `/v1/t3/environments/${environmentId}/archive`, {
+    method: "POST",
+    headers,
+    body: {},
+  });
+  assert.equal(archived.environment.status, "archived");
+  assert.match(archived.environment.archivedAt, /^\d{4}-\d{2}-\d{2}T/u);
+  assert.equal(archived.alreadyArchived, false);
+  assert.deepEqual(archived.removed.devices, [device.device.id]);
+
+  const listed = await requestJson(fetch, baseUrl, "/v1/t3/environments", { method: "GET", headers });
+  assert.equal(listed.environments.length, 1);
+  assert.equal(listed.environments[0].archivedAt, archived.environment.archivedAt);
+  const config = await requestJson(fetch, baseUrl, `/v1/devices/${device.device.id}/config`, { method: "GET", headers });
+  assert.equal(config.config.environmentId, null);
+  assert.equal(config.config.projectId, null);
+  assert.equal(config.config.threadId, null);
+  const deviceEnvironments = await requestJson(fetch, baseUrl, "/v1/device/environments", {
+    method: "GET",
+    headers: {
+      "x-device-id": device.device.id,
+      "x-device-secret": device.secret,
+    },
+  });
+  assert.deepEqual(deviceEnvironments.environments, []);
+
+  const repeated = await requestJson(fetch, baseUrl, `/v1/t3/environments/${environmentId}/archive`, {
+    method: "POST",
+    headers,
+    body: {},
+  });
+  assert.equal(repeated.alreadyArchived, true);
+
+  const snapshotResponse = await fetch(new URL(`/v1/t3/environments/${environmentId}/snapshot`, baseUrl), {
+    method: "GET",
+    headers,
+  });
+  assert.equal(snapshotResponse.status, 404);
+  assert.match((await snapshotResponse.json()).error.message, /not found/u);
+
+  const restored = await requestJson(fetch, baseUrl, `/v1/t3/environments/${environmentId}/restore`, {
+    method: "POST", headers, body: {},
+  });
+  assert.equal(restored.environment.status, "needs_repair");
+  assert.equal(restored.environment.archivedAt, undefined);
+  const activeAgain = await requestJson(fetch, baseUrl, "/v1/t3/environments", { method: "GET", headers });
+  assert.equal(activeAgain.environments.length, 1);
 });
 
 function listen(server) {
@@ -2900,6 +3232,14 @@ test("a device reads only its selected thread response through bounded pages", a
       id: "thread_output",
       title: "Response task",
       session: { status: "stopped" },
+      activities: [{
+        id: "task_output",
+        kind: "task.started",
+        tone: "info",
+        summary: "Private device task",
+        payload: { taskId: "agent_output", agentKind: "agent", title: "Private device task" },
+        createdAt: "2026-08-08T20:00:01.000Z",
+      }],
       messages: [{
         id: "message_output",
         role: "assistant",
@@ -2920,6 +3260,9 @@ test("a device reads only its selected thread response through bounded pages", a
   assert.equal(output.thread.id, "thread_output");
   assert.equal(output.response.messageId, "message_output");
   assert.equal(output.response.state, "complete");
+  assert.equal(output.work.active, 1);
+  assert.equal(output.work.backgroundLiveness, "working");
+  assert.doesNotMatch(JSON.stringify(output.work), /agent_output|Private device task/u);
   assert.ok(output.response.lines.every((line) => line.length <= 31));
   assert.doesNotMatch(output.response.lines.join(" "), /AC_FOLLOWUPS/u);
   assert.deepEqual(output.suggestions, [], "unassigned model output never becomes a device action");
@@ -2929,6 +3272,7 @@ test("a device reads only its selected thread response through bounded pages", a
   });
   assert.equal(waiting.response.state, "waiting");
   assert.equal(waiting.response.messageId, null);
+  assert.deepEqual(waiting.response.lines, ["1 active task", "0 done · 0 failed", "EXIT returns to actions"]);
 
   const invalid = await f.originalFetch(new URL("/v1/device/thread-output?page=-1", f.baseUrl), {
     headers: f.deviceHeaders,
@@ -3198,7 +3542,8 @@ async function environmentSelectionFixture(t, { snapshotError = null, dispatchEr
     globalThis.fetch = originalFetch;
   });
 
-  const { server } = createApp();
+  const runtime = createApp();
+  const { server } = runtime;
   await listen(server);
   t.after(() => server.close());
   const baseUrl = `http://127.0.0.1:${server.address().port}`;
@@ -3256,6 +3601,7 @@ async function environmentSelectionFixture(t, { snapshotError = null, dispatchEr
     deviceHeaders,
     dispatches,
     snapshots,
+    store: runtime.store,
     bound: bound.environment,
     spare: spare.environment,
     foreign: foreign.environment,
@@ -3273,14 +3619,40 @@ test("a device lists its owner's environments and flags the bound one", async (t
     headers: f.deviceHeaders,
   });
   assert.equal(unbound.environmentId, null);
+  assert.equal(unbound.environmentsTruncated, false);
   assert.deepEqual(unbound.environments.map((environment) => environment.id), [f.bound.id, f.spare.id]);
   assert.equal(unbound.environments.every((environment) => environment.selected === false), true);
 
+  const observedAt = new Date().toISOString();
+  await f.store.updateEnvironmentHealth({
+    userId: "user_dev",
+    environmentId: f.bound.id,
+    status: "reachable",
+    health: { lastCheckedAt: observedAt, lastReachableAt: observedAt, lastError: null, failureReason: null },
+  });
+  await f.store.updateEnvironmentCatalogue({
+    userId: "user_dev",
+    environmentId: f.bound.id,
+    catalogue: {
+      updatedAt: observedAt,
+      instances: [{ status: "ready", auth: { status: "authenticated" }, models: [{ slug: "gpt-5" }] }],
+    },
+  });
   await f.bind({ environmentId: f.bound.id });
   const listed = await requestJson(f.originalFetch, f.baseUrl, "/v1/device/environments", {
     headers: f.deviceHeaders,
   });
   assert.equal(listed.environmentId, f.bound.id);
+  assert.deepEqual(listed.environments[0].health, {
+    transport: "direct",
+    freshness: "live",
+    connector: "not_applicable",
+    t3: "ready",
+      provider: "ready",
+      capability: "unknown",
+    observedAt,
+    action: "READY",
+  });
   assert.deepEqual(
     listed.environments.map((environment) => ({
       id: environment.id,
@@ -3298,6 +3670,111 @@ test("a device lists its owner's environments and flags the bound one", async (t
   assert.equal(listed.environments.some((environment) => environment.id === f.foreign.id), false);
   assert.equal(JSON.stringify(listed).includes("accessToken"), false);
   assert.equal(JSON.stringify(listed).includes("intruder-t3.example"), false);
+});
+
+test("device environment health separates connector, T3, and provider action layers", async (t) => {
+  const f = await environmentSelectionFixture(t);
+  const enrolled = await f.store.createConnector({
+    userId: "user_dev",
+    environmentId: f.spare.id,
+    scopes: ["connector:connect", "t3:proxy"],
+  });
+  await f.store.recordConnectorPresence({
+    connectorId: enrolled.connector.id,
+    environmentId: f.spare.id,
+    connected: true,
+    t3Health: "ready",
+    providerCatalogue: {
+      updatedAt: new Date().toISOString(),
+      instances: [{ status: "auth_required", auth: { status: "required" }, models: [] }],
+    },
+  });
+
+  let listed = await requestJson(f.originalFetch, f.baseUrl, "/v1/device/environments", {
+    headers: f.deviceHeaders,
+  });
+  let connectorRow = listed.environments.find((environment) => environment.id === f.spare.id);
+  assert.equal(connectorRow.health.transport, "connector");
+  assert.equal(connectorRow.health.freshness, "live");
+  assert.equal(connectorRow.health.connector, "online");
+  assert.equal(connectorRow.health.t3, "ready");
+  assert.equal(connectorRow.health.provider, "auth_required");
+  assert.equal(connectorRow.health.action, "AUTH PROVIDER");
+  assert.match(connectorRow.health.observedAt, /^\d{4}-\d{2}-\d{2}T/u);
+
+  await f.store.recordConnectorPresence({
+    connectorId: enrolled.connector.id,
+    environmentId: f.spare.id,
+    connected: true,
+    t3Health: "auth_failed",
+    providerCatalogue: {
+      updatedAt: new Date().toISOString(),
+      instances: [{ status: "ready", auth: { status: "authenticated" }, models: [{ slug: "gpt-5" }] }],
+    },
+  });
+  listed = await requestJson(f.originalFetch, f.baseUrl, "/v1/device/environments", {
+    headers: f.deviceHeaders,
+  });
+  connectorRow = listed.environments.find((environment) => environment.id === f.spare.id);
+  assert.equal(connectorRow.health.t3, "auth_failed");
+  assert.equal(connectorRow.health.provider, "ready");
+  assert.equal(connectorRow.health.action, "FIX T3 AUTH");
+
+  await f.store.recordConnectorPresence({
+    connectorId: enrolled.connector.id,
+    environmentId: f.spare.id,
+    connected: false,
+    t3Health: "ready",
+  });
+  listed = await requestJson(f.originalFetch, f.baseUrl, "/v1/device/environments", {
+    headers: f.deviceHeaders,
+  });
+  connectorRow = listed.environments.find((environment) => environment.id === f.spare.id);
+  assert.equal(connectorRow.health.connector, "offline");
+  assert.equal(connectorRow.health.freshness, "stale");
+  assert.equal(connectorRow.health.action, "START CONNECTOR");
+});
+
+test("device environment projection is bounded and redacts health and provider details", async (t) => {
+  const f = await environmentSelectionFixture(t);
+  const secret = "device-projection-must-not-leak-this-value";
+  await f.store.updateEnvironmentHealth({
+    userId: "user_dev",
+    environmentId: f.bound.id,
+    status: "unreachable",
+    health: { lastCheckedAt: new Date().toISOString(), failureReason: "unknown", lastError: secret },
+  });
+  await f.store.updateEnvironmentCatalogue({
+    userId: "user_dev",
+    environmentId: f.bound.id,
+    catalogue: {
+      updatedAt: new Date().toISOString(),
+      instances: [{ instanceId: secret, status: "error", auth: { status: "unknown" }, models: [{ slug: secret }] }],
+    },
+  });
+  for (let index = 0; index < 10; index += 1) {
+    await f.store.upsertEnvironment({
+      userId: "user_dev",
+      label: `Environment ${index} ${"x".repeat(100)}`,
+      baseUrl: `https://host-${index}.example/${secret}`,
+      accessToken: secret,
+      scopes: ["orchestration:read"],
+      status: "unchecked",
+    });
+  }
+
+  const listed = await requestJson(f.originalFetch, f.baseUrl, "/v1/device/environments", {
+    headers: f.deviceHeaders,
+  });
+  const serialized = JSON.stringify(listed);
+  assert.equal(listed.environmentsTruncated, true);
+  assert.equal(listed.environments.length, 8);
+  assert.equal(listed.environments.every((environment) => environment.label.length <= 64), true);
+  assert.equal(serialized.length < 5_000, true, `device projection was ${serialized.length} bytes`);
+  assert.equal(serialized.includes(secret), false);
+  for (const forbidden of ["baseUrl", "accessToken", "lastError", "providerCatalogue", "models", "scopes"]) {
+    assert.equal(serialized.includes(forbidden), false, `${forbidden} crossed the device boundary`);
+  }
 });
 
 test("a device can bind itself to one of its owner's environments", async (t) => {
@@ -3570,7 +4047,7 @@ test("a device creates a thread in its bound project and is left pointing at it"
   const response = await f.originalFetch(new URL("/v1/device/threads", f.baseUrl), {
     method: "POST",
     headers: { ...f.deviceHeaders, "content-type": "application/json" },
-    body: JSON.stringify({}),
+    body: JSON.stringify({ clientRequestId: "dev:thread-create-0001" }),
   });
   assert.equal(response.status, 201, "a create answers 201, not 200");
   const created = await response.json();
@@ -3581,6 +4058,17 @@ test("a device creates a thread in its bound project and is left pointing at it"
   assert.equal(created.thread.id, created.threadId);
   assert.equal(created.thread.selected, true);
   assert.equal(created.command.status, "completed");
+
+  const duplicateResponse = await f.originalFetch(new URL("/v1/device/threads", f.baseUrl), {
+    method: "POST",
+    headers: { ...f.deviceHeaders, "content-type": "application/json" },
+    body: JSON.stringify({ clientRequestId: "dev:thread-create-0001" }),
+  });
+  assert.equal(duplicateResponse.status, 200);
+  const duplicate = await duplicateResponse.json();
+  assert.equal(duplicate.duplicate, true);
+  assert.equal(duplicate.threadId, created.threadId);
+  assert.equal(duplicate.command.id, created.command.id);
 
   // The wire command is T3's own `thread.create`, with every field its schema requires.
   assert.equal(f.dispatches.length, 1);

@@ -1,33 +1,31 @@
 /**
- * Approval notifications.
+ * Local browser notifications for new durable attention records.
  *
- * A command that stops on `approval_required` is blocking real work on the operator's
- * machine, so the phone build raises an OS notification when the console is not the
- * foreground tab. Permission is requested lazily — only when the operator opts in from
- * Settings — never on page load.
+ * This is deliberately not Web Push: the page raises an OS notification only while the console
+ * is running and backgrounded. The durable in-app notification center remains authoritative and
+ * is replayed from the gateway after reconnect. Permission is requested lazily from Settings.
  */
 
 import { useCallback, useEffect, useRef, useState } from "react";
 
-import { commandSummary, commandType } from "./format";
 import { serviceWorkerRegistration } from "./pwa";
-import type { Command } from "./types";
+import type { UserNotification } from "./types";
 
-export const APPROVAL_NOTIFICATION_STORAGE_KEY = "agentControllerApprovalNotifications";
+/** Retain the existing key so an operator's opt-in survives the broader notification center. */
+export const LOCAL_NOTIFICATION_STORAGE_KEY = "agentControllerApprovalNotifications";
 
 /** `unsupported` is distinct from `denied`: the operator can still fix `denied` in browser settings. */
 export type NotificationSupportState = "unsupported" | "default" | "granted" | "denied";
 
-export interface ApprovalNotificationPayload {
+export interface LocalNotificationPayload {
   tag: string;
   title: string;
   body: string;
   url: string;
 }
 
-export interface ApprovalNotificationPlan {
-  notifications: ApprovalNotificationPayload[];
-  /** The ids to carry forward as "already announced". Pruned to what is still pending. */
+export interface LocalNotificationPlan {
+  notifications: LocalNotificationPayload[];
   seen: string[];
 }
 
@@ -39,69 +37,87 @@ export function readNotificationSupport(): NotificationSupportState {
   return permission === "granted" || permission === "denied" ? permission : "default";
 }
 
-export function readApprovalNotificationPreference(): boolean {
+export function readLocalNotificationPreference(): boolean {
   try {
-    return localStorage.getItem(APPROVAL_NOTIFICATION_STORAGE_KEY) === "on";
+    return localStorage.getItem(LOCAL_NOTIFICATION_STORAGE_KEY) === "on";
   } catch {
     return false;
   }
 }
 
-export function writeApprovalNotificationPreference(enabled: boolean): void {
+export function writeLocalNotificationPreference(enabled: boolean): void {
   try {
-    if (enabled) localStorage.setItem(APPROVAL_NOTIFICATION_STORAGE_KEY, "on");
-    else localStorage.removeItem(APPROVAL_NOTIFICATION_STORAGE_KEY);
+    if (enabled) localStorage.setItem(LOCAL_NOTIFICATION_STORAGE_KEY, "on");
+    else localStorage.removeItem(LOCAL_NOTIFICATION_STORAGE_KEY);
   } catch {
     // Preference persistence is a convenience; the in-memory toggle still works.
   }
 }
 
+function notificationUrl(notification: UserNotification): string {
+  const params = new URLSearchParams({ view: "notifications", notification: notification.id });
+  if (notification.commandId) params.set("command", notification.commandId);
+  if (notification.environmentId) params.set("environment", notification.environmentId);
+  if (notification.threadId) params.set("thread", notification.threadId);
+  return `/#activity?${params.toString()}`;
+}
+
 /**
- * Decides what to announce for the current pending-approval set.
- *
- * Approvals seen while the tab was in the foreground are recorded as announced without
- * firing anything, so backgrounding the tab later never replays a queue the operator
- * has already looked at.
+ * Plans local OS notifications only for records first observed after the initial durable replay.
+ * Existing unread records remain visible in the notification center without producing a burst on
+ * page load. `seen` remains bounded while retaining ids from older pages, so loading another page
+ * cannot re-announce a record that the client observed earlier.
  */
-export function planApprovalNotifications(options: {
-  pending: readonly Command[];
+export function planLocalNotifications(options: {
+  records: readonly UserNotification[];
   seen: readonly string[];
   enabled: boolean;
   permission: NotificationSupportState;
   hidden: boolean;
-}): ApprovalNotificationPlan {
-  const seen = options.pending.map((command) => command.id);
+  initialReplay: boolean;
+}): LocalNotificationPlan {
+  const visible = options.records.filter((record) => !record.dismissedAt);
+  const dismissed = new Set(options.records.filter((record) => record.dismissedAt).map((record) => record.id));
+  const seen = [...new Set([
+    ...options.seen.filter((id) => !dismissed.has(id)),
+    ...visible.map((record) => record.id),
+  ])].slice(-1_000);
+  if (options.initialReplay) return { notifications: [], seen };
   const active = options.enabled && options.permission === "granted" && options.hidden;
   if (!active) return { notifications: [], seen };
 
   const previous = new Set(options.seen);
-  const fresh = options.pending.filter((command) => !previous.has(command.id));
+  const fresh = visible.filter((record) => !record.readAt && !previous.has(record.id));
   if (fresh.length === 0) return { notifications: [], seen };
 
   if (fresh.length > 2) {
     return {
       notifications: [{
-        tag: "agent-controller-approvals",
-        title: `${fresh.length} commands need approval`,
-        body: "Open Agent Controller to review the approval queue.",
-        url: "/#activity",
+        tag: "agent-controller-attention",
+        title: `${fresh.length} new Agent Controller updates`,
+        body: "Open the notification center to review them.",
+        url: "/#activity?view=notifications",
       }],
       seen,
     };
   }
 
   return {
-    notifications: fresh.map((command) => ({
-      tag: `agent-controller-approval-${command.id}`,
-      title: `Approval required: ${commandType(command)}`,
-      body: commandSummary(command),
-      url: "/#activity",
+    notifications: fresh.map((record) => ({
+      tag: `agent-controller-${record.id}`,
+      title: record.title,
+      body: record.severity === "error"
+        ? "Agent Controller needs your attention."
+        : record.severity === "attention"
+          ? "Open Agent Controller to respond."
+          : "Open Agent Controller for details.",
+      url: notificationUrl(record),
     })),
     seen,
   };
 }
 
-export async function deliverApprovalNotification(payload: ApprovalNotificationPayload): Promise<boolean> {
+export async function deliverLocalNotification(payload: LocalNotificationPayload): Promise<boolean> {
   const options: NotificationOptions = {
     body: payload.body,
     tag: payload.tag,
@@ -137,24 +153,24 @@ export async function deliverApprovalNotification(payload: ApprovalNotificationP
   }
 }
 
-export interface ApprovalNotificationsController {
-  /** Whether the operator has opted in (independent of the browser permission). */
-  approvalNotificationsEnabled: boolean;
+export interface LocalNotificationsController {
+  localNotificationsEnabled: boolean;
   notificationSupport: NotificationSupportState;
-  /** Lazily prompts for permission. Returns the resulting permission state. */
-  enableApprovalNotifications: () => Promise<NotificationSupportState>;
-  disableApprovalNotifications: () => void;
+  enableLocalNotifications: () => Promise<NotificationSupportState>;
+  disableLocalNotifications: () => void;
 }
 
-export function useApprovalNotifications(
-  pendingApprovals: readonly Command[],
-): ApprovalNotificationsController {
-  const [enabled, setEnabled] = useState(readApprovalNotificationPreference);
+export function useLocalNotifications(
+  records: readonly UserNotification[],
+  loaded: boolean,
+): LocalNotificationsController {
+  const [enabled, setEnabled] = useState(readLocalNotificationPreference);
   const [permission, setPermission] = useState<NotificationSupportState>(readNotificationSupport);
   const [hidden, setHidden] = useState(
     () => typeof document !== "undefined" && document.visibilityState === "hidden",
   );
   const seenRef = useRef<string[]>([]);
+  const replaySeededRef = useRef(false);
 
   useEffect(() => {
     if (typeof document === "undefined") return;
@@ -164,18 +180,22 @@ export function useApprovalNotifications(
   }, []);
 
   useEffect(() => {
-    const plan = planApprovalNotifications({
-      pending: pendingApprovals,
+    if (!loaded) return;
+    const initialReplay = !replaySeededRef.current;
+    const plan = planLocalNotifications({
+      records,
       seen: seenRef.current,
       enabled,
       permission,
       hidden,
+      initialReplay,
     });
+    replaySeededRef.current = true;
     seenRef.current = plan.seen;
-    for (const payload of plan.notifications) void deliverApprovalNotification(payload);
-  }, [enabled, hidden, pendingApprovals, permission]);
+    for (const payload of plan.notifications) void deliverLocalNotification(payload);
+  }, [enabled, hidden, loaded, permission, records]);
 
-  const enableApprovalNotifications = useCallback(async () => {
+  const enableLocalNotifications = useCallback(async () => {
     const support = readNotificationSupport();
     if (support === "unsupported") {
       setPermission("unsupported");
@@ -193,19 +213,19 @@ export function useApprovalNotifications(
     setPermission(result);
     const granted = result === "granted";
     setEnabled(granted);
-    writeApprovalNotificationPreference(granted);
+    writeLocalNotificationPreference(granted);
     return result;
   }, []);
 
-  const disableApprovalNotifications = useCallback(() => {
+  const disableLocalNotifications = useCallback(() => {
     setEnabled(false);
-    writeApprovalNotificationPreference(false);
+    writeLocalNotificationPreference(false);
   }, []);
 
   return {
-    approvalNotificationsEnabled: enabled && permission === "granted",
+    localNotificationsEnabled: enabled && permission === "granted",
     notificationSupport: permission,
-    enableApprovalNotifications,
-    disableApprovalNotifications,
+    enableLocalNotifications,
+    disableLocalNotifications,
   };
 }

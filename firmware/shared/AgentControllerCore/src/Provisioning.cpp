@@ -1,6 +1,7 @@
 #include "Provisioning.h"
 
 #include "GatewayDiscovery.h"
+#include "GatewayTls.h"
 
 namespace {
 constexpr uint32_t kJoinTimeoutMs = 20000;
@@ -354,14 +355,25 @@ void Provisioning::handlePortalSubmit() {
 
   const String ssid = server_.arg("ssid");
   const String password = server_.arg("password");
-  const String gateway = server_.arg("gateway");
+  String gateway = server_.arg("gateway");
+  gateway.trim();
+  while (gateway.endsWith("/")) gateway.remove(gateway.length() - 1);
+  if (gateway.length() > 0 && !gateway_tls::gatewayUrlAllowed(gateway)) {
+    portalError_ = "Use verified HTTPS. Plain HTTP is allowed only for an explicit local bench build.";
+    handlePortalRoot();
+    return;
+  }
 
   if (ssid.length() == 0) {
     // A gateway-only correction. The owner reached this portal to fix a URL, and the stored
     // network is already known good — making them re-pick it and retype the password would be
     // asking for a second chance to get something wrong.
     if (gateway.length() > 0 && store_->hasWifiCredentials()) {
-      store_->setGatewayUrl(gateway);
+      if (!store_->setGatewayUrl(gateway)) {
+        portalError_ = "Gateway URL was not saved.";
+        handlePortalRoot();
+        return;
+      }
       Serial.printf("[wifi] gateway updated to %s; rejoining %s\n",
                     gateway.c_str(), store_->wifiSsid().c_str());
       server_.send(
@@ -394,7 +406,12 @@ void Provisioning::handlePortalSubmit() {
   server_.client().flush();
 
   if (attemptJoin(ssid, password, kJoinTimeoutMs)) {
-    if (gateway.length() > 0) store_->setGatewayUrl(gateway);
+    if (gateway.length() > 0 && !store_->setGatewayUrl(gateway)) {
+      portalError_ = "Gateway URL was not saved.";
+      portalUp_ = false;
+      startPortal();
+      return;
+    }
     store_->setWifiCredentials(ssid, password);
     portalError_ = "";
     status_.joinFailures = 0;

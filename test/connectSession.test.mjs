@@ -2,7 +2,12 @@ import assert from "node:assert/strict";
 import test from "node:test";
 
 import { createApp } from "../src/app.mjs";
-import { buildConnectCommand, normalizeConnectAccessMode } from "../src/connectSession.mjs";
+import {
+  buildConnectorRotateCommand,
+  buildConnectCommand,
+  buildLegacyDirectConnectCommand,
+  normalizeConnectAccessMode,
+} from "../src/connectSession.mjs";
 import { createMemoryStore } from "../src/store.mjs";
 
 test("the console mints a connect code and the T3 host redeems it into an environment", async (t) => {
@@ -39,9 +44,12 @@ test("the console mints a connect code and the T3 host redeems it into an enviro
   assert.equal(minted.session.environmentId, null);
   assert.match(minted.code, /^[A-Z0-9]{5}-[A-Z0-9]{5}$/u);
   // The one-liner is what the user copies; it has to name this gateway and carry the code.
-  assert.match(minted.command, /^npm run setup:t3 -- --gateway-url /u);
-  assert.ok(minted.command.includes(`--connect-code '${minted.code}'`));
-  assert.ok(minted.command.includes("--tunnel 'tailscale'"));
+  assert.equal(
+    minted.command,
+    `npx @agent-controller/connector connect --server '${baseUrl}' --code '${minted.code}'`,
+  );
+  assert.equal(minted.command.includes("tailscale"), false, "access mode is not a connector CLI credential");
+  assert.equal(minted.command.includes("token"), false, "the copyable command never carries a T3 token");
 
   // The console polls this while the user is still in a terminal on the other machine.
   const pending = await requestJson(originalFetch, baseUrl, `/v1/t3/connect-sessions/${minted.session.id}`, {
@@ -288,16 +296,33 @@ test("another user cannot poll someone else's connect session", async (t) => {
   assert.equal(denied.status, 404);
 });
 
-test("the connect command is scoped to the access mode the console picked", () => {
+test("the default connect command launches the published connector CLI with shell-safe arguments", () => {
   assert.equal(
     buildConnectCommand({ gatewayUrl: "https://gateway.example/", code: "ABCDE-FGHIJ", accessMode: "local" }),
-    "npm run setup:t3 -- --gateway-url 'https://gateway.example' --connect-code 'ABCDE-FGHIJ' --tunnel 'local'",
+    "npx @agent-controller/connector connect --server 'https://gateway.example' --code 'ABCDE-FGHIJ'",
   );
-  // Online endpoints go through a tunnel the user already owns, so the flag is omitted rather than
-  // guessed at — setup:t3 would otherwise try to create one.
   assert.equal(
-    buildConnectCommand({ gatewayUrl: "https://gateway.example", code: "ABCDE-FGHIJ", accessMode: "online" }),
-    "npm run setup:t3 -- --gateway-url 'https://gateway.example' --connect-code 'ABCDE-FGHIJ'",
+    buildConnectCommand({ gatewayUrl: "https://gateway.example/path'o/", code: "CODE'VALUE", accessMode: "tailscale" }),
+    `npx @agent-controller/connector connect --server 'https://gateway.example/path'"'"'o' --code 'CODE'"'"'VALUE'`,
+  );
+  assert.equal(buildConnectCommand({ gatewayUrl: "https://gateway.example", code: "ABCDE-FGHIJ", accessMode: "online" }).includes("online"), false);
+});
+
+test("the rotation command is shell-safe and explicitly confirmed", () => {
+  const command = buildConnectorRotateCommand({
+    gatewayUrl: "https://controller.example/path'with-quote/",
+    code: "ABCDE-'FGHIJ",
+  });
+  assert.match(command, /^npx @agent-controller\/connector rotate /u);
+  assert.match(command, /--server 'https:\/\/controller\.example\/path'"'"'with-quote'/u);
+  assert.match(command, /--code 'ABCDE-'"'"'FGHIJ'/u);
+  assert.match(command, / --yes$/u);
+});
+
+test("legacy direct setup is available only through its explicitly named builder", () => {
+  assert.equal(
+    buildLegacyDirectConnectCommand({ gatewayUrl: "https://gateway.example/", code: "ABCDE-FGHIJ", accessMode: "tailscale" }),
+    "npm run setup:t3 -- --gateway-url 'https://gateway.example' --connect-code 'ABCDE-FGHIJ' --tunnel 'tailscale'",
   );
   assert.equal(normalizeConnectAccessMode("TAILSCALE"), "tailscale");
   assert.equal(normalizeConnectAccessMode("nonsense"), "local");

@@ -510,13 +510,10 @@ board — pins, radios, the one physical button — and nothing in it knows what
 
 In dependency order:
 
-1. **OTA.** `partitions_ota.csv` is in place, but the manifest poll, the download, and the
-   `confirmFirmwareIfPendingVerify()` rollback confirm still live only in the CrowPanel's
-   `src/main.cpp`. A board that cannot be updated in the field is a board that has to come back.
-2. **Gateway profiles.** The two-phase LAN/tailnet switch protocol is likewise unported, so
+1. **Gateway profiles.** The two-phase LAN/tailnet switch protocol is still unported, so
    `config.gatewayUrl` is read and ignored rather than persisted unprobed.
-3. **On-screen keyboard**, for correcting a transcript rather than for composing a request.
-4. **On-device transcript correction.** The gateway transcribes a device upload automatically and
+2. **On-screen keyboard**, for correcting a transcript rather than for composing a request.
+3. **On-device transcript correction.** The gateway transcribes a device upload automatically and
    the board now follows the job to its milestone, but a capture that lands at `review` can only be
    resolved in the console — there is no keyboard here to edit a transcript with.
 
@@ -544,8 +541,10 @@ In dependency order:
    (the vendor examples contradict each other, hence `LED_COLOR_ORDER_GRB`); that one LED is the
    right count; that the WS2812B-V5 part latches on our 100 ns-tick bit timings; and every
    brightness and hue judgement, all of which were made without seeing the diffuser.
-5. **OTA rollback.** The 16 MB flash/partition configuration boots, but the dual-slot failure and
-   rollback ceremony has not been tested.
+5. **Bootloader rollback drill.** Signed OTA download, SHA verification, inactive-slot boot,
+   heartbeat confirmation, and the NVS fallback were exercised on hardware with `0.1.1 -> 0.2.1`,
+   followed by the event-triggered production rollout to `0.2.2` (`verified`, 100%). A deliberately
+   broken-image bootloader rollback drill is still outstanding.
 6. **Touch/display bus coexistence.** Display and codec work, but adding FT6336G on the shared I2C
    bus still needs a real-board test.
 7. **Sustained capture/upload power and thermals.** Local clips work; Wi-Fi upload under battery

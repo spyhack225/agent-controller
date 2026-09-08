@@ -11,7 +11,9 @@ import { deviceJobStatus, milestoneForJob } from "../src/deviceAudio.mjs";
 // can poll until a word appears on its screen. Everything here drives the real HTTP surface with a
 // real device credential, because the point of the loop is that the hardware needs no other route.
 
-const AUDIO = Buffer.from("pretend this is a wav").toString("base64");
+const AUDIO = Buffer.from([0x1a, 0x45, 0xdf, 0xa3]).toString("base64");
+const PNG_BASE64 =
+  "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg==";
 
 /**
  * A gateway with a claimed controller, a paired environment, and the mock ASR provider.
@@ -141,7 +143,7 @@ test("an image from a device is stored without inventing a transcription job", a
     body: {
       kind: "image",
       contentType: "image/png",
-      dataBase64: Buffer.from("not really a png").toString("base64"),
+      dataBase64: PNG_BASE64,
     },
   });
 
@@ -331,8 +333,8 @@ test("auto-send on dispatches the transcript through the ordinary policy path", 
   assert.equal(loop.dispatches.length, 1);
   assert.equal(loop.dispatches[0].type, "thread.turn.start");
   assert.match(loop.dispatches[0].message.text, /Mock transcript/u);
-  // The recording travels with the prompt, exactly as a hand-driven audio intent would.
-  assert.equal(loop.dispatches[0].message.attachments[0].mediaId, uploaded.media.id);
+  // The certified T3 adapter accepts the reviewed transcript, not private raw audio bytes.
+  assert.deepEqual(loop.dispatches[0].message.attachments, []);
 
   const status = await loop.call(`/v1/device/media/jobs/${uploaded.job.jobId}`, { headers: loop.deviceHeaders });
   assert.equal(status.job.milestone, "sent");

@@ -2,11 +2,39 @@
 
 Vendor documentation: <https://docs.waveshare.com/ESP32-S3-Touch-AMOLED-1.75C>
 
-**Status: scaffold. Compiles, never flashed.** Both environments build clean against
-`espressif32` + Arduino (bring-up image: 761 KB flash, 46 KB RAM), which confirms the toolchain,
-the 16 MB partition table, and the shared-core wiring. No board has been in hand, so nothing here
-has run on silicon, and the pin map is transcribed from community sources for the non-cased
+**Status: network bring-up scaffold, never flashed.** The source now uses the shared authenticated
+gateway client for heartbeat, claim-code caching, credential rotation, firmware-manifest
+observation, and link truth (`unclaimed`, `claimed`, `revoked`, or `unreachable`). BOOT tap reopens
+configuration without erasing working Wi-Fi; a 10-second hold clears owner setup while preserving
+the factory identity.
+
+This is deliberately not a usable controller yet. Its heartbeat advertises no `display`,
+`thread_picker`, `microphone`, or `camera`, and the shared client therefore does not poll operate
+resources for it. USB serial reports provisioning/link transitions and the claim code for bring-up;
+it is not counted as customer UI or remote-operation parity. No board has been in hand, so nothing
+here has run on silicon, and the pin map is transcribed from community sources for the non-cased
 variant. See [What is unverified](#what-is-unverified).
+
+Both isolated placeholder-config environments compile from the current source. Each uses 51,684
+bytes of static RAM (15.8% of the build target) and 1,095,187 bytes of its 5 MiB app slot (20.9%).
+That is compile evidence only; it does not validate the board definition or any physical path.
+
+## Implemented safe path
+
+- NVS factory identity seed and owner-managed SoftAP Wi-Fi/gateway provisioning.
+- Fail-closed shared TLS gate for every device-credential request.
+- Background heartbeat and event tasks, so gateway I/O does not stall the provisioning/recovery
+  loop.
+- Stable cached claim code plus explicit claimed, revoked, unreachable, and missing-identity states.
+- Two-step device-credential rotation and OTA rollback observation from the shared core; OTA apply
+  remains disabled.
+- BOOT tap to reopen configuration without data loss, and BOOT hold to clear owner setup without
+  erasing the factory identity.
+
+Environment/project/thread browsing, controls, command outcome rendering, approvals, responses,
+AMOLED, touch, microphone, speaker, battery telemetry, and OTA apply remain unavailable on this
+board. The shared APIs exist, but wiring them before input/output hardware works would be a false
+capability claim.
 
 ## Verdict: suitable, and the best voice target we have
 
@@ -100,7 +128,7 @@ Nothing here has been checked against hardware or against a 1.75C schematic. Spe
    CrowPanel's 8 MB table. The arithmetic is contiguous and exactly fills 16 MB, and the build
    applies it (the linker reports a 5 MB app slot), but it has never been flashed. The CrowPanel's
    was confirmed byte-for-byte against real silicon; this one has not been.
-5. **That the build matches the board.** Both environments compile, but a clean compile only proves
+5. **That the build matches the board.** A clean compile only proves
    the toolchain and the code are consistent — it says nothing about whether `qio_opi`, the flash
    size, or the native-USB CDC setting are right for this hardware. `src/main.cpp` prints the
    detected PSRAM and flash size at boot precisely so the first flash answers that.
@@ -110,45 +138,41 @@ Nothing here has been checked against hardware or against a 1.75C schematic. Spe
 
 The order matters: the PMIC gates the rails everything else needs.
 
-1. **Bring-up.** Flash `src/main.cpp` as-is. It boots, opens NVS, runs the shared provisioning state
-   machine, and prints memory and identity over USB serial. This confirms the board, the partition
-   table, the PSRAM configuration, and the SoftAP portal without touching an unverified pin.
+1. **Bring-up.** Flash `src/main.cpp` as-is. It boots, opens NVS, runs shared provisioning plus the
+   authenticated claim/heartbeat path, and prints memory, identity, provisioning, and gateway-link
+   transitions over USB serial. This is designed not to touch an unverified peripheral pin.
 2. **Confirm the pin map** against the 1.75C schematic and correct
    `include/controller_config.example.h`. Everything below depends on this.
 3. **AXP2101 over I2C.** Rails first. Battery telemetry feeds the existing heartbeat fields.
-4. **Extract the gateway client into `firmware/shared`.** This is the real work, and it is not
-   board-specific. Today the heartbeat, display-state fetch, intent submission, OTA, and media
-   upload all live inside the CrowPanel's 3652-line `src/main.cpp`; `DeviceStore`, `Provisioning`,
-   and `ThinkingOrb` are shared. A third board makes that duplication untenable — port the client once,
-   into `AgentControllerCore`, and let each board supply a display adapter.
-5. **CO5300 panel over QSPI**, framebuffer in PSRAM. Waveshare's engineering-sample sources
+4. **CO5300 panel over QSPI**, framebuffer in PSRAM. Waveshare's engineering-sample sources
    (<https://github.com/waveshareteam/ESP32-S3-Touch-AMOLED-1.75>) or an LVGL port are the
    candidates. Vendor the driver in `lib/` the way the CrowPanel vendors `ElecrowEPD`.
-6. **CST9217 touch**, then the on-screen UI: thread list, agent reply text, approve/reject, and
-   push-to-talk.
-7. **ES7210 microphone array.** The one genuinely new driver: an I2C register init, then a standard
+5. **CST9217 touch**, then the on-screen UI. Only after the rendered list and confirmed touch target
+   work should the heartbeat enable `display` and `thread_picker` and the board call the shared
+   environment/project/thread, controls, command-result, approvals, and response APIs.
+6. **ES7210 microphone array.** The one genuinely new driver: an I2C register init, then a standard
    I2S read. Note this is neither of the two modes the CrowPanel capture layer supports — it is not
    PDM, and it is not a bare I2S MEMS mic that needs no configuration. Downmix the array to mono at
    16 kHz before upload; the ASR discards the second channel.
-8. **Wire capture to the existing endpoints.** `POST /v1/device/media` then an `audio_prompt` intent
-   already works and is exercised by the CrowPanel capture build — reuse it rather than inventing a
-   path. Note the gateway does not currently auto-transcribe device audio; that gap is Category 2 of
-   the roadmap.
-9. **On-screen keyboard**, once voice is working. Voice first: it is the better input on a round
+7. **Wire capture to the shared raw upload-session client and assigned capture control.** Enable the
+   `microphone` capability only after the ES7210 path produces a measured, gap-free clip. Reuse the
+   shared media/action contract rather than inventing a board route.
+8. **On-screen keyboard**, once voice is working. Voice first: it is the better input on a round
    466x466 panel, and the keyboard is the fallback for correcting a transcript.
-10. **Power profile.** Measure idle, screen-on, Wi-Fi-active, and recording draw against the battery
+9. **Power profile.** Measure idle, screen-on, Wi-Fi-active, and recording draw against the battery
     before committing to any runtime claim.
 
 ## Build
 
 ```
-pio run -e waveshare-amoled-175c              # bring-up, audio off
-pio run -e waveshare-amoled-175c-capture      # audio capture enabled
+pio run -e waveshare-amoled-175c              # safe claim/health scaffold
+pio run -e waveshare-amoled-175c-capture      # compile probe only; microphone still unadvertised
 ```
 
 Copy `include/controller_config.example.h` to `include/controller_config.h` first. Wi-Fi credentials
 are deliberately not in it — they are entered by the owner through the SoftAP portal and stored in
-NVS. Hold BOOT for 10 seconds to wipe them and re-enter provisioning.
+NVS. Tap BOOT to reopen configuration without erasing them. Hold BOOT for 10 seconds to clear
+owner setup and re-enter provisioning; the factory device ID and secret remain intact.
 
 ## Vendor documents
 

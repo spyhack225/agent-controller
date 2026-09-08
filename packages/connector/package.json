@@ -1,0 +1,33 @@
+{
+  "name": "@agent-controller/connector",
+  "version": "0.1.0",
+  "description": "Outbound bridge between a local T3 Code environment and Agent Controller",
+  "type": "module",
+  "bin": {
+    "agent-controller-connect": "./bin/agent-controller-connect.mjs"
+  },
+  "exports": {
+    ".": "./src/index.mjs"
+  },
+  "files": [
+    "bin",
+    "src",
+    "README.md"
+  ],
+  "engines": {
+    "node": ">=22"
+  },
+  "scripts": {
+    "test": "node --test test/*.test.mjs",
+    "pack:smoke": "node scripts/pack-smoke.mjs"
+  },
+  "keywords": [
+    "agent-controller",
+    "t3-code",
+    "connector"
+  ],
+  "license": "UNLICENSED",
+  "publishConfig": {
+    "access": "public"
+  }
+}

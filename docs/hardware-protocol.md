@@ -4,27 +4,30 @@ This document describes hardware protocol v2 for the ESP32 agent controller and 
 protocol-v1 compatibility path.
 
 Project-wide firmware progress is maintained in
-[roadmap/IMPLEMENTATION-STATUS.md](../roadmap/IMPLEMENTATION-STATUS.md). As of 2026-08-24 all 11
-PlatformIO environments compile; Hosyond is the only board with current silicon evidence. The
-CrowPanel sections below deliberately distinguish the implemented slice from the target protocol
-and UI contract.
+[roadmap/IMPLEMENTATION-STATUS.md](../roadmap/IMPLEMENTATION-STATUS.md). The current inventory is 15
+PlatformIO environments; the post-TLS release and CrowPanel/Waveshare build evidence is recorded in
+[firmware-build-gate.md](firmware-build-gate.md). Hosyond is the only board with current silicon
+evidence. The CrowPanel sections below deliberately distinguish the implemented slice from the
+target protocol and UI contract.
 
 The current design keeps the ESP32 simple:
 
-- The VPS gateway owns account, device, and T3 environment state.
+- The cloud gateway owns account, device, policy, and durable control-plane state.
 - The ESP32 authenticates with a per-device ID and secret.
 - The ESP32 polls compact display state instead of holding a long-lived stream.
 - The ESP32 sends opaque saved-action IDs, not action payloads or raw T3 commands.
 - Phone/web clients and the ESP32 share the same intent model.
+- T3 state and provider execution remain on the user's machine behind the outbound connector.
 
 ## Topology
 
 ```mermaid
 flowchart TD
-  ESP32["ESP32 controller<br/>keys, e-ink, optional mic/camera"] --> Gateway["VPS gateway<br/>auth, device registry, policy"]
+  ESP32["ESP32 controller<br/>keys, display, optional media"] --> Gateway["Cloud gateway<br/>auth, registry, policy, routing"]
   Phone["Phone/web client<br/>audio, images, prompts"] --> Gateway
-  Gateway --> Tailscale["Tailscale/T3 Connect"]
-  Tailscale --> T3["T3 Code on Mac"]
+  Connector["Outbound connector CLI<br/>on user machine"] --> Gateway
+  Connector --> Tailscale["Loopback or optional Tailscale"]
+  Tailscale --> T3["T3 Code on user machine"]
   T3 --> Agents["Codex / Claude Code"]
 ```
 
@@ -35,8 +38,10 @@ The physical product target in this document is the **CrowPanel ESP32 2.13-inch 
 vendored driver exposes a 250-by-128 logical buffer; UI code must keep meaningful pixels inside
 rows `0..121` because the final six rows are not part of the visible product canvas.
 
-The Vision Master T190 remains a development bring-up target. It does not inherit the navigation,
-screen, input, or protocol-v2 parity described below until that work is planned separately.
+The Vision Master T190 remains a development target with no silicon proof. Its adapter now uses the
+shared identity, provisioning, gateway, and browse layers. The checked-in build is status-only;
+navigation and operate capability compile only behind an explicit external-encoder verification
+gate, so they are not release or hardware evidence.
 
 The following sections define the **target CrowPanel interaction contract**. They are deliberately
 more complete than the implemented first slice. The current source now includes:
@@ -880,19 +885,55 @@ x-device-secret: ...
 ```json
 {
   "environmentId": "env_bound",
+  "environmentsTruncated": false,
   "environments": [
-    { "id": "env_bound", "label": "Workshop mac", "status": "ready", "tokenExpired": false, "selected": true },
-    { "id": "env_spare", "label": "Spare T3", "status": "ready", "tokenExpired": false, "selected": false }
+    {
+      "id": "env_bound",
+      "label": "Workshop mac",
+      "status": "reachable",
+      "tokenExpired": false,
+      "selected": true,
+      "health": {
+        "transport": "connector",
+        "freshness": "live",
+        "connector": "online",
+        "t3": "ready",
+        "provider": "ready",
+        "observedAt": "2026-08-27T18:44:12.000Z",
+        "action": "READY"
+      }
+    }
   ]
 }
 ```
 
-Only the environments owned by the account that claimed the device are listed, and only
-these five fields: `baseUrl`, scopes, pairing state and anything token-bearing stay in
-the console realm. `tokenExpired` is carried so the device can show a dead end before the
-owner walks over to it. Unlike every other environment-scoped route this one answers
-`200` with no environment bound — a controller with none is exactly the one that needs
-the list.
+Only environments owned by the account that claimed the device are listed. The response is capped
+at eight rows; `environmentsTruncated` tells the controller to send the owner to the console for the
+rest. Labels are capped at 64 characters. `baseUrl`, scopes, raw health errors, connector versions,
+provider/model names, pairing state, and anything token-bearing stay in the console realm.
+`tokenExpired` is retained because it is an immediately actionable dead end.
+
+`health` is a compact observation, not a second source of environment truth:
+
+| Field | Values |
+| --- | --- |
+| `transport` | `direct`, `connector` |
+| `freshness` | `live`, `stale`, `unknown` |
+| `connector` | `not_applicable`, `enrolled`, `waiting`, `online`, `reconnecting`, `sleeping`, `offline`, `revoked`, `incompatible`, `unknown` |
+| `t3` | `ready`, `starting`, `stopped`, `auth_failed`, `incompatible`, `error`, `unknown` |
+| `provider` | `ready`, `auth_required`, `model_unavailable`, `error`, `unknown` |
+| `observedAt` | Latest applicable ISO-8601 health/heartbeat/catalogue observation, or `null` |
+| `action` | A fixed, at-most-24-character display instruction |
+
+The action is deterministic. Token repair wins first, followed by connector state, T3 state,
+provider state, and stale freshness. Thus an offline or sleeping connector is never presented as a
+provider-only failure based on an old catalogue. Shared firmware uses the provided action and
+applies the same priority as a compatibility fallback. `READY` requires both explicit T3 readiness
+and an explicitly authenticated provider with at least one model; a model list alone is not proof
+of authentication.
+
+Unlike every other environment-scoped route this one answers `200` with no environment bound — a
+controller with none is exactly the one that needs the list.
 
 ```http
 POST /v1/device/config/environment
@@ -970,6 +1011,7 @@ x-device-secret: ...
 
 ```json
 {
+  "clientRequestId": "dev:991fd3c2-9248c000-97ce21ae-fbad0091",
   "environmentId": "env_...",
   "projectId": null,
   "threadId": "thread_current",
@@ -1122,6 +1164,21 @@ x-device-secret: ...
 ```json
 {
   "thread": { "id": "thread_current", "title": "Firmware navigation" },
+  "work": {
+    "version": 1,
+    "source": "t3-task-activities",
+    "total": 3,
+    "active": 2,
+    "queued": 0,
+    "working": 1,
+    "waiting": 1,
+    "completed": 1,
+    "failed": 0,
+    "stopped": 0,
+    "backgroundLiveness": "working",
+    "truncated": false,
+    "omitted": 0
+  },
   "response": {
     "messageId": "message_...",
     "state": "complete",
@@ -1143,6 +1200,14 @@ characters, and returned one three-line page at a time, with at most 12 pages. `
 newly dispatched action from briefly showing the previous assistant response. Until a newer
 assistant message exists the state is `waiting`; streaming responses are `streaming` and are polled
 on the normal five-second display cadence.
+
+`work` is a content-free aggregate of T3's structured `task.*` activity. It is independently capped
+at 64 retained task IDs and includes only status counts, liveness, and truncation — never task IDs,
+titles, roles, models, paths, summaries, errors, output, token usage, or parent links. When there is
+no newer assistant response and structured work is active, the existing three response lines show
+`N active task(s)`, completed/failed counts, and the EXIT hint. Every line remains within the same
+31-character budget, so current firmware gains truthful parallel-work status without rendering a
+dense tree. The full evidence-linked hierarchy remains in the web/PWA inspector.
 
 The gateway may add a hidden instruction to a device-originated T3 turn asking the model to append
 `<!--AC_FOLLOWUPS:["action_id"]-->`. This is a recommendation, never authority. The gateway parses
@@ -1235,6 +1300,7 @@ Status intent:
 
 ```json
 {
+  "clientRequestId": "dev:d18cc98f-05a6127b-fac88742-1a970c11",
   "environmentId": "env_...",
   "intent": {
     "type": "status"
@@ -1246,6 +1312,7 @@ Prompt intent:
 
 ```json
 {
+  "clientRequestId": "dev:51c701c3-37f72315-a72c7640-6987acee",
   "environmentId": "env_...",
   "threadId": "thread_...",
   "intent": {
@@ -1254,6 +1321,15 @@ Prompt intent:
   }
 }
 ```
+
+Every mutating agent call carries a fresh `clientRequestId`, except a retry whose HTTP outcome was
+unknown: that retry must reuse the same id and exact body. Shared firmware writes one pending id and
+a short non-content fingerprint to NVS before opening the socket, clears both after any positive HTTP
+status, and reuses them after a timeout or reboot. Prompt, transcript, shell, media, and path content
+must never be copied into that journal. Saved-action/macro runs and device thread creation follow the
+same rule. The gateway answers an in-flight duplicate with `202`/`recovery: "processing"`, a settled
+duplicate with the original command, and conflicting reuse with `409`; none is permission to invent a
+new id and blindly retry the effect.
 
 Stop intent:
 
@@ -1295,6 +1371,19 @@ The timeline is intended for web/phone support views, not for the low-bandwidth 
 ## Media Upload
 
 Hardware and phone/web clients use the same media model. The ESP32 camera or mic should upload a short capture first:
+
+For a controller without the desired input, claimed firmware may instead create a phone companion
+with `POST /v1/device/companion-handoffs`. The request selects `record_audio` or `capture_image` and
+uses the device's current environment/thread unless explicit owned values are supplied. The response
+contains a locally encoded QR payload for `/#/media?handoff=...` and a compact `waiting` state. The
+device may poll `GET /v1/device/companion-handoffs/:id` and cancel with `DELETE` using its own realm.
+It can never read or cancel another device's handoff. The code expires after five minutes, is
+single-use, and carries no prompt, transcript, device credential, or T3 token. Firmware should show
+only `Waiting for phone`, `Claimed`, `Completed`, `Expired`, or `Cancelled`; retry mints a new code.
+QR rendering on each physical display remains board-specific and must be verified on that panel.
+
+Bluetooth earbuds pair with the phone and are selected through the browser's audio-input list. This
+does not add Bluetooth HFP or LE Audio support to ESP32-S3 firmware.
 
 ```http
 POST /v1/device/media
@@ -1377,6 +1466,13 @@ becomes `Update <version> / READY` and opens the confirmation without another ne
 The confirm-capable build advertises heartbeat feature `ota_confirm`. This compatibility gate is
 required: older firmware interpreted every `updateAvailable: true` response as unattended install
 permission, so the gateway continues returning `manual_or_notify`/false to those builds.
+
+An owner may pin a desired version through a staged release rollout. The device protocol does not
+receive cohort membership, percentages, evidence references, or fleet records; it sees only the
+same capability-scoped signed manifest after the cloud reconciler verifies ownership, hardware,
+channel, protocol, and required features. A rollback pin may point to a validated older signed
+release. It still uses the identical signature, size, SHA-256, inactive-slot, reboot, and health
+confirmation path. Fleet state is never account truth on the controller or in NVS.
 
 ## Firmware Project
 

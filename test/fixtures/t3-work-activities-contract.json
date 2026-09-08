@@ -1,0 +1,148 @@
+{
+  "_provenance": {
+    "kind": "deterministic-contract-fixture",
+    "verifiedAt": "2026-08-27",
+    "source": "/opt/homebrew/lib/node_modules/t3/dist/bin.mjs.map",
+    "contracts": [
+      "packages/contracts/src/providerRuntime.ts:471-646",
+      "src/orchestration/Layers/ProviderRuntimeIngestion.ts:315-357,539-739"
+    ],
+    "note": "No live user data. Shapes and field names are copied from T3's shipped contract and activity projector."
+  },
+  "activities": [
+    {
+      "id": "evt_parent_start",
+      "tone": "info",
+      "kind": "task.started",
+      "summary": "subagent task started",
+      "payload": {
+        "taskId": "agent_parent",
+        "taskType": "subagent",
+        "agentKind": "agent",
+        "title": "Repository audit",
+        "role": "reviewer",
+        "model": "gpt-5.6",
+        "effort": "high",
+        "agentPath": "/root/repository_audit",
+        "detail": "Inspect the repository architecture"
+      },
+      "turnId": "turn_1",
+      "sequence": 1,
+      "createdAt": "2026-08-27T12:00:00.000Z"
+    },
+    {
+      "id": "evt_child_start",
+      "tone": "info",
+      "kind": "task.started",
+      "summary": "subagent task started",
+      "payload": {
+        "taskId": "agent_child",
+        "taskType": "subagent",
+        "agentKind": "agent",
+        "title": "Frontend audit",
+        "role": "reviewer",
+        "model": "gpt-5.6",
+        "parentAgentId": "agent_parent",
+        "agentPath": "/root/repository_audit/frontend",
+        "detail": "Inspect live thread UI"
+      },
+      "turnId": "turn_1",
+      "sequence": 2,
+      "createdAt": "2026-08-27T12:00:01.000Z"
+    },
+    {
+      "id": "task-progress:thread_1:agent_parent",
+      "tone": "info",
+      "kind": "task.progress",
+      "summary": "Inspecting gateway contracts",
+      "payload": {
+        "taskId": "agent_parent",
+        "taskType": "subagent",
+        "agentKind": "agent",
+        "title": "Repository audit",
+        "status": "running",
+        "summary": "Inspecting gateway contracts",
+        "detail": "Inspecting gateway contracts",
+        "lastToolName": "Read",
+        "typedUsage": {
+          "totalTokens": 1200,
+          "inputTokens": 900,
+          "cachedInputTokens": 500,
+          "outputTokens": 300,
+          "reasoningOutputTokens": 80,
+          "toolUses": 4,
+          "durationMs": 4500
+        }
+      },
+      "turnId": "turn_1",
+      "sequence": 3,
+      "createdAt": "2026-08-27T12:00:02.000Z"
+    },
+    {
+      "id": "evt_child_tool",
+      "tone": "tool",
+      "kind": "tool.started",
+      "summary": "Read frontend/src/liveThread.ts started",
+      "payload": {
+        "itemType": "file_read",
+        "agentId": "agent_child",
+        "parentToolUseId": "tool_parent"
+      },
+      "turnId": "turn_1",
+      "sequence": 4,
+      "createdAt": "2026-08-27T12:00:03.000Z"
+    },
+    {
+      "id": "evt_monitor",
+      "tone": "info",
+      "kind": "task.progress",
+      "summary": "Watch deployment logs",
+      "payload": {
+        "taskId": "monitor_1",
+        "taskType": "monitor",
+        "agentKind": "background",
+        "title": "Deployment monitor",
+        "status": "waiting",
+        "summary": "Waiting for the next deployment event"
+      },
+      "turnId": "turn_1",
+      "sequence": 5,
+      "createdAt": "2026-08-27T12:00:04.000Z"
+    },
+    {
+      "id": "evt_child_complete",
+      "tone": "info",
+      "kind": "task.completed",
+      "summary": "Task completed",
+      "payload": {
+        "taskId": "agent_child",
+        "status": "completed",
+        "taskType": "subagent",
+        "agentKind": "agent",
+        "title": "Frontend audit",
+        "parentAgentId": "agent_parent",
+        "summary": "Frontend audit complete"
+      },
+      "turnId": "turn_1",
+      "sequence": 6,
+      "createdAt": "2026-08-27T12:00:05.000Z"
+    },
+    {
+      "id": "evt_parent_fail",
+      "tone": "error",
+      "kind": "task.updated",
+      "summary": "Task failed",
+      "payload": {
+        "taskId": "agent_parent",
+        "taskType": "subagent",
+        "agentKind": "agent",
+        "title": "Repository audit",
+        "status": "failed",
+        "error": "Provider process exited"
+      },
+      "turnId": "turn_1",
+      "sequence": 7,
+      "createdAt": "2026-08-27T12:00:06.000Z"
+    }
+  ]
+}

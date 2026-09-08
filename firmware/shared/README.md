@@ -12,10 +12,10 @@ All four are pinned to one toolchain — ESP-IDF 5.5 / Arduino core 3.3 via the
 `platformio/platform-espressif32` is unmaintained and frozen at Arduino 2.0.17 / ESP-IDF 4.4, which
 has no `driver/i2s_std.h` and therefore cannot build the on-board audio boards.
 
-**Still to lift out of the CrowPanel's `src/main.cpp`:** media upload, OTA (manifest poll, signed
-download, rollback confirm), and the two-phase gateway-profile switch. `GatewayClient` now covers
-claiming and the whole operate flow, so a board can drive a thread — but until media upload moves
-here, a board that records a clip still has nowhere to put it. Port plans:
+**Still to lift out of the CrowPanel's `src/main.cpp`:** the two-phase gateway-profile switch. OTA
+now lives in `GatewayOta.cpp`, `GatewayClient` covers claiming and the whole operate flow, and every
+capture surface—including CrowPanel's optional carrier build—uses the shared raw media-session
+transport. Port plans:
 [`Waveshare`](../Waveshare-ESP32-S3-Touch-AMOLED-1.75C/README.md),
 [`Hosyond`](../Hosyond-ESP32-S3-2.8-Touchscreen/README.md).
 
@@ -72,6 +72,20 @@ On production units this partition needs flash encryption. Without it, `esptool 
 both the Wi-Fi password and the device secret — see
 [docs/production-security.md](../../docs/production-security.md).
 
+### Gateway TLS
+
+Every shared gateway client verifies HTTPS by default. Production configuration must provide the
+gateway's issuing root in `GATEWAY_TLS_ROOT_CA_PEM`; `GATEWAY_TLS_NEXT_ROOT_CA_PEM` lets a release
+carry the current and next roots during a planned CA rotation. The first request after boot starts
+SNTP and fails closed until the device has a credible clock, because certificate validity cannot be
+checked against the ESP32's 1970 boot time.
+
+`INSECURE_SKIP_TLS_VERIFY=1` is a local-bench escape hatch only. It exposes the device credential and
+must not appear in a production image. A build with `SECURE_BUILD_REQUIRE_OTA_SIGNATURE=1` or
+`SECURE_BUILD_TLS_VERIFY=1` overrides that setting and continues to fail closed. Never replace the
+root with a leaf certificate: doing so makes routine certificate renewal an emergency firmware
+rollout.
+
 ### The portal is not an auth surface
 
 It is an open AP serving one local form. It never carries the device secret, never talks to the
@@ -85,13 +99,26 @@ returns the owner to the form instead of writing a value that bricks the next bo
 
 `GatewayClient` splits its calls two ways, and the difference decides how a board uses them.
 
-**Polled.** `runCycle()` refreshes the display, the controls layout, the approval queue, and an open
-response page on their own timers — heartbeat 30 s, config 60 s, controls 30 s, approvals 30 s,
-display 5 s. It makes **at most one HTTP request per call** on every path, including the
+**Polled.** `runCycle()` refreshes the thread list, display, controls layout, approval queue, firmware
+manifest, and an open response page on their own timers — heartbeat 30 s, config 60 s,
+threads/controls/approvals 30 s, display 5 s, firmware 6 h. It makes **at most one HTTP request per call** on every path, including the
 just-connected edge, which marks the operate resources due rather than firing them in a burst. A UI
 never asks for these: it renders whatever the accessors hold, and repaints when `revision()` changes.
 
-**Gesture.** `refreshThreads()`, `selectThread()`, the `send*` / `run*` calls, `fetchResponsePage()`,
+**Event-driven.** Boards that call `startNetworkTask()` also hold `/v1/device/events` on a second
+network task. `threads.changed` applies a rename/archive/delete delta under the state mutex and
+wakes the list after creation.
+`device.refresh` coalesces config/control/display refreshes, `firmware.changed` wakes the six-hour
+manifest poll immediately, and T3 command/thread/approval/user-input/media events refresh only the
+affected read model. Every signal is reduced to a due-time flag; bursts never issue HTTP from the
+event task and the ordinary scheduler still performs one request at a time.
+
+`GatewayOta.cpp` streams automatic or mandatory releases to the inactive slot, verifies the signed
+manifest and artifact SHA-256, records the attempt in NVS, and confirms the new image only after a
+healthy gateway heartbeat. The 16 KB network-task stack is intentional: the 4 KB OTA buffer plus
+HTTP/TLS frames overflowed the former 8 KB stack during a physical rollout test.
+
+**Gesture.** Manual `refreshThreads()`, `selectThread()`, the `send*` / `run*` calls, `fetchResponsePage()`,
 and `answerApproval()` are driven by a person. Each performs one request and **blocks for up to the
 5 s timeout** — `HTTPClient` has no async mode, and a worker task would put a lock in front of every
 accessor. The contract inherited from the CrowPanel firmware is therefore: paint a pending frame
@@ -132,22 +159,21 @@ those routes.
 
 ### Media upload
 
-`uploadMedia()` is the one call that does not go through `request()`. Its body is base64 inside JSON
-and a 30 s voice note is over a megabyte encoded, so `MediaUpload.h` streams
-`prefix + base64(header ++ body) + suffix` four characters at a time straight into the TCP buffer —
-the capture buffer in PSRAM stays the only full copy. `buildWavHeader()` fills the 44-byte header as
-its own segment so the PCM is never memmoved to make room in front of it.
+`media::uploadSession()` owns the device-side create → raw PUT → finalize contract. It hashes and
+streams `header ++ body` directly, so the capture buffer stays the only full copy and base64's 33%
+wire expansion is gone. `buildWavHeader()` fills the 44-byte header as its own segment so PCM is
+never memmoved. GatewayClient, GatewayVoice, and CrowPanel's optional capture carrier all delegate
+to this one function; boards retain only pins, capture buffers, review UI, and capability gating.
 
-It repeats the local backoff gate, the device credentials and the retry-after handling rather than
-skipping them, takes a 30 s timeout against everyone else's 5 s, and answers 413 locally — without
-opening a socket — when the decoded size exceeds the `mediaUploadBytes` declared in `setLimits()`,
-which is the same number the gateway checks.
+The shared transport owns the local size guard, credentials, TLS gate, retry-after backoff, 30 s
+timeout, idempotent request digest, exact raw content length, and finalize response. It answers 413
+locally without opening a socket when the raw size exceeds the declared `mediaUploadBytes`.
 
 ## Status
 
-Compiles on all 12 environments across all four board folders: CrowPanel 4, Hosyond 5, Waveshare 2,
-and Vision Master T190 1. Hosyond has exercised NVS-backed provisioning, the SoftAP portal, BOOT
-recovery, and `ThinkingOrb` on silicon. **The operate surface has run on no board at all** — it is a
-port of a flow verified end to end on the CrowPanel, compiled here but never executed against a live
-gateway. Current evidence and blockers are maintained in
+The shared operate surface and signed OTA path have run against a live gateway on Hosyond hardware;
+the mandatory 0.2.1 rollout downloaded, installed, rebooted, and reported `verified`. The CrowPanel
+keeps its mature monolithic operate client, but now listens to the same device event stream and
+coalesces refreshes before issuing requests from its main loop. Waveshare and Vision Master T190 are
+still bring-up scaffolds rather than production gateway clients. Current evidence and blockers are maintained in
 [roadmap/IMPLEMENTATION-STATUS.md](../../roadmap/IMPLEMENTATION-STATUS.md).

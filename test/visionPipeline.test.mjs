@@ -8,6 +8,7 @@ import { createApp } from "../src/app.mjs";
 
 const PNG_BASE64 =
   "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg==";
+const WEBM_BASE64 = Buffer.from([0x1a, 0x45, 0xdf, 0xa3]).toString("base64");
 
 const BASE_CONFIG = {
   maxMediaBytes: 64 * 1024,
@@ -134,7 +135,7 @@ test("audio cannot be described and images cannot be transcribed", async (t) => 
   const audio = await requestJson(baseUrl, "/v1/media", {
     method: "POST",
     headers,
-    body: { kind: "audio", contentType: "audio/webm", dataBase64: Buffer.from("aa").toString("base64") },
+    body: { kind: "audio", contentType: "audio/webm", dataBase64: WEBM_BASE64 },
   });
   const image = await requestJson(baseUrl, "/v1/media", {
     method: "POST",

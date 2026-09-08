@@ -1,5 +1,12 @@
+import { chmod, mkdir, rename, writeFile } from "node:fs/promises";
+import { dirname, resolve } from "node:path";
+
 const baseUrl = process.env.AGENT_CONTROLLER_URL ?? "http://127.0.0.1:3996";
 const userId = process.env.AGENT_CONTROLLER_USER_ID ?? "user_dev";
+const credentialFile = resolve(
+  process.env.AGENT_CONTROLLER_SIMULATOR_CREDENTIAL_FILE
+    ?? ".data/simulated-device-credential.json",
+);
 
 async function main() {
   const authHeaders = await createDevAuthHeaders();
@@ -8,11 +15,26 @@ async function main() {
     profile: "agent-controller",
   }, authHeaders);
 
-  console.log("Registered device:");
-  console.log(JSON.stringify(device, null, 2));
-  console.log("\nUse these for device-authenticated calls:");
-  console.log(`x-device-id: ${device.device.id}`);
-  console.log(`x-device-secret: ${device.secret}`);
+  await persistCredential({
+    baseUrl,
+    deviceId: device.device.id,
+    deviceSecret: device.secret,
+  });
+  console.log(`Registered simulated device ${device.device.id}.`);
+  console.log(`Credential saved with owner-only permissions: ${credentialFile}`);
+}
+
+async function persistCredential(credential) {
+  await mkdir(dirname(credentialFile), { recursive: true, mode: 0o700 });
+  await chmod(dirname(credentialFile), 0o700);
+  const temporaryFile = `${credentialFile}.${process.pid}.tmp`;
+  await writeFile(temporaryFile, `${JSON.stringify(credential, null, 2)}\n`, {
+    encoding: "utf8",
+    mode: 0o600,
+    flag: "wx",
+  });
+  await rename(temporaryFile, credentialFile);
+  await chmod(credentialFile, 0o600);
 }
 
 async function createDevAuthHeaders() {

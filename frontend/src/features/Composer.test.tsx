@@ -2,8 +2,10 @@ import { fireEvent, render, screen, waitFor, within } from "@testing-library/rea
 import { afterEach, vi } from "vitest";
 
 import type { Controller } from "../controller";
+import { capableT3Environment } from "../test/t3Capabilities";
 import type { MediaItem } from "../types";
 import { ConfirmProvider } from "../ui";
+import { AttachmentSourceMenu, sendComposerIntent, useComposerDraft } from "./Composer";
 import { OperatePage } from "./OperatePage";
 
 const IMAGE: MediaItem = {
@@ -15,12 +17,14 @@ const IMAGE: MediaItem = {
 };
 
 function controller(overrides: Record<string, unknown> = {}) {
+  const selectedEnvironment = capableT3Environment({ label: "Mac T3" });
   return {
     selectedEnvironmentId: "env_1",
     selectedThreadId: "thread_1",
     selectedProjectId: "project_1",
     selectedProject: { id: "project_1", title: "Tacs" },
-    environments: [{ id: "env_1", label: "Mac T3" }],
+    selectedEnvironment,
+    environments: [selectedEnvironment],
     threads: [{ id: "thread_1", label: "Thread", projectId: "project_1" }],
     projects: [{ id: "project_1", title: "Tacs" }],
     harnesses: [],
@@ -56,7 +60,7 @@ function controller(overrides: Record<string, unknown> = {}) {
 }
 
 function renderOperate(c: Controller) {
-  render(<ConfirmProvider><OperatePage controller={c} /></ConfirmProvider>);
+  return render(<ConfirmProvider><OperatePage controller={c} /></ConfirmProvider>);
 }
 
 function openSourceMenu() {
@@ -78,9 +82,28 @@ function chipNames() {
 const originalMediaDevices = Object.getOwnPropertyDescriptor(navigator, "mediaDevices");
 
 afterEach(() => {
+  localStorage.clear();
   if (originalMediaDevices) Object.defineProperty(navigator, "mediaDevices", originalMediaDevices);
   else delete (navigator as { mediaDevices?: unknown }).mediaDevices;
   delete (globalThis as { MediaRecorder?: unknown }).MediaRecorder;
+});
+
+test("an uncertain browser retry reuses its persisted client request id without storing the draft", async () => {
+  const api = vi.fn()
+    .mockRejectedValueOnce(new TypeError("network lost after send"))
+    .mockResolvedValueOnce({ command: { id: "cmd_original" } });
+  const c = controller({ api });
+  const intent = { type: "agent_prompt", text: "private retry text" };
+
+  await expect(sendComposerIntent(c, intent, "Sent.")).rejects.toThrow("network lost");
+  const stored = Object.values(localStorage);
+  expect(JSON.stringify(stored)).not.toContain("private retry text");
+
+  await sendComposerIntent(c, intent, "Sent.");
+  const firstId = api.mock.calls[0][1].body.clientRequestId;
+  const secondId = api.mock.calls[1][1].body.clientRequestId;
+  expect(secondId).toBe(firstId);
+  expect(localStorage.length).toBe(0);
 });
 
 /** Enough of MediaRecorder to drive one push-to-talk round trip in jsdom. */
@@ -138,14 +161,55 @@ test("uploading from the source menu stores the file and attaches it", async () 
   });
   fireEvent.click(screen.getByRole("button", { name: "Upload file" }));
 
-  await waitFor(() => expect(c.uploadMedia).toHaveBeenCalledWith(expect.objectContaining({
-    kind: "image",
-    contentType: "image/png",
-    originalName: "shot.png",
-  })));
+  await waitFor(() => expect(c.uploadMedia).toHaveBeenCalledWith(
+    expect.objectContaining({
+      kind: "image",
+      contentType: "image/png",
+      originalName: "shot.png",
+    }),
+    expect.objectContaining({
+      signal: expect.any(AbortSignal),
+      onProgress: expect.any(Function),
+    }),
+  ));
   // The capture dialog closes itself once the upload lands on the draft.
   await waitFor(() => expect(chipNames()).toEqual(["media_new"]));
   expect(screen.queryByRole("dialog", { name: "Add attachment" })).toBeNull();
+});
+
+test("unmounting the capture surface aborts an active upload without a late attachment", async () => {
+  const uploadSignals: AbortSignal[] = [];
+  const c = controller({
+    uploadMedia: vi.fn(async (_payload, options) => {
+      uploadSignals.push(options.signal);
+      options.onProgress({ stage: "uploading", loaded: 1, total: 3 });
+      return await new Promise((_resolve, reject) => {
+        options.signal.addEventListener("abort", () => reject(new DOMException("cancelled", "AbortError")), { once: true });
+      });
+    }),
+    // Production run() owns action failures. This stub mirrors that contract so the expected
+    // AbortError never escapes the click handler as an unhandled test promise.
+    run: vi.fn(async (_key: string, _message: string, task: () => Promise<unknown>) => {
+      try {
+        return await task();
+      } catch {
+        return undefined;
+      }
+    }),
+  });
+  const rendered = renderOperate(c);
+  openSourceMenu();
+  fireEvent.click(screen.getByRole("menuitem", { name: "Upload from this device" }));
+  fireEvent.change(screen.getByLabelText(/Choose an image or audio file/iu), {
+    target: { files: [new File(["png"], "shot.png", { type: "image/png" })] },
+  });
+  fireEvent.click(screen.getByRole("button", { name: "Upload file" }));
+  await waitFor(() => expect(uploadSignals).toHaveLength(1));
+
+  rendered.unmount();
+
+  expect(uploadSignals[0].aborted).toBe(true);
+  expect(c.refreshMedia).not.toHaveBeenCalled();
 });
 
 test("a recorded voice clip is attached without leaving the composer", async () => {
@@ -162,10 +226,16 @@ test("a recorded voice clip is attached without leaving the composer", async () 
   const stop = await screen.findByRole("button", { name: "Stop recording" });
   fireEvent.click(stop);
 
-  await waitFor(() => expect(c.uploadMedia).toHaveBeenCalledWith(expect.objectContaining({
-    kind: "audio",
-    contentType: "audio/webm",
-  })));
+  await waitFor(() => expect(c.uploadMedia).toHaveBeenCalledWith(
+    expect.objectContaining({
+      kind: "audio",
+      contentType: "audio/webm",
+    }),
+    expect.objectContaining({
+      signal: expect.any(AbortSignal),
+      onProgress: expect.any(Function),
+    }),
+  ));
   await waitFor(() => expect(chipNames()).toEqual(["media_voice"]));
 });
 
@@ -182,7 +252,7 @@ test("taking a photo opens the shared camera capture, not a second implementatio
 
 test("pasted and dropped media are uploaded and attached", async () => {
   const c = controller();
-  renderOperate(c);
+  const rendered = renderOperate(c);
 
   fireEvent.paste(screen.getByLabelText("Command or prompt"), {
     clipboardData: { files: [new File(["png"], "pasted.png", { type: "image/png" })] },
@@ -191,6 +261,12 @@ test("pasted and dropped media are uploaded and attached", async () => {
   await waitFor(() => expect(c.uploadMedia).toHaveBeenCalledWith(expect.objectContaining({
     originalName: "pasted.png",
   })));
+  // Exercise the two independent browser entry points on clean composer instances. Keeping the
+  // paste upload mounted while starting the drop makes this test depend on the mock controller's
+  // intentionally incomplete media refresh cycle rather than on either DOM event path.
+  rendered.unmount();
+  const dropped = controller();
+  renderOperate(dropped);
 
   fireEvent.drop(composerShell(), {
     dataTransfer: {
@@ -199,7 +275,7 @@ test("pasted and dropped media are uploaded and attached", async () => {
     },
   });
 
-  await waitFor(() => expect(c.uploadMedia).toHaveBeenCalledWith(expect.objectContaining({
+  await waitFor(() => expect(dropped.uploadMedia).toHaveBeenCalledWith(expect.objectContaining({
     kind: "audio",
     originalName: "note.wav",
   })));
@@ -235,6 +311,7 @@ test("Cmd+Enter sends the free-form request as a plain agent prompt", async () =
     method: "POST",
     body: {
       environmentId: "env_1",
+      clientRequestId: expect.stringMatching(/^web:/u),
       threadId: "thread_1",
       intent: { type: "agent_prompt", text: "Summarise the diff" },
     },
@@ -257,6 +334,7 @@ test("attaching audio alone keeps the audio intent so the transcript keeps its p
     method: "POST",
     body: {
       environmentId: "env_1",
+      clientRequestId: expect.stringMatching(/^web:/u),
       threadId: "thread_1",
       intent: {
         type: "audio_prompt",
@@ -267,6 +345,17 @@ test("attaching audio alone keeps the audio intent so the transcript keeps its p
   }));
 });
 
+function AttachmentLimitHarness({ c, media }: { c: Controller; media: MediaItem[] }) {
+  const draft = useComposerDraft(media);
+  return (
+    <>
+      <button type="button" onClick={() => draft.addAttachments(media.map((item) => item.id))}>Fill draft</button>
+      <AttachmentSourceMenu controller={c} draft={draft} />
+      <output aria-label="Attachment count">{draft.attachmentIds.length}</output>
+    </>
+  );
+}
+
 test("the draft stops accepting attachments at the server's ceiling", () => {
   const media = Array.from({ length: 9 }, (_, index) => ({
     id: `media_${index}`,
@@ -274,15 +363,11 @@ test("the draft stops accepting attachments at the server's ceiling", () => {
     contentType: "image/png",
     originalName: `shot-${index}.png`,
   }));
-  renderOperate(controller({ media }));
+  const c = controller({ media });
+  render(<AttachmentLimitHarness c={c} media={media} />);
+  fireEvent.click(screen.getByRole("button", { name: "Fill draft" }));
 
-  openSourceMenu();
-  fireEvent.click(screen.getByRole("menuitem", { name: "Choose from media library" }));
-  for (let index = 0; index < 8; index += 1) {
-    fireEvent.click(screen.getByRole("button", { name: `Attach shot-${index}.png` }));
-  }
-
-  expect(chipNames()).toHaveLength(8);
+  expect(screen.getByRole("status", { name: "Attachment count" })).toHaveTextContent("8");
   const attach = screen.getByRole("button", { name: "Add attachment" });
   expect(attach).toBeDisabled();
   expect(attach).toHaveAttribute("title", "Attachment limit reached (8)");
@@ -310,6 +395,7 @@ test("shell stays a deliberate mode: it cannot carry attachments and dispatches 
     method: "POST",
     body: {
       environmentId: "env_1",
+      clientRequestId: expect.stringMatching(/^web:/u),
       threadId: "thread_1",
       intent: { type: "shell_input", command: "npm test" },
     },

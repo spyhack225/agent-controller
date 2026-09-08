@@ -1,3 +1,5 @@
+import { buildT3WorkSummary } from "./t3Work.mjs";
+
 const FOLLOW_UP_MARKER = /<!--\s*AC_FOLLOWUPS\s*:\s*(\[[\s\S]*?\])\s*-->/giu;
 
 export const DEVICE_RESPONSE_LINE_LENGTH = 31;
@@ -43,18 +45,33 @@ export function buildDeviceThreadOutput({
     .filter(({ message }) => isAtOrAfter(message?.createdAt, after))
     .sort(compareMessages);
   const selected = candidates.at(-1)?.message ?? null;
-  const active = deviceThreadIsActive(thread);
+  const projectedWork = buildT3WorkSummary(thread?.activities);
+  const explicitLiveness = ["working", "monitoring"].includes(thread?.backgroundLiveness)
+    ? thread.backgroundLiveness
+    : null;
+  const work = {
+    ...projectedWork,
+    backgroundLiveness: explicitLiveness ?? projectedWork.backgroundLiveness,
+  };
+  const active = deviceThreadIsActive(thread) || work.active > 0 || Boolean(work.backgroundLiveness);
 
   if (!selected) {
     return {
       thread: compactThread(thread),
+      work,
       response: {
         messageId: null,
         state: active || after ? "waiting" : "empty",
         page: 0,
         pageCount: 1,
         lines: active || after
-          ? ["Waiting for agent response", "The display will refresh", "EXIT returns to actions"]
+          ? work.total > 0
+            ? [
+                `${work.active} active ${work.active === 1 ? "task" : "tasks"}`,
+                `${work.completed} done · ${work.failed} failed`,
+                "EXIT returns to actions",
+              ]
+            : ["Waiting for agent response", "The display will refresh", "EXIT returns to actions"]
           : ["No agent response yet", "Run a thread action first", "EXIT returns to actions"],
         truncated: false,
         updatedAt: null,
@@ -77,6 +94,7 @@ export function buildDeviceThreadOutput({
 
   return {
     thread: compactThread(thread),
+    work,
     response: {
       messageId: stringOrNull(selected.id ?? selected.messageId),
       state: selected.streaming ? "streaming" : "complete",

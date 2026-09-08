@@ -5,6 +5,8 @@
 #include <WiFi.h>
 #include <WiFiClientSecure.h>
 
+#include "GatewayTls.h"
+
 #include "MediaUpload.h"
 #include "OperateModel.h"
 
@@ -29,25 +31,6 @@ constexpr uint8_t kMaxFailures = 4;
 // Nothing in this pipeline legitimately takes longer than this. A job still unresolved afterwards
 // is one the owner has to look at in the console, and the device stops asking.
 constexpr uint32_t kGiveUpAfterMs = 180000;
-
-String jsonEscape(const String& value) {
-  String out;
-  out.reserve(value.length() + 8);
-  for (size_t i = 0; i < value.length(); i += 1) {
-    const char c = value[i];
-    switch (c) {
-      case '"':  out += "\\\""; break;
-      case '\\': out += "\\\\"; break;
-      case '\n': out += "\\n"; break;
-      case '\r': out += "\\r"; break;
-      case '\t': out += "\\t"; break;
-      default:
-        if (static_cast<uint8_t>(c) < 0x20) continue;
-        out += c;
-    }
-  }
-  return out;
-}
 
 // Percent-encoding for a path segment: a job id is generated and safe, but it lands in a URL and
 // assuming that is how a 404 becomes unexplainable.
@@ -148,75 +131,12 @@ String GatewayVoice::upload(const char* kind, const char* contentType, const cha
   ok_ = true;
   failures_ = 0;
   if (!store_) return String();
-  if (WiFi.status() != WL_CONNECTED) return String();
-
-  const size_t rawBytes = (headerBytes ? headerLength : 0) + (bodyBytes ? bodyLength : 0);
-  if (rawBytes == 0) return String();
-
-  // The gateway measures the DECODED size against its own ceiling, so this is the same number it
-  // will check. Refusing here turns a wasted upload of 1.33x the clip into an instant local error.
-  if (maxRawBytes > 0 && rawBytes > (size_t)maxRawBytes) {
-    httpStatusOut = 413;
-    return String();
-  }
-
-  const String base = store_->gatewayUrl();
-  if (base.length() == 0) return String();
-  const String url = base + "/v1/device/media";
-
-  String prefix = "{\"kind\":\"";
-  prefix += jsonEscape(kind);
-  prefix += "\",\"contentType\":\"";
-  prefix += jsonEscape(contentType);
-  prefix += "\",\"originalName\":\"";
-  prefix += jsonEscape(originalName);
-  prefix += "\",\"dataBase64\":\"";
-
-  // The body is generated four characters at a time straight into HTTPClient's TCP buffer. This is
-  // the delicate part of the upload and it is reused verbatim rather than reimplemented: the
-  // capture buffer in PSRAM stays the only full copy of a payload that would be 1.28 MB encoded.
-  media::Base64JsonBodyStream stream(prefix, "\"}", headerBytes, headerLength, bodyBytes,
-                                     bodyLength);
-  const size_t contentLength = stream.contentLength();
-
-  // Declaration order is load-bearing, exactly as in GatewayClient::request(): HTTPClient holds a
-  // reference to the client it was handed and C++ destroys locals in reverse, so an HTTPClient
-  // declared first would call stop() through a dead vtable. Clients first.
-  WiFiClientSecure secure;
-  WiFiClient plain;
-  HTTPClient http;
-
-  bool began = false;
-  if (url.startsWith("https://")) {
-    secure.setInsecure();   // pin the gateway certificate before production
-    began = http.begin(secure, url);
-  } else {
-    began = http.begin(plain, url);
-  }
-  if (!began) return String();
-
-  http.addHeader("content-type", "application/json");
-  http.addHeader("x-device-id", store_->deviceId());
-  http.addHeader("x-device-secret", store_->deviceSecret());
-  http.setTimeout(30000);
-
-  const int code = http.sendRequest("POST", &stream, contentLength);
-  httpStatusOut = code;
-  const String response = code > 0 ? http.getString() : String();
-  http.end();
-
-  Serial.printf("[voice] upload raw=%u encoded=%u code=%d\n", (unsigned)rawBytes,
-                (unsigned)contentLength, code);
-  if (!ok2xx(code)) return String();
-
-  JsonDocument doc;
-  if (deserializeJson(doc, response)) return String();
-
-  // Both ids, which is the whole reason this method exists. `job.jobId` is what the poll route
-  // takes; `media.id` is what an audio_prompt intent takes. GatewayClient::uploadMedia() returns
-  // only the second and discards the first.
-  jobId_ = String(doc["job"]["jobId"] | "");
-  const String mediaId = String(doc["media"]["id"] | "");
+  const media::UploadSessionResult result = media::uploadSession(
+    *store_, "voice", kind, contentType, originalName, headerBytes, headerLength, bodyBytes,
+    bodyLength, maxRawBytes
+  );
+  httpStatusOut = result.httpStatus;
+  jobId_ = result.jobId;
 
   if (jobId_.length() > 0) {
     const uint32_t now = millis();
@@ -226,7 +146,7 @@ String GatewayVoice::upload(const char* kind, const char* contentType, const cha
     // and it is an observation rather than a guess: the POST answered with the job.
     publish(VoiceStage::Transcribing, String("Transcribing"));
   }
-  return mediaId;
+  return result.mediaId;
 }
 
 bool GatewayVoice::poll() {
@@ -251,14 +171,7 @@ bool GatewayVoice::poll() {
   http.setTimeout(kTimeoutMs);
   http.setConnectTimeout(kTimeoutMs);
 
-  bool began = false;
-  if (url.startsWith("https://")) {
-    secure.setInsecure();
-    began = http.begin(secure, url);
-  } else {
-    began = http.begin(plain, url);
-  }
-  if (!began) return false;
+  if (!gateway_tls::beginHttp(http, plain, secure, url, "voice")) return false;
 
   http.addHeader("x-device-id", store_->deviceId());
   http.addHeader("x-device-secret", store_->deviceSecret());

@@ -4,6 +4,7 @@ import {
   Plus,
   RefreshCw,
   Save,
+  Smartphone,
   Trash2,
   UploadCloud,
   WandSparkles,
@@ -21,7 +22,8 @@ import {
   mediaJobTone,
 } from "../format";
 import { ActivityOrb } from "../motion";
-import type { MediaItem, MediaJob } from "../types";
+import { clearCompanionCode } from "../companionLink";
+import type { CompanionHandoff, MediaItem, MediaJob } from "../types";
 import {
   Button,
   EmptyState,
@@ -30,12 +32,21 @@ import {
   StatusBadge,
   useConfirm,
 } from "../ui";
-import { MediaCaptureDialog, mediaLabel } from "./MediaCapture";
+import { MediaCaptureDialog, mediaLabel, mediaOriginLabel } from "./MediaCapture";
 
-export function MediaPage({ controller: c }: { controller: Controller }) {
+interface HandoffMint {
+  handoff: CompanionHandoff;
+  launchUrl: string;
+  qrSvg: string;
+}
+
+export function MediaPage({ controller: c, companionCode = null }: { controller: Controller; companionCode?: string | null }) {
   const confirm = useConfirm();
   const [transcriptDrafts, setTranscriptDrafts] = useState<Record<string, string>>({});
   const [creatorOpen, setCreatorOpen] = useState(false);
+  const [companion, setCompanion] = useState<CompanionHandoff | null>(null);
+  const [companionError, setCompanionError] = useState<string | null>(null);
+  const [handoffMint, setHandoffMint] = useState<HandoffMint | null>(null);
   const creatorTriggerRef = useRef<HTMLButtonElement>(null);
 
   useEffect(() => {
@@ -47,6 +58,61 @@ export function MediaPage({ controller: c }: { controller: Controller }) {
       return next;
     });
   }, [c.media]);
+
+  useEffect(() => {
+    if (!companionCode || companion || companionError) return;
+    let active = true;
+    void c.api<{ handoff: CompanionHandoff }>("/v1/companion-handoffs/claim", {
+      method: "POST",
+      body: { code: companionCode },
+    }).then(({ handoff }) => {
+      if (!active) return;
+      clearCompanionCode();
+      setCompanion(handoff);
+      setCreatorOpen(true);
+    }).catch((error: unknown) => {
+      if (!active) return;
+      const message = error instanceof Error ? error.message : "Companion handoff could not be claimed.";
+      setCompanionError(message);
+      clearCompanionCode();
+    });
+    return () => { active = false; };
+  }, [c.api, companion, companionCode, companionError]);
+
+  useEffect(() => {
+    if (!handoffMint || handoffMint.handoff.status !== "waiting") return;
+    const timer = window.setInterval(() => {
+      void c.api<{ handoff: CompanionHandoff }>(
+        `/v1/companion-handoffs/${encodeURIComponent(handoffMint.handoff.id)}`,
+      ).then(({ handoff }) => setHandoffMint((current) => current ? { ...current, handoff } : null))
+        .catch(() => undefined);
+    }, 2_000);
+    return () => window.clearInterval(timer);
+  }, [c.api, handoffMint]);
+
+  const createHandoff = async (action: CompanionHandoff["action"]) => {
+    if (!c.selectedEnvironmentId || !c.selectedThreadId) {
+      c.setNotice({ tone: "danger", message: "Select an environment and thread before opening phone capture." });
+      return;
+    }
+    await c.run("create-companion-handoff", "Phone capture link is ready.", async () => {
+      const minted = await c.api<HandoffMint>("/v1/companion-handoffs", {
+        method: "POST",
+        body: { environmentId: c.selectedEnvironmentId, threadId: c.selectedThreadId, action },
+      });
+      setHandoffMint(minted);
+      return minted;
+    });
+  };
+
+  const cancelHandoff = async () => {
+    if (!handoffMint) return;
+    const result = await c.api<{ handoff: CompanionHandoff }>(
+      `/v1/companion-handoffs/${encodeURIComponent(handoffMint.handoff.id)}`,
+      { method: "DELETE", body: {} },
+    );
+    setHandoffMint({ ...handoffMint, handoff: result.handoff });
+  };
 
   const saveTranscript = async (item: MediaItem) => {
     const transcript = transcriptDrafts[item.id]?.trim();
@@ -140,6 +206,12 @@ export function MediaPage({ controller: c }: { controller: Controller }) {
           <p>Uploads and captures available to attach from Operations.</p>
         </div>
         <div className="media-library-header__actions">
+          <Button size="sm" variant="secondary" onClick={() => void createHandoff("record_audio")}>
+            <Smartphone className="size-4" /> Record on phone
+          </Button>
+          <Button size="sm" variant="secondary" onClick={() => void createHandoff("capture_image")}>
+            <FileImage className="size-4" /> Photo on phone
+          </Button>
           <Button size="sm" onClick={() => void c.refreshMedia()}>
             <RefreshCw className="size-4" /> Refresh
           </Button>
@@ -155,6 +227,53 @@ export function MediaPage({ controller: c }: { controller: Controller }) {
           ) : null}
         </div>
       </header>
+
+      {companionError ? (
+        <Panel className="p-4" role="alert">
+          <p className="font-semibold">Phone capture unavailable</p>
+          <p className="mt-1 text-sm text-ink-muted">{companionError}</p>
+        </Panel>
+      ) : companion ? (
+        <Panel className="p-4" role="status">
+          <p className="eyebrow">Phone companion</p>
+          <p className="mt-1 font-semibold">Connected to the requested thread</p>
+          <p className="mt-1 text-sm text-ink-muted">
+            {companion.action === "record_audio" ? "Record audio" : "Capture an image"}. No prompt or device credential was included in the link.
+          </p>
+        </Panel>
+      ) : null}
+
+      {handoffMint ? (
+        <Panel className="grid gap-4 p-4 sm:grid-cols-[180px_1fr] sm:items-center" role="status" aria-live="polite">
+          <img
+            className="size-[180px] rounded-lg bg-white p-2"
+            src={`data:image/svg+xml;charset=utf-8,${encodeURIComponent(handoffMint.qrSvg)}`}
+            alt="QR code to open phone capture"
+            width="180"
+            height="180"
+          />
+          <div>
+            <p className="eyebrow">Phone companion</p>
+            <h3 className="mt-1 font-display text-lg">{handoffStatusLabel(handoffMint.handoff.status)}</h3>
+            <p className="mt-1 text-sm text-ink-muted">
+              The link is bound to the selected environment, thread, and capture action. It expires at {new Date(handoffMint.handoff.expiresAt).toLocaleTimeString()}.
+            </p>
+            <div className="mt-3 flex flex-wrap gap-2">
+              {handoffMint.handoff.status === "waiting" ? (
+                <>
+                  <Button size="sm" variant="secondary" onClick={() => void navigator.clipboard.writeText(handoffMint.launchUrl)}>
+                    Copy private link
+                  </Button>
+                  <Button size="sm" variant="danger-ghost" onClick={() => void cancelHandoff()}>Cancel</Button>
+                </>
+              ) : null}
+              {["expired", "cancelled"].includes(handoffMint.handoff.status) ? (
+                <Button size="sm" onClick={() => void createHandoff(handoffMint.handoff.action)}>Create a new link</Button>
+              ) : null}
+            </div>
+          </div>
+        </Panel>
+      ) : null}
 
       <Panel className="media-library overflow-hidden">
         {c.media.length ? (
@@ -192,11 +311,13 @@ export function MediaPage({ controller: c }: { controller: Controller }) {
                   <p className="mt-1 text-xs text-ink-muted">
                     {item.contentType} · {item.sizeBytes ?? 0} B
                   </p>
+                  <p className="mt-1 text-xs text-ink-muted">Origin: {mediaOriginLabel(item)}</p>
                   <p className="mt-1 text-xs text-ink-muted">
                     {formatMediaExpiry(item.expiresAt)}
                   </p>
                 </div>
                 <div>
+                  <MediaPreview controller={c} item={item} />
                   {item.kind === "audio" ? (
                     <>
                       <Field label="Transcript" htmlFor={`transcript-${item.id}`}>
@@ -293,8 +414,78 @@ export function MediaPage({ controller: c }: { controller: Controller }) {
       </Panel>
 
       {creatorOpen ? (
-        <MediaCaptureDialog controller={c} onClose={() => setCreatorOpen(false)} />
+        <MediaCaptureDialog
+          controller={c}
+          onClose={() => setCreatorOpen(false)}
+          {...(companion ? {
+            initialSource: companion.action === "record_audio" ? "audio" as const : "camera" as const,
+            allowedSources: [companion.action === "record_audio" ? "audio" as const : "camera" as const],
+            companionHandoffId: companion.id,
+            title: companion.action === "record_audio" ? "Record on this phone" : "Capture on this phone",
+            description: "The result is pinned to the thread chosen on the originating controller or console.",
+            onUploaded: () => setCompanion((current) => current ? { ...current, status: "completed" } : null),
+          } : {})}
+        />
       ) : null}
     </div>
+  );
+}
+
+function handoffStatusLabel(status: CompanionHandoff["status"]): string {
+  if (status === "waiting") return "Waiting for phone";
+  if (status === "claimed") return "Claimed on phone";
+  if (status === "completed") return "Capture completed";
+  if (status === "expired") return "Link expired";
+  return "Handoff cancelled";
+}
+
+function MediaPreview({ controller, item }: { controller: Controller; item: MediaItem }) {
+  const [url, setUrl] = useState<string | null>(null);
+  const [error, setError] = useState<string | null>(null);
+  const [loading, setLoading] = useState(false);
+
+  useEffect(() => () => {
+    if (url) URL.revokeObjectURL(url);
+  }, [url]);
+
+  const load = async () => {
+    setLoading(true);
+    setError(null);
+    try {
+      const blob = await controller.loadMediaPreview(item);
+      setUrl((current) => {
+        if (current) URL.revokeObjectURL(current);
+        return URL.createObjectURL(blob);
+      });
+    } catch (cause) {
+      setError(cause instanceof Error ? cause.message : "Preview failed.");
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  if (!url) {
+    return (
+      <div className="mb-3 rounded-lg border border-dashed border-control p-3 text-center text-xs text-ink-muted">
+        {error ? <p role="alert" className="mb-2 text-danger">{error}</p> : null}
+        <Button size="sm" variant="secondary" busy={loading} onClick={() => void load()}>
+          {error ? "Retry preview" : `Load ${item.kind} preview`}
+        </Button>
+        <p className="mt-2">Loaded only on request; preview bytes are not cached by the app.</p>
+      </div>
+    );
+  }
+  return item.kind === "audio" ? (
+    <audio className="mb-3 w-full" controls preload="metadata" src={url}>
+      Audio preview is unavailable in this browser.
+    </audio>
+  ) : (
+    <img
+      className="mb-3 max-h-56 w-full rounded-lg border border-control bg-black/20 object-contain"
+      src={url}
+      alt={`Preview of ${mediaLabel(item)}`}
+      loading="lazy"
+      decoding="async"
+    />
   );
 }

@@ -65,7 +65,7 @@ test("onboarding readiness requires operational evidence and accepts browser-onl
           modelSelection: { instanceId: "codex", model: "gpt-5.4" },
         },
       },
-      status: "dispatched",
+      status: "completed",
     }],
   });
 
@@ -77,9 +77,26 @@ test("onboarding readiness requires operational evidence and accepts browser-onl
     environmentReachable: true,
     workspaceSelected: true,
     providerConfigured: true,
+    firstRunCompleted: true,
     firstRunDispatched: true,
     deviceReady: true,
   });
+
+  const acceptedButUnanswered = buildOnboardingReadiness({
+    onboarding,
+    environments: [{
+      id: "env_1",
+      status: "reachable",
+      health: { lastReachableAt: "2026-01-01T00:00:00.000Z" },
+    }],
+    commands: [{
+      ...readiness.firstRunCommand,
+      status: "dispatched",
+    }],
+  });
+  assert.equal(acceptedButUnanswered.checks.firstRunCompleted, false);
+  assert.equal(acceptedButUnanswered.checks.firstRunDispatched, false);
+  assert.equal(acceptedButUnanswered.ready, false);
 
   const mismatchedActivation = buildOnboardingReadiness({
     onboarding,
@@ -99,10 +116,10 @@ test("onboarding readiness requires operational evidence and accepts browser-onl
           modelSelection: { instanceId: "codex", model: "different-model" },
         },
       },
-      status: "dispatched",
+      status: "completed",
     }],
   });
-  assert.equal(mismatchedActivation.checks.firstRunDispatched, false);
+  assert.equal(mismatchedActivation.checks.firstRunCompleted, false);
   assert.equal(mismatchedActivation.ready, false);
 });
 

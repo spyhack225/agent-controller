@@ -1,6 +1,7 @@
 import {
   BellOff,
   BellRing,
+  Cable,
   CheckCircle2,
   Clipboard,
   Download,
@@ -20,6 +21,7 @@ import {
 import { useEffect, useState } from "react";
 
 import type { Controller } from "../controller";
+import { formatRelativeTime } from "../format";
 import {
   buildGatewayTunnelDisableCommand,
   buildGatewayTunnelSetupCommand,
@@ -41,6 +43,14 @@ import {
 } from "../ui";
 import { T3CompatibilityPanel } from "./T3CompatibilityPanel";
 import { GatewayProfilesPanel } from "./GatewayProfilesPanel";
+import { ReleaseRolloutsPanel } from "./ReleaseRolloutsPanel";
+import {
+  currentWebPushSubscription,
+  serializeWebPushSubscription,
+  subscribeWebPush,
+  webPushSupported,
+  type WebPushConfig,
+} from "../webPush";
 
 const NOTIFICATION_HINTS: Record<string, string> = {
   unsupported: "This browser cannot raise notifications. Install the console to your home screen, or use a desktop browser.",
@@ -54,6 +64,10 @@ export function SettingsPage({ controller: c }: { controller: Controller }) {
     c.privacyDays === null ? "" : String(c.privacyDays),
   );
   const [notificationHint, setNotificationHint] = useState<string | null>(null);
+  const [webPushConfig, setWebPushConfig] = useState<WebPushConfig | null>(null);
+  const [webPushEnabled, setWebPushEnabled] = useState(false);
+  const [webPushBusy, setWebPushBusy] = useState(false);
+  const [webPushError, setWebPushError] = useState<string | null>(null);
   const [remoteAccessMode, setRemoteAccessMode] = useState<RemoteAccessMode>("serve");
 
   useEffect(() => {
@@ -64,20 +78,70 @@ export function SettingsPage({ controller: c }: { controller: Controller }) {
     if (c.remoteAccess?.tailscale.mode) setRemoteAccessMode(c.remoteAccess.tailscale.mode);
   }, [c.remoteAccess?.tailscale.mode]);
 
-  const toggleApprovalNotifications = async () => {
-    if (c.approvalNotificationsEnabled) {
-      c.disableApprovalNotifications();
+  useEffect(() => {
+    let cancelled = false;
+    void (async () => {
+      try {
+        const config = await c.api<WebPushConfig>("/v1/push/config", { silent: true });
+        const current = await currentWebPushSubscription();
+        if (!cancelled) {
+          setWebPushConfig(config);
+          setWebPushEnabled(Boolean(current));
+          setWebPushError(null);
+        }
+      } catch (error) {
+        if (!cancelled) setWebPushError(error instanceof Error ? error.message : "Web Push status is unavailable.");
+      }
+    })();
+    return () => { cancelled = true; };
+  }, [c.api]);
+
+  const toggleLocalNotifications = async () => {
+    if (c.localNotificationsEnabled) {
+      c.disableLocalNotifications();
       setNotificationHint(null);
-      c.setNotice({ tone: "info", message: "Approval notifications turned off." });
+      c.setNotice({ tone: "info", message: "Local system notifications turned off." });
       return;
     }
-    const result = await c.enableApprovalNotifications();
+    const result = await c.enableLocalNotifications();
     if (result === "granted") {
       setNotificationHint(null);
-      c.setNotice({ tone: "success", message: "Approval notifications enabled." });
+      c.setNotice({ tone: "success", message: "Local system notifications enabled." });
       return;
     }
     setNotificationHint(NOTIFICATION_HINTS[result] ?? NOTIFICATION_HINTS.default);
+  };
+
+  const toggleWebPush = async () => {
+    if (!webPushConfig?.supported || !webPushConfig.publicKey || webPushBusy) return;
+    setWebPushBusy(true);
+    setWebPushError(null);
+    try {
+      if (webPushEnabled) {
+        const current = await currentWebPushSubscription();
+        if (current) {
+          await c.api("/v1/push/subscriptions/revoke", {
+            method: "POST",
+            body: { endpoint: current.endpoint },
+          });
+          await current.unsubscribe();
+        }
+        setWebPushEnabled(false);
+        c.setNotice({ tone: "info", message: "Web Push turned off for this browser." });
+      } else {
+        const subscription = await subscribeWebPush(webPushConfig.publicKey);
+        await c.api("/v1/push/subscriptions", {
+          method: "POST",
+          body: { subscription: serializeWebPushSubscription(subscription) },
+        });
+        setWebPushEnabled(true);
+        c.setNotice({ tone: "success", message: "Web Push enabled for this browser." });
+      }
+    } catch (error) {
+      setWebPushError(error instanceof Error ? error.message : "Web Push could not be updated.");
+    } finally {
+      setWebPushBusy(false);
+    }
   };
 
   const saveRetention = async () => {
@@ -114,6 +178,20 @@ export function SettingsPage({ controller: c }: { controller: Controller }) {
     });
   };
 
+  const revokeConnector = async (connectorId: string, label: string) => {
+    const accepted = await confirm({
+      title: `Revoke ${label}?`,
+      description: "The connector will be disconnected immediately. Its standing secret cannot be recovered or reused; reconnecting requires a new enrollment command.",
+      confirmLabel: "Revoke connector",
+    });
+    if (!accepted) return;
+    await c.run(`revoke-connector-${connectorId}`, "Connector revoked.", async () => {
+      const result = await c.api(`/v1/connectors/${encodeURIComponent(connectorId)}`, { method: "DELETE" });
+      await c.refreshAll();
+      return result;
+    });
+  };
+
   const copyRemoteAccessCommand = async (command: string, label: string) => {
     try {
       await navigator.clipboard.writeText(command);
@@ -133,11 +211,63 @@ export function SettingsPage({ controller: c }: { controller: Controller }) {
 
       <GatewayProfilesPanel controller={c} />
 
+      <ReleaseRolloutsPanel controller={c} />
+
       <Panel elevated className="overflow-hidden">
         <SectionHeader
-          eyebrow="Remote access"
-          title="Connect securely from anywhere"
-          description="Put this gateway behind a stable Tailscale HTTPS address without opening router ports. Serve is private to your Tailnet; Funnel is an intentionally public option."
+          eyebrow="Connector fleet"
+          title="Workspace computers"
+          description="Outbound connectors keep T3 and provider credentials on each workspace computer. Status is based on the most recent heartbeat, not a generic environment flag."
+          action={<StatusBadge tone={c.connectors.some((connector) => connector.status === "online") ? "success" : "neutral"} label={`${c.connectors.length} enrolled`} />}
+        />
+        <div className="space-y-3 border-t border-control p-5">
+          {c.connectors.length ? c.connectors.map((connector) => {
+            const environment = c.environments.find((candidate) => candidate.id === connector.environmentId);
+            const revoked = connector.status === "revoked" || Boolean(connector.revokedAt);
+            const tone = revoked || connector.status === "offline" || connector.status === "incompatible"
+              ? "danger"
+              : connector.status === "online" ? "success" : "warning";
+            return (
+              <article key={connector.id} className="rounded-lg border border-control bg-surface-inset/35 p-4">
+                <div className="flex flex-wrap items-start gap-3">
+                  <span className="grid size-9 shrink-0 place-items-center rounded-md bg-primary/10 text-primary"><Cable className="size-4" /></span>
+                  <div className="min-w-0 flex-1">
+                    <div className="flex flex-wrap items-center gap-2">
+                      <strong className="text-sm text-ink">{connector.label}</strong>
+                      <StatusBadge tone={tone} label={connector.status} />
+                    </div>
+                    <p className="mt-1 text-xs text-ink-muted">{environment?.label ?? connector.environmentId} · Last seen {formatRelativeTime(connector.lastSeenAt ?? connector.lastConnectedAt)}</p>
+                    <p className="mt-1 font-mono text-[11px] text-ink-faint">{[connector.connectorVersion ? `v${connector.connectorVersion}` : "version unknown", connector.platform ?? "platform unknown", connector.secretPrefix].filter(Boolean).join(" · ")}</p>
+                  </div>
+                  <Button
+                    size="sm"
+                    variant="danger-ghost"
+                    disabled={revoked}
+                    busy={c.busyAction === `revoke-connector-${connector.id}`}
+                    onClick={() => void revokeConnector(connector.id, connector.label)}
+                  >
+                    <Trash2 className="size-3.5" /> {revoked ? "Revoked" : "Revoke"}
+                  </Button>
+                </div>
+              </article>
+            );
+          }) : (
+            <p className="rounded-lg border border-control bg-surface-inset/45 p-4 text-sm text-ink-muted">No connector has enrolled yet. Connect a computer from Environments or Initial setup.</p>
+          )}
+          <div className="grid gap-2 sm:grid-cols-2">
+            {["npx @agent-controller/connector status", "npx @agent-controller/connector doctor"].map((command) => (
+              <button key={command} type="button" className="rounded-md border border-control bg-console p-3 text-left font-mono text-xs text-console-ink" onClick={() => void copyRemoteAccessCommand(command, "Connector command")}>{command}</button>
+            ))}
+          </div>
+          <p className="text-xs text-ink-muted">Run status or doctor on the workspace computer. These checks do not reveal the standing connector secret or local T3/provider credentials.</p>
+        </div>
+      </Panel>
+
+      {c.authConfig.deploymentMode !== "cloud" ? <Panel elevated className="overflow-hidden">
+        <SectionHeader
+          eyebrow="Advanced self-hosted gateway access"
+          title="Open this console from another device"
+          description="Optional for self-hosted Agent Controller gateways. This controls console access only; connector-mode T3 computers do not require Tailscale, an inbound port, or a public URL."
           action={
             <StatusBadge
               tone={tunnelReady ? "success" : c.remoteAccess ? "warning" : "neutral"}
@@ -260,11 +390,11 @@ export function SettingsPage({ controller: c }: { controller: Controller }) {
             </div>
 
             <p className="border-t border-control pt-4 text-xs leading-relaxed text-ink-muted">
-              This tunnel exposes the Agent Controller console. To expose a T3 Code host too, choose <strong className="text-ink">Tailscale Serve</strong> in Initial setup, or run <code className="font-mono text-[11px] text-ink">npx t3 pair --tailscale</code> for an already-running T3 server.
+              This tunnel exposes the Agent Controller console only. Connector-mode T3 computers continue to dial out independently and keep their credentials local.
             </p>
           </div>
         </div>
-      </Panel>
+      </Panel> : null}
 
       <div className="grid gap-4 xl:grid-cols-2">
         <Panel elevated className="overflow-hidden">
@@ -370,36 +500,71 @@ export function SettingsPage({ controller: c }: { controller: Controller }) {
       <Panel className="overflow-hidden">
         <SectionHeader
           eyebrow="Alerts"
-          title="Approval notifications"
-          description="Raise a system notification when a command stops for approval while this tab is in the background. Permission is only requested when you turn this on."
+          title="Local system notifications"
+          description="Raise an OS notification for new approvals, questions, completed or failed turns, and connection changes while this console is open in the background. Permission is requested only when you turn this on."
           action={
             <StatusBadge
-              tone={c.approvalNotificationsEnabled
+              tone={c.localNotificationsEnabled
                 ? "success"
                 : c.notificationSupport === "denied" || c.notificationSupport === "unsupported"
                   ? "danger"
                   : "neutral"}
-              label={c.approvalNotificationsEnabled ? "on" : c.notificationSupport}
+              label={c.localNotificationsEnabled ? "on" : c.notificationSupport}
             />
           }
         />
         <div className="space-y-3 border-t border-control p-5">
           <p className="text-xs leading-relaxed text-ink-muted">
-            Notifications carry the command type and its summary. Nothing is sent to a push service —
-            they are raised locally by this browser while the console is open.
+            Notification bodies contain only a content-free event summary. Nothing is sent to a
+            push service unless Web Push is enabled separately below. Local delivery stops when
+            this browser and its installed PWA are closed.
           </p>
           {notificationHint ? (
             <p className="text-xs text-danger" role="alert">{notificationHint}</p>
           ) : null}
           <Button
-            variant={c.approvalNotificationsEnabled ? "danger-ghost" : "primary"}
+            variant={c.localNotificationsEnabled ? "danger-ghost" : "primary"}
             disabled={c.notificationSupport === "unsupported"}
-            onClick={() => void toggleApprovalNotifications()}
+            onClick={() => void toggleLocalNotifications()}
           >
-            {c.approvalNotificationsEnabled
-              ? <><BellOff className="size-4" /> Turn off approval notifications</>
-              : <><BellRing className="size-4" /> Enable approval notifications</>}
+            {c.localNotificationsEnabled
+              ? <><BellOff className="size-4" /> Turn off local notifications</>
+              : <><BellRing className="size-4" /> Enable local notifications</>}
           </Button>
+          <div className="border-t border-control pt-4">
+            <div className="flex flex-wrap items-start justify-between gap-3">
+              <div>
+                <p className="text-sm font-semibold text-ink">Web Push</p>
+                <p className="mt-1 max-w-2xl text-xs leading-relaxed text-ink-muted">
+                  Optional encrypted delivery through your browser's push service, including while
+                  this console is closed. Payloads contain only a static event label and an opaque
+                  notification id—never prompts, paths, provider output, questions, or answers.
+                  “Accepted” means the push service accepted a request; it does not prove display.
+                </p>
+              </div>
+              <StatusBadge
+                tone={webPushEnabled ? "success" : webPushConfig?.supported ? "neutral" : "warning"}
+                label={webPushEnabled ? "on" : webPushConfig?.supported ? "off" : "unavailable"}
+              />
+            </div>
+            {webPushError ? <p className="mt-3 text-xs text-danger" role="alert">{webPushError}</p> : null}
+            {!webPushConfig?.supported && webPushConfig ? (
+              <p className="mt-3 text-xs text-ink-muted">
+                Server delivery is disabled: {webPushConfig.reason?.replaceAll("_", " ") ?? "not configured"}.
+              </p>
+            ) : null}
+            <Button
+              className="mt-3"
+              variant={webPushEnabled ? "danger-ghost" : "primary"}
+              busy={webPushBusy}
+              disabled={!webPushConfig?.supported || !webPushSupported()}
+              onClick={() => void toggleWebPush()}
+            >
+              {webPushEnabled
+                ? <><BellOff className="size-4" /> Turn off Web Push</>
+                : <><BellRing className="size-4" /> Enable Web Push</>}
+            </Button>
+          </div>
         </div>
       </Panel>
 

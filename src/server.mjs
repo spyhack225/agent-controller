@@ -21,7 +21,7 @@ if (config.rateLimits?.redisUrl) {
   rateLimiter = createRateLimiter();
 }
 
-const { server, snapshotPoller, threadStreams, mediaJobRunner } = createApp({
+const { server, snapshotPoller, threadStreams, mediaJobRunner, releaseRolloutRunner, webPushDeliveryRunner } = createApp({
   config,
   rateLimiter,
   ...(store ? { store } : {}),
@@ -58,5 +58,13 @@ server.listen(config.port, config.host, async () => {
       `media job worker ${mediaJobRunner.workerId} running every ${config.transcriptionWorkerIntervalMs}ms`
       + ` (transcription provider: ${config.transcriptionProvider})`,
     );
+  }
+  // Rollout reconciliation is idempotent and only observes cohorts explicitly started by an
+  // owner. The local adapter uses a timer; Cloudflare invokes the same runner from Queue/Cron.
+  releaseRolloutRunner.start();
+  console.log("release rollout reconciler running every 30000ms");
+  if (config.webPushWorkerEnabled && config.webPush.supported) {
+    webPushDeliveryRunner.start();
+    console.log(`Web Push delivery worker running every ${config.webPushWorkerIntervalMs}ms`);
   }
 });

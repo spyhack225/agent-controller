@@ -149,7 +149,7 @@ test("a custom profile actually gates what a device may do", async (t) => {
     body: body({ type: "agent_prompt", text: "hello" }),
   });
   await allowed.text();
-  assert.equal(allowed.status, 200);
+  assert.equal(allowed.status, 202, "a dispatched agent turn is accepted for asynchronous completion");
   assert.equal(dispatched, 1);
 
   // shell_input is NOT, so the custom capability list is genuinely enforced.

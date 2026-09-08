@@ -2,6 +2,7 @@ import { fireEvent, render, screen, waitFor, within } from "@testing-library/rea
 import { vi } from "vitest";
 
 import type { Controller } from "../controller";
+import { capableT3Environment } from "../test/t3Capabilities";
 import type { T3Harness, T3SessionFailure } from "../types";
 import { ConfirmProvider } from "../ui";
 import { OperatePage } from "./OperatePage";
@@ -51,12 +52,14 @@ const FAILURE: T3SessionFailure = {
 };
 
 function controller(overrides: Record<string, unknown> = {}) {
+  const selectedEnvironment = capableT3Environment({ label: "Mac T3" });
   return {
     selectedEnvironmentId: "env_1",
     selectedThreadId: "thread_1",
     selectedProjectId: "project_1",
     selectedProject: { id: "project_1", title: "Tacs", defaultModelSelection: { instanceId: "codex", model: "gpt-5.4" } },
-    environments: [{ id: "env_1", label: "Mac T3" }],
+    selectedEnvironment,
+    environments: [selectedEnvironment],
     threads: [{ id: "thread_1", label: "Thread" }],
     projects: [{ id: "project_1", title: "Tacs" }],
     harnesses: HARNESSES,
@@ -429,6 +432,7 @@ test("sends composer messages to the selected thread instead of launching anothe
     method: "POST",
     body: {
       environmentId: "env_1",
+      clientRequestId: expect.stringMatching(/^web:/u),
       threadId: "thread_1",
       intent: { type: "agent_prompt", text: "Review the next change" },
     },

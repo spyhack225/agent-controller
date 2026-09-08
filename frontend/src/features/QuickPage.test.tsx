@@ -2,6 +2,7 @@ import { fireEvent, render, screen, waitFor, within } from "@testing-library/rea
 import { afterEach, vi } from "vitest";
 
 import type { Controller } from "../controller";
+import { capableT3Environment } from "../test/t3Capabilities";
 import type { Command, MediaItem } from "../types";
 import { ConfirmProvider } from "../ui";
 import { QuickPage } from "./QuickPage";
@@ -22,9 +23,14 @@ const CLIP: MediaItem = {
 };
 
 function controller(overrides: Record<string, unknown> = {}) {
+  const selectedEnvironment = capableT3Environment({
+    label: "Studio Mac",
+    baseUrl: "http://127.0.0.1:3773",
+  });
   return {
     busyAction: null,
-    environments: [{ id: "env_1", label: "Studio Mac", baseUrl: "http://127.0.0.1:3773" }],
+    selectedEnvironment,
+    environments: [selectedEnvironment],
     threads: [{ id: "thread_1", label: "Agent Controller", status: "running", messages: [] }],
     projects: [{ id: "project_1", label: "agent-controller" }],
     actions: [],
@@ -141,6 +147,7 @@ test("sends a free-form prompt into the selected thread", async () => {
     method: "POST",
     body: {
       environmentId: "env_1",
+      clientRequestId: expect.stringMatching(/^web:/u),
       threadId: "thread_1",
       intent: { type: "agent_prompt", text: "Ship the release notes" },
     },
@@ -189,6 +196,7 @@ test("push-to-talk records, attaches, and sends as an audio prompt", async () =>
     method: "POST",
     body: {
       environmentId: "env_1",
+      clientRequestId: expect.stringMatching(/^web:/u),
       threadId: "thread_1",
       intent: { type: "audio_prompt", transcript: "", mediaUploadIds: ["media_voice"] },
     },
@@ -276,7 +284,11 @@ test("runs a saved action against the selected thread", async () => {
 
   await waitFor(() => expect(c.api).toHaveBeenCalledWith("/v1/actions/action_1/run", {
     method: "POST",
-    body: { environmentId: "env_1", threadId: "thread_1" },
+    body: {
+      environmentId: "env_1",
+      threadId: "thread_1",
+      clientRequestId: expect.stringMatching(/^web:/u),
+    },
   }));
 });
 

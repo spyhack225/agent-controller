@@ -1,6 +1,7 @@
 import { createHash } from "node:crypto";
 
-import { compressSnapshot, fetchT3Snapshot, isEnvironmentTokenExpired } from "./t3Client.mjs";
+import { compressSnapshot, isEnvironmentTokenExpired } from "./t3Client.mjs";
+import { createT3TransportResolver } from "./t3Transport.mjs";
 import { rememberSnapshotThreadTitles } from "./mediaNaming.mjs";
 import { classifyEnvironmentFailure } from "./environmentFailure.mjs";
 import { extractThreadOutcomes } from "./t3Harness.mjs";
@@ -17,9 +18,11 @@ const DEFAULT_ACTIVE_TTL_MS = 5 * 60 * 1000;
 export function createSnapshotPoller({
   store,
   events = null,
+  notifications = null,
   intervalMs = DEFAULT_INTERVAL_MS,
   activeTtlMs = DEFAULT_ACTIVE_TTL_MS,
-  fetchSnapshot = fetchT3Snapshot,
+  fetchSnapshot = null,
+  transportResolver = createT3TransportResolver(),
   // Shared with the live thread stream in createApp() so the two evidence sources cannot decide
   // the same command twice. Defaulting to a private one keeps a standalone poller self-contained.
   arbiter = createCommandArbiter(),
@@ -47,12 +50,15 @@ export function createSnapshotPoller({
     lastScreenDigests.delete(environmentId);
   }
 
-  async function runOnce() {
+  async function runOnce({ userIds = null } = {}) {
     if (inFlight) return { skipped: true, polled: [] };
     inFlight = true;
     try {
       const polled = [];
-      for (const userId of activeUserIds()) {
+      const targets = Array.isArray(userIds)
+        ? [...new Set(userIds.filter((userId) => typeof userId === "string" && userId.length > 0))]
+        : activeUserIds();
+      for (const userId of targets) {
         polled.push(...(await pollUser(userId)));
       }
       return { skipped: false, polled };
@@ -72,6 +78,7 @@ export function createSnapshotPoller({
 
     const outcomes = [];
     for (const summary of listed ?? []) {
+      if (summary.archivedAt || summary.status === "archived") continue;
       outcomes.push(await pollEnvironment(userId, summary.id));
     }
     return outcomes;
@@ -88,6 +95,10 @@ export function createSnapshotPoller({
     if (!environment) {
       forgetEnvironment(environmentId);
       return { environmentId, status: "missing" };
+    }
+    if (environment.archivedAt || environment.status === "archived") {
+      forgetEnvironment(environmentId);
+      return { environmentId, status: "archived" };
     }
 
     const checkedAt = new Date(now()).toISOString();
@@ -108,7 +119,9 @@ export function createSnapshotPoller({
     }
 
     try {
-      const snapshot = await fetchSnapshot(environment);
+      const snapshot = await (fetchSnapshot
+        ? fetchSnapshot(environment)
+        : transportResolver.forEnvironment(environment).snapshot(environment));
       // The one place that reads every environment on a timer, so it is also the cheapest place to
       // keep thread titles current for media naming. See src/mediaNaming.mjs.
       rememberSnapshotThreadTitles(environment.id, snapshot);
@@ -161,7 +174,7 @@ export function createSnapshotPoller({
           outcome: outcomes.get(command.threadId),
           source: "snapshot",
           apply: async (decision) => {
-            await store.updateCommand({
+            const updated = await store.updateCommand({
               userId,
               commandId: command.id,
               status: decision.status,
@@ -182,6 +195,13 @@ export function createSnapshotPoller({
               observedAt: new Date(now()).toISOString(),
               source: "snapshot",
             });
+            if (notifications?.forCommand) {
+              try {
+                await notifications.forCommand(updated);
+              } catch (error) {
+                logger?.warn?.(`snapshot poll: command notification failed for ${command.id}: ${message(error)}`);
+              }
+            }
           },
         });
         if (update) applied.push({ commandId: command.id, status: update.status });
@@ -205,12 +225,21 @@ export function createSnapshotPoller({
     if (unchanged) return false;
 
     try {
-      await store.updateEnvironmentHealth({
+      const updated = await store.updateEnvironmentHealth({
         userId,
         environmentId: environment.id,
         status,
         health,
       });
+      try {
+        await notifications?.forEnvironmentHealth?.({
+          userId,
+          environment: updated,
+          previousStatus: environment.status,
+        });
+      } catch (error) {
+        logger?.warn?.(`snapshot poll: notification projection failed for ${environment.id}: ${message(error)}`);
+      }
       return true;
     } catch (error) {
       logger?.warn?.(`snapshot poll: health update failed for ${environment.id}: ${message(error)}`);
@@ -246,7 +275,7 @@ export function createSnapshotPoller({
     timer = null;
   }
 
-  return { trackUser, activeUserIds, runOnce, start, stop, forgetEnvironment };
+  return { trackUser, activeUserIds, pollUser, pollEnvironment, runOnce, start, stop, forgetEnvironment };
 }
 
 function message(error) {

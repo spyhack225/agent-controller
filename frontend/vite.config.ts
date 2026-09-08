@@ -32,6 +32,12 @@ export default defineConfig({
   build: {
     outDir: fileURLToPath(new URL("../dist/web", import.meta.url)),
     emptyOutDir: true,
-    sourcemap: true,
+    // The performance gate follows the entry's static import graph from this manifest. Hashed
+    // filenames alone cannot tell a required first-load chunk from a route loaded on demand.
+    manifest: true,
+    // Browser source maps contain the original TypeScript and internal module structure. Keep
+    // production artifacts private-by-default; a future error-reporting upload must build maps
+    // into a non-public staging directory and delete them before the web bundle is served.
+    sourcemap: false,
   },
 });

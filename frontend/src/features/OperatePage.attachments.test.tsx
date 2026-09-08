@@ -2,6 +2,7 @@ import { fireEvent, render, screen, waitFor, within } from "@testing-library/rea
 import { vi } from "vitest";
 
 import type { Controller } from "../controller";
+import { capableT3Environment } from "../test/t3Capabilities";
 import type { MediaItem } from "../types";
 import { ConfirmProvider } from "../ui";
 import { OperatePage } from "./OperatePage";
@@ -31,12 +32,14 @@ const MEDIA: MediaItem[] = [
 ];
 
 function controller(overrides: Record<string, unknown> = {}) {
+  const selectedEnvironment = capableT3Environment({ label: "Mac T3" });
   return {
     selectedEnvironmentId: "env_1",
     selectedThreadId: "thread_1",
     selectedProjectId: "project_1",
     selectedProject: { id: "project_1", title: "Tacs" },
-    environments: [{ id: "env_1", label: "Mac T3" }],
+    selectedEnvironment,
+    environments: [selectedEnvironment],
     threads: [{ id: "thread_1", label: "Thread", projectId: "project_1" }],
     projects: [{ id: "project_1", title: "Tacs" }],
     harnesses: [],

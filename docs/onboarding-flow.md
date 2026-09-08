@@ -15,7 +15,7 @@ A user is ready when all of the following are true:
 3. The user has chosen how that environment is exposed: local, LAN, Tailnet, or a custom URL.
 4. A T3 workspace/project is visible in the live snapshot.
 5. A provider instance and model have been selected.
-6. A first thread has been launched successfully, and a matching non-failed gateway launch command exists for the selected environment, project, provider instance, and model. This is the activation event because it proves the T3 connection, workspace, provider authentication, and model all work together.
+6. A first thread has produced a completed agent reply, and the command arbiter has marked the matching gateway launch command `completed` for the selected environment, project, provider instance, and model. Dispatch acknowledgement alone is insufficient. This is the activation event because it proves the T3 connection, workspace, provider authentication, model, and reply path all work together.
 7. A controller has been claimed/registered and pointed at the environment/thread, or the user has explicitly chosen browser-only operation. A development-device credential must be confirmed as saved.
 
 Completion is derived from operational evidence plus a durable per-user setup record. It is not inferred from visiting screens.

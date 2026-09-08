@@ -1,5 +1,7 @@
 #include "ui.h"
 
+#include <math.h>
+
 #include <GatewayBrowse.h>
 #include <GatewayVoice.h>
 #include <MediaUpload.h>
@@ -24,6 +26,10 @@
 #endif
 #ifndef FIRMWARE_VERSION
 #define FIRMWARE_VERSION "0.1.0"
+#endif
+#ifdef BUILD_FIRMWARE_VERSION
+#undef FIRMWARE_VERSION
+#define FIRMWARE_VERSION BUILD_FIRMWARE_VERSION
 #endif
 
 // The visual language is the orb's, not a dashboard's.
@@ -247,6 +253,35 @@ int pickerIndex = -1;          // into the thread list; -1 means "follow the bou
 uint32_t pickerCommitAt = 0;   // 0 when there is nothing pending
 bool pickerBinding = false;    // a write is in flight this frame
 constexpr uint32_t kPickerCommitMs = 600;
+
+// The destination picker is a carousel, not a value that changes after the finger has gone away.
+// Only its lower composition moves — the orb is the stable landmark above it. During a drag the
+// offset follows the glass directly; on release it eases the remaining distance into place. The
+// strings are captured at the start of the motion so the 30 fps path does not allocate two Arduino
+// Strings per frame.
+struct HomePickerVisual {
+  String prominent;
+  String secondary;
+  String verb;
+  bool big = false;
+  uint8_t prominentTone = kText;
+  uint8_t secondaryTone = kMuted;
+};
+
+struct PickerMotion {
+  bool active = false;
+  bool dragging = false;
+  int8_t direction = 0;       // 1: later slot enters from right; -1: earlier enters from left
+  float offset = 0.0f;        // outgoing copy's x offset
+  float startOffset = 0.0f;
+  float targetOffset = 0.0f;
+  uint32_t startedAt = 0;
+  HomePickerVisual from;
+  HomePickerVisual to;
+};
+
+PickerMotion pickerMotion;
+constexpr uint32_t kPickerSlideMs = 190;
 
 // Whether the thread list has ever been asked for this boot. Before that, an empty list means "not
 // loaded", not "none" — and the two must never look the same on the destination line.
@@ -815,6 +850,10 @@ const char* threadStatusWord(const String& status) {
 // True while the overlay row is still the only place the new thread exists.
 bool createdRowLive() {
   if (createdRow.id.length() == 0 || !gw) return false;
+  // Rename/delete/archive events can move the binding while this local projection still exists.
+  // Once the gateway no longer points at the created id, retaining the overlay would resurrect a
+  // removed thread on glass even though the shared client correctly removed its real row.
+  if (gw->context().threadId != createdRow.id) return false;
   for (size_t i = 0; i < gw->threadCount(); i += 1) {
     const ThreadOption* row = gw->thread(i);
     if (row && row->id == createdRow.id) return false;   // the real list has it; retire
@@ -1117,11 +1156,10 @@ Stack homeStack() {
                      /*action=*/true, /*line1Big=*/true);
 }
 
-void paintHome() {
-  const int target = pickerTarget();
+HomePickerVisual homePickerVisual(int slot, bool pending) {
+  const bool onNew = slot == (int)threadRowCount();
+  const int target = slot >= 0 && slot < (int)threadRowCount() ? slot : -1;
   const ThreadOption* row = (target >= 0) ? threadRowAt((size_t)target) : nullptr;
-  const bool pending = pickerPending();
-  const bool onNew = pickerOnNew();
 
   // The destination, by name. Never an id — see threadTitle().
   String name;
@@ -1141,6 +1179,8 @@ void paintHome() {
     name = "No thread selected";
   }
 
+  HomePickerVisual visual;
+
   // THE RULE. See OrbPresentation::speaks: the name wins unless the state is something the orb has
   // no animation for, in which case the word is the only way to know and it takes the big line.
   const String prominent = currentSpeaks ? String(currentLabel) : name;
@@ -1156,31 +1196,128 @@ void paintHome() {
     secondary = strlen(word) > 0 ? String(word) : String(currentLabel);
   }
 
-  stack = homeStack();
-  clearContent();
-
   // A title too long for size 2 drops to size 1 rather than being cut down to something that no
   // longer identifies the thread — but it is drawn CENTRED IN THE SAME BAND, so changing size moves
   // the glyphs within the band and never moves the band.
-  const bool big = prominent.length() <= kCols2;
-  const int16_t promY = big ? stack.line1Y : (int16_t)(stack.line1Y + (kLabelInkH - kLineH) / 2);
-  uip::textCentered(promY, big ? 2 : 1, pending ? kMuted : kText,
-                    uip::fitWords(prominent, big ? kCols2 : kCols1));
-  uip::textCentered(stack.line2Y, 1, pending ? kBright : kMuted,
-                    uip::fitWords(secondary, kCols1));
+  visual.big = prominent.length() <= kCols2;
+  visual.prominent = uip::fitWords(prominent, visual.big ? kCols2 : kCols1);
+  visual.secondary = uip::fitWords(secondary, kCols1);
+  visual.verb = onNew ? "CREATE" : (row == nullptr && !haveThread() ? "CHOOSE" : "OPEN");
+  visual.prominentTone = pending ? kMuted : kText;
+  visual.secondaryTone = pending ? kBright : kMuted;
+  return visual;
+}
 
-  const Rect action = homeActionRect();
-  const char* verb = onNew ? "CREATE" : (row == nullptr && !haveThread() ? "CHOOSE" : "OPEN");
-  uip::button(action, verb, true, true);
+void drawHomePickerVisual(const HomePickerVisual& visual, int16_t offsetX) {
+  const uint8_t size = visual.big ? 2 : 1;
+  const int16_t promY = visual.big
+    ? stack.line1Y : (int16_t)(stack.line1Y + (kLabelInkH - kLineH) / 2);
+  const int16_t prominentW = (int16_t)(visual.prominent.length() * 6 * size);
+  const int16_t secondaryW = (int16_t)(visual.secondary.length() * 6);
+  uip::text((int16_t)((kW - prominentW) / 2 + offsetX), promY, size, visual.prominentTone,
+            visual.prominent);
+  uip::text((int16_t)((kW - secondaryW) / 2 + offsetX), stack.line2Y, 1,
+            visual.secondaryTone, visual.secondary);
 
+  Rect action = homeActionRect();
+  action.x = (int16_t)(action.x + offsetX);
+  if (action.x < kW && action.x + action.w > 0) {
+    uip::button(action, visual.verb, true, true);
+  }
+}
+
+void drawHomePickerChevrons() {
   // The swipe affordance. Only drawn when there is somewhere to swipe to, because a chevron that
   // does nothing is worse than no chevron.
-  //
   if (pickerSlotCount() > 1) {
+    const Rect action = homeActionRect();
     const int16_t cy = (int16_t)(action.y + action.h / 2);
     uip::chevron((int16_t)(action.x - 18), cy, 5.0f, -1, kHair, 2.0f);
     uip::chevron((int16_t)(action.x + action.w + 18), cy, 5.0f, 1, kHair, 2.0f);
   }
+}
+
+void paintHome() {
+  stack = homeStack();
+  clearContent();
+  drawHomePickerVisual(homePickerVisual(pickerSlot(), pickerPending()), 0);
+  drawHomePickerChevrons();
+}
+
+bool homePickerSlotPending(int slot) {
+  return slot >= 0 && slot < (int)threadRowCount() && slot != boundThreadIndex();
+}
+
+// Repaints only the carousel's bands. The orb and header stay untouched, which both makes the
+// gesture read as movement within HOME and keeps the redraw comfortably inside one frame.
+void paintHomePickerMotion() {
+  if (!pickerMotion.active || screen != Screen::Home) return;
+  stack = homeStack();
+  const Rect action = homeActionRect();
+  const int16_t top = (int16_t)(stack.line1Y - 2);
+  const int16_t bottom = (int16_t)(action.y + action.h + 3);
+  g().fillRect(0, top, kW, (int16_t)(bottom - top), panelGrey(kBg));
+
+  const int16_t outgoingX = (int16_t)lroundf(pickerMotion.offset);
+  drawHomePickerVisual(pickerMotion.from, outgoingX);
+  if (pickerMotion.direction != 0) {
+    const int16_t incomingX = (int16_t)(outgoingX + pickerMotion.direction * kW);
+    drawHomePickerVisual(pickerMotion.to, incomingX);
+  }
+  drawHomePickerChevrons();
+}
+
+void updateHomePickerDrag(int16_t travelX) {
+  if (screen != Screen::Home || modal != Modal::None || drawerT > 0.05f) return;
+
+  const int fromSlot = pickerSlot();
+  const int8_t direction = travelX < 0 ? 1 : (travelX > 0 ? -1 : 0);
+  int toSlot = fromSlot + direction;
+  const bool atWall = direction == 0 || toSlot < 0 || toSlot >= pickerSlotCount();
+
+  float offset = (float)travelX;
+  if (offset < -kW * 0.82f) offset = -kW * 0.82f;
+  if (offset > kW * 0.82f) offset = kW * 0.82f;
+  // Resistance at either end makes the boundary tangible without letting the selector disappear.
+  if (atWall) offset *= 0.24f;
+
+  if (!pickerMotion.active || !pickerMotion.dragging || pickerMotion.direction != direction) {
+    pickerMotion.from = homePickerVisual(fromSlot, pickerPending());
+    pickerMotion.to = atWall ? HomePickerVisual()
+                             : homePickerVisual(toSlot, homePickerSlotPending(toSlot));
+  }
+  pickerMotion.active = true;
+  pickerMotion.dragging = true;
+  pickerMotion.direction = atWall ? 0 : direction;
+  pickerMotion.offset = offset;
+}
+
+void settleHomePickerBack() {
+  if (!pickerMotion.active || !pickerMotion.dragging) return;
+  pickerMotion.dragging = false;
+  pickerMotion.startOffset = pickerMotion.offset;
+  pickerMotion.targetOffset = 0.0f;
+  pickerMotion.startedAt = millis();
+}
+
+bool advanceHomePickerMotion(uint32_t now) {
+  if (!pickerMotion.active) return false;
+  if (pickerMotion.dragging) return true;
+
+  const uint32_t elapsed = now - pickerMotion.startedAt;
+  const float t = elapsed >= kPickerSlideMs ? 1.0f : (float)elapsed / (float)kPickerSlideMs;
+  const float eased = uip::easeOutCubic(t);
+  pickerMotion.offset = pickerMotion.startOffset
+    + (pickerMotion.targetOffset - pickerMotion.startOffset) * eased;
+  if (t < 1.0f) return true;
+
+  pickerMotion.active = false;
+  pickerMotion.direction = 0;
+  pickerMotion.offset = 0.0f;
+  // Replace the final carousel frame with the canonical settled HOME paint. This also picks up any
+  // gateway revision that arrived during the 190 ms motion.
+  contentDirty = true;
+  return false;
 }
 
 // The claim screen. A brand-new controller has one job: tell its owner how to take possession of
@@ -1385,9 +1522,10 @@ void paintEnvironments() {
     if (y + kChoiceRowInkTop < kContentTop) continue;
     const BrowseEnvironment* row = browse.environment(i);
     if (!row) continue;
-    // An expired access token is a dead end the owner has to fix at the host, and the listing
-    // carries it precisely so the device can say so before they walk over.
-    const String meta = row->tokenExpired ? String("TOKEN EXPIRED") : row->status;
+    // Show the first layer a person can act on. The shared helper gives connector reachability
+    // priority over T3 and provider state, then freshness, so a sleeping computer never appears
+    // to have a provider-only fault merely because its last catalogue was incomplete.
+    const String meta = browseEnvironmentAction(*row);
     paintChoiceRow(y, kBrowseRowH, row->label, meta, row->selected, i + 1 == count);
   }
   paintBrowseChrome("ENVIRONMENT");
@@ -2220,6 +2358,7 @@ void showBusy(const String& title, const String& detail) {
 void goTo(Screen next) {
   closeDrawerNow();
   if (screen == next) return;
+  pickerMotion = PickerMotion();
   // Leaving the voice screen acknowledges a finished capture. Without this the orb would go on
   // reporting "Voice failed" from HOME for the rest of the session — and because that state is
   // classified as speaking, it would sit on the prominent line hiding the thread name behind a
@@ -2967,20 +3106,40 @@ void handleContentTap(int16_t x, int16_t y) {
 // eight swipes cost one request and the device is never bound to something merely passed over.
 void pickerStep(int delta) {
   const int slots = pickerSlotCount();
-  const int next = pickerSlot() + delta;
+  const int current = pickerSlot();
+  const int next = current + delta;
   if (next < 0 || next >= slots) {
     // A wall, said out loud. A swipe that silently does nothing is indistinguishable from one the
     // device failed to see. NEW THREAD is the last slot, so "last thread" is never the far end.
     message = next < 0 ? "First thread" : "That is the end";
-    contentDirty = true;
+    if (pickerMotion.active && pickerMotion.dragging) settleHomePickerBack();
+    else contentDirty = true;
     return;
   }
+
+  const bool continuingDrag = pickerMotion.active && pickerMotion.dragging
+    && pickerMotion.direction == delta;
+  HomePickerVisual from = continuingDrag
+    ? pickerMotion.from : homePickerVisual(current, pickerPending());
+  float startOffset = continuingDrag ? pickerMotion.offset : 0.0f;
+  // A noisy final touch sample must not start the settle on the wrong side of centre.
+  if ((delta > 0 && startOffset > 0.0f) || (delta < 0 && startOffset < 0.0f)) startOffset = 0.0f;
+
   pickerIndex = next;
   // The virtual slot binds nothing, so it arms no write. Stepping onto it and away again costs the
   // gateway nothing at all.
   pickerCommitAt = (next == (int)threadRowCount()) ? 0 : (millis() + kPickerCommitMs);
   message = "";
-  contentDirty = true;
+
+  pickerMotion.active = true;
+  pickerMotion.dragging = false;
+  pickerMotion.direction = (int8_t)delta;
+  pickerMotion.offset = startOffset;
+  pickerMotion.startOffset = startOffset;
+  pickerMotion.targetOffset = (float)(-delta * kW);
+  pickerMotion.startedAt = millis();
+  pickerMotion.from = from;
+  pickerMotion.to = homePickerVisual(next, homePickerSlotPending(next));
 }
 
 // Moves between the three levels of the hierarchy.
@@ -3059,8 +3218,9 @@ void handleDrag(int16_t y, int16_t dy) {
       dragAxis = ax > ay ? DragAxis::Horizontal : DragAxis::Vertical;
     }
   }
-  // A horizontal gesture is resolved on the lift, by touchPoll's swipe classification. Nothing
-  // happens while it is in progress, and in particular the drawer is not touched.
+  // HOME previews its adjacent thread while the finger is still down. Navigation and response
+  // paging remain release-only because they trigger screen changes or network work. In every case
+  // a horizontal gesture leaves the drawer untouched.
   if (dragAxis == DragAxis::Horizontal) return;
 
   if (dragOwner == DragOwner::Drawer) {
@@ -3164,9 +3324,13 @@ void uiHandleTouch(const TouchEvent& event) {
     case TouchGesture::Drag:
       dragTravelX = (int16_t)(dragTravelX + event.dx);
       handleDrag(event.y, event.dy);
+      if (dragAxis == DragAxis::Horizontal && dragOwner == DragOwner::Content) {
+        updateHomePickerDrag(dragTravelX);
+      }
       return;
 
     case TouchGesture::Release:
+      if (dragAxis == DragAxis::Horizontal) settleHomePickerBack();
       dragTravel = 0;
       dragTravelX = 0;
       if (recordArmed) finishRecording();
@@ -3500,6 +3664,7 @@ void uiTick() {
 #endif
 
   const uint32_t drawStart = millis();
+  const bool pickerMoving = advanceHomePickerMotion(now);
 
   // The drawer eases open and shut. While it is moving nothing else in the content region is
   // painted: it covers all of it, and repainting underneath would be work nobody can see.
@@ -3567,14 +3732,18 @@ void uiTick() {
   const bool repaintedContent = contentDirty && drawerT <= 0.001f;
   if (repaintedContent) paintContent();
 
-  // Only the orb and its label animate. Everything else is repainted on change, which is what keeps
-  // a list screen inside the frame budget: a full list redraw costs several frames' worth of SPI
-  // and happens once, when the list actually changed.
+  const bool paintedPickerMotion = pickerMoving && screen == Screen::Home
+    && modal == Modal::None && drawerT <= 0.001f;
+  if (paintedPickerMotion) paintHomePickerMotion();
+
+  // The orb, its label, and HOME's small carousel band animate. Everything else is repainted on
+  // change, which is what keeps a list screen inside the frame budget: a full list redraw costs
+  // several frames' worth of SPI and happens once, when the list actually changed.
   const uint32_t elapsed = now - orbStartedAt;
   const bool bigOrb = (screen == Screen::Home || screen == Screen::Status || voiceOwnsScreen())
     && modal == Modal::None && drawerT <= 0.001f;
 
-  // The orb and a full content repaint do not share a frame.
+  // The orb and either a full content repaint or a carousel frame do not share a frame.
   //
   // Measured on the board, the orb alone is about 24 ms of a 33 ms budget — its geometry, its
   // rasterisation and its blit. A content repaint clears and redraws the whole region and costs
@@ -3583,9 +3752,10 @@ void uiTick() {
   // not, and it is what "sluggish" looked like.
   //
   // The drawer and the action tray are cheap enough to coexist with it now that neither pays
-  // distance-field arithmetic for its flat middle, so only the content repaint is excluded.
-  if (repaintedContent) {
-    // Nothing: the orb resumes on the next frame, 33 ms later.
+  // distance-field arithmetic for its flat middle. The carousel draws up to two anti-aliased
+  // buttons, so it gets the same one-frame priority as a content repaint.
+  if (repaintedContent || paintedPickerMotion) {
+    // Nothing: the orb resumes when the short repaint/transition is finished.
   } else if (bigOrb && orbReady) {
     displayDrawOrb(orb, kOrbCx, stack.orbCy, elapsed, kOrbDrawPx);
     // The claim block starts where the label would be, and the label's strip is full width: drawing

@@ -1,0 +1,195 @@
+name: Staging bootstrap
+
+on:
+  workflow_dispatch:
+    inputs:
+      operation:
+        description: Bootstrap an empty staging account, resume the same bootstrap, or clean a stub-only abort.
+        required: true
+        type: choice
+        options:
+          - bootstrap
+          - resume
+          - abort_cleanup
+      target_commit_sha:
+        description: Exact 40-character main commit to bootstrap.
+        required: true
+        type: string
+      bootstrap_id:
+        description: Stable 8-64 character operator ticket reused for resume or abort cleanup.
+        required: true
+        type: string
+      current_edge_version:
+        description: Exact active edge version for resume/abort; leave empty only for a fresh bootstrap.
+        required: false
+        default: ""
+        type: string
+      current_control_plane_version:
+        description: Exact active private control-plane version for resume; leave empty until it exists.
+        required: false
+        default: ""
+        type: string
+      confirmation:
+        description: Enter operation:staging:TARGET_SHA:BOOTSTRAP_ID exactly.
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: agent-controller-staging-bootstrap
+  cancel-in-progress: false
+
+jobs:
+  verify-commit:
+    name: Verify pinned bootstrap source
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - name: Check out protected automation source
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          ref: ${{ github.sha }}
+          path: automation
+          persist-credentials: false
+      - name: Check out exact bootstrap source
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          ref: ${{ inputs.target_commit_sha }}
+          fetch-depth: 0
+          path: release
+          persist-credentials: false
+      - name: Set up Node.js
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: "22.21.1"
+          cache: npm
+          cache-dependency-path: |
+            release/package-lock.json
+            release/cloudflare/package-lock.json
+            release/cloudflare-control-plane/package-lock.json
+      - name: Capture checked-out commit without credentials
+        working-directory: release
+        run: echo "STAGING_BOOTSTRAP_CHECKED_OUT_COMMIT=$(git rev-parse HEAD)" >> "$GITHUB_ENV"
+      - name: Validate branch, topology, stub boundary, and confirmation
+        working-directory: release
+        env:
+          STAGING_BOOTSTRAP_OPERATION: ${{ inputs.operation }}
+          STAGING_BOOTSTRAP_TARGET_COMMIT: ${{ inputs.target_commit_sha }}
+          STAGING_BOOTSTRAP_ID: ${{ inputs.bootstrap_id }}
+          STAGING_BOOTSTRAP_CURRENT_EDGE_VERSION: ${{ inputs.current_edge_version }}
+          STAGING_BOOTSTRAP_CURRENT_CONTROL_PLANE_VERSION: ${{ inputs.current_control_plane_version }}
+          STAGING_BOOTSTRAP_CONFIRMATION: ${{ inputs.confirmation }}
+          STAGING_BOOTSTRAP_CHECKED_OUT_COMMIT: ${{ env.STAGING_BOOTSTRAP_CHECKED_OUT_COMMIT }}
+          STAGING_BOOTSTRAP_AUTOMATION_COMMIT: ${{ github.sha }}
+          STAGING_BOOTSTRAP_DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+          STAGING_BOOTSTRAP_DISPATCH_REF: ${{ github.ref_name }}
+          STAGING_BOOTSTRAP_REPOSITORY_ROOT: ${{ github.workspace }}/release
+          AGENT_CONTROLLER_STAGING_URL: https://staging.invalid
+          AGENT_CONTROLLER_STAGING_MEDIA_BUCKET: agent-controller-media-staging
+          AGENT_CONTROLLER_STAGING_FIRMWARE_BUCKET: agent-controller-firmware-staging
+        run: node ../automation/scripts/bootstrap-staging.mjs validate-local
+      - name: Install locked dependencies
+        working-directory: release
+        run: |
+          npm ci --no-audit --no-fund
+          npm ci --prefix cloudflare --no-audit --no-fund
+          npm ci --prefix cloudflare-control-plane --no-audit --no-fund
+      - name: Run repository and bootstrap workflow gates
+        working-directory: release
+        run: |
+          npm run security:repo
+          npm run check:docs
+          npm run test:workflow
+          npm run typecheck:cloud
+          npm run typecheck:cloud-control-plane
+
+  bootstrap:
+    name: Protected staging bootstrap mutation
+    needs: verify-commit
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    environment:
+      name: staging-bootstrap
+      url: ${{ vars.AGENT_CONTROLLER_STAGING_URL }}
+    steps:
+      - name: Check out protected automation source
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          ref: ${{ github.sha }}
+          path: automation
+          persist-credentials: false
+      - name: Check out exact bootstrap source
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          ref: ${{ inputs.target_commit_sha }}
+          fetch-depth: 0
+          path: release
+          persist-credentials: false
+      - name: Set up Node.js
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: "22.21.1"
+          cache: npm
+          cache-dependency-path: |
+            release/package-lock.json
+            release/cloudflare/package-lock.json
+            release/cloudflare-control-plane/package-lock.json
+      - name: Install locked bootstrap dependencies
+        working-directory: release
+        run: |
+          npm ci --no-audit --no-fund
+          npm ci --prefix cloudflare --no-audit --no-fund
+          npm ci --prefix cloudflare-control-plane --no-audit --no-fund
+      - name: Build the console from the pinned commit
+        working-directory: release
+        run: npm run build:app
+      - name: Capture checked-out commit without credentials
+        working-directory: release
+        run: echo "STAGING_BOOTSTRAP_CHECKED_OUT_COMMIT=$(git rev-parse HEAD)" >> "$GITHUB_ENV"
+      - name: Bootstrap, resume, or explicitly clean the fail-closed stub
+        working-directory: release
+        env:
+          CI: "true"
+          NO_COLOR: "1"
+          STAGING_BOOTSTRAP_OPERATION: ${{ inputs.operation }}
+          STAGING_BOOTSTRAP_TARGET_COMMIT: ${{ inputs.target_commit_sha }}
+          STAGING_BOOTSTRAP_ID: ${{ inputs.bootstrap_id }}
+          STAGING_BOOTSTRAP_CURRENT_EDGE_VERSION: ${{ inputs.current_edge_version }}
+          STAGING_BOOTSTRAP_CURRENT_CONTROL_PLANE_VERSION: ${{ inputs.current_control_plane_version }}
+          STAGING_BOOTSTRAP_CONFIRMATION: ${{ inputs.confirmation }}
+          STAGING_BOOTSTRAP_CHECKED_OUT_COMMIT: ${{ env.STAGING_BOOTSTRAP_CHECKED_OUT_COMMIT }}
+          STAGING_BOOTSTRAP_AUTOMATION_COMMIT: ${{ github.sha }}
+          STAGING_BOOTSTRAP_DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+          STAGING_BOOTSTRAP_DISPATCH_REF: ${{ github.ref_name }}
+          STAGING_BOOTSTRAP_REPOSITORY_ROOT: ${{ github.workspace }}/release
+          STAGING_BOOTSTRAP_EVIDENCE_PATH: ${{ github.workspace }}/release/staging-bootstrap-evidence.json
+          AGENT_CONTROLLER_STAGING_URL: ${{ vars.AGENT_CONTROLLER_STAGING_URL }}
+          AGENT_CONTROLLER_STAGING_MEDIA_BUCKET: ${{ vars.AGENT_CONTROLLER_STAGING_MEDIA_BUCKET }}
+          AGENT_CONTROLLER_STAGING_FIRMWARE_BUCKET: ${{ vars.AGENT_CONTROLLER_STAGING_FIRMWARE_BUCKET }}
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_BOOTSTRAP_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_STAGING_ACCOUNT_ID }}
+          CONVEX_DEPLOY_KEY: ${{ secrets.CONVEX_STAGING_DEPLOY_KEY }}
+          STAGING_RUNTIME_SECRET_PUBLIC_BASE_URL: ${{ secrets.STAGING_RUNTIME_PUBLIC_BASE_URL }}
+          STAGING_RUNTIME_SECRET_CONVEX_URL: ${{ secrets.STAGING_RUNTIME_CONVEX_URL }}
+          STAGING_RUNTIME_SECRET_GATEWAY_CONVEX_SECRET: ${{ secrets.STAGING_RUNTIME_GATEWAY_CONVEX_SECRET }}
+          STAGING_RUNTIME_SECRET_CLERK_SECRET_KEY: ${{ secrets.STAGING_RUNTIME_CLERK_SECRET_KEY }}
+          STAGING_RUNTIME_SECRET_CLERK_PUBLISHABLE_KEY: ${{ secrets.STAGING_RUNTIME_CLERK_PUBLISHABLE_KEY }}
+          STAGING_RUNTIME_SECRET_T3_TOKEN_ENCRYPTION_KEY: ${{ secrets.STAGING_RUNTIME_T3_TOKEN_ENCRYPTION_KEY }}
+          STAGING_RUNTIME_SECRET_S3_ENDPOINT: ${{ secrets.STAGING_RUNTIME_S3_ENDPOINT }}
+          STAGING_RUNTIME_SECRET_S3_BUCKET: ${{ secrets.STAGING_RUNTIME_S3_BUCKET }}
+          STAGING_RUNTIME_SECRET_FIRMWARE_S3_BUCKET: ${{ secrets.STAGING_RUNTIME_FIRMWARE_S3_BUCKET }}
+          STAGING_RUNTIME_SECRET_S3_ACCESS_KEY_ID: ${{ secrets.STAGING_RUNTIME_S3_ACCESS_KEY_ID }}
+          STAGING_RUNTIME_SECRET_S3_SECRET_ACCESS_KEY: ${{ secrets.STAGING_RUNTIME_S3_SECRET_ACCESS_KEY }}
+          STAGING_RUNTIME_SECRET_WEB_PUSH_VAPID_KEYS: ${{ secrets.STAGING_RUNTIME_WEB_PUSH_VAPID_KEYS }}
+          STAGING_RUNTIME_SECRET_WEB_PUSH_STORAGE_ENCRYPTION_KEY: ${{ secrets.STAGING_RUNTIME_WEB_PUSH_STORAGE_ENCRYPTION_KEY }}
+        run: node ../automation/scripts/bootstrap-staging.mjs execute
+      - name: Upload redacted bootstrap evidence
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: staging-bootstrap-${{ inputs.operation }}-${{ inputs.target_commit_sha }}
+          path: release/staging-bootstrap-evidence.json
+          if-no-files-found: error
+          retention-days: 30

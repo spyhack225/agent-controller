@@ -12,10 +12,22 @@ const connected: Environment = {
   baseUrl: "https://mac.tailnet.ts.net",
   status: "paired",
 };
+const connectorConnected: Environment = {
+  id: "env_new",
+  label: "Mac T3 Code",
+  baseUrl: null,
+  transportMode: "connector",
+  connectorId: "con_1",
+  freshness: "unknown",
+  status: "unchecked",
+};
 
 function controller(environments: Environment[] = []): Controller {
   return {
     environments,
+    archivedEnvironments: [],
+    connectors: [],
+    connection: "connected",
     selectedEnvironmentId: environments[0]?.id ?? "",
     selectedEnvironment: environments[0] ?? null,
     setSelectedEnvironmentId: vi.fn(),
@@ -28,11 +40,11 @@ function controller(environments: Environment[] = []): Controller {
     loadSnapshot: vi.fn(async () => ({ environment: environments[0] ?? connected })),
     // Console-first pairing: the dialog mints a session, then polls it. The default stub keeps the
     // session pending so the waiting state is what renders unless a test says otherwise.
-    createConnectSession: vi.fn(async (input: { accessMode?: string }) => ({
+    createConnectSession: vi.fn(async () => ({
       session: pendingSession,
       code: "ABCDE-FGHIJ",
       gatewayUrl: "https://gateway.example",
-      command: `npm run setup:t3 -- --gateway-url 'https://gateway.example' --connect-code 'ABCDE-FGHIJ' --tunnel '${input.accessMode ?? "local"}'`,
+      command: "npx @agent-controller/connector connect --server 'https://gateway.example' --code 'ABCDE-FGHIJ'",
     })),
     fetchConnectSession: vi.fn(async () => ({ session: pendingSession, environment: null })),
     api: vi.fn(async (path: string, options?: { method?: string }) => {
@@ -51,7 +63,7 @@ const pendingSession: ConnectSession = {
   status: "pending",
   baseUrl: null,
   error: null,
-  expiresAt: "2026-08-24T18:15:00.000Z",
+  expiresAt: "2026-09-01T18:15:00.000Z",
   completedAt: null,
 };
 
@@ -75,24 +87,22 @@ test("hands an empty account a copyable connect command and waits for the host t
 
   fireEvent.click(screen.getByRole("button", { name: /Continue/u }));
   fireEvent.change(screen.getByLabelText("Environment label"), { target: { value: "Studio Mac" } });
-  fireEvent.click(screen.getByRole("radio", { name: /Tailscale/u }));
+  fireEvent.click(screen.getByRole("radio", { name: /Connect another computer/u }));
   fireEvent.click(screen.getByRole("button", { name: /Continue/u }));
 
-  // The mode the user picked scopes the command the gateway mints.
   await waitFor(() => expect(c.createConnectSession).toHaveBeenCalledWith({
     label: "Studio Mac",
-    accessMode: "tailscale",
     environmentId: null,
   }));
 
-  const command = "npm run setup:t3 -- --gateway-url 'https://gateway.example' --connect-code 'ABCDE-FGHIJ' --tunnel 'tailscale'";
+  const command = "npx @agent-controller/connector connect --server 'https://gateway.example' --code 'ABCDE-FGHIJ'";
   expect(await screen.findByText(command)).toBeVisible();
   fireEvent.click(screen.getByRole("button", { name: "Copy connect command" }));
   await waitFor(() => expect(writeText).toHaveBeenCalledWith(command));
   expect(screen.getByRole("button", { name: "Copied connect command" })).toBeVisible();
 
   // Nothing is pasted back: the dialog polls until the host lands the pairing.
-  expect(screen.getByText("Waiting for the T3 host…")).toBeVisible();
+  expect(screen.getByText("Waiting for the connector…")).toBeVisible();
   await waitFor(() => expect(c.fetchConnectSession).toHaveBeenCalledWith("cxn_1"));
   expect(within(dialog).queryByRole("button", { name: /Connect environment/u })).toBeNull();
 });
@@ -102,7 +112,7 @@ test("closes the connect flow when the polled session reports the pairing landed
   Object.assign(c, {
     fetchConnectSession: vi.fn(async () => ({
       session: { ...pendingSession, status: "completed", environmentId: "env_new" },
-      environment: connected,
+      environment: connectorConnected,
     })),
   });
   renderPage(c);
@@ -111,12 +121,14 @@ test("closes the connect flow when the polled session reports the pairing landed
   fireEvent.click(screen.getByRole("button", { name: /Continue/u }));
   fireEvent.click(screen.getByRole("button", { name: /Continue/u }));
 
-  await screen.findByText("Host paired successfully");
+  await screen.findByText("Connector enrolled");
   expect(c.setSelectedEnvironmentId).toHaveBeenCalledWith("env_new");
   expect(c.refreshAll).toHaveBeenCalled();
-  // The access path shown is the one inferred from the endpoint the host reported, not the guess
-  // made before the host was reachable.
-  expect(screen.getByText("Tailscale")).toBeVisible();
+  expect(screen.getByText("Outbound connector")).toBeVisible();
+  expect(screen.getByText("Enrollment complete")).toBeVisible();
+  expect(screen.getByRole("button", { name: "Continue setup" })).toBeVisible();
+  expect(screen.getByText(/Enrollment is only the first layer/u)).toBeVisible();
+  expect(screen.queryByText("Connection ready")).toBeNull();
 });
 
 test("surfaces a pairing that failed on the host instead of spinning forever", async () => {
@@ -141,19 +153,17 @@ test("surfaces a pairing that failed on the host instead of spinning forever", a
 
 test("keeps manual credential paste as the fallback and still requires HTTPS for online hosts", async () => {
   const c = controller();
+  Object.assign(c, { authConfig: { deploymentMode: "self-hosted" } });
   renderPage(c);
 
   fireEvent.click(screen.getByRole("button", { name: "Connect T3 Code" }));
   fireEvent.click(screen.getByRole("button", { name: /Continue/u }));
+  fireEvent.click(screen.getByRole("button", { name: /Continue/u }));
+  fireEvent.click(screen.getByRole("button", { name: /Advanced: connect directly/u }));
   fireEvent.click(screen.getByRole("radio", { name: /Online HTTPS/u }));
   expect(screen.getByText("Public internet endpoint")).toBeVisible();
   expect(screen.getByText("Never enter a plain HTTP URL for an internet-accessible host.")).toBeVisible();
-  fireEvent.click(screen.getByRole("button", { name: /Continue/u }));
-
   const dialog = screen.getByRole("dialog", { name: "Connect T3 Code" });
-  // The fallback is collapsed by default — a host that can reach the gateway never needs it.
-  expect(within(dialog).queryByLabelText("T3 base URL")).toBeNull();
-  fireEvent.click(screen.getByRole("button", { name: /Paste a credential manually instead/u }));
 
   fireEvent.change(screen.getByLabelText("T3 base URL"), { target: { value: "http://t3.example.com" } });
   fireEvent.change(screen.getByLabelText("Pairing token"), { target: { value: "pair_once" } });
@@ -164,7 +174,7 @@ test("keeps manual credential paste as the fallback and still requires HTTPS for
   expect(connect).toBeEnabled();
   fireEvent.click(connect);
 
-  await screen.findByText("Host paired successfully");
+  await screen.findByText("Host credential saved");
   expect(c.api).toHaveBeenCalledWith("/v1/t3/environments", {
     method: "POST",
     body: {
@@ -174,6 +184,52 @@ test("keeps manual credential paste as the fallback and still requires HTTPS for
     },
   });
   expect(c.setSelectedEnvironmentId).toHaveBeenCalledWith("env_new");
+});
+
+test("keeps the rejected direct URL and token flow out of managed cloud", async () => {
+  const c = controller();
+  Object.assign(c, { authConfig: { deploymentMode: "cloud", clerk: { enabled: true } } });
+  renderPage(c);
+
+  fireEvent.click(screen.getByRole("button", { name: "Connect T3 Code" }));
+  fireEvent.click(screen.getByRole("button", { name: /Continue/u }));
+  fireEvent.click(screen.getByRole("button", { name: /Continue/u }));
+
+  await waitFor(() => expect(c.createConnectSession).toHaveBeenCalledTimes(1));
+  expect(screen.queryByRole("button", { name: /Advanced: connect directly/u })).toBeNull();
+  expect(screen.queryByLabelText("T3 base URL")).toBeNull();
+  expect(screen.queryByLabelText("Pairing token")).toBeNull();
+  expect(screen.queryByLabelText("Access token")).toBeNull();
+});
+
+test("offers connector migration instead of URL or token edits for a legacy direct cloud record", async () => {
+  const environment: Environment = {
+    id: "env_legacy",
+    label: "Legacy Mac",
+    baseUrl: "https://legacy.example.test",
+    status: "unreachable",
+  };
+  const c = controller([environment]);
+  Object.assign(c, { authConfig: { deploymentMode: "cloud", clerk: { enabled: true } } });
+  renderPage(c);
+
+  fireEvent.click(screen.getByRole("button", { name: "Edit Legacy Mac" }));
+  const dialog = screen.getByRole("dialog", { name: "Legacy Mac" });
+  expect(within(dialog).getByText("Direct connection unavailable in managed cloud")).toBeVisible();
+  expect(within(dialog).queryByLabelText("T3 base URL")).toBeNull();
+
+  fireEvent.click(within(dialog).getByRole("button", { name: "credential" }));
+  expect(within(dialog).getByText("Replace the legacy direct connection")).toBeVisible();
+  expect(within(dialog).queryByLabelText(/Replacement .* token/u)).toBeNull();
+
+  fireEvent.click(within(dialog).getByRole("button", { name: "connection" }));
+  fireEvent.change(within(dialog).getByLabelText("Environment label"), { target: { value: "Legacy Mac renamed" } });
+  fireEvent.click(within(dialog).getByRole("button", { name: "Save changes" }));
+
+  await waitFor(() => expect(c.api).toHaveBeenCalledWith("/v1/t3/environments/env_legacy", {
+    method: "PUT",
+    body: { label: "Legacy Mac renamed" },
+  }));
 });
 
 test("re-pairing an existing host reuses the same flow and updates it in place", async () => {
@@ -195,13 +251,12 @@ test("re-pairing an existing host reuses the same flow and updates it in place",
   // redemption updates that row rather than adding a second one for the same machine.
   await waitFor(() => expect(c.createConnectSession).toHaveBeenCalledWith({
     label: "Studio Mac",
-    accessMode: "tailscale",
     environmentId: "env_42",
   }));
-  expect(within(dialog).getByText("Run this on the T3 host")).toBeVisible();
+  expect(within(dialog).getByText("Run this on this computer")).toBeVisible();
 
   // The manual fallback of a re-pair is a PUT, never a POST.
-  fireEvent.click(within(dialog).getByRole("button", { name: /Paste a credential manually instead/u }));
+  fireEvent.click(within(dialog).getByRole("button", { name: /Advanced: connect directly/u }));
   fireEvent.change(within(dialog).getByLabelText("Pairing token"), { target: { value: "pair_again" } });
   fireEvent.click(within(dialog).getByRole("button", { name: "Save credential" }));
 
@@ -234,12 +289,15 @@ test("renders environment health tiles and edits connection details in a focused
   const c = controller([environment]);
   renderPage(c);
 
-  for (const label of ["Last checked", "Last reachable", "Credential", "Snapshot age", "Projects", "Sessions"]) {
+  for (const label of ["Last checked", "Last reachable", "Credential", "Projection", "Projects", "Sessions"]) {
     expect(screen.getByText(label)).toBeVisible();
   }
   expect(screen.getByText("3 projects")).toBeVisible();
   expect(screen.getByRole("button", { name: "Load snapshot" })).toBeVisible();
   expect(screen.getByRole("button", { name: "Check" })).toBeVisible();
+  expect(screen.getByRole("button", { name: "Edit Studio Mac" })).toBeVisible();
+  expect(screen.getByRole("button", { name: "Archive Studio Mac" })).toBeVisible();
+  expect(screen.getByRole("button", { name: "Delete Studio Mac" })).toBeVisible();
 
   fireEvent.click(screen.getByRole("button", { name: "Edit Studio Mac" }));
   expect(screen.getByRole("dialog", { name: "Studio Mac" })).toBeVisible();
@@ -256,6 +314,37 @@ test("renders environment health tiles and edits connection details in a focused
     },
   }));
   expect(c.refreshAll).toHaveBeenCalled();
+});
+
+test("labels cached connector projections as stale and keeps each health layer visible", () => {
+  const environment: Environment = {
+    id: "env_connector",
+    label: "Sleeping Mac",
+    baseUrl: null,
+    transportMode: "connector",
+    connectorId: "con_sleeping",
+    freshness: "stale",
+    lastConnectorSeenAt: "2026-08-27T12:00:00.000Z",
+    providerCatalogue: { instances: [{ instanceId: "codex", status: "ready", models: [{ slug: "gpt-5" }] }] },
+  };
+  const c = controller([environment]);
+  Object.assign(c, {
+    connectors: [{
+      id: "con_sleeping",
+      environmentId: environment.id,
+      label: "Sleeping Mac",
+      status: "offline",
+      lastSeenAt: "2026-08-27T12:00:00.000Z",
+      lastT3Health: "ready",
+    }],
+  });
+  renderPage(c);
+
+  expect(screen.getByText("connector offline")).toBeVisible();
+  expect(screen.getByText("Cached projection")).toBeVisible();
+  for (const layer of ["Cloud", "Connector", "T3", "Provider", "Proof"]) {
+    expect(screen.getByText(layer)).toBeVisible();
+  }
 });
 
 test("lists controller gateways, marks the active endpoint, and names its devices", () => {
@@ -341,7 +430,7 @@ test("lists controller gateways, marks the active endpoint, and names its device
   expect(within(dialog).getByText("online")).toBeVisible();
 });
 
-test("removes an environment only after showing what still points at it", async () => {
+test("archives an environment only after showing what will be disconnected", async () => {
   const environment: Environment = {
     id: "env_42",
     label: "Studio Mac",
@@ -368,19 +457,73 @@ test("removes an environment only after showing what still points at it", async 
   });
   renderPage(c);
 
-  fireEvent.click(screen.getByRole("button", { name: "Edit Studio Mac" }));
-  const dialog = screen.getByRole("dialog", { name: "Studio Mac" });
-  fireEvent.click(within(dialog).getByRole("button", { name: "health" }));
-  expect(within(dialog).queryByRole("button", { name: /Unpair/u })).toBeNull();
-  fireEvent.click(within(dialog).getByRole("button", { name: "Remove environment" }));
+  fireEvent.click(screen.getByRole("button", { name: "Archive Studio Mac" }));
 
   const confirmation = await screen.findByRole("alertdialog");
-  expect(within(confirmation).getByText("Remove Studio Mac?")).toBeVisible();
+  expect(within(confirmation).getByText("Archive Studio Mac?")).toBeVisible();
   expect(within(confirmation).getByText(/1 device default, 1 saved action and your onboarding selection/u)).toBeVisible();
   expect(within(confirmation).getByText(/disabled until you re-save them/u)).toBeVisible();
 
-  fireEvent.click(within(confirmation).getByRole("button", { name: "Remove environment" }));
+  fireEvent.click(within(confirmation).getByRole("button", { name: "Archive environment" }));
 
-  await waitFor(() => expect(c.api).toHaveBeenCalledWith("/v1/t3/environments/env_42", { method: "DELETE" }));
-  expect(c.run).toHaveBeenCalledWith("remove-environment", "Environment removed.", expect.any(Function));
+  await waitFor(() => expect(c.api).toHaveBeenCalledWith("/v1/t3/environments/env_42/archive", {
+    method: "POST",
+    body: {},
+  }));
+  expect(c.run).toHaveBeenCalledWith("archive-environment", "Environment archived and disconnected.", expect.any(Function));
+});
+
+test("dependency-heavy removal requires the exact current label before the request can run", async () => {
+  const environment: Environment = { id: "env_42", label: "Studio Mac", baseUrl: null, status: "reachable" };
+  const c = controller([environment]);
+  Object.assign(c, {
+    api: vi.fn(async (path: string) => path.endsWith("/dependencies")
+      ? {
+          environmentId: environment.id,
+          dependencies: { devices: [{ id: "dev_1", label: "Desk" }], actions: [], macros: [], onboarding: false },
+          counts: { devices: 1, actions: 0, macros: 0, onboarding: 0 },
+        }
+      : { environment }),
+  });
+  renderPage(c);
+
+  fireEvent.click(screen.getByRole("button", { name: "Delete Studio Mac" }));
+  const confirmation = await screen.findByRole("alertdialog");
+  const removeButton = within(confirmation).getByRole("button", { name: "Remove environment" });
+  expect(removeButton).toBeDisabled();
+  fireEvent.change(within(confirmation).getByLabelText("Confirmation label"), { target: { value: "Studio mac" } });
+  expect(removeButton).toBeDisabled();
+  fireEvent.change(within(confirmation).getByLabelText("Confirmation label"), { target: { value: "Studio Mac" } });
+  fireEvent.click(removeButton);
+
+  await waitFor(() => expect(c.api).toHaveBeenCalledWith("/v1/t3/environments/env_42", {
+    method: "DELETE",
+    body: { confirmationLabel: "Studio Mac" },
+  }));
+});
+
+test("shows removed environments separately and restores them during retention", async () => {
+  const archived: Environment = {
+    id: "env_archived",
+    label: "Old Studio",
+    baseUrl: "https://old-studio.example",
+    status: "archived",
+    archivedAt: "2026-08-20T12:00:00.000Z",
+  };
+  const c = controller();
+  Object.assign(c, { archivedEnvironments: [archived] });
+  renderPage(c);
+
+  expect(screen.getByRole("heading", { name: "Archived environments" })).toBeVisible();
+  expect(screen.getByText("Old Studio")).toBeVisible();
+  fireEvent.click(screen.getByRole("button", { name: "Restore" }));
+  await waitFor(() => expect(c.api).toHaveBeenCalledWith("/v1/t3/environments/env_archived/restore", {
+    method: "POST",
+    body: {},
+  }));
+  expect(c.run).toHaveBeenCalledWith(
+    "restore-environment-env_archived",
+    "Environment restored. Re-pair its connector to resume control.",
+    expect.any(Function),
+  );
 });

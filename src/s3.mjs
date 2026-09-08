@@ -490,14 +490,38 @@ export function createS3Client({
       };
     },
 
-    async getObject({ key } = {}) {
+    async getObject({ key, maxBytes } = {}) {
       const objectKey = normalizeKey(key);
       const { response, url } = await send({
         method: "GET",
         key: objectKey,
         payloadHash: EMPTY_PAYLOAD_SHA256,
       });
-      const buffer = Buffer.from(await response.arrayBuffer());
+      const declaredLength = Number.parseInt(response.headers.get("content-length") ?? "", 10);
+      if (Number.isFinite(maxBytes) && maxBytes >= 0 && Number.isFinite(declaredLength) && declaredLength > maxBytes) {
+        await response.body?.cancel();
+        throw new S3Error("Object exceeds the configured read limit.", { code: "EntityTooLarge", status: 413 });
+      }
+      const chunks = [];
+      let length = 0;
+      if (response.body) {
+        const reader = response.body.getReader();
+        try {
+          while (true) {
+            const { done, value } = await reader.read();
+            if (done) break;
+            length += value.byteLength;
+            if (Number.isFinite(maxBytes) && maxBytes >= 0 && length > maxBytes) {
+              await reader.cancel();
+              throw new S3Error("Object exceeds the configured read limit.", { code: "EntityTooLarge", status: 413 });
+            }
+            chunks.push(Buffer.from(value));
+          }
+        } finally {
+          reader.releaseLock();
+        }
+      }
+      const buffer = Buffer.concat(chunks, length);
       return {
         key: objectKey,
         bucket,

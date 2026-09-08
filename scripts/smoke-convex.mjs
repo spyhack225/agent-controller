@@ -9,6 +9,9 @@ import { loadConfig } from "../src/config.mjs";
 import { createConfiguredStore } from "../src/storage.mjs";
 
 const rootDir = new URL("..", import.meta.url);
+const PNG_BASE64 =
+  "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg==";
+const WEBM_BASE64 = Buffer.from([0x1a, 0x45, 0xdf, 0xa3]).toString("base64");
 
 async function main() {
   const env = {
@@ -27,7 +30,7 @@ async function main() {
 
   const config = loadConfig(env);
   const store = await createConfiguredStore(config);
-  const { server } = createApp({ config, store });
+  const { server, mediaJobRunner, releaseRolloutRunner } = createApp({ config, store });
   await listen(server);
   const baseUrl = `http://127.0.0.1:${server.address().port}`;
 
@@ -43,21 +46,30 @@ async function main() {
       accessToken: "mock-t3-token",
       accessTokenExpiresAt: new Date(Date.now() + 3600_000).toISOString(),
     }, authHeaders);
+    // A direct environment is unique by owner + normalized base URL. Use a distinct URL for the
+    // disposable lifecycle row so this smoke test does not update and delete the primary row it
+    // needs below. `localhost` reaches the same local mock if a future assertion probes it.
+    const disposableT3Url = mockT3Url.replace("127.0.0.1", "localhost");
     const environmentHealth = await post(baseUrl, `/v1/t3/environments/${environment.id}/check`, {}, authHeaders);
     const environmentSnapshot = await get(baseUrl, `/v1/t3/environments/${environment.id}/snapshot`, authHeaders);
     const selectedThreadId = environmentSnapshot.snapshot.threads[0]?.id ?? "thread_convex_smoke";
     const { environment: disposableEnvironment } = await post(baseUrl, "/v1/t3/environments", {
       label: "Convex disposable T3",
-      baseUrl: mockT3Url,
+      baseUrl: disposableT3Url,
       accessToken: "convex-disposable-token",
     }, authHeaders);
     const { environment: updatedEnvironment } = await put(
       baseUrl,
       `/v1/t3/environments/${disposableEnvironment.id}`,
-      { label: "Convex updated disposable T3", baseUrl: mockT3Url, accessToken: "convex-updated-disposable-token" },
+      { label: "Convex updated disposable T3", baseUrl: disposableT3Url, accessToken: "convex-updated-disposable-token" },
       authHeaders,
     );
     const deletedEnvironment = await del(baseUrl, `/v1/t3/environments/${updatedEnvironment.id}`, authHeaders);
+    const environmentList = await get(baseUrl, "/v1/t3/environments", authHeaders);
+    const connectorList = await get(baseUrl, "/v1/connectors", authHeaders);
+    const notifications = await get(baseUrl, "/v1/notifications?limit=1", authHeaders);
+    const backgroundLiveness = await get(baseUrl, "/v1/background/liveness", authHeaders);
+    const rolloutRun = await releaseRolloutRunner.runOnce({ limit: 1 });
     const privacy = await put(baseUrl, "/v1/settings/privacy", { mediaRetentionDays: 7 }, authHeaders);
 
     await put(baseUrl, `/v1/devices/${device.id}/config`, {
@@ -79,27 +91,30 @@ async function main() {
     const { media } = await post(baseUrl, "/v1/device/media", {
       kind: "image",
       contentType: "image/png",
-      dataBase64: Buffer.from("convex-smoke-image").toString("base64"),
+      dataBase64: PNG_BASE64,
       originalName: "convex-smoke.png",
     }, deviceHeaders(device.id, secret));
     const { media: audioMedia } = await post(baseUrl, "/v1/media", {
       kind: "audio",
       contentType: "audio/webm",
-      dataBase64: Buffer.from("convex-smoke-audio").toString("base64"),
+      dataBase64: WEBM_BASE64,
       originalName: "convex-smoke.webm",
       transcript: "Use this Convex smoke audio transcript to continue the task.",
     }, authHeaders);
-    const transcribedAudio = await post(
+    const queuedTranscription = await post(
       baseUrl,
       `/v1/media/${audioMedia.id}/transcribe`,
       {},
       authHeaders,
     );
+    await mediaJobRunner.runOnce();
+    const transcribedAudio = (await get(baseUrl, "/v1/media", authHeaders)).media
+      .find((item) => item.id === audioMedia.id);
 
     const disposableMedia = await post(baseUrl, "/v1/media", {
       kind: "image",
       contentType: "image/png",
-      dataBase64: Buffer.from("convex-delete-smoke-image").toString("base64"),
+      dataBase64: PNG_BASE64,
       originalName: "convex-delete-smoke.png",
     }, authHeaders);
     const deletedMedia = await del(baseUrl, `/v1/media/${disposableMedia.media.id}`, authHeaders);
@@ -108,7 +123,7 @@ async function main() {
       headers: authHeaders,
     });
     if (!fetchedMedia.ok) throw new Error(`/v1/media/${media.id} failed with ${fetchedMedia.status}`);
-    const fetchedMediaText = await fetchedMedia.text();
+    const fetchedMediaBase64 = Buffer.from(await fetchedMedia.arrayBuffer()).toString("base64");
 
     const prompt = await post(baseUrl, "/v1/device/intents", {
       intent: { type: "agent_prompt", text: "Convex smoke prompt." },
@@ -183,11 +198,31 @@ async function main() {
       {},
       authHeaders,
     );
+    const transferSecret = "convex_smoke_transfer_secret_0123456789abcdef";
+    await post(
+      baseUrl,
+      "/v1/device/credentials/stage",
+      {
+        rotationId: transferReset.rotation.id,
+        credentialVersion: transferReset.rotation.pendingCredentialVersion,
+        secret: transferSecret,
+      },
+      deviceHeaders(transferDevice.device.id, transferDevice.secret),
+    );
+    const transferAck = await post(
+      baseUrl,
+      "/v1/device/credentials/ack",
+      {
+        rotationId: transferReset.rotation.id,
+        credentialVersion: transferReset.rotation.pendingCredentialVersion,
+      },
+      deviceHeaders(transferDevice.device.id, transferSecret),
+    );
     const setupCode = await post(
       baseUrl,
       "/v1/device/setup-code",
-      {},
-      deviceHeaders(transferReset.device.id, transferReset.secret),
+      { rotate: true },
+      deviceHeaders(transferReset.device.id, transferSecret),
     );
 
     assertEqual(prompt.command.status, "dispatched", "prompt command status");
@@ -198,8 +233,9 @@ async function main() {
     assertEqual(deviceMacroRun.command.status, "dispatched", "device macro command status");
     assertEqual(camera.command.status, "dispatched", "camera command status");
     assertEqual(audio.command.status, "dispatched", "audio command status");
-    assertEqual(transcribedAudio.media.processing.transcriptionStatus, "ready", "transcription status");
-    assertEqual(transcribedAudio.media.processing.transcriptSource, "mock", "transcription source");
+    assertEqual(queuedTranscription.media.processing.transcriptionStatus, "processing", "queued transcription status");
+    assertEqual(transcribedAudio.processing.transcriptionStatus, "ready", "transcription status");
+    assertEqual(transcribedAudio.processing.transcriptSource, "mock", "transcription source");
     assertEqual(dangerousShell.command.status, "approval_required", "dangerous shell command status");
     assertEqual(approvalQueue.commands.length, 1, "device approval queue count");
     assertEqual(approvedShell.command.status, "dispatched", "approved shell command status");
@@ -210,8 +246,18 @@ async function main() {
     assertEqual(environmentHealth.environment.status, "reachable", "environment health status");
     assertEqual(updatedEnvironment.label, "Convex updated disposable T3", "updated environment label");
     assertEqual(deletedEnvironment.environment.id, updatedEnvironment.id, "deleted environment id");
+    assertEqual(environmentList.environments.some((item) => item.id === environment.id), true, "primary environment retained");
+    assertEqual(
+      environmentList.environments.some((item) => item.id === updatedEnvironment.id && Boolean(item.archivedAt)),
+      true,
+      "archived environment list",
+    );
+    assertEqual(Array.isArray(connectorList.connectors), true, "connector list");
+    assertEqual(Array.isArray(notifications.notifications), true, "notification list");
+    assertEqual(typeof backgroundLiveness.scheduledWorker, "object", "background liveness");
+    assertEqual(rolloutRun.skipped, false, "release rollout runner");
     assertEqual(privacy.privacy.mediaRetentionDays, 7, "privacy media retention");
-    assertEqual(fetchedMediaText, "convex-smoke-image", "downloaded media body");
+    assertEqual(fetchedMediaBase64, PNG_BASE64, "downloaded media body");
     if (!media.expiresAt) throw new Error("uploaded media did not include expiresAt");
     assertEqual(deletedMedia.media.id, disposableMedia.media.id, "deleted media id");
     assertEqual(diagnostics.counts.devices, 1, "diagnostic device count");
@@ -219,9 +265,11 @@ async function main() {
     assertEqual(diagnostics.observability.devices.online, observability.summary.devices.online, "diagnostic observability device count");
     assertEqual(profileUpdate.device.profile, "read-only", "updated device profile");
     assertEqual(transferReset.device.claimed, false, "transfer reset claimed state");
-    if (!transferReset.claimCode) throw new Error("transfer reset did not return a claimCode");
+    assertEqual(transferReset.secret, undefined, "transfer reset secret is not exposed to the owner");
+    assertEqual(transferReset.claimCode, undefined, "transfer reset claim code is not exposed to the former owner");
+    assertEqual(transferAck.promoted, true, "transfer credential promoted");
+    assertEqual(transferAck.resetForTransfer, true, "transfer credential reset purpose");
     if (!setupCode.setup.claimCode) throw new Error("setup code rotation did not return a claimCode");
-    if (!transferReset.secret) throw new Error("transfer reset did not return a secret");
     if (JSON.stringify(diagnostics).includes("rm -rf build")) {
       throw new Error("diagnostics bundle leaked raw shell command");
     }
@@ -257,7 +305,7 @@ async function main() {
         deviceMacro: deviceMacroRun.command.status,
         camera: camera.command.status,
         audio: audio.command.status,
-        transcription: transcribedAudio.media.processing.transcriptionStatus,
+        transcription: transcribedAudio.processing.transcriptionStatus,
         dangerousShell: dangerousShell.command.status,
         approvedShell: approvedShell.command.status,
       },
@@ -266,8 +314,8 @@ async function main() {
         deviceId: transferReset.device.id,
         profile: profileUpdate.device.profile,
         claimed: transferReset.device.claimed,
-        claimCode: transferReset.claimCode,
-        setupCode: setupCode.setup.claimCode,
+        ownerClaimCodeExposed: Boolean(transferReset.claimCode),
+        setupCodeReady: Boolean(setupCode.setup.claimCode),
       },
       counts: {
         devices: devices.devices.length,

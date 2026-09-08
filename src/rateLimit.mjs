@@ -97,6 +97,7 @@ export function loadRateLimitConfig(env = process.env) {
     deviceHeartbeat: intEnv(env, "DEVICE_HEARTBEAT_RATE_LIMIT", 120),
     deviceRead: intEnv(env, "DEVICE_READ_RATE_LIMIT", 120),
     deviceWrite: intEnv(env, "DEVICE_WRITE_RATE_LIMIT", 30),
+    connectorWrite: intEnv(env, "CONNECTOR_WRITE_RATE_LIMIT", 60),
     connectRedeem: intEnv(env, "CONNECT_REDEEM_RATE_LIMIT", 20),
     redisUrl: env.RATE_LIMIT_REDIS_URL ?? null,
   };

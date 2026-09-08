@@ -5,6 +5,7 @@
 #include <WiFi.h>
 #include <WiFiClientSecure.h>
 
+#include "GatewayTls.h"
 #include "OperateModel.h"
 
 namespace {
@@ -60,14 +61,7 @@ int GatewayBrowse::request(const char* method, const char* path, const String& b
   http.setTimeout(kTimeoutMs);
   http.setConnectTimeout(kTimeoutMs);
 
-  bool began = false;
-  if (url.startsWith("https://")) {
-    secure.setInsecure();   // pin the gateway certificate before production
-    began = http.begin(secure, url);
-  } else {
-    began = http.begin(plain, url);
-  }
-  if (!began) return -1;
+  if (!gateway_tls::beginHttp(http, plain, secure, url, "browse")) return -1;
 
   http.addHeader("content-type", "application/json");
   http.addHeader("x-device-id", store_->deviceId());
@@ -104,6 +98,33 @@ bool GatewayBrowse::consumeContextCleared() {
   return value;
 }
 
+String browseEnvironmentAction(const BrowseEnvironment& row) {
+  if (row.action.length() > 0) return row.action;
+  if (row.tokenExpired) return "RE-PAIR T3";
+  if (row.transport == "connector") {
+    if (row.connectorStatus == "revoked") return "RE-PAIR CONNECTOR";
+    if (row.connectorStatus == "incompatible") return "UPDATE CONNECTOR";
+    if (row.connectorStatus == "sleeping") return "WAKE COMPUTER";
+    if (row.connectorStatus == "unknown" || row.connectorStatus == "enrolled"
+        || row.connectorStatus == "waiting" || row.connectorStatus == "offline") {
+      return "START CONNECTOR";
+    }
+    if (row.connectorStatus == "reconnecting") return "CHECK CONNECTION";
+  }
+  if (row.t3Status == "auth_failed") return "FIX T3 AUTH";
+  if (row.t3Status == "stopped") return "START T3 CODE";
+  if (row.t3Status == "incompatible") return "UPDATE T3 CODE";
+  if (row.t3Status == "starting") return "T3 STARTING";
+  if (row.t3Status == "error") return "CHECK T3 CODE";
+  if (row.providerStatus == "auth_required") return "AUTH PROVIDER";
+  if (row.providerStatus == "model_unavailable") return "ADD PROVIDER MODEL";
+  if (row.providerStatus == "error") return "CHECK PROVIDER";
+  if (row.freshness == "stale") return "CHECK CONNECTION";
+  if (row.t3Status == "ready" && row.providerStatus == "ready") return "READY";
+  if (row.status.length() > 0 && row.status != "UNKNOWN") return row.status;
+  return "CHECK STATUS";
+}
+
 // ---------------------------------------------------------------------------------------------
 // Environments
 // ---------------------------------------------------------------------------------------------
@@ -132,6 +153,7 @@ bool GatewayBrowse::refreshEnvironments() {
   // The gateway names what is bound; the per-row flag duplicates it for simple renderers, and this
   // one trusts either. A device never invents a binding it was not told about.
   boundEnvironmentId_ = String(doc["environmentId"] | "");
+  environmentsTruncated_ = doc["environmentsTruncated"] | false;
   JsonArray rows = doc["environments"].as<JsonArray>();
   for (JsonObject input : rows) {
     // Bounds-checked against environments_, which is the array being written. The cap and the loop
@@ -150,6 +172,16 @@ bool GatewayBrowse::refreshEnvironments() {
     row.status.toUpperCase();
     row.tokenExpired = input["tokenExpired"] | false;
     row.selected = (input["selected"] | false) || id == boundEnvironmentId_;
+    JsonObject health = input["health"].as<JsonObject>();
+    row.transport = String(health["transport"] | "direct");
+    row.freshness = String(health["freshness"] | "unknown");
+    row.connectorStatus = String(health["connector"] | "not_applicable");
+    row.t3Status = String(health["t3"] | "unknown");
+    row.providerStatus = String(health["provider"] | "unknown");
+    row.observedAt = String(health["observedAt"] | "");
+    row.action = String(health["action"] | "");
+    if (row.action.length() > 24) row.action = "CHECK STATUS";
+    row.action.toUpperCase();
     if (row.selected) selectedEnvironmentIndex_ = (int)environmentCount_;
     environmentCount_ += 1;
   }

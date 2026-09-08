@@ -1,0 +1,29 @@
+{
+  "name": "@agent-controller/cloud-runtime",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Cloudflare Worker and Durable Object runtime for Agent Controller.",
+  "scripts": {
+    "build:console": "npm --prefix .. run build:app",
+    "check": "npm run typecheck && npm test",
+    "dev": "npm run build:console && wrangler dev",
+    "test": "npm run build:console && npm run test:contract && npm run test:workers && npm run test:resilience",
+    "test:contract": "vitest run --config vitest.node.config.ts",
+    "test:capacity": "vitest run --config vitest.capacity.config.ts",
+    "test:resilience": "vitest run --config vitest.resilience.config.ts",
+    "test:workers": "vitest run",
+    "typecheck": "wrangler types --env-interface CloudflareBindings && tsc --noEmit",
+    "deploy:staging": "npm run build:console && wrangler deploy --env staging",
+    "deploy:production": "npm run build:console && wrangler deploy --env production"
+  },
+  "devDependencies": {
+    "@cloudflare/vitest-pool-workers": "0.22.0",
+    "typescript": "^6.0.0",
+    "vitest": "4.1.10",
+    "wrangler": "4.127.0"
+  },
+  "engines": {
+    "node": ">=22"
+  }
+}

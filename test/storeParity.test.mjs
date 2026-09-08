@@ -125,14 +125,14 @@ function extractConvexHandler(source, name) {
   return matchBraces(source, source.indexOf("{", start));
 }
 
-test("deleteEnvironment repairs the same dependencies in both store implementations", async () => {
+test("environment archive and delete repair the same dependencies in both store implementations", async () => {
   const [memory, convex] = await Promise.all([
     readFile(join(ROOT, "src", "store.mjs"), "utf8"),
     readFile(join(ROOT, "convex", "gatewayStore.ts"), "utf8"),
   ]);
 
-  const memoryBody = extractFunctionWithParams(memory, "deleteEnvironment");
-  const convexBody = extractConvexHandler(convex, "deleteEnvironment");
+  const memoryBody = extractFunctionWithParams(memory, "disconnectEnvironmentReferences");
+  const convexBody = extractFunctionWithParams(convex, "disconnectEnvironmentReferences");
 
   // The summary keys are the contract: an owner who removes an environment is told exactly what
   // was cleared, and a backend that repairs one fewer thing leaves an orphan behind.
@@ -141,14 +141,27 @@ test("deleteEnvironment repairs the same dependencies in both store implementati
   assert.deepEqual(
     summaryKeys(convexBody),
     summaryKeys(memoryBody),
-    "deleteEnvironment() reports a different removal summary from src/store.mjs and "
+    "disconnectEnvironmentReferences() reports a different removal summary from src/store.mjs and "
       + "convex/gatewayStore.ts. Both backends must repair — and report — the same dependencies.",
   );
 
   for (const [label, body] of [["memory", memoryBody], ["convex", convexBody]]) {
-    assert.match(body, /ENVIRONMENT_REMOVED_REASON/u, `${label} deleteEnvironment() no longer disables orphans.`);
-    assert.match(body, /targetMode\s*[:=]\s*"device-current"/u, `${label} deleteEnvironment() leaves a fixed action without a target.`);
-    assert.match(body, /firstThreadId: null/u, `${label} deleteEnvironment() no longer clears the onboarding selection.`);
+    assert.match(body, /ENVIRONMENT_REMOVED_REASON/u, `${label} disconnect no longer disables orphans.`);
+    assert.match(body, /targetMode\s*[:=]\s*"device-current"/u, `${label} disconnect leaves a fixed action without a target.`);
+    assert.match(body, /firstThreadId: null/u, `${label} disconnect no longer clears the onboarding selection.`);
+  }
+
+  for (const [label, source] of [["memory", memory], ["convex", convex]]) {
+    const archiveBody = label === "convex"
+      ? extractConvexHandler(source, "archiveEnvironment")
+      : extractFunctionWithParams(source, "archiveEnvironment");
+    assert.match(archiveBody, /disconnectEnvironmentReferences/u,
+      `${label} archiveEnvironment() bypasses dependency repair.`);
+    const deleteBody = label === "convex"
+      ? extractConvexHandler(source, "deleteEnvironment")
+      : extractFunctionWithParams(source, "deleteEnvironment");
+    assert.match(deleteBody, /disconnectEnvironmentReferences/u,
+      `${label} deleteEnvironment() bypasses dependency repair.`);
   }
 });
 

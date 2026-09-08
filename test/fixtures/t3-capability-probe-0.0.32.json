@@ -1,0 +1,31 @@
+{
+  "source": "T3 Code 0.0.32 read-only environment/snapshot/server.getConfig responses",
+  "metadata": {
+    "serverVersion": "0.0.32"
+  },
+  "snapshot": {
+    "snapshotSequence": 38,
+    "projects": [],
+    "threads": []
+  },
+  "serverConfig": {
+    "providers": [],
+    "shellResumeCompletionMarker": true,
+    "threadResumeCompletionMarker": true,
+    "threadSnapshotPagination": true
+  },
+  "connectorProbe": {
+    "schema": "agent-controller.t3-probe.v1",
+    "installedVersion": "0.0.32",
+    "probes": {
+      "metadata": "passed",
+      "snapshot": "passed",
+      "serverConfig": "passed",
+      "threadDetail": "not_exercised"
+    },
+    "serverCapabilities": {
+      "threadResumeCompletionMarker": true,
+      "threadSnapshotPagination": true
+    }
+  }
+}

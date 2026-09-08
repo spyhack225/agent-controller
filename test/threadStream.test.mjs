@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { readFile } from "node:fs/promises";
 import test from "node:test";
 
 import { createApp } from "../src/app.mjs";
@@ -8,6 +9,10 @@ import { createThreadStreamHub } from "../src/threadStream.mjs";
 import { openT3ThreadStream } from "../src/t3Ws.mjs";
 
 const ENVIRONMENT = { baseUrl: "http://127.0.0.1:3773", accessToken: "test-access-token" };
+const workFixture = JSON.parse(await readFile(
+  new URL("./fixtures/t3-work-activities-contract.json", import.meta.url),
+  "utf8",
+));
 
 // ---------------------------------------------------------------------------------------------
 // A stand-in for T3's Effect-RPC WebSocket server.
@@ -341,6 +346,35 @@ test("a snapshot then events reaches subscribers in order, with the cursor advan
   assert.deepEqual(delivered.map((payload) => payload.sequence), [101, 102]);
   assert.equal(delivered[0].event.payload.activity.summary, "Read file");
   assert.equal(hub.describe()[0].sequence, 102);
+});
+
+test("preserves T3's verified task linkage fields through snapshot and SSE event delivery", async () => {
+  const { environment, t3, hub, events } = await hubFixture();
+  const [started, child] = workFixture.activities;
+  hub.watch({ userId: "user_1", environmentId: environment.id, threadId: "thread_1" });
+  await hub.runOnce();
+  await until(() => t3.sockets.length === 1, "a socket");
+
+  t3.latest().push(snapshotItem(500, { activities: [started] }));
+  t3.latest().push({ kind: "synchronized" });
+  t3.latest().push(eventItem(501, "thread.activity-appended", {
+    threadId: "thread_1",
+    activity: child,
+  }));
+
+  await until(
+    () => events.typed("t3.thread.snapshot").length === 1
+      && events.typed("t3.thread.event").length === 1,
+    "the task snapshot and event",
+  );
+  const snapshotActivity = events.typed("t3.thread.snapshot")[0].payload.thread.activities[0];
+  const eventActivity = events.typed("t3.thread.event")[0].payload.event.payload.activity;
+  assert.equal(snapshotActivity.kind, "task.started");
+  assert.deepEqual(snapshotActivity.payload, started.payload);
+  assert.equal(eventActivity.payload.taskId, "agent_child");
+  assert.equal(eventActivity.payload.parentAgentId, "agent_parent");
+  assert.equal(eventActivity.payload.agentKind, "agent");
+  assert.equal(eventActivity.payload.timelineBypass, undefined);
 });
 
 test("a drop resumes from the cursor and replays without duplicating or losing an event", async () => {

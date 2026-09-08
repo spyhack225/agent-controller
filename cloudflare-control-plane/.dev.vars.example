@@ -1,0 +1,3 @@
+# Local development intentionally uses in-memory records and ephemeral media.
+# Staging and production require Convex, Clerk, encryption, and R2 S3 credentials.
+DEPLOYMENT_ENVIRONMENT=local

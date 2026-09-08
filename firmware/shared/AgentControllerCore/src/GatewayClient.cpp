@@ -4,11 +4,14 @@
 #include <ArduinoJson.h>
 #include <HTTPClient.h>
 #include <WiFi.h>
+#include <esp_system.h>
 
 #include <freertos/FreeRTOS.h>
 #include <freertos/semphr.h>
 #include <freertos/task.h>
 #include <WiFiClientSecure.h>
+
+#include "GatewayTls.h"
 
 namespace {
 // The reference firmware's cadences. A heartbeat is cheap and proves liveness; config changes
@@ -22,6 +25,19 @@ constexpr uint32_t kSetupCodeIntervalMs = 10UL * 60UL * 1000UL;
 // tens of milliseconds; anything slower than this is a gateway that is not going to answer usefully
 // inside a frame budget anyway, and waiting longer only freezes the animation for longer.
 constexpr uint16_t kTimeoutMs = 1200;
+
+String generateDeviceCredential() {
+  uint8_t bytes[32];
+  esp_fill_random(bytes, sizeof(bytes));
+  static constexpr char kHex[] = "0123456789abcdef";
+  char encoded[(sizeof(bytes) * 2) + 1];
+  for (size_t index = 0; index < sizeof(bytes); index += 1) {
+    encoded[index * 2] = kHex[bytes[index] >> 4];
+    encoded[(index * 2) + 1] = kHex[bytes[index] & 0x0f];
+  }
+  encoded[sizeof(bytes) * 2] = '\0';
+  return String(encoded);
+}
 
 // Operate cadences. The display poll dominates the request budget (12/min against a device-read
 // limit of 120/min), which is what leaves room for the gesture-driven calls a person makes.
@@ -37,6 +53,7 @@ constexpr uint32_t kControlsIntervalMs = 30000;
 // `approval_required`, so a command parked by policy afterwards was invisible until someone opened
 // the console. On a screen that can show a queue, that is worth two requests a minute.
 constexpr uint32_t kApprovalsIntervalMs = 30000;
+constexpr uint32_t kFirmwareIntervalMs = 6UL * 60UL * 60UL * 1000UL;
 }  // namespace
 
 const char* gatewayLinkName(GatewayLink link) {
@@ -65,6 +82,12 @@ void GatewayClient::begin(DeviceStore& store, const String& hardwareModel,
 }
 
 void GatewayClient::setCapabilities(bool microphone, bool camera) {
+  setCapabilities(true, true, microphone, camera);
+}
+
+void GatewayClient::setCapabilities(bool display, bool threadPicker, bool microphone, bool camera) {
+  hasDisplay_ = display;
+  hasThreadPicker_ = threadPicker;
   hasMicrophone_ = microphone;
   hasCamera_ = camera;
 }
@@ -76,7 +99,8 @@ void GatewayClient::setLimits(const GatewayLimits& limits) {
 }
 
 int GatewayClient::request(const char* method, const char* path, const String& body,
-                           String& response) {
+                           String& response, const String* credentialOverride,
+                           bool trackAuthState) {
   if (!store_) return -1;
   String base = store_->gatewayUrl();
   if (base.length() == 0) return -1;
@@ -108,18 +132,11 @@ int GatewayClient::request(const char* method, const char* path, const String& b
   http.setTimeout(kTimeoutMs);
   http.setConnectTimeout(kTimeoutMs);
 
-  bool began = false;
-  if (url.startsWith("https://")) {
-    secure.setInsecure();   // pin the gateway certificate before production
-    began = http.begin(secure, url);
-  } else {
-    began = http.begin(plain, url);
-  }
-  if (!began) return -1;
+  if (!gateway_tls::beginHttp(http, plain, secure, url, "gateway")) return -1;
 
   http.addHeader("content-type", "application/json");
   http.addHeader("x-device-id", store_->deviceId());
-  http.addHeader("x-device-secret", store_->deviceSecret());
+  http.addHeader("x-device-secret", credentialOverride ? *credentialOverride : store_->deviceSecret());
   // HTTPClient discards every response header it was not told to keep, so without this the
   // retry-after read below always parsed an empty string and every 429 backed off for the 1 s
   // floor instead of the interval the gateway asked for.
@@ -153,8 +170,10 @@ int GatewayClient::request(const char* method, const char* path, const String& b
   // 401 means the credential itself was rejected — the owner revoked this device, or it was
   // transfer-reset. No amount of retrying fixes that, so it is recorded here, once, rather than
   // being re-derived at every call site.
-  if (code == 401) revoked_ = true;
-  else if (code >= 200 && code < 300) revoked_ = false;
+  if (trackAuthState) {
+    if (code == 401) revoked_ = true;
+    else if (code >= 200 && code < 300) revoked_ = false;
+  }
 
   // A rate-limited gateway is telling us exactly how long to wait; ignoring it turns one 429 into
   // a storm.
@@ -180,10 +199,14 @@ void GatewayClient::sendHeartbeat() {
   // Features gate which controls the gateway is willing to assign: it will not put a capture action
   // on a board that never claimed a microphone.
   JsonArray features = doc["features"].to<JsonArray>();
-  features.add("display");
-  features.add("thread_picker");
+  if (hasDisplay_) features.add("display");
+  if (hasThreadPicker_) features.add("thread_picker");
   if (hasMicrophone_) features.add("microphone");
   if (hasCamera_) features.add("camera");
+#if ENABLE_OTA_APPLY
+  features.add("ota");
+  features.add("ota_confirm");
+#endif
 
   // Limits are how the gateway knows what to wrap and truncate to. They are declared, not
   // negotiated — send the wrong numbers and the text comes back clipped.
@@ -201,10 +224,113 @@ void GatewayClient::sendHeartbeat() {
   if (code > 0 && (code < 200 || code >= 300)) {
     Serial.printf("[gateway] heartbeat %d\n", code);
   }
+  if (code >= 200 && code < 300) {
+    observeCredentialRotation(response);
+    confirmFirmwareIfPendingVerify();
+  }
   if (code <= 0) {
     link_ = GatewayLink::Unreachable;
     detail_ = "No response";
   }
+}
+
+void GatewayClient::observeCredentialRotation(const String& heartbeatPayload) {
+  JsonDocument doc;
+  if (deserializeJson(doc, heartbeatPayload)) return;
+  JsonObject rotation = doc["device"]["credentialRotation"];
+  if (rotation.isNull()) return;
+
+  const String rotationId = String(rotation["id"] | "");
+  const String state = String(rotation["state"] | "idle");
+  const String purpose = String(rotation["purpose"] | "");
+  const uint32_t version = rotation["pendingCredentialVersion"] | 0;
+  const bool mayStage = state == "pending" || (state == "expired" && purpose == "transfer");
+  if (!mayStage || rotationId.length() == 0 || version <= store_->credentialVersion()) {
+    // A local candidate for a superseded or cancelled ordinary rotation must not leak into a later
+    // rotation. A completed rotation is handled by the pending-auth replay path before heartbeat.
+    if (store_->hasPendingDeviceSecret() && state != "completed") {
+      store_->rollbackPendingDeviceSecret();
+      stagedCredentialRotationId_ = "";
+    }
+    return;
+  }
+
+  if (store_->hasPendingDeviceSecret()
+      && store_->pendingCredentialRotationId() == rotationId
+      && store_->pendingCredentialVersion() == version) return;
+
+  if (store_->hasPendingDeviceSecret()) store_->rollbackPendingDeviceSecret();
+  const String candidate = generateDeviceCredential();
+  if (!store_->stagePendingDeviceSecret(candidate, rotationId, version, purpose)) {
+    Serial.println("[gateway] could not persist a pending device credential");
+    return;
+  }
+  stagedCredentialRotationId_ = "";
+  Serial.printf("[gateway] credential rotation staged locally version=%u purpose=%s\n",
+                static_cast<unsigned>(version), purpose.c_str());
+}
+
+bool GatewayClient::processPendingDeviceCredential() {
+  if (!store_->hasPendingDeviceSecret()) return false;
+  const String rotationId = store_->pendingCredentialRotationId();
+  const uint32_t version = store_->pendingCredentialVersion();
+  const String pendingSecret = store_->pendingDeviceSecret();
+
+  JsonDocument doc;
+  doc["rotationId"] = rotationId;
+  doc["credentialVersion"] = version;
+
+  if (stagedCredentialRotationId_ != rotationId) {
+    doc["secret"] = pendingSecret;
+    String body;
+    serializeJson(doc, body);
+    String response;
+    const int code = request("POST", "/v1/device/credentials/stage", body, response,
+                             nullptr, /*trackAuthState=*/false);
+    if (code >= 200 && code < 300) {
+      stagedCredentialRotationId_ = rotationId;
+    } else if (code == 401) {
+      // The gateway may already have promoted the candidate and lost only its success response.
+      // The pending-auth ACK is idempotent and distinguishes that case on the next pass.
+      stagedCredentialRotationId_ = rotationId;
+    } else if (code == 409 || code == 410) {
+      store_->rollbackPendingDeviceSecret();
+      stagedCredentialRotationId_ = "";
+      nextHeartbeatAt_ = millis();
+    }
+    return true;
+  }
+
+  String body;
+  serializeJson(doc, body);
+  String response;
+  const int code = request("POST", "/v1/device/credentials/ack", body, response,
+                           &pendingSecret, /*trackAuthState=*/false);
+  if (code >= 200 && code < 300) {
+    const bool resetForTransfer = store_->pendingCredentialPurpose() == "transfer";
+    if (!store_->promotePendingDeviceSecret(rotationId, version)) {
+      Serial.println("[gateway] credential ACK received but local promotion failed; retrying");
+      return true;
+    }
+    stagedCredentialRotationId_ = "";
+    revoked_ = false;
+    Serial.printf("[gateway] credential rotation acknowledged version=%u\n",
+                  static_cast<unsigned>(version));
+    if (resetForTransfer) {
+      claimCode_ = "";
+      store_->resetForProvisioning();
+      link_ = GatewayLink::Unclaimed;
+      detail_ = "Ready to claim";
+      nextSetupCodeAt_ = 0;
+    }
+  } else if (code == 401 || code == 409 || code == 410) {
+    // 401 here is safe to roll back: an already-promoted candidate is accepted by the ACK replay
+    // branch, while a rejected candidate leaves the still-active old secret as the recovery path.
+    store_->rollbackPendingDeviceSecret();
+    stagedCredentialRotationId_ = "";
+    nextHeartbeatAt_ = millis();
+  }
+  return true;
 }
 
 // Claim state is discovered HERE, not from the heartbeat.
@@ -379,6 +505,10 @@ void gatewayNetworkTask(void* arg) {
   }
 }
 
+void gatewayEventTask(void* arg) {
+  static_cast<GatewayClient*>(arg)->eventTaskLoop();
+}
+
 }  // namespace
 
 void GatewayClient::networkTick() {
@@ -398,8 +528,196 @@ void GatewayClient::startNetworkTask() {
     return;
   }
   // Core 0. The Arduino loop, and therefore the renderer, runs on core 1.
-  xTaskCreatePinnedToCore(gatewayNetworkTask, "gwnet", 8192, this, 1, nullptr, 0);
-  Serial.println("[gateway] network task started; the render loop no longer waits on HTTP");
+  // OTA adds a 4 KB streaming buffer on top of HTTP/TLS and ArduinoJson frames. The former 8 KB
+  // stack hit its canary on real hardware as soon as a mandatory manifest began downloading.
+  xTaskCreatePinnedToCore(gatewayNetworkTask, "gwnet", 16384, this, 1, nullptr, 0);
+  xTaskCreatePinnedToCore(gatewayEventTask, "gwevents", 6144, this, 1, nullptr, 0);
+  Serial.println("[gateway] network and event tasks started; the render loop never waits on HTTP");
+}
+
+void GatewayClient::eventTaskLoop() {
+  for (;;) {
+    if (!store_ || WiFi.status() != WL_CONNECTED || link_ != GatewayLink::Claimed
+        || networkPaused_) {
+      vTaskDelay(pdMS_TO_TICKS(500));
+      continue;
+    }
+
+    String base = store_->gatewayUrl();
+    if (base.length() == 0) {
+      vTaskDelay(pdMS_TO_TICKS(2000));
+      continue;
+    }
+
+    WiFiClientSecure secure;
+    WiFiClient plain;
+    HTTPClient http;
+    http.useHTTP10(true);  // close-delimited body: no chunk frames mixed into the SSE lines
+    http.setConnectTimeout(kTimeoutMs);
+    http.setTimeout(kTimeoutMs);
+    const String url = base + "/v1/device/events";
+    if (!gateway_tls::beginHttp(http, plain, secure, url, "events")) {
+      vTaskDelay(pdMS_TO_TICKS(2000));
+      continue;
+    }
+    http.addHeader("x-device-id", store_->deviceId());
+    http.addHeader("x-device-secret", store_->deviceSecret());
+
+    const int code = http.GET();
+    if (code != 200) {
+      Serial.printf("[gateway] device event stream failed code=%d\n", code);
+      http.end();
+      vTaskDelay(pdMS_TO_TICKS(code == 429 ? 5000 : 2000));
+      continue;
+    }
+
+    WiFiClient* stream = http.getStreamPtr();
+    String line;
+    String event;
+    String data;
+    line.reserve(160);
+    data.reserve(384);
+    while (WiFi.status() == WL_CONNECTED && !networkPaused_
+           && (stream->connected() || stream->available())) {
+      if (!stream->available()) {
+        vTaskDelay(pdMS_TO_TICKS(20));
+        continue;
+      }
+      const char c = static_cast<char>(stream->read());
+      if (c != '\n') {
+        if (c != '\r' && line.length() < 768) line += c;
+        continue;
+      }
+      if (line.startsWith("event:")) {
+        event = line.substring(6);
+        event.trim();
+      } else if (line.startsWith("data:")) {
+        if (data.length() > 0) data += '\n';
+        String part = line.substring(5);
+        part.trim();
+        data += part;
+      } else if (line.length() == 0) {
+        if (data.length() > 0) {
+          if (event == "threads.changed") applyThreadChangedEvent(data);
+          else applyRefreshEvent(event, data);
+        }
+        event = "";
+        data = "";
+      }
+      line = "";
+    }
+    http.end();
+    vTaskDelay(pdMS_TO_TICKS(2000));
+  }
+}
+
+void GatewayClient::applyRefreshEvent(const String& event, const String& payload) {
+  JsonDocument doc;
+  if (deserializeJson(doc, payload)) return;
+  const String targetDevice = String(doc["deviceId"] | "");
+  if (targetDevice.length() > 0 && (!store_ || targetDevice != store_->deviceId())) return;
+
+  lockState();
+  const uint32_t due = millis() + 250;  // coalesce a route's store write + typed event burst
+  if (event == "device.refresh") {
+    for (JsonVariant value : doc["resources"].as<JsonArray>()) {
+      const char* raw = value | "";
+      const String resource = String(raw);
+      if (resource == "config") nextConfigAt_ = due;
+      else if (resource == "threads") nextThreadsAt_ = due;
+      else if (resource == "controls") nextControlsAt_ = due;
+      else if (resource == "approvals") nextApprovalsAt_ = due;
+      else if (resource == "display") nextDisplayAt_ = due;
+    }
+  } else if (event == "firmware.changed") {
+    const String model = String(doc["hardwareModel"] | "");
+    if (model.length() == 0 || model == hardwareModel_) nextFirmwareAt_ = due;
+  } else if (event == "t3.approval.decided" || event == "t3.user-input.answered") {
+    nextApprovalsAt_ = due;
+    nextDisplayAt_ = due;
+  } else if (event == "command.reconciled" || event == "t3.snapshot"
+             || event == "t3.thread.snapshot" || event == "t3.thread.event"
+             || event == "t3.thread.status" || event == "media.job") {
+    nextDisplayAt_ = due;
+  }
+  unlockState();
+}
+
+void GatewayClient::applyThreadChangedEvent(const String& payload) {
+  JsonDocument doc;
+  if (deserializeJson(doc, payload)) return;
+  const String environmentId = String(doc["environmentId"] | "");
+  const String threadId = String(doc["threadId"] | "");
+  const String action = String(doc["action"] | "");
+  const String title = String(doc["title"] | "");
+  if (environmentId.length() == 0 || threadId.length() == 0) return;
+  if (action != "created" && action != "renamed" && action != "archived" && action != "deleted") return;
+  if (action == "renamed" && title.length() == 0) return;
+
+  lockState();
+  if (context_.environmentId != environmentId) {
+    unlockState();
+    return;
+  }
+
+  if (action != "created") {
+    size_t pendingIndex = pendingThreadMutationCount_;
+    for (size_t i = 0; i < pendingThreadMutationCount_; i += 1) {
+      if (pendingThreadMutations_[i].threadId == threadId) {
+        pendingIndex = i;
+        break;
+      }
+    }
+    if (pendingIndex >= kMaxPendingThreadMutations) pendingIndex = 0;
+    if (pendingIndex == pendingThreadMutationCount_
+        && pendingThreadMutationCount_ < kMaxPendingThreadMutations) {
+      pendingThreadMutationCount_ += 1;
+    }
+    PendingDeviceThreadMutation& pending = pendingThreadMutations_[pendingIndex];
+    pending.threadId = threadId;
+    pending.title = title;
+    pending.remove = action == "archived" || action == "deleted";
+    pending.expiresAt = millis() + 2UL * 60UL * 1000UL;
+  }
+
+  bool changed = false;
+  if (action == "renamed" && title.length() > 0) {
+    for (size_t i = 0; i < threadCount_; i += 1) {
+      if (threads_[i].id != threadId || threads_[i].title == title) continue;
+      threads_[i].title = title;
+      changed = true;
+    }
+  } else if (action == "archived" || action == "deleted") {
+    size_t write = 0;
+    for (size_t read = 0; read < threadCount_; read += 1) {
+      if (threads_[read].id == threadId) {
+        changed = true;
+        continue;
+      }
+      if (write != read) threads_[write] = threads_[read];
+      write += 1;
+    }
+    threadCount_ = write;
+    if (context_.threadId == threadId) {
+      context_.threadId = "";
+      closeResponse();
+      nextConfigAt_ = millis();
+      nextControlsAt_ = millis();
+      changed = true;
+    }
+    selectedThreadIndex_ = -1;
+    for (size_t i = 0; i < threadCount_; i += 1) {
+      threads_[i].selected = threads_[i].id == context_.threadId;
+      if (threads_[i].selected) selectedThreadIndex_ = static_cast<int>(i);
+    }
+  }
+
+  // T3 accepts commands before its snapshot projection necessarily catches up. The event supplies
+  // the immediate delta; the pending entry keeps later snapshot polls from resurrecting stale data
+  // until T3's read projection agrees.
+  nextThreadsAt_ = millis() + 1500;
+  if (changed) touch();
+  unlockState();
 }
 
 
@@ -419,10 +737,15 @@ void GatewayClient::runCycle(bool justConnected) {
   const uint32_t now = millis();
   if (backoffUntil_ != 0 && (int32_t)(now - backoffUntil_) < 0) return;
 
+  // Credential recovery precedes ordinary traffic. It performs at most one HTTP request per pass,
+  // and the active slot is not replaced until the gateway has authenticated the candidate.
+  if (processPendingDeviceCredential()) return;
+
   if (justConnected) {
     if (link_ == GatewayLink::Idle) link_ = GatewayLink::Connecting;
     nextHeartbeatAt_ = now + kHeartbeatIntervalMs;
     nextConfigAt_ = now + kConfigIntervalMs;
+    nextFirmwareAt_ = now + 1500;
     sendHeartbeat();
     fetchConfig();
     // Deliberately not fetched here. The reference firmware ran the whole sequence in one burst on
@@ -458,27 +781,33 @@ void GatewayClient::runCycle(bool justConnected) {
   // owned resource — so an unclaimed unit sits on heartbeat plus config and nothing else.
   if (link_ != GatewayLink::Claimed) return;
 
+  if ((int32_t)(now - nextFirmwareAt_) >= 0) {
+    nextFirmwareAt_ = now + kFirmwareIntervalMs;
+    pollFirmwareManifest();
+    return;
+  }
+
   // Ahead of controls and approvals: a device that cannot name its destination cannot be used at
   // all, while a stale action row or approval badge is merely out of date.
-  if ((int32_t)(now - nextThreadsAt_) >= 0) {
+  if (hasThreadPicker_ && (int32_t)(now - nextThreadsAt_) >= 0) {
     nextThreadsAt_ = now + kThreadsIntervalMs;
     refreshThreads();
     return;
   }
 
-  if ((int32_t)(now - nextControlsAt_) >= 0) {
+  if (hasDisplay_ && (int32_t)(now - nextControlsAt_) >= 0) {
     nextControlsAt_ = now + kControlsIntervalMs;
     fetchControls();
     return;
   }
 
-  if ((int32_t)(now - nextApprovalsAt_) >= 0) {
+  if (hasDisplay_ && (int32_t)(now - nextApprovalsAt_) >= 0) {
     nextApprovalsAt_ = now + kApprovalsIntervalMs;
     refreshApprovals();
     return;
   }
 
-  if ((int32_t)(now - nextDisplayAt_) >= 0) {
+  if (hasDisplay_ && (int32_t)(now - nextDisplayAt_) >= 0) {
     nextDisplayAt_ = now + kDisplayIntervalMs;
     // An open, unfinished response takes the display slot rather than adding a request to it. This
     // is the whole turn-completion poll: `waiting` or `streaming` means the assistant has not

@@ -30,7 +30,7 @@ const baseReadiness: OnboardingReadiness = {
     environmentReachable: false,
     workspaceSelected: false,
     providerConfigured: false,
-    firstRunDispatched: false,
+    firstRunCompleted: false,
     deviceReady: false,
   },
   ready: false,
@@ -49,6 +49,8 @@ function controller(overrides: Record<string, unknown> = {}) {
     onboarding: baseOnboarding,
     onboardingReadiness: baseReadiness,
     environments: [],
+    connectors: [],
+    connection: "connected",
     projects: [],
     devices: [],
     deviceProfiles: [{ id: "agent-controller", label: "Agent Controller" }],
@@ -86,41 +88,55 @@ test("keeps host validation errors inline and does not discard the current step"
   expect(screen.getByRole("heading", { name: "T3 host" })).toBeVisible();
 });
 
-test("shows the missing machine tunnel steps when Tailscale Serve is selected", async () => {
-  const c = controller({
-    remoteAccess: {
-      checkedAt: "2026-08-08T17:00:00.000Z",
-      gateway: {
-        host: "0.0.0.0",
-        port: 3996,
-        loopbackUrl: "http://127.0.0.1:3996",
-        lanUrls: [],
-        publicBaseUrl: null,
-      },
-      tailscale: {
-        installed: false,
-        connected: false,
-        backendState: "Not installed",
-        dnsName: null,
-        ips: [],
-        httpsUrl: null,
-        serve: { active: false, statusAvailable: false },
-        funnel: { active: false, statusAvailable: false },
-        mode: null,
-        publicBaseUrlConfigured: false,
-        ready: false,
-        error: null,
-        nextStep: "install",
-      },
-    },
-  });
+test("uses computer-first connector choices without asking for a network tunnel", async () => {
+  const c = controller();
   render(<OnboardingPage controller={c} onNavigate={vi.fn()} />);
 
-  fireEvent.click(await screen.findByRole("button", { name: /Tailscale Serve/i }));
+  expect(await screen.findByRole("button", { name: /Connect this computer/i })).toBeVisible();
+  expect(screen.getByRole("button", { name: /Connect another computer/i })).toBeVisible();
+  expect(screen.getByText(/do not need an inbound port, Tailnet, tunnel, or public T3 URL/i)).toBeVisible();
+  expect(screen.queryByLabelText(/Public T3 URL/i)).toBeNull();
+});
 
-  expect(screen.getByText("Tailscale installed")).toBeVisible();
-  expect(screen.getByText(/Install Tailscale on the machine running Agent Controller/i)).toBeVisible();
-  expect(screen.getByText(/If T3 runs elsewhere/i)).toBeVisible();
+test("does not send cloud users back to a nonexistent Agent Controller host for tunnel setup", async () => {
+  const onboarding: OnboardingState = {
+    ...baseOnboarding,
+    currentStep: "ready",
+    environmentId: "env_1",
+    firstThreadId: "thread_1",
+    workspace: { path: "/work/app", title: "App", projectId: "project_1" },
+    provider: { harness: "codex", instanceId: "codex", model: "gpt-5" },
+    device: { mode: "browser_only", deviceId: null, credentialConfirmed: false },
+  };
+  const readiness: OnboardingReadiness = {
+    checks: {
+      account: true,
+      hostPlan: true,
+      environmentPaired: true,
+      environmentReachable: true,
+      workspaceSelected: true,
+      providerConfigured: true,
+      firstRunCompleted: true,
+      deviceReady: true,
+    },
+    ready: true,
+    environment: { id: "env_1", label: "Studio Mac", baseUrl: null },
+    device: null,
+  };
+  const c = controller({
+    onboarding,
+    onboardingReadiness: readiness,
+    authConfig: { deploymentMode: "cloud", clerk: { enabled: true } },
+  });
+
+  render(<OnboardingPage controller={c} onNavigate={vi.fn()} />);
+
+  expect(await screen.findByText("Everything is connected")).toBeVisible();
+  expect(screen.getByText("A matching agent reply completed the first command in the selected workspace with the selected model.")).toBeVisible();
+  expect(screen.queryByText(/first agent command was accepted by T3/u)).toBeNull();
+  expect(screen.queryByText("Optional remote console")).toBeNull();
+  expect(screen.queryByText("Finish tunnel setup on this machine")).toBeNull();
+  expect(screen.queryByText("Run on the Agent Controller host")).toBeNull();
 });
 
 test("recovers a pending one-time device registration without silently duplicating it", async () => {
@@ -152,7 +168,7 @@ test("recovers a pending one-time device registration without silently duplicati
       environmentReachable: true,
       workspaceSelected: true,
       providerConfigured: true,
-      firstRunDispatched: true,
+      firstRunCompleted: true,
       deviceReady: false,
     },
   };

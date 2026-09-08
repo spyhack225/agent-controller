@@ -8,6 +8,7 @@ export async function createConfiguredStore(config) {
   if (config.dataFile) {
     return await createFileStore(config.dataFile, {
       t3TokenEncryptionKey: config.t3TokenEncryptionKey,
+      pushEncryptionKey: config.webPushEncryptionKey,
     });
   }
   return undefined;

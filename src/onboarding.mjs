@@ -172,7 +172,10 @@ export function buildOnboardingReadiness({
     && command.normalized?.createThread?.projectId === setup.workspace.projectId
     && command.normalized?.startTurn?.modelSelection?.instanceId === setup.provider.instanceId
     && command.normalized?.startTurn?.modelSelection?.model === setup.provider.model
-    && !["failed", "rejected"].includes(command.status)) ?? null;
+    // Dispatch acknowledgement only proves T3 accepted the request. The command arbiter moves the
+    // row to completed only after a newer assistant reply is observed, which is the first honest
+    // end-to-end proof that the provider actually ran.
+    && command.status === "completed") ?? null;
   // `latestActivityAt` rather than `presence.online`, deliberately: activation means "this hardware
   // has proven it reaches the gateway", not "it is powered on at the instant you loaded the page".
   // A controller unplugged since setup must not un-complete someone's onboarding.
@@ -183,6 +186,7 @@ export function buildOnboardingReadiness({
     && device.config?.threadId === setup.firstThreadId
     && device.presence?.latestActivityAt,
   );
+  const firstRunCompleted = Boolean(setup.firstThreadId && firstRunCommand);
   const checks = {
     account: true,
     hostPlan: Boolean(
@@ -199,7 +203,10 @@ export function buildOnboardingReadiness({
     ),
     workspaceSelected: Boolean(setup.workspace.projectId),
     providerConfigured: Boolean(setup.provider.instanceId && setup.provider.model),
-    firstRunDispatched: Boolean(setup.firstThreadId && firstRunCommand),
+    firstRunCompleted,
+    // Compatibility alias for pre-cloud console builds. Its semantics are deliberately stricter
+    // now: accepted/dispatched is false until the command arbiter observes the agent reply.
+    firstRunDispatched: firstRunCompleted,
     deviceReady: setup.device.mode === "browser_only"
       || Boolean(
         configuredDevice
@@ -208,7 +215,9 @@ export function buildOnboardingReadiness({
   };
   return {
     checks,
-    ready: Object.values(checks).every(Boolean),
+    ready: Object.entries(checks)
+      .filter(([key]) => key !== "firstRunDispatched")
+      .every(([, value]) => Boolean(value)),
     environment,
     device,
     firstRunCommand,

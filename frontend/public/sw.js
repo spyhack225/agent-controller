@@ -8,7 +8,9 @@
  *   3. `/legacy/*` is left to the network so the pre-React dashboard is never shadowed.
  *   4. Navigations are network-first with the cached app shell as the offline fallback.
  *   5. Build assets under `/assets/` are content-hashed, so cache-first is safe.
- *   6. Remaining static files (manifest, icons) are stale-while-revalidate.
+ *   6. Only the explicit public-static allowlist (manifest and icons) is
+ *      stale-while-revalidate. Unknown same-origin GETs stay on the network so a future
+ *      authenticated route cannot silently become persistent browser-cache content.
  *
  * Registered only from production builds — see frontend/src/pwa.ts.
  */
@@ -33,6 +35,10 @@ function isLegacyPath(pathname) {
   return pathname === "/legacy" || pathname.startsWith("/legacy/");
 }
 
+function isPublicStaticPath(pathname) {
+  return pathname === "/manifest.webmanifest" || pathname.startsWith("/icons/");
+}
+
 /** Returns the caching strategy for a request: bypass | navigate | asset | passive. */
 function routeFor(request) {
   if (request.method !== "GET") return "bypass";
@@ -47,7 +53,8 @@ function routeFor(request) {
   if (isLegacyPath(url.pathname)) return "bypass";
   if (request.mode === "navigate") return "navigate";
   if (url.pathname.startsWith("/assets/")) return "asset";
-  return "passive";
+  if (isPublicStaticPath(url.pathname)) return "passive";
+  return "bypass";
 }
 
 async function networkFirstShell(request) {
@@ -122,8 +129,25 @@ self.addEventListener("message", (event) => {
   if (event.data === "skip-waiting") void self.skipWaiting();
 });
 
-// Approval notifications are raised from the page via registration.showNotification();
-// clicking one should surface the existing tab rather than opening a second console.
+self.addEventListener("push", (event) => {
+  let payload = {};
+  try { payload = event.data?.json() ?? {}; } catch { payload = {}; }
+  const title = typeof payload.title === "string" && payload.title.length <= 80
+    ? payload.title
+    : "Agent Controller update";
+  const body = typeof payload.body === "string" && payload.body.length <= 160
+    ? payload.body
+    : "Open Agent Controller to review this update.";
+  const candidateUrl = typeof payload.url === "string" ? payload.url : "/#activity?view=notifications";
+  const url = candidateUrl.startsWith("/#activity?") ? candidateUrl : "/#activity?view=notifications";
+  const tag = typeof payload.tag === "string" && /^[a-zA-Z0-9_-]{1,160}$/.test(payload.tag)
+    ? payload.tag
+    : "agent-controller-attention";
+  event.waitUntil(self.registration.showNotification(title, { body, tag, data: { url } }));
+});
+
+// Local and Web Push notifications share one same-origin click path. Never navigate to a URL from
+// a push payload unless it matches the notification-center route above.
 self.addEventListener("notificationclick", (event) => {
   event.notification.close();
   const target = event.notification.data?.url ?? "/#activity";
@@ -140,4 +164,12 @@ self.addEventListener("notificationclick", (event) => {
   })());
 });
 
-self.__swInternals = { routeFor, isApiPath, isLegacyPath, SHELL_CACHE, ASSET_CACHE, PRECACHE_URLS };
+self.__swInternals = {
+  routeFor,
+  isApiPath,
+  isLegacyPath,
+  isPublicStaticPath,
+  SHELL_CACHE,
+  ASSET_CACHE,
+  PRECACHE_URLS,
+};

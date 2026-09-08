@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import test from "node:test";
 
 import { createApp } from "../src/app.mjs";
+import { createMemoryStore } from "../src/store.mjs";
 
 test("onboarding API persists progress and completes only after operational readiness", async (t) => {
   const originalFetch = globalThis.fetch;
@@ -24,7 +25,8 @@ test("onboarding API persists progress and completes only after operational read
     globalThis.fetch = originalFetch;
   });
 
-  const { server } = createApp();
+  const store = createMemoryStore();
+  const { server } = createApp({ store });
   await listen(server);
   t.after(() => server.close());
   const baseUrl = `http://127.0.0.1:${server.address().port}`;
@@ -117,24 +119,39 @@ test("onboarding API persists progress and completes only after operational read
   );
   assert.equal(launch.command.status, "dispatched");
 
+  const completionBody = {
+    status: "completed",
+    currentStep: "ready",
+    networkMode: "local",
+    networkUrl: "https://t3.example",
+    provider: { harness: "openai", instanceId: "codex", model: "gpt-5.4" },
+    workspace: {
+      path: "/work/agent-controller",
+      title: "Agent Controller",
+      projectId: "project_1",
+    },
+    environmentId: environment.environment.id,
+    firstThreadId: launch.threadId,
+    device: { mode: "browser_only", deviceId: null, credentialConfirmed: false },
+  };
+  const acceptedOnlyResponse = await fetch(new URL("/v1/onboarding", baseUrl), {
+    method: "PUT",
+    headers: { ...headers, "content-type": "application/json" },
+    body: JSON.stringify(completionBody),
+  });
+  assert.equal(acceptedOnlyResponse.status, 409, "dispatch acknowledgement is not activation proof");
+
+  await store.updateCommand({
+    userId: "user_onboarding",
+    commandId: launch.command.id,
+    status: "completed",
+    result: { assistantReplyObserved: true },
+  });
+
   const completed = await request(baseUrl, "/v1/onboarding", {
     method: "PUT",
     headers,
-    body: {
-      status: "completed",
-      currentStep: "ready",
-      networkMode: "local",
-      networkUrl: "https://t3.example",
-      provider: { harness: "openai", instanceId: "codex", model: "gpt-5.4" },
-      workspace: {
-        path: "/work/agent-controller",
-        title: "Agent Controller",
-        projectId: "project_1",
-      },
-      environmentId: environment.environment.id,
-      firstThreadId: launch.threadId,
-      device: { mode: "browser_only", deviceId: null, credentialConfirmed: false },
-    },
+    body: completionBody,
   });
 
   assert.equal(completed.onboarding.status, "completed");
@@ -187,6 +204,7 @@ test("removing the onboarding environment clears the selection instead of lockin
   const removed = await request(baseUrl, `/v1/t3/environments/${environment.environment.id}`, {
     method: "DELETE",
     headers,
+    body: { confirmationLabel: environment.environment.label },
   });
   assert.equal(removed.removed.onboarding, true);
 

@@ -18,7 +18,6 @@ import {
   KeyRound,
   Laptop,
   Network,
-  PackagePlus,
   Plus,
   Radio,
   RefreshCw,
@@ -69,8 +68,12 @@ import {
   useConfirm,
 } from "../ui";
 import { ProfilePicker } from "./ProfilePicker";
+import {
+  DeviceActionCluster,
+  type DeviceOnboardingFlow,
+} from "./FeatureActionClusters";
 
-export type DeviceOnboardingFlow = "preprovision" | "register" | "claim";
+export type { DeviceOnboardingFlow } from "./FeatureActionClusters";
 type DeviceGatewayAccessMode = "local" | "tailscale" | "online";
 
 interface DevicesPageProps {
@@ -149,6 +152,8 @@ const FLOW_COPY: Record<DeviceOnboardingFlow, {
 function deviceStatus(device: Device | null | undefined): { label: string; tone: StatusTone } {
   if (!device) return { label: "offline", tone: "neutral" };
   if (device.revokedAt) return { label: "revoked", tone: "danger" };
+  if (device.credentialRotation?.state === "pending") return { label: "rotating", tone: "warning" };
+  if (device.credentialRotation?.state === "expired") return { label: "rotation expired", tone: "danger" };
   const state = device.presence?.state
     ?? (device.lastSeenAt && Date.now() - Date.parse(device.lastSeenAt) <= 90_000 ? "online" : "offline");
   return {
@@ -234,18 +239,19 @@ export function DevicesPage({
   };
 
   const rotateSecret = async (device: Device) => {
+    const restart = device.credentialRotation?.state === "pending"
+      || device.credentialRotation?.state === "expired";
     const accepted = await confirm({
-      title: `Rotate ${device.label}’s secret?`,
-      description: "The existing hardware credential will stop working immediately. Install the new secret on the device.",
-      confirmLabel: "Rotate secret",
+      title: `${restart ? "Restart" : "Rotate"} ${device.label}’s secret?`,
+      description: "The controller will generate and persist its replacement locally. Its current credential remains valid until the controller proves the replacement and acknowledges promotion.",
+      confirmLabel: restart ? "Restart rotation" : "Queue rotation",
     });
     if (!accepted) return;
-    await c.run("rotate-device-secret", "Device secret rotated. Copy it now.", async () => {
-      const result = await c.api<{ device: Device; secret: string }>(
+    await c.run("rotate-device-secret", "Credential rotation queued for controller acknowledgement.", async () => {
+      const result = await c.api<{ device: Device; rotation: NonNullable<Device["credentialRotation"]>; created: boolean }>(
         `/v1/devices/${encodeURIComponent(device.id)}/rotate-secret`,
-        { method: "POST", body: {} },
+        { method: "POST", body: { restart } },
       );
-      c.setDeviceSecret({ title: "Rotated device secret", id: result.device.id, secret: result.secret });
       await c.refreshAll();
       return result;
     });
@@ -254,21 +260,15 @@ export function DevicesPage({
   const transferReset = async (device: Device) => {
     const accepted = await confirm({
       title: `Reset ${device.label} for transfer?`,
-      description: "This unclaims the controller, rotates its hardware secret, creates a new claim code, and removes it from this account.",
+      description: "Ownership is removed immediately. The controller keeps only a restricted rotation channel until it installs and acknowledges a new local credential, then clears owner Wi-Fi/config and returns to provisioning for the recipient.",
       confirmLabel: "Reset for transfer",
     });
     if (!accepted) return;
-    await c.run("transfer-reset-device", "Device reset for transfer.", async () => {
-      const result = await c.api<{ device: Device; secret: string; claimCode: string }>(
+    await c.run("transfer-reset-device", "Transfer reset queued; the controller will finish securely when it reconnects.", async () => {
+      const result = await c.api<{ device: Device; rotation: NonNullable<Device["credentialRotation"]> }>(
         `/v1/devices/${encodeURIComponent(device.id)}/transfer-reset`,
         { method: "POST", body: {} },
       );
-      c.setDeviceSecret({
-        title: "Transfer reset",
-        id: result.device.id,
-        secret: result.secret,
-        claimCode: result.claimCode,
-      });
       setEditingDevice(null);
       await c.refreshAll();
       return result;
@@ -421,28 +421,6 @@ export function DevicesPage({
   );
 }
 
-export function DeviceActionCluster({
-  onOpen,
-  className,
-}: {
-  onOpen: (flow: DeviceOnboardingFlow) => void;
-  className?: string;
-}) {
-  return (
-    <div className={cn("device-action-cluster", className)} aria-label="Add a device">
-      <Button size="sm" onClick={() => onOpen("preprovision")}>
-        <Fingerprint className="size-3.5" /> Pre-provision
-      </Button>
-      <Button size="sm" onClick={() => onOpen("register")}>
-        <PackagePlus className="size-3.5" /> Register
-      </Button>
-      <Button size="sm" variant="primary" onClick={() => onOpen("claim")}>
-        <KeyRound className="size-3.5" /> Claim
-      </Button>
-    </div>
-  );
-}
-
 function CredentialBanner({ controller: c }: { controller: Controller }) {
   const copy = () => {
     const value = [c.deviceSecret?.id, c.deviceSecret?.secret, c.deviceSecret?.claimCode].filter(Boolean).join("\n");
@@ -556,7 +534,11 @@ function DeviceTile({
 
       <div className="device-tile__context">
         <span>{device.config?.environmentId ?? "No environment"}</span>
-        <span>{device.profile}</span>
+        <span>{device.credentialRotation?.state === "pending"
+          ? `credential v${device.credentialRotation.pendingCredentialVersion ?? "next"} awaiting controller`
+          : device.credentialRotation?.state === "expired"
+            ? "credential rotation needs retry"
+            : device.profile}</span>
       </div>
       <div className="device-tile__actions" aria-label={`Credential actions for ${device.label}`}>
         <Button size="sm" disabled={!can(device, "rotateSecret")} onClick={stop(onRotate)}>
@@ -1317,14 +1299,22 @@ function DeviceEditorDialog({
                 ) : null}
                 <ReviewRow label="Firmware" value={device.status?.firmwareVersion ?? "unknown"} mono />
                 <ReviewRow label="Last seen" value={formatRelativeTime(device.status?.lastHeartbeatAt ?? device.lastSeenAt)} />
+                <ReviewRow
+                  label="Credential"
+                  value={device.credentialRotation?.state === "pending"
+                    ? `v${device.credentialVersion ?? 1} active · v${device.credentialRotation.pendingCredentialVersion ?? "next"} awaiting controller ACK`
+                    : device.credentialRotation?.state === "expired"
+                      ? `v${device.credentialVersion ?? 1} active · rotation expired`
+                      : `v${device.credentialVersion ?? 1} active`}
+                />
               </dl>
               <section className="device-editor__danger" aria-labelledby="credential-actions-title">
                 <div>
                   <p id="credential-actions-title" className="font-display text-sm font-semibold text-danger">Credential actions</p>
-                  <p className="mt-1 text-xs text-ink-muted">These actions interrupt authentication or ownership. Each requires confirmation.</p>
+                  <p className="mt-1 text-xs text-ink-muted">Rotation keeps the active credential until the controller acknowledges its replacement. Transfer removes ownership immediately and finishes on the controller.</p>
                 </div>
                 <div className="flex flex-wrap gap-2">
-                  <Button size="sm" disabled={!(device.actions?.rotateSecret ?? true)} onClick={onRotate}><RotateCcwKey className="size-3.5" /> Rotate</Button>
+                  <Button size="sm" disabled={!(device.actions?.rotateSecret ?? true)} onClick={onRotate}><RotateCcwKey className="size-3.5" /> {device.credentialRotation?.state === "pending" || device.credentialRotation?.state === "expired" ? "Restart rotation" : "Rotate"}</Button>
                   <Button size="sm" variant="danger-ghost" disabled={!(device.actions?.transferReset ?? true)} onClick={onTransfer}><Unplug className="size-3.5" /> Transfer reset</Button>
                   <Button size="sm" variant="danger-ghost" disabled={!(device.actions?.revoke ?? true)} onClick={onRevoke}><CircleOff className="size-3.5" /> Revoke</Button>
                 </div>

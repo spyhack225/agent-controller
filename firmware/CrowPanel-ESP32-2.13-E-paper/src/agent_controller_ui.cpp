@@ -1,4 +1,6 @@
-#if __has_include("controller_config.h")
+#if defined(CONTROLLER_CONFIG_PLACEHOLDER_BUILD)
+#include "controller_config.example.h"
+#elif __has_include("controller_config.h")
 #include "controller_config.h"
 #else
 #include "controller_config.example.h"

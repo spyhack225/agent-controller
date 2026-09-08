@@ -29,16 +29,28 @@ constexpr size_t kMaxBrowseEnvironments = 8;
 // browsed a page at a time, not displayed whole.
 constexpr size_t kMaxBrowseProjects = 12;
 
-// Five of the fields `deviceSelectableEnvironments()` publishes. `baseUrl`, scopes and pairing
-// state stay in the console realm and never cross the device boundary, so there is nothing else
-// to hold.
+// The compact, non-secret row `deviceSelectableEnvironments()` publishes. These are facts and one
+// bounded action label, not the environment record: URLs, errors, provider names/models, scopes,
+// pairing state, and credentials stay out of the device realm.
 struct BrowseEnvironment {
   String id;
   String label;
   String status;        // upper-cased, for display
   bool tokenExpired = false;
   bool selected = false;
+  String transport;
+  String freshness;
+  String connectorStatus;
+  String t3Status;
+  String providerStatus;
+  String observedAt;
+  String action;
 };
+
+// One deterministic line for a constrained display. New gateways send `health.action`; the
+// fallback keeps controllers useful while talking to an older gateway or a partially populated
+// projection, using the same connector -> T3 -> provider -> freshness priority.
+String browseEnvironmentAction(const BrowseEnvironment& row);
 
 // `threadCount` is the field that makes this list usable at arm's length: it says which folder has
 // anything in it before somebody pages into an empty one.

@@ -50,15 +50,35 @@
 #define OTA_MANIFEST_VERIFY_KEY ""
 #endif
 
+#if SECURE_BUILD_ENABLE_OTA_APPLY
+#undef ENABLE_OTA_APPLY
+#define ENABLE_OTA_APPLY 1
+#endif
+#if SECURE_BUILD_REQUIRE_OTA_SIGNATURE
+#undef REQUIRE_OTA_SIGNATURE
+#define REQUIRE_OTA_SIGNATURE 1
+#endif
+#ifdef BUILD_FIRMWARE_VERSION
+#undef FIRMWARE_VERSION
+#define FIRMWARE_VERSION BUILD_FIRMWARE_VERSION
+#endif
+#ifdef BUILD_OTA_MANIFEST_VERIFY_KEY
+#undef OTA_MANIFEST_VERIFY_KEY
+#define OTA_MANIFEST_VERIFY_KEY BUILD_OTA_MANIFEST_VERIFY_KEY
+#endif
+
 // Defaults used by the on-screen quick actions.
 #define ENVIRONMENT_ID "env_replace_me"
 #define THREAD_ID "thread_replace_me"
 #define DEFAULT_AGENT_PROMPT "Continue the current task, inspect progress, and run relevant tests."
 #define DEFAULT_SHELL_COMMAND "npm test"
 
-// TLS certificate validation is disabled in this scaffold so self-hosted HTTPS gateways work
-// during bring-up. Pin the gateway certificate before production.
-#define INSECURE_SKIP_TLS_VERIFY 1
+// HTTPS fails closed unless the cloud gateway's issuing root is configured. Concatenate a current
+// and next root during rotation. Set INSECURE_SKIP_TLS_VERIFY=1 only in a local bench config; it
+// exposes the long-lived device credential to interception.
+#define GATEWAY_TLS_ROOT_CA_PEM ""
+#define GATEWAY_TLS_NEXT_ROOT_CA_PEM ""
+#define INSECURE_SKIP_TLS_VERIFY 0
 
 // ---------------------------------------------------------------------------
 // Display: ILI9341V, 240x320, 4-line SPI.
@@ -398,3 +418,10 @@
 #define EXPANSION_IO_B 3
 #define EXPANSION_IO_C 14
 #define EXPANSION_IO_D 21
+
+// HTTPS fails closed unless the cloud gateway's issuing root is configured. Concatenate a current
+// and next root during rotation. Set INSECURE_SKIP_TLS_VERIFY=1 only in a local bench config; it
+// exposes the long-lived device credential to interception.
+#define GATEWAY_TLS_ROOT_CA_PEM ""
+#define GATEWAY_TLS_NEXT_ROOT_CA_PEM ""
+#define INSECURE_SKIP_TLS_VERIFY 0

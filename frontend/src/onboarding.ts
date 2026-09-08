@@ -112,7 +112,7 @@ export function firstIncompleteStep(
   if (onboarding.status === "not_started") return "welcome";
   if (!readiness?.checks.hostPlan) return "host";
   if (!readiness.checks.environmentReachable) return "connect";
-  if (!readiness.checks.firstRunDispatched) return "workspace";
+  if (!readiness.checks.firstRunCompleted) return "workspace";
   if (!readiness.checks.deviceReady) return "device";
   return "ready";
 }

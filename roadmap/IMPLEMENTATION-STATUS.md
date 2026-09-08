@@ -5,24 +5,69 @@ Canonical progress ledger for
 This file records what the repository can do now; the roadmap records the target and sequence.
 Anything not marked **done** is not complete.
 
-Last verified: **2026-08-24**, at commit `4d06ff2`.
+Last verified: **2026-09-02** in the current working tree. The earlier `4d06ff2` evidence remains the
+baseline for the open-input/media initiative; the cloud workstream below is uncommitted and has not
+been deployed.
+
+## Cloud control-plane and local connector workstream
+
+| Surface | State | Current evidence | Remaining gate |
+|---|---|---|---|
+| Connector backend | partial | Separate credential/ticket realm, Store/Convex parity, connector projections, `T3Transport`, private router, bounded 25-second immediate-wake result/subscription reads, credential-scoped idempotent self-revocation with fail-closed local cleanup, managed-topology exclusion of the local ticket issuer, and reconnect recovery; focused local gates cover these contracts | Deployed binding latency/call rate, machine sleep/WAN, and live T3 parity |
+| Connector package | partial | Real npm bin and clean pack/install; manual protected release automation binds exact stable version, annotated tag, source commit and confirmation, enforces dependency-free contents/size/executable plus npm dry-run, grants OIDC only to `npm-release`, refuses immutable version reuse, requests provenance, designs clean external exact-version verification, and emits redacted evidence; native credential adapters, cross-platform T3 ownership, transactional update rollback, rotation, and platform-mocked service lifecycle remain covered locally | Commit the authoritative GitHub repository metadata, configure the npm trusted publisher/environment/tag rules, execute publication; then prove clean macOS/Linux/Windows install, service/T3/native-store/sleep/update/rotation handoff behavior |
+| Cloudflare edge | partial | Worker/Static Assets, per-environment Durable Object, bounded immediate-wake waits, Queue/Cron handlers, redacted terminal/exhaustion quarantine plus configured broker DLQs, revoke/reconnect recovery, and sampled privacy-safe Analytics Engine/log telemetry for request duration/outcome, DO capacity, Queue lag/retry/quarantine/DLQ risk, connector transitions, and rollouts; Wrangler/preflight sampling and binding policy plus hermetic telemetry tests are local-only | Execute isolated bootstrap and protected deploy/rollback; prove hosted ingestion/privacy, dashboards/alerts, native Queue/DLQ correlation, cron, rollover/load/security behavior |
+| Cloudflare control plane | partial | Private Worker + bounded Container wrapper + private edge-router/background joins; managed Web Push VAPID rotation/sealing secrets are name-preflighted and passed only to the private Container with its process timer disabled in favor of Queue/Cron; Container proxy telemetry distinguishes startup-wait candidates, startup timeout, and response-header timeout without request data; reproducible 81 MB `linux/amd64` image runs non-root and passes public/private/graceful-stop release smoke; protected bootstrap/release/rollback and redacted qualification harnesses have local coverage | Execute paid-plan bootstrap/deploy, live rollback rehearsal, qualification/binding/jobs/R2/Web Push provider, hosted telemetry privacy/alert delivery, and `standard-1` CPU/memory/cold-start/cost proof |
+| Capacity/SLO | partial | Provisional singleton budget and `npm run test:capacity`; local report qualifies 16 concurrent environments, 48 Container proxy requests, exact 32-request/16-lease/48-waiter DO bounds, fresh/warm/saturated latency, Node RSS/heap/CPU, and the process-local rate-limit restart caveat | Hosted `standard-1` saturation/soak/rollover, Redis continuity, per-hop WAN latency, availability, Cloudflare billing observation, and accepted singleton/partition decision |
+| Console | partial | Connector-first enrollment, five-layer proof-gated readiness, recovery and fleet settings; the current frontend suite, production build, and typecheck pass; the browser gate enforces lazy feature chunks, first-load budgets, a 512-row live projection, and frame-batched SSE updates | Deployed live journey plus representative desktop/mobile GPU, usability, WAN, and real-stream heap-soak proof |
+| Firmware TLS | partial | Fail-closed CA verification/rotation, compact layered device health, a statically complete 15-environment matrix including hermetic CrowPanel capture, explicit secure CrowPanel/Hosyond release targets, shared secure Waveshare claim/health/recovery, and a capability-gated T190 status/operate adapter | Production CA, negative TLS, WAN and hardware proof; remaining probe/benchmark environments need a quiet-runner matrix renewal |
+| Release controls | partial | Owner-scoped firmware/connector rollouts plus manual protected npm/staging automation; production promotion now has a hermetic policy/orchestrator that binds an exact forward commit to fresh hashed staging release/qualification/hosted-capacity/security evidence and tracked deploy-input identities, verifies active versions/topology/resources/secret names, and separates Convex/private Container, public edge, and postflight with four protected operator checkpoints and redacted evidence; current single Container is truthfully immediate rather than canaried | Configure protected environments/provider scopes, create real hosted evidence, and execute bootstrap/staging/promotion; rehearse compatible and incident-specific rollback; publish/deploy candidate artifacts and prove internal/browser/controller cohorts on hosted Cloudflare and clean connector hosts |
+
+Canonical detail: [cloud-control-plane-connector-roadmap.md](cloud-control-plane-connector-roadmap.md).
+The evidence-backed remaining work is tracked as CG-01 through CG-12 in that roadmap. CG-01
+(Queue/Cron ownership), CG-02 (online revocation), and CG-03 (reconnect replay) are implemented and
+cross-runtime tested locally; each still requires its named hosted or real-machine proof before the
+workstream is marked done.
 
 ## Verified baseline
 
-- **Delivery:** Milestone 0.5 is complete. Milestones 2 and 3 are substantially complete —
-  this file previously recorded both as not started, which was wrong. Milestone 4 is partial.
-  Milestones 0, 1 and 5 are not started.
-- **Web/server gate:** production frontend build and typecheck pass; 204 frontend tests pass;
-  439 server tests, 436 passing, 3 S3 integration tests intentionally skipped when no S3 service
-  is configured.
-- **Firmware gate:** all PlatformIO environments across four board folders compile.
+- **Delivery:** Milestone 0.5 is complete. Milestones 2 and 3 are substantially complete.
+  Milestones 0, 1, 4, and 5 are partial: the live-thread contracts and conversation path have
+  landed, including the evidence-limited T3-native work graph, durable in-app notifications, locally
+  verified rollout controls, and the expanded probed capability manifest. Hardware validation,
+  deployed Web Push qualification, and live-system proof remain.
+- **Current repository gate:** the production build, frontend performance budgets, and frontend,
+  Convex, Cloudflare, and control-plane typechecks pass. The post-integration server suite passes
+  773 tests with three intentional live-S3 skips; connector passes 82; Cloudflare passes 15
+  contract, 28 Worker, 13 resilience, and 13 private-control-plane tests. The umbrella frontend run
+  passed 49 files/337 tests but one additional file never started because Vitest worker startup
+  timed out on the macOS File Provider-backed checkout; an isolated fork and thread retry failed at
+  the same pre-import boundary, with no assertion failure. The preceding complete run passed all
+  361 frontend tests, so a fresh quiet-checkout rerun remains required for a current full-green
+  `npm test` claim. `npm run smoke:convex` also passes against disposable live Convex records. The
+  browser gate checks lazy feature chunks, a bounded initial static graph, a 512-row live projection,
+  and frame-batched SSE updates; current measurements are recorded by
+  `docs/frontend-performance-gate.md` rather than duplicated as brittle totals here.
+- **Firmware baseline:** `firmware/build-matrix.json` now enumerates all 15 PlatformIO environments
+  on the one pinned pioarduino toolchain, and CI checks that inventory plus secure release selection.
+  Current isolated placeholder-config builds prove all four CrowPanel environments, the secure
+  Hosyond controller (plus base/capture), both Waveshare environments, and the Vision controller
+  from the same post-TLS source. The earlier CrowPanel/Waveshare pre-compile stall was a macOS File
+  Provider conflict in worktree `.pio` output (`build 2`/`libdeps 2`), not a source failure. A
+  contended exhaustive retry hit the build runner's bounded tool/setup timeout while PlatformIO
+  repaired its local esptool Python package, so the remaining Hosyond probes/benchmarks still rely
+  on earlier compilation evidence.
 - **Hardware evidence:** Hosyond ES3C28P has been flashed and exercised on silicon: 8 MB PSRAM,
   16 MB flash, battery reading, ES8311 codec, microphone samples, SoftAP provisioning, ILI9341
   display, panel polarity, and the orb UI. Other boards remain unvalidated on hardware.
-- **Onboarding proven end to end, without user-side flashing:** a factory NVS seed was written
-  once, after which the owner entered Wi-Fi through the SoftAP portal, the device discovered the
-  gateway over LAN broadcast, reported itself unclaimed, displayed its claim code, and was claimed
-  from the console.
+- **Self-hosted LAN onboarding proven end to end, without user-side flashing:** a factory NVS seed
+  was written once, after which the owner entered Wi-Fi through the SoftAP portal, the device
+  discovered the gateway over LAN broadcast, reported itself unclaimed, displayed its claim code,
+  and was claimed from the console.
+- **Cloud onboarding is locally proof-gated, not deployed:** readiness requires the selected
+  environment/project/provider/model and a `completed` command with a newer T3 reply; an accepted
+  dispatch alone is rejected by the test contract. No hosted connector or live-T3 first-reply
+  journey has been observed. `npm run qualify:staging` can collect that narrow deployed proof after
+  authorization; its eight tests currently prove only hermetic mock behavior.
 - **Reboot loop fixed and verified on hardware.** Two distinct bugs, found in sequence:
   1. Both HTTP call sites declared `HTTPClient` before the `WiFiClient` handed to `begin()`. C++
      destroys locals in reverse order, so `~HTTPClient()` ran `stop()` on freed memory.
@@ -58,12 +103,13 @@ Last verified: **2026-08-24**, at commit `4d06ff2`.
 - **Speaker and notification LED** are implemented behind compile flags. The LED pin (GPIO42) is
   documented from four vendor sources; no LED has been lit and no sound has been heard, so both
   remain hardware-unverified.
-- **Critical product gap:** a request can be dispatched to T3 Code, but Agent Controller still
-  cannot show and interact with the complete live response, provider approvals/questions,
-  subagents, or parallel work. This is Milestone 1. Its transport foundation has now landed (see
-  below); the user-visible parity work has not.
+- **Conversation and attention state:** the console shows streamed assistant/tool activity,
+  supports provider approvals plus structured user questions, folds verified T3 `task.*` activities
+  into a bounded Agents & work tree/roster, and persists privacy-minimal notifications with cursor
+  replay, acknowledgement, dismissal, and bounded retention. Scheduled-worker liveness is separate
+  from connector/T3/provider health. Controllers retain capability-scoped approval/input/result and
+  content-free task-count projections; the owner inbox is intentionally not exposed to devices.
 
-The frontend build also reports a non-blocking JavaScript chunk-size warning (about 655 kB).
 Firmware compilation reports deprecated ESP32 legacy I2S/PCNT API warnings in capture/probe code.
 
 ## Correction notice
@@ -87,13 +133,13 @@ resolved. Status claims in this file are now expected to cite the file or test t
 
 | Category | State | What is real now | What remains |
 |---|---|---|---|
-| 1. Open request and composer | partial | Operate sends arbitrary text; ordered multi-attachment selection, removal, reordering, and first-turn attachments work | One unified composer, inline capture/upload, QuickPage composer, request envelope/state machine, and idempotency |
-| 2. Unified media | partial | Media library supports browser upload, recording, camera capture, manual transcription/editing, retention, and deletion; Operate can reuse stored media | Reusable picker/capture dialog in the composer, raw upload/finalize, upload state, previews, paste/drop, and richer origin metadata |
-| 3. Voice transcription | todo | Synchronous `disabled`, `mock`, and OpenAI provider branches and manual transcription exist | CPU-hosted Parakeet adapter, durable jobs, automatic processing, raw/normalized transcript versions, correction, retry, review/auto-send, and metrics |
-| 4. Controller voice | partial | Hosyond records 16 kHz mono audio to PSRAM and proves the microphone; the display and orb UI run on hardware | Shared gateway client, upload/dispatch, device request status, touch/review controls, PWA deep link, and response/interaction projection |
-| 5. T3 environments | partial | Eight typed failure reasons, reason-specific recovery, dependency preview, idempotent removal, reference repair, and in-place environment update exist | `T3Adapter`, probed capability manifest, console-first pairing/discovery, guided handoff, tombstones, and dependency-label confirmation |
-| 6. Live T3 conversation | partial | Persistent thread subscription with resume/dedup, event folding, streamed responses/tools, T3 approval UI with the full four-decision set, and structured user-input UI with per-shape controls and pre-dispatch validation exist | Subagent/work graph, background liveness, and notifications |
-| 7. Security, observability, testing | partial | Auth, policy, TLS controls, rate limits, media ownership/quotas, signed URLs, redaction, audit, diagnostics, and strong Milestone 0.5 tests exist | Voice-queue/live-stream metrics and audit, request/task attribution, new store parity, failure injection, and end-to-end tests for the initiative |
+| 1. Open request and composer | done | Shared `ComposerShell` serves Operate and QuickPage; durable actor/operation-scoped request identity covers command writes plus raw media create/finalize recovery across memory/file/Convex, browser restart, firmware NVS retry, and stable connector ids | Deployed/live retry proof remains an environment qualification item |
+| 2. Unified media | partial | Media library plus shared composer support browser upload, recording, camera capture, stored-media reuse, paste/drop, transcription/editing, retention, deletion, private raw upload sessions, source provenance, and bounded owner-triggered image/audio previews with retry across Memory/File/Convex | Hosted private R2/Convex lifecycle and deployed browser/device performance proof |
+| 3. Voice transcription | partial | Local Parakeet/provider adapters, durable staged jobs, automatic device processing, raw upload/finalize sessions, abandoned-upload cleanup, transcript versions, review/auto-send, retry gates, and timing metrics exist | Hosted worker/storage proof and physical voice validation |
+| 4. Controller voice | partial | Shared gateway client, Hosyond 16 kHz capture, and CrowPanel's capability-gated carrier capture all delegate to one raw segmented session transport without base64 expansion; the PWA has an owner/device-authenticated, five-minute, single-use QR/fragment handoff pinned to environment/thread/action and browser audio-input selection for phone/earbud capture; durable job polling, review/auto-send policy, request status, and compact response paths exist | Deployed PWA/phone/earbud usability plus physical end-to-end CrowPanel audio/camera/display proof |
+| 5. T3 environments | partial | Typed recovery, current-label dependency confirmation, recoverable credential-free tombstones, explicit retention purge, outbound connector package/enrollment, cloud-mode direct-origin blocking, layered health, a single direct/connector `T3Adapter`, cached versioned read-only capability manifests, and guided handoff exist | npm publication and deployed connector/probe/Queue-Cron proof |
+| 6. Live T3 conversation | partial | Persistent thread subscription with resume/dedup, event folding, streamed responses/tools, T3 approval UI, structured user input, a 64-node/16-activity evidence-linked T3 task inspector, durable privacy-minimal notifications, an opt-in queued Web Push boundary, scheduled-worker liveness, conservative T3 feature gates, and compact device capability state exist | Deployed Web Push/live-T3/browser/device qualification; any per-task control remains blocked until T3 certifies a targetable command |
+| 7. Security, observability, testing | partial | Auth, policy, fail-closed firmware TLS source/build gates, rate limits, media ownership/quotas, signed URLs, redaction, audit, diagnostics, plus fixed-schema sampled Cloudflare request/DO/Queue/connector/rollout/Container telemetry, queries, and provisional alert thresholds have local coverage | Hosted telemetry field/privacy review, dashboards/alert delivery, native DLQ and Container lifecycle/cost correlation, production CA and negative-TLS hardware proof, voice/live attribution metrics, failure injection, and deployed end-to-end tests |
 
 ## Milestone progress
 
@@ -101,21 +147,25 @@ resolved. Status claims in this file are now expected to cite the file or test t
 
 | Item | State | Evidence |
 |---|---|---|
-| Remove environment + dependency repair | done | Dependency preview; idempotent delete; actions/macros disabled with `environment_removed`; onboarding and device defaults repaired across stores |
+| Remove environment + dependency repair | done | Current-label dependency preview and confirmation; connector/credential revocation; recoverable tombstone with bounded retention; idempotent restore; explicit user-scoped purge runner; actions/macros disabled with `environment_removed`; onboarding and device defaults repaired across Memory/File/Convex stores |
 | Reason-specific recovery dialog | done | Eight failure reasons, retryability metadata, reason-specific instructions, and recovery polling behavior |
 | First-turn attachments | done | Project launch resolves and passes attachments through the same ownership/type/limit checks as follow-up turns |
 | Multiple attachments end to end | done | Ordered list, maximum of eight, scalar protocol-v1 alias, validation, and Operate add/remove/reorder controls |
 
-The current Remove flow still hard-deletes the environment rather than retaining a tombstone, and it
-does not require typing the environment label. Those are Category 5 hardening tasks, not regressions
-in the completed Milestone 0.5 repair.
+The local Remove flow now retains a credential-free tombstone, requires the exact current label when
+dependencies exist, and offers restore until the configured purge deadline. Hosted Queue/Cron
+execution and deployed connector-socket closure remain environment proof, not local green claims.
 
-### Milestone 0 — contracts and diagnostics: todo
+### Milestone 0 — contracts and diagnostics: partial
 
-No milestone deliverable has landed. The repository has no `RequestSubmission`,
-`clientRequestId`, `/v1/requests`, durable request state machine, long-lived T3 subscription, work
-node model, or expanded probed capability manifest. The `/v1/intents` versus `/v1/requests` design
-decision remains open.
+Versioned thread detail/events, separate pending-interaction contracts, captured T3 fixtures,
+long-lived subscription leases, sequence resume/dedup/reset behavior, typed recovery diagnostics,
+a cached `agent-controller.t3-capabilities.v1` manifest shared by direct/connector adapters, and the
+durable command-request envelope have landed. The API decision is settled: existing command
+write routes carry `clientRequestId`, while `GET /v1/requests/:clientRequestId` is a recovery read;
+there is no second `POST /v1/requests` policy entry path. The evidence-limited work-node model is
+implemented from T3 0.0.32's shipped contract. Media upload/finalize is a separate Category 2 state machine rather than being
+mislabeled as a dispatched command; it is now locally implemented and awaits hosted object-store proof.
 
 ### Milestone 1 — live conversation and interaction parity: partial
 
@@ -160,12 +210,18 @@ The durable row holds a SHA-256 fingerprint of the answers and nothing readable.
 The device realm accepts exactly one shape — a single short multiple-choice question — and shows
 every other question with the sentence to put on screen instead of an unanswerable form.
 
-Outstanding, and genuinely not started: subagent and parallel-task inspection, and the work-graph
-view.
+T3-native task inspection has now landed. `frontend/src/workGraph.ts` folds only verified
+`task.started|progress|updated|completed` fields from T3 0.0.32, trusts its stamped `agentKind`, and
+draws parent edges only from `parentAgentId`/`agentId`. The 64-node/16-activity projection replaces
+on snapshot and inherits sequence/event-ID replay dedup; missing linkage becomes an explicit roster,
+not an inferred graph. Agent-owned tools are re-homed by T3 attribution, background work keeps a
+settled parent visibly in flight, reconnect/stopped projections say they may be stale, and there are
+no fake per-agent controls because T3 exposes no certified target command. The device receives only
+bounded status counts from `src/t3Work.mjs`. See `docs/t3-work-graph.md`.
 
 Unproven: none of this has met a live T3 instance. It is verified against T3's checked-in contract
-(read from its shipped source map) and its real Effect runtime, plus 46 frontend tests whose trap
-handling was confirmed by mutation.
+(read from its shipped source map), its real Effect runtime, and the current focused frontend suite,
+including mutation checks for the trap cases.
 
 ### Milestone 2 — composer and connection: substantially done
 
@@ -175,78 +231,89 @@ Corrected: this was recorded as `partial` with the composer "not landed". It had
 `MediaCapture.tsx`; `Composer.test.tsx` covers ten cases including paste/drop, the single source
 menu, camera reuse, and the server attachment ceiling. `QuickPage.tsx` imports the same composer
 rather than forking it, and `MediaPage.tsx` reuses `MediaCaptureDialog` — a real extraction.
-Console-first connection landed as `POST /v1/t3/connect-sessions` + `/redeem` +
-`GET /v1/t3/connect-sessions/:id` (`src/connectSession.mjs`, 7 tests); local discovery as
-`GET /v1/discovery` (`src/discovery.mjs`, 5 tests); guided re-pair as
-`PUT /v1/t3/environments/:id`.
+Connector-first connection uses `POST /v1/t3/connect-sessions` to mint the console's one-time code,
+`POST /v1/connectors/enroll` for the local CLI's tokenless cloud redemption, and
+`GET /v1/t3/connect-sessions/:id` for status. Cloud mode rejects the legacy direct `/redeem` path
+before consuming the code or making outbound network requests. Guided recovery creates a replacement
+enrollment and closes the old connector socket before issuing the new standing credential.
 
-Outstanding: funnel instrumentation for the Add-environment flow.
+Outstanding: production proof of the connector-first flow. Direct Tailscale/Funnel enrollment is retained only for self-hosted/advanced
+deployments; it is not the cloud production path.
 
 ### Milestone 3 — automatic Parakeet voice pipeline: substantially done
 
 Corrected: this was recorded as `todo` asserting none of it existed. Most of it does.
 `src/transcription.mjs` lists `parakeet` in `TRANSCRIPTION_PROVIDERS` with a dedicated adapter,
-concurrency gate and three terminal pre-checks (`test/parakeet.test.mjs`, 16 tests).
+concurrency gate and three terminal pre-checks.
 `src/mediaJobs.mjs` implements the durable stage machine
-`queued → transcribing → normalizing → review_required|ready → dispatching → dispatched`
-(`test/mediaJobs.test.mjs`, 19 tests). Transcript versioning exists as
+`queued → transcribing → normalizing → review_required|ready → dispatching → dispatched`.
+Transcript versioning exists as
 `rawTranscript`/`normalizedTranscript`/`userEditedTranscript` with the `describeTranscriptChange`
 letter-preservation guard. Auto-send is `PUT /v1/devices/:id/voice-auto-send` with the policy
 re-read at dispatch. Metrics cover `queueWaitMs`, `gateWaitMs`, `inferenceMs`, `realtimeFactor`.
-The device loop is `POST /v1/device/media` → `GET /v1/device/media/jobs/:id`
-(`src/deviceAudio.mjs`, 13 tests).
+The device loop is `POST /v1/device/media` → `GET /v1/device/media/jobs/:id`.
 
-Outstanding, and genuinely missing: the two-step raw upload/finalize protocol. Media still moves as
-base64 JSON through `POST /v1/media`; there is no `uploadStatus` field distinct from processing
-status, no presigned PUT, and no abandoned-session cleanup.
+The two-step raw upload/finalize protocol is now implemented locally. Browser and shared-controller
+clients create an authenticated session, stream exact raw bytes over private HTTP, and finalize only
+after a second length/SHA-256 check. Pending/uploaded/finalized/aborted/expired is distinct from media
+processing; Memory/File/Convex adapters persist it; retention removes abandoned staged bytes; and
+responses redact object keys and user content. The legacy base64 routes remain only for compatibility.
+No presigned R2 route or live hosted R2 lifecycle has been exercised, so that production proof remains.
 
 ### Milestone 4 — controller voice paths: partial
 
 Corrected: the shared gateway client HAS been extracted. `firmware/shared/AgentControllerCore/src/`
 now holds `GatewayClient.{h,cpp}`, `GatewayDiscovery.{h,cpp}`, `GatewayOperate.cpp`,
 `MediaUpload.{h,cpp}` and `OperateModel.h`; the Hosyond `main.cpp` instantiates `GatewayClient` and
-`ui.cpp` includes `MediaUpload.h`. Three boards pull `lib_extra_dirs = ../shared`.
+`ui.cpp` includes `MediaUpload.h`. All four board folders pull `lib_extra_dirs = ../shared`.
 
 The device can also now list and select its environment, project and thread — `GET/POST
 /v1/device/environments`, `/v1/device/projects`, `/v1/device/threads` and the matching
 `/v1/device/config/*` setters (documented in `docs/hardware-protocol.md`).
 
-Outstanding: the PWA deep-link/QR companion (`claimLink.ts` handles device *claiming*, not thread
-deep links), and silicon validation of the operate UI and its gateway calls.
+The PWA deep-link/QR companion is implemented locally with a separate one-shot fragment bearer;
+`claimLink.ts` remains dedicated to device ownership claiming. Outstanding work is deployed
+phone/earbud usability evidence and silicon validation of the operate UI and its gateway calls.
 
-### Milestone 5 — adapter hardening and rollout: todo
+### Milestone 5 — adapter hardening and rollout: partial
 
-Compatibility checks, scopes, and transport helpers predate this initiative, but there is no
-consolidated `T3Adapter`, rollout flags for the new flows, load/failure testing, or staged beta for
-live threads and voice.
+The shared `T3Transport` boundary, direct/connector implementations, compatibility UI, deterministic
+connector resilience tests, Cloudflare adapter boundaries, and conservative release controls have
+landed. Rollouts are owner scoped, select stable percentage or explicit allowlist cohorts, require an
+evidence reference for every transition, re-check protocol/capabilities during execution, retain
+per-target truth across File/Convex stores, and reconcile through the Node timer or Cloudflare
+Queue/Cron. Firmware may queue only an existing compatible signed release; connector rollout status
+truthfully remains `awaiting_operator_update` until the local CLI reports the target version. A fully
+consolidated versioned T3 adapter, staged live-T3 beta, and hosted load/failure/security/retention and
+rollback evidence remain. Runbook: [../docs/release-rollouts.md](../docs/release-rollouts.md).
 
 ## Hardware status
 
 | Board / component | State | Current evidence |
 |---|---|---|
-| CrowPanel 2.13-inch e-paper | partial | Most complete gateway-connected firmware; four environments compile; no current silicon validation recorded |
+| CrowPanel 2.13-inch e-paper | partial | All four prior environments compile post-TLS; the new hermetic capture-placeholder target proves shared raw create/PUT/finalize transport at 20.4% RAM/37.5% flash without reading live config; verified reference pins/capability-off defaults remain unchanged; no current capture silicon validation recorded |
 | Hosyond ES3C28P | done (hardware) | Only board validated end to end on silicon: provisioning, LAN discovery, claim, flash/PSRAM, battery, codec, microphone, ILI9341 display, polarity, touch, orb rendering, BOOT recovery. Operate UI confirmed on glass from photographs. 170 s soak: 0 resets, 0 panics, 30.3 fps, worst frame gap 68 ms. Speaker and LED compile but are unheard and unlit |
-| Waveshare AMOLED 1.75C | partial | Two scaffold environments compile; board and pin map remain unverified on silicon |
-| Vision Master T190 | partial | One bring-up environment compiles; placeholder pins and incomplete protocol client remain |
-| Shared `AgentControllerCore` | done | `DeviceStore`, `Provisioning`, `ThinkingOrb`, `OrbPainter`, `GatewayClient`, `GatewayDiscovery`, `GatewayOperate`, `MediaUpload` and `OperateModel` are all shared and consumed by three boards |
+| Waveshare AMOLED 1.75C | partial | Both placeholder environments compile with shared `DeviceStore`/`Provisioning`/`GatewayClient` claim, health, rotation, OTA observation, and recovery (each 15.8% RAM/20.9% flash). The default heartbeat truthfully disables display, thread picker, microphone, and camera; the board, pin map, AMOLED, touch, audio, power, and OTA apply remain unverified on silicon |
+| Vision Master T190 | partial | Shared `DeviceStore`/`Provisioning`/`GatewayClient`/`GatewayBrowse` now provide secure status and the compact environment/folder/thread/control/approval/response path. The default status-only build disables its unverified external encoder and thread-picker capability (16.9% RAM/34.2% flash); both the default and explicitly gated input variants compile, but display pins, input carrier, network flows, and all physical behavior remain unverified |
+| Shared `AgentControllerCore` | done | `DeviceStore`, `Provisioning`, `ThinkingOrb`, `OrbPainter`, `GatewayClient`, `GatewayDiscovery`, `GatewayOperate`, `MediaUpload` and `OperateModel` are shared across the board folders |
 
 ## Active blockers and next dependency
 
-1. **Live T3 event contract:** Milestone 0 must define the long-lived subscription, sequence,
-   resume, deduplication, interaction, and work-node contracts before the conversation UI can be
-   reliable.
-3. **Request API decision:** choose either one expanded `/v1/intents` path or a new
-   `/v1/requests` path with a dated intent deprecation. Do not leave two indefinite policy entry
-   paths.
-4. **Parakeet job boundary:** automatic CPU transcription needs a durable request/media job model;
-   the current synchronous HTTP handler is not a safe base for device retries or auto-send.
+1. **Durable request production proof:** the single-path `clientRequestId` contract, bounded receipts,
+   browser/NVS recovery, and stable connector ids are locally implemented; exercise browser/device
+   retry during hosted Container rollover and real machine sleep/wake.
+2. **Raw media production proof:** the private raw session/finalize/cleanup boundary is locally
+   implemented; exercise live R2/Convex lifecycle, failure recovery, expiry, and hosted voice scale.
 
 ## Next recommended implementation order
 
-1. Settle the request API and live-thread contracts in Milestone 0.
-2. Implement Milestone 1 so dispatched work becomes a complete, interactive T3 conversation.
-3. Finish the unified Operate/QuickPage composer and console-first connection flow.
-4. Add the CPU-hosted Parakeet queue and review/auto-send policies.
-5. Extract the shared firmware gateway client, then connect Hosyond capture to the same request
-   pipeline.
-6. Consolidate the adapter and run staged load, failure, security, retention, and end-to-end gates.
+1. Qualify raw upload/finalize, abandoned-session cleanup, and post-move retry through deployed R2/Convex.
+2. Qualify notification replay, optional Web Push, and scheduled-worker liveness through deployed
+   Queue/Cron/Convex, browser reconnect, VAPID rotation, and provider-failure exercises.
+3. Publish and deploy the connector/cloud packages, then prove completed-reply onboarding with live T3.
+4. Configure production roots and run negative-TLS plus physical controller-to-cloud validation;
+   renew the remaining Hosyond probe/benchmark environments on an uncontended runner.
+5. Run hosted telemetry/privacy/alert, Queue/DLQ/R2/Convex, Container cold-start/cost, rollover, load,
+   failure, security, retention, and WAN/sleep gates.
+6. Use the implemented rollout controls to stage the browser, voice, connector, and controller beta;
+   record hosted cohort, per-target, promotion, cancellation, and rollback evidence.

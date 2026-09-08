@@ -4,7 +4,8 @@
 > ledger of record for hardware and commercial execution (eFuse ceremony, OTA rollback, hardware
 > capture validation, beta adoption). It is **not** current on product usability: a 2026-08-24
 > codebase review found the input surface, media flow, voice pipeline, and environment lifecycle
-> materially incomplete despite the phase table below once reading "Done".
+> materially incomplete despite the phase table below once reading "Done". Subsequent local
+> implementation is reflected in the current-status table and newer ledger linked below.
 >
 > For that work see
 > [open-input-media-voice-environments-roadmap.md](open-input-media-voice-environments-roadmap.md).
@@ -16,21 +17,22 @@
 
 Every phase reached the limit of what its original scope required. Phases 3, 6, and 8 shipped
 important plumbing but not the complete product experience and are reopened in the active roadmap.
-As of 2026-08-24, active-roadmap Milestone 0.5 is complete; Milestones 0–5 remain open.
+As of 2026-08-27, active-roadmap Milestone 0.5 is complete; Milestones 2 and 3 are substantially
+implemented, while Milestones 0, 1, 4, and 5 remain partial pending their named external proof.
 
 | Phase | Status | Notes |
 |---|---|---|
 | 0 Product scope | Done | All three v1 workflows; deferred items still deferred |
-| 1 Cloud foundation | Done | Convex/file/memory stores; S3-compatible media via `src/s3.mjs` |
-| 2 T3 integration | Done | HTTP orchestration **and** the WebSocket RPC API (`src/t3Ws.mjs`); background snapshot poller |
-| 3 Environment pairing | Transport done, UX reopened | Token exchange, encrypted storage, expiry handling, 4 connection modes, eight typed failure reasons, targeted recovery, and dependency-aware removal. First-run pairing still requires host-side setup and manual token transfer; discovery/handoff are missing |
-| 4 Device provisioning | Code done | QR claim labels; `REQUIRE_TLS` enforcement. **eFuse ceremony outstanding** |
-| 5 Firmware MVP | Code done, hardware partial | All 11 environments across four board folders compile. Hosyond provisioning, audio, display, and orb UI have been exercised on silicon; CrowPanel, Waveshare, and T190 still lack current hardware validation |
-| 6 Text / audio / camera | **Reopened; transport repairs done** | Ordered multi-attachment and first-turn attachment transport are complete. Transcription remains synchronous (`disabled`/`mock`/`openai`), capture is MediaPage-only, there is no unified picker/request state machine, and device audio does not auto-transcribe. See Categories 1–3 of the newer roadmap |
+| 1 Cloud foundation | Locally implemented; deploy open | Convex/file/memory stores, S3-compatible media, Worker/DO/Queue adapters, private Container, and protected deploy/bootstrap automation exist; no hosted deployment is claimed |
+| 2 T3 integration | Locally implemented; live proof open | HTTP/Effect RPC, shared direct/connector adapter, outbound connector routing, subscriptions, background Queue/Cron ownership, and capability probes exist; deployed live-T3 parity remains unproven |
+| 3 Environment pairing | Locally implemented; external proof open | Connector-first one-command enrollment, separate connector credentials, native credential adapters with private-file fallback, layered health, eight typed failure reasons, guided recovery, and dependency-aware removal are implemented. npm publication plus deployed cloud/live-T3 and clean-host OS proof remain |
+| 4 Device provisioning | Code done; physical proof partial | QR claim labels and shared fail-closed CA validation/rotation exist across credential paths. **Production-root negative-TLS proof and eFuse ceremony outstanding** |
+| 5 Firmware MVP | Code done, hardware partial | The canonical matrix contains 15 environments across four board folders. Current post-TLS evidence covers the secure release images, all CrowPanel/Waveshare environments, shared secure Waveshare claim/health/recovery, and default plus capability-gated T190 builds; a complete quiet-runner renewal is still open. Hosyond provisioning, audio, display, and orb UI have been exercised on silicon; CrowPanel, Waveshare, and T190 still lack current hardware validation |
+| 6 Text / audio / camera | **Substantially implemented; external proof open** | Shared Operate/Quick composer, ordered and first-turn attachments, browser/device capture, raw integrity-finalized sessions, source-aware previews, durable request receipts and media jobs, automatic device transcription, and Parakeet/provider adapters are implemented. Hosted storage/worker and physical voice proof remain; see Categories 1–4 of the newer roadmap |
 | 7 Policy engine | Done | All 8 dimensions; credential/deletion/install screening; custom profiles |
-| 8 Phone and web apps | **Partially reopened** | PWA, mobile Quick page, profile editor, and billing exist, but Quick/Dashboard has no composer and Operate cannot show the complete live T3 response, provider interactions, subagents, or parallel work. See Categories 1 and 6 |
+| 8 Phone and web apps | **Partially reopened** | PWA, scoped single-use phone companion, shared Quick/Operate composer, profile editor, billing, live T3 response/provider interactions, evidence-linked T3 task/subagent visibility, durable notifications, and optional Web Push exist. Deployed browser/WAN/live-T3/Web Push proof remains. See Categories 1, 4, and 6 |
 | 9 Shell input | Done | Stages 1–4; `terminal:operate` opt-in, confirm-always, dispatched over WS |
-| 10 Observability | Done | Metrics plus alerts at the Phase 11 budgets |
+| 10 Observability | Locally implemented; hosted proof open | Application metrics plus privacy-safe Worker/DO/Queue/Container telemetry, operational queries, and provisional thresholds exist; hosted ingestion/privacy/dashboard/alert delivery remains unproven |
 | 11 Beta launch | Measurable | `/v1/observability/beta-readiness`. **Needs real users** |
 | 12 Commercial | Code done | Billing, transfer/reset, diagnostics, OTA + rollback. **Rollback untested on hardware** |
 
@@ -41,17 +43,18 @@ As of 2026-08-24, active-roadmap Milestone 0.5 is complete; Milestones 0–5 rem
 2. **OTA rollback test** — four-step procedure documented; needs one board and a deliberately
    broken image. Keep `ENABLE_OTA_APPLY=0` on shipping units until it passes.
 3. **Remaining hardware validation** — Hosyond I2S audio and display now run on a board. CrowPanel
-   capture, Waveshare audio/pins, T190 pins/protocol, and OTA rollback still need silicon evidence.
+   capture, Waveshare display/touch/audio/pins, T190 display/input/network flows, and OTA rollback
+   still need silicon evidence. The corresponding code and compile gates are not physical proof.
 4. **Beta** — 10–20 users and 50+ paired device-days is real adoption over real time.
 
-The usability gaps in Phases 3, 6, and 8 are *not* on this list. They are ordinary software work and
-are scheduled in
+The remaining qualification gaps for Phases 3, 6, and 8 are tracked in
 [open-input-media-voice-environments-roadmap.md](open-input-media-voice-environments-roadmap.md).
 
 ### Verified during implementation
 
-- Current verification gate: production frontend build/typecheck, 166 frontend tests, 341 passing
-  server tests with 3 S3 integration skips, and all 11 PlatformIO environments passing.
+- At this historical roadmap checkpoint, the then-current frontend, server, and firmware gates
+  passed. The current 15-environment inventory and newer evidence live in
+  `roadmap/IMPLEMENTATION-STATUS.md` and `docs/firmware-build-gate.md`.
 - Hosyond ES3C28P: 8 MB PSRAM, 16 MB flash, battery telemetry, ES8311 codec/microphone, SoftAP
   provisioning, ILI9341 display, panel polarity, and the orb UI exercised on silicon; orb rendering
   quality/buffer tuning remains active.
@@ -66,21 +69,20 @@ are scheduled in
 ## Target Architecture
 
 ```text
-Device / Phone / Web
-        |
-        v
-Your Platform API
-  auth, users, devices, profiles, media, policies
-        |
-        v
-T3 Code environment endpoint
-  Tailscale / T3 Connect / HTTPS reachable backend
-        |
-        v
-Codex / Claude / terminals
+Controller device ── authenticated HTTPS/WSS ─┐
+                                              ├── Agent Controller cloud control plane
+Web console / phone PWA ── HTTPS/SSE ─────────┤   Cloudflare edge + private control plane
+                                              │   Convex state + R2 media + Queue/Cron work
+User machine                                  │
+  T3 Code <── loopback or Tailnet ── connector CLI ── outbound authenticated WSS/HTTPS ──┘
+  Tailscale (optional, operator-managed)
 ```
 
-The platform owns identity, device control, policy, media processing, and audit logs. T3 Code remains the private execution runtime that controls Codex, Claude, terminals, projects, and workspace state.
+The cloud platform owns identity, device control, policy, routing, media processing, and audit logs.
+T3 Code remains the private execution runtime that owns providers, terminals, projects, threads,
+and workspace state. The cloud never reaches into a user's LAN or Tailnet: the local connector
+discovers or launches T3, keeps T3 access material on that machine, and initiates the outbound
+control channel. Controllers connect to the stable cloud origin and never run Tailscale.
 
 ## Phase 0: Product Scope
 
@@ -100,7 +102,7 @@ Defer until later:
 
 ## Phase 1: Cloud Foundation
 
-Build the VPS/SaaS backend as the commercial control plane.
+Build the cloud SaaS control plane with an explicit local/reference adapter.
 
 Core services:
 
@@ -115,15 +117,18 @@ Core services:
 - Audit log.
 - Media upload and processing pipeline.
 
-Chosen stack:
+Chosen production stack:
 
 ```text
-Backend: Node.js / TypeScript
+Public edge: Cloudflare Worker + Static Assets
+Connection coordination: per-environment Durable Objects
+Private control plane: Cloudflare Container/Worker service binding
+Local/reference adapter: Node.js 22+ ESM HTTP server
 Auth: Clerk
 Storage: Convex
-Realtime: Server-sent events first, Convex subscriptions/WebSocket later
-Queue: Convex actions or managed queue when background work grows
-Object storage: Local disk for prototype, S3-compatible storage for production media
+Realtime: connector WebSocket plus demand-driven SSE/device projections
+Background work: Cloudflare Queues, Cron, and Durable Object alarms
+Object storage: R2 in production; adapter-backed local disk only in development
 ```
 
 Initial Convex tables:
@@ -134,7 +139,8 @@ devices
 device_credentials
 device_sessions
 t3_environments
-t3_tokens
+connector_credentials
+connector_tickets
 controller_profiles
 commands
 command_events
@@ -148,11 +154,15 @@ Gateway boundary:
 HTTP/API routes -> Store API -> Convex functions
 ```
 
-Keep the gateway route code independent from Convex-specific calls. This allows local memory/file storage during hardware development and Convex storage in the hosted platform.
+Keep gateway domain and route code independent from Convex and Cloudflare runtime APIs. Memory/file
+stores and the Node server are reference adapters; production uses Convex, R2, Queue/Cron, Durable
+Objects, and the private control-plane binding without assuming a permanent process or local disk.
 
 ## Phase 2: T3 Code Integration
 
-Use T3 Code's existing environment HTTP API first.
+Treat T3 Code as a versioned local external system behind one `T3Transport` boundary. The connector
+uses T3's HTTP and Effect WebSocket contracts on the user's machine; cloud application code uses the
+connector transport and never calls a stored user-machine `baseUrl` in production.
 
 Known useful endpoints:
 
@@ -165,14 +175,16 @@ POST /api/auth/websocket-ticket
 GET  /ws?wsTicket=...
 ```
 
-Start with HTTP polling:
+Production flow:
 
 ```text
-VPS -> T3 snapshot every few seconds
-VPS -> compressed state for device
+controller | console -> cloud policy/router -> outbound connector channel -> local T3
+local T3 events -> connector cursor/dedup -> cloud projection -> subscribed surfaces
 ```
 
-Add WebSocket later for live updates.
+Snapshots remain the authoritative reset path. Live subscriptions are demand-driven and resumable;
+disconnects use leases, cursors, idempotency keys, bounded replay, and an explicit snapshot reset on
+an unfillable gap. Dispatch acknowledgement remains distinct from completed provider work.
 
 Required T3 scopes for normal remote agent control:
 
@@ -189,26 +201,23 @@ terminal:operate
 
 ## Phase 3: T3 Environment Pairing
 
-User flow:
+Production user flow:
 
 1. User opens the web dashboard.
-2. User adds a T3 Code environment.
-3. T3 Code generates a pairing token.
-4. User pastes the token or opens a pairing URL.
-5. The platform exchanges the token via `/oauth/token`.
-6. The platform stores the encrypted T3 access token.
-7. The platform verifies the connection with `/api/orchestration/snapshot`.
+2. The console mints a short-lived, single-use connector enrollment code and a copyable `npx`
+   command.
+3. The user runs `npx @agent-controller/connector connect --server <cloud-origin> --code <code>`.
+4. The connector discovers or safely launches local T3, performs local T3 authentication, and keeps
+   the resulting access material in the OS credential store or an explicit mode-`0600` fallback.
+5. The connector redeems the cloud code for an environment-scoped standing credential, exchanges it
+   for a short-lived socket ticket, and opens the outbound channel.
+6. The console advances truthfully through cloud, connector, T3, provider, and first-completed-action
+   readiness. A socket connection or accepted dispatch alone is not “ready.”
 
-Support more than one connection mode:
-
-```text
-Tailscale HTTPS endpoint
-T3 Connect / hosted relay endpoint
-Manual HTTPS endpoint
-Local development endpoint
-```
-
-For commercial use, do not assume every customer will let the VPS join their Tailnet. T3 Connect or user-provided HTTPS endpoints may become cleaner defaults.
+Self-hosted development may retain an explicitly named direct-transport flow. It is not the cloud
+product contract, and the cloud must never store a T3 access/pairing token, require an inbound port,
+or join a customer's Tailnet. Tailscale may protect connector-to-T3 traffic on the user machine but
+is not installed on controllers and is not required in the cloud account.
 
 ## Phase 4: Device Provisioning
 
@@ -248,7 +257,7 @@ For the ESP32 controller:
 
 - Wi-Fi setup.
 - Device authentication.
-- WebSocket or MQTT connection to VPS.
+- Authenticated outbound HTTPS/WSS connection to the cloud control plane.
 - E-ink status rendering.
 - Rotary encoder and menu navigation.
 - Button actions.
@@ -285,19 +294,19 @@ type UserIntent =
 Text flow:
 
 ```text
-phone/web/device -> VPS -> T3 thread.turn.start
+phone/web/device -> cloud policy/router -> local connector -> T3 thread.turn.start
 ```
 
 Audio flow:
 
 ```text
-device/phone -> VPS upload/stream -> transcription -> prompt preview -> dispatch
+device/phone -> cloud private upload -> durable transcription -> preview -> connector dispatch
 ```
 
 Camera flow:
 
 ```text
-device/phone -> VPS image upload -> OCR/vision/attachment -> prompt -> dispatch
+device/phone -> cloud private image upload -> vision/attachment -> connector dispatch
 ```
 
 For ESP32, start with:
@@ -463,8 +472,8 @@ Before selling broadly:
 
 Implement in this order:
 
-1. VPS platform skeleton.
-2. T3 Code pairing and snapshot.
+1. Cloud runtime plus runtime-neutral domain/store boundaries.
+2. Outbound connector enrollment, local T3 pairing, snapshot, and resumable event transport.
 3. Web dashboard for sending prompts.
 4. Device registry and simulated device client.
 5. ESP32 firmware for status and buttons.

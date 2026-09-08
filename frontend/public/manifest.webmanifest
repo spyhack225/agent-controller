@@ -43,6 +43,12 @@
       "short_name": "Approvals",
       "url": "/#activity",
       "icons": [{ "src": "/icons/icon-192.png", "sizes": "192x192", "type": "image/png" }]
+    },
+    {
+      "name": "Media capture",
+      "short_name": "Capture",
+      "url": "/#media",
+      "icons": [{ "src": "/icons/icon-192.png", "sizes": "192x192", "type": "image/png" }]
     }
   ]
 }

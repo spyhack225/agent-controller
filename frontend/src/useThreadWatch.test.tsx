@@ -242,3 +242,36 @@ test("applies the three stream events, and only for the thread being watched", a
   });
   expect(result.current.liveThread?.entries).toHaveLength(1);
 });
+
+test("reduces one display-frame event batch through a single ordered state update", async () => {
+  const { api } = recordingApi();
+  const { result } = renderHook(() => useThreadWatch({ api, enabled: true }));
+  await act(async () => {
+    result.current.watchThread({ environmentId: "env_1", threadId: "thread_1" });
+  });
+
+  await act(async () => {
+    result.current.applyThreadEventEvents(Array.from({ length: 80 }, (_, index) => ({
+      environmentId: "env_1",
+      threadId: "thread_1",
+      sequence: index + 1,
+      eventId: `evt_${index + 1}`,
+      type: "thread.message-sent",
+      event: {
+        type: "thread.message-sent",
+        payload: {
+          messageId: "msg_stream",
+          role: "assistant",
+          text: String(index % 10),
+          streaming: true,
+        },
+      },
+    })));
+  });
+
+  expect(result.current.liveThread?.entries).toHaveLength(1);
+  expect(result.current.liveThread?.entries[0]).toMatchObject({
+    kind: "message",
+    text: Array.from({ length: 80 }, (_, index) => String(index % 10)).join(""),
+  });
+});

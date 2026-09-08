@@ -7,7 +7,11 @@ import test from "node:test";
 import { buildUserDisplayState } from "../src/displayState.mjs";
 import { createFileStore } from "../src/fileStore.mjs";
 import { buildUserObservabilitySummary } from "../src/observability.mjs";
-import { createMemoryStore } from "../src/store.mjs";
+import {
+  createMemoryStore,
+  createStore,
+  DEVICE_CREDENTIAL_ROTATION_TTL_MS,
+} from "../src/store.mjs";
 
 test("platform tokens authenticate users without exposing token hashes", () => {
   const store = createMemoryStore();
@@ -16,6 +20,95 @@ test("platform tokens authenticate users without exposing token hashes", () => {
   assert.equal(token.tokenHash, undefined);
   assert.equal(store.authenticateUserToken(secret).id, "user_1");
   assert.equal(store.authenticateUserToken("wrong"), null);
+});
+
+test("device credential rotation overlaps safely, rejects races, expires, restarts, and revokes", () => {
+  let clock = Date.parse("2026-08-28T12:00:00.000Z");
+  const store = createStore({}, { now: () => clock });
+  const { device, secret: activeSecret } = store.createDevice({
+    userId: "user_1",
+    label: "Controller",
+  });
+  const candidate = "candidate_device_secret_0123456789abcdef";
+  const conflictingCandidate = "conflicting_device_secret_0123456789abcd";
+
+  const started = store.rotateDeviceSecret({ userId: "user_1", deviceId: device.id });
+  assert.equal(started.rotation.state, "pending");
+  assert.equal(started.rotation.pendingCredentialVersion, 2);
+  assert.equal(started.secret, undefined);
+  assert.equal(store.authenticateDevice(device.id, activeSecret).credentialState, "active");
+
+  const staged = store.stageDeviceSecret({
+    deviceId: device.id,
+    secret: candidate,
+    rotationId: started.rotation.id,
+    credentialVersion: 2,
+    authenticatedCredentialVersion: 1,
+  });
+  assert.equal(staged.reason, null);
+  assert.equal(store.authenticateDevice(device.id, candidate).credentialState, "pending");
+
+  const duplicate = store.stageDeviceSecret({
+    deviceId: device.id,
+    secret: candidate,
+    rotationId: started.rotation.id,
+    credentialVersion: 2,
+    authenticatedCredentialVersion: 1,
+  });
+  assert.equal(duplicate.reason, null);
+  const conflict = store.stageDeviceSecret({
+    deviceId: device.id,
+    secret: conflictingCandidate,
+    rotationId: started.rotation.id,
+    credentialVersion: 2,
+    authenticatedCredentialVersion: 1,
+  });
+  assert.equal(conflict.reason, "candidate_conflict");
+
+  clock += DEVICE_CREDENTIAL_ROTATION_TTL_MS + 1;
+  assert.equal(store.authenticateDevice(device.id, candidate), null);
+  assert.equal(store.authenticateDevice(device.id, activeSecret).credentialState, "active");
+  const expiredAck = store.acknowledgeDeviceSecret({
+    deviceId: device.id,
+    rotationId: started.rotation.id,
+    credentialVersion: 2,
+    authenticatedCredentialVersion: 2,
+  });
+  assert.equal(expiredAck.reason, "expired");
+
+  const restarted = store.rotateDeviceSecret({ userId: "user_1", deviceId: device.id, restart: true });
+  assert.notEqual(restarted.rotation.id, started.rotation.id);
+  assert.equal(store.authenticateDevice(device.id, candidate), null);
+  const replacement = "replacement_device_secret_0123456789abcdef";
+  assert.equal(store.stageDeviceSecret({
+    deviceId: device.id,
+    secret: replacement,
+    rotationId: restarted.rotation.id,
+    credentialVersion: 2,
+    authenticatedCredentialVersion: 1,
+  }).reason, null);
+  const promoted = store.acknowledgeDeviceSecret({
+    deviceId: device.id,
+    rotationId: restarted.rotation.id,
+    credentialVersion: 2,
+    authenticatedCredentialVersion: 2,
+  });
+  assert.equal(promoted.replayed, false);
+  assert.equal(store.authenticateDevice(device.id, activeSecret), null);
+  assert.equal(store.authenticateDevice(device.id, replacement).credentialState, "active");
+  assert.equal(store.acknowledgeDeviceSecret({
+    deviceId: device.id,
+    rotationId: restarted.rotation.id,
+    credentialVersion: 2,
+    authenticatedCredentialVersion: 2,
+  }).replayed, true);
+
+  store.rotateDeviceSecret({ userId: "user_1", deviceId: device.id, restart: true });
+  store.revokeDevice({ userId: "user_1", deviceId: device.id });
+  assert.equal(store.authenticateDevice(device.id, replacement), null);
+  const exported = JSON.stringify(store.exportState());
+  assert.equal(exported.includes(candidate), false);
+  assert.equal(exported.includes(replacement), false);
 });
 
 test("pairing an existing T3 URL updates the original environment and hides legacy duplicates", () => {
@@ -437,6 +530,52 @@ test("file store persists users, tokens, devices, and audit logs", async () => {
   }
 });
 
+test("file store durably preserves pending device credentials and their promotion", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "agent-controller-device-rotation-"));
+  const dataFile = join(dir, "store.json");
+  try {
+    const first = await createFileStore(dataFile);
+    const { device, secret: activeSecret } = first.createDevice({
+      userId: "user_1",
+      label: "Durable controller",
+    });
+    const rotation = await first.rotateDeviceSecret({ userId: "user_1", deviceId: device.id });
+    const candidate = "durable_device_secret_0123456789abcdef";
+    await first.stageDeviceSecret({
+      deviceId: device.id,
+      secret: candidate,
+      rotationId: rotation.rotation.id,
+      credentialVersion: rotation.rotation.pendingCredentialVersion,
+      authenticatedCredentialVersion: 1,
+    });
+    await first.flush();
+
+    const stagedState = JSON.parse(await readFile(dataFile, "utf8"));
+    assert.equal(stagedState.devices[0].pendingSecretHash.length, 64);
+    assert.equal(JSON.stringify(stagedState).includes(candidate), false);
+
+    const second = await createFileStore(dataFile);
+    assert.equal(second.authenticateDevice(device.id, activeSecret).credentialState, "active");
+    assert.equal(second.authenticateDevice(device.id, candidate).credentialState, "pending");
+    await second.acknowledgeDeviceSecret({
+      deviceId: device.id,
+      rotationId: rotation.rotation.id,
+      credentialVersion: rotation.rotation.pendingCredentialVersion,
+      authenticatedCredentialVersion: rotation.rotation.pendingCredentialVersion,
+    });
+    await second.flush();
+
+    const third = await createFileStore(dataFile);
+    assert.equal(third.authenticateDevice(device.id, activeSecret), null);
+    assert.equal(third.authenticateDevice(device.id, candidate).credentialState, "active");
+    assert.equal(third.getDeviceForUser("user_1", device.id).credentialVersion, 2);
+    assert.equal(third.getDeviceForUser("user_1", device.id).credentialRotation.state, "completed");
+    await third.flush();
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
 test("file store encrypts T3 access tokens when a token key is configured", async () => {
   const dir = await mkdtemp(join(tmpdir(), "agent-controller-encrypted-store-"));
   const dataFile = join(dir, "store.json");
@@ -496,7 +635,7 @@ test("deleting an environment repairs every record that pointed at it", () => {
   store.updateDeviceConfig({
     userId: "user_1",
     deviceId: device.id,
-    config: { environmentId: environment.id, threadId: "thread_1" },
+    config: { environmentId: environment.id, projectId: "project_1", threadId: "thread_1" },
   });
   const doomedAction = store.createAction({
     userId: "user_1",
@@ -538,6 +677,8 @@ test("deleting an environment repairs every record that pointed at it", () => {
     onboarding: true,
   });
   assert.equal(store.getDeviceForUser("user_1", device.id).config.environmentId, null);
+  assert.equal(store.getDeviceForUser("user_1", device.id).config.projectId, null);
+  assert.equal(store.getDeviceForUser("user_1", device.id).config.threadId, null);
 
   const repaired = store.getActionForUser("user_1", doomedAction.id);
   assert.equal(repaired.disabled, true);
@@ -556,6 +697,50 @@ test("deleting an environment repairs every record that pointed at it", () => {
 
   // Removal is idempotent: the second call has nothing left to repair.
   assert.equal(store.deleteEnvironment({ userId: "user_1", environmentId: environment.id }), null);
+});
+
+test("archiving an environment destroys its credential, disconnects dependencies, and retains an archive row", () => {
+  const store = createMemoryStore();
+  store.ensureUser({ userId: "user_1", email: "owner@example.local" });
+  const environment = store.upsertEnvironment({
+    userId: "user_1",
+    label: "Archived T3",
+    baseUrl: "https://archive.example",
+    accessToken: "secret-token",
+    scopes: ["orchestration:read"],
+    status: "reachable",
+  });
+  const enrolled = store.createConnector({ userId: "user_1", environmentId: environment.id, scopes: ["connector:connect"] });
+  const { device } = store.createDevice({ userId: "user_1", label: "Desk", profile: "agent-controller" });
+  store.updateDeviceConfig({
+    userId: "user_1",
+    deviceId: device.id,
+    config: { environmentId: environment.id, projectId: "project_1", threadId: "thread_1" },
+  });
+
+  const result = store.archiveEnvironment({ userId: "user_1", environmentId: environment.id });
+
+  assert.equal(result.alreadyArchived, false);
+  assert.deepEqual(result.removed.devices, [device.id]);
+  assert.equal(store.getDeviceForUser("user_1", device.id).config.environmentId, null);
+  assert.equal(store.getDeviceForUser("user_1", device.id).config.projectId, null);
+  assert.equal(store.getDeviceForUser("user_1", device.id).config.threadId, null);
+  const archived = store.listArchivedEnvironments("user_1")[0];
+  assert.equal(archived.status, "archived");
+  assert.match(archived.archivedAt, /^\d{4}-\d{2}-\d{2}T/u);
+  assert.equal(archived.accessToken, undefined);
+  assert.equal(store.getEnvironmentForUser("user_1", environment.id), null);
+  assert.equal(store.listEnvironments("user_1").length, 0);
+  assert.equal(store.getDisplaySummary("user_1").counts.environments, 0);
+  assert.equal(store.getConnectorForUser("user_1", enrolled.connector.id).status, "revoked");
+
+  const repeated = store.archiveEnvironment({ userId: "user_1", environmentId: environment.id });
+  assert.equal(repeated.alreadyArchived, true);
+  assert.deepEqual(repeated.removed, { devices: [], actions: [], macros: [], onboarding: false });
+
+  const deleted = store.deleteEnvironment({ userId: "user_1", environmentId: environment.id });
+  assert.equal(deleted.environment.id, environment.id);
+  assert.equal(store.listArchivedEnvironments("user_1").length, 0);
 });
 
 // getDisplaySummary() exists so the five-second display poll stops fetching whole collections.

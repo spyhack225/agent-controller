@@ -99,3 +99,18 @@ test("the broker turns a user-scoped change into a state.changed event", () => {
   events.broadcastUserChange("user_other", { action: "createDevice" });
   assert.equal(written.join(""), "", "changes must not leak to another user's stream");
 });
+
+test("the broker can wake every connected user for a fleet firmware release", () => {
+  const events = createEventBroker();
+  const first = [];
+  const second = [];
+  const response = (written) => ({ writeHead: () => {}, write: (chunk) => written.push(chunk), on: () => {} });
+  events.connect({ userId: "user_1", res: response(first) });
+  events.connect({ userId: "user_2", res: response(second) });
+  first.length = 0;
+  second.length = 0;
+
+  events.broadcastToAll("firmware.changed", { version: "0.2.0", hardwareModel: "ips28-esp32-s3r8" });
+  assert.match(first.join(""), /event: firmware\.changed/u);
+  assert.match(second.join(""), /"version":"0.2.0"/u);
+});

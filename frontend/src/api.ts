@@ -26,6 +26,13 @@ export interface ApiOptions {
   keepalive?: boolean;
 }
 
+export interface BinaryUploadOptions {
+  token: string;
+  contentType: string;
+  signal?: AbortSignal;
+  onProgress?: (loaded: number, total: number) => void;
+}
+
 export async function requestJson<T>(path: string, options: ApiOptions = {}): Promise<T> {
   const headers = new Headers();
   if (options.body !== undefined) headers.set("content-type", "application/json");
@@ -64,6 +71,69 @@ export async function requestJson<T>(path: string, options: ApiOptions = {}): Pr
   }
 
   return data as T;
+}
+
+/** Raw HTTP upload with byte progress. Media never enters JSON or the event/WebSocket channels. */
+export function uploadBinary<T>(
+  path: string,
+  body: Blob,
+  options: BinaryUploadOptions,
+): Promise<T> {
+  return new Promise((resolve, reject) => {
+    // AbortSignal does not replay an abort event to listeners added after it fired. Refuse before
+    // constructing an XHR so a cancelled capture can never put bytes on the wire during teardown.
+    if (options.signal?.aborted) {
+      reject(options.signal.reason ?? new DOMException("Media upload cancelled.", "AbortError"));
+      return;
+    }
+    const request = new XMLHttpRequest();
+    let settled = false;
+    const abort = () => request.abort();
+    const cleanup = () => options.signal?.removeEventListener("abort", abort);
+    const settle = (action: () => void) => {
+      if (settled) return;
+      settled = true;
+      cleanup();
+      action();
+    };
+    request.open("PUT", path);
+    request.responseType = "json";
+    request.setRequestHeader("authorization", `Bearer ${options.token}`);
+    request.setRequestHeader("content-type", options.contentType);
+    request.upload.addEventListener("progress", (event) => {
+      if (settled) return;
+      options.onProgress?.(event.loaded, event.lengthComputable ? event.total : body.size);
+    });
+    request.addEventListener("load", () => {
+      const data = request.response ?? parseXhrJson(request.responseText);
+      if (request.status >= 200 && request.status < 300) {
+        settle(() => resolve(data as T));
+        return;
+      }
+      const record = data && typeof data === "object" ? data as Record<string, unknown> : {};
+      const envelope = record.error && typeof record.error === "object"
+        ? record.error as Record<string, unknown>
+        : {};
+      settle(() => reject(new ApiError(
+        request.status,
+        typeof envelope.message === "string" ? envelope.message : `Request failed with HTTP ${request.status}.`,
+        envelope.details,
+      )));
+    });
+    request.addEventListener("error", () => settle(() => reject(new ApiError(0, "Media upload connection failed."))));
+    request.addEventListener("abort", () => settle(() => reject(new DOMException("Media upload cancelled.", "AbortError"))));
+    options.signal?.addEventListener("abort", abort, { once: true });
+    request.addEventListener("loadend", cleanup);
+    request.send(body);
+  });
+}
+
+function parseXhrJson(value: string): unknown {
+  try {
+    return value ? JSON.parse(value) : {};
+  } catch {
+    return {};
+  }
 }
 
 export function downloadJson(filename: string, value: unknown): void {

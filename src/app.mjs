@@ -9,9 +9,24 @@ import { fileURLToPath } from "node:url";
 
 import { createClerkAuthenticator } from "./clerkAuth.mjs";
 import { loadConfig } from "./config.mjs";
-import { buildConnectCommand, normalizeConnectAccessMode } from "./connectSession.mjs";
+import { buildConnectorRotateCommand, buildConnectCommand, normalizeConnectAccessMode } from "./connectSession.mjs";
+import {
+  CONNECTOR_CREDENTIAL_SCOPES,
+  CONNECTOR_PROTOCOL_VERSION,
+  CONNECTOR_TICKET_AUDIENCE,
+} from "./connectorProtocol.mjs";
 import { buildDeviceDisplayState, buildUserDisplayState, invalidateDisplayCache } from "./displayState.mjs";
 import { createEventBroker } from "./events.mjs";
+import {
+  buildBackgroundLiveness,
+  createNotificationPublisher,
+  notificationView,
+} from "./notifications.mjs";
+import {
+  createWebPushDeliveryRunner,
+  publicWebPushConfig,
+  validatePushSubscription,
+} from "./webPush.mjs";
 import {
   HttpError,
   optionalString,
@@ -23,8 +38,15 @@ import {
   sendError,
   sendJson,
 } from "./http.mjs";
-import { createId } from "./ids.mjs";
+import { createId, createSecret } from "./ids.mjs";
 import { normalizeIntent } from "./intent.mjs";
+import {
+  COMMAND_REQUEST_OPERATION,
+  THREAD_LAUNCH_REQUEST_OPERATION,
+  THREAD_CREATE_REQUEST_OPERATION,
+  commandRequestHash,
+  normalizeClientRequestId,
+} from "./requestEnvelope.mjs";
 import {
   buildDeviceFollowUpInstruction,
   buildDeviceThreadOutput,
@@ -40,15 +62,23 @@ import {
   normalizeFirmwareRelease,
 } from "./manufacturing.mjs";
 import { verifyMediaAccessToken } from "./mediaLinks.mjs";
+import { renderQrSvg } from "./qrcode.mjs";
 import { deleteFirmwareArtifact, readFirmwareArtifact, storeFirmwareArtifact } from "./firmwareArtifacts.mjs";
 import { buildFirmwareArtifactUrl, verifyFirmwareArtifactCapability } from "./firmwareLinks.mjs";
 import {
+  abortMediaUpload,
   buildMediaAttachments,
-  deleteStoredMedia,
+  createMediaUploadIntent,
+  deleteStoredMediaRecord,
+  finalizeMediaUpload,
   readStoredMedia,
   storeUploadedMedia,
+  writeMediaUploadSession,
 } from "./mediaStore.mjs";
+import { createMediaRetentionRunner } from "./mediaRetention.mjs";
+import { createEnvironmentRetentionRunner } from "./environmentRetention.mjs";
 import { createMediaJobRunner } from "./mediaJobs.mjs";
+import { createReleaseRolloutRunner } from "./releaseRollouts.mjs";
 import {
   buildMediaName,
   lookupThreadTitle,
@@ -103,9 +133,8 @@ import { createStore, emptyEnvironmentRemoval } from "./store.mjs";
 import { assertSecureTransport } from "./transport.mjs";
 import {
   TERMINAL_SCOPE,
+  T3_WS_METHODS,
   environmentHasTerminalScope,
-  fetchProviderCatalogue,
-  writeTerminalInput,
 } from "./t3Ws.mjs";
 import {
   buildProviderCatalogue,
@@ -120,12 +149,10 @@ import {
   buildT3ProjectLaunchCommands,
   buildT3ThreadCreateCommand,
   compressSnapshot,
-  dispatchT3Command,
   exchangePairingToken,
-  fetchT3Snapshot,
-  fetchT3ThreadDetail,
   isEnvironmentTokenExpired,
 } from "./t3Client.mjs";
+import { createT3TransportResolver } from "./t3Transport.mjs";
 import { refineThreadStatus } from "./agentVerb.mjs";
 import {
   PROVIDER_APPROVAL_DECISION_CATALOGUE,
@@ -149,6 +176,13 @@ import {
   T3_COMPATIBILITY_POLICY,
 } from "./t3Compatibility.mjs";
 import {
+  T3Adapter,
+  attachmentCapabilitySupported,
+  capabilityManifestIsFresh,
+  capabilitySupported,
+  ownerSafeT3CapabilityProjection,
+} from "./t3CapabilityManifest.mjs";
+import {
   classifyEnvironmentFailure,
   describeEnvironmentFailure,
   isRetryableEnvironmentFailure,
@@ -158,13 +192,22 @@ const STANDARD_T3_SCOPES = ["orchestration:read", "orchestration:operate"];
 const BILLING_WEBHOOK_TOLERANCE_MS = 5 * 60 * 1000;
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const WEB_DIST_DIR = join(__dirname, "..", "dist", "web");
+const t3TransportResolversByStore = new WeakMap();
+const notificationPublishersByStore = new WeakMap();
+const defaultT3TransportResolver = createT3TransportResolver();
 
-async function resolveEnvironmentHarnesses(environment, snapshot) {
+async function resolveEnvironmentHarnessesWithTransport(environment, snapshot, transportResolver) {
   let catalogue = environment.providerCatalogue ?? null;
   let catalogueSource = catalogue ? "registered" : "snapshot-only";
   try {
-    const providers = await fetchProviderCatalogue(environment, { timeoutMs: 8000 });
-    catalogue = buildProviderCatalogue(providers, { source: "t3-websocket" });
+    const config = await transportResolver.forEnvironment(environment).callRpc(
+      environment,
+      T3_WS_METHODS.serverGetConfig,
+      {},
+      { timeoutMs: 8000 },
+    );
+    if (!Array.isArray(config?.providers)) throw new Error("T3 server.getConfig did not return providers.");
+    catalogue = buildProviderCatalogue(config.providers, { source: "t3-websocket" });
     catalogueSource = "live";
   } catch {
     // A registered catalogue is still authoritative when the live socket is unavailable. Without
@@ -182,10 +225,32 @@ export function createApp({
   rateLimiter = createRateLimiter(),
   clerkAuth = createClerkAuthenticator(config),
   t3CompatibilityRpc = undefined,
+  t3TransportResolver = createT3TransportResolver(),
+  connectorRouter = null,
   remoteAccessControl = configurePrivateTailscaleServe,
 } = {}) {
   store ??= createStore({}, { t3TokenEncryptionKey: config.t3TokenEncryptionKey });
+  // Cloud deployments must never turn a persisted legacy baseUrl into an outbound request. A
+  // connector is the sole production transport; direct T3 remains available only to the
+  // self-hosted compatibility adapter. Keeping this at the resolver boundary also covers jobs,
+  // device routes, and helper paths which do not pass through the environment-management routes.
+  const runtimeT3TransportResolver = cloudSafeT3TransportResolver(config, t3TransportResolver);
+  t3TransportResolversByStore.set(store, runtimeT3TransportResolver);
+  const dispatchT3Command = (environment, command, options) => (
+    dispatchT3CommandForStore(store, environment, command, options)
+  );
+  const fetchT3ThreadDetail = (environment, threadId, options) => (
+    runtimeT3TransportResolver.forEnvironment(environment).threadDetail(environment, threadId, options)
+  );
+  const readT3Snapshot = (environment, options = {}) => (
+    readT3SnapshotWithTransport(environment, options, runtimeT3TransportResolver)
+  );
+  const resolveEnvironmentHarnesses = (environment, snapshot) => (
+    resolveEnvironmentHarnessesWithTransport(environment, snapshot, runtimeT3TransportResolver)
+  );
   const events = createEventBroker();
+  const notifications = createNotificationPublisher({ store, events });
+  notificationPublishersByStore.set(store, notifications);
   // The memory and file stores hand back a full snapshot; the Convex store can only name the
   // user whose data changed. Both end up as a state.changed event for that user.
   store.subscribe((change) => {
@@ -208,7 +273,9 @@ export function createApp({
   const snapshotPoller = createSnapshotPoller({
     store,
     events,
+    notifications,
     arbiter: commandArbiter,
+    transportResolver: runtimeT3TransportResolver,
     ...(config.snapshotPollIntervalMs ? { intervalMs: config.snapshotPollIntervalMs } : {}),
   });
   // Constructed here, started from server.mjs — same rule as the poller and the media worker, so
@@ -216,7 +283,9 @@ export function createApp({
   const threadStreams = createThreadStreamHub({
     store,
     events,
+    notifications,
     arbiter: commandArbiter,
+    transportResolver: runtimeT3TransportResolver,
     ...(config.threadStreamIntervalMs ? { intervalMs: config.threadStreamIntervalMs } : {}),
     ...(config.threadStreamWatchTtlMs ? { watchTtlMs: config.threadStreamWatchTtlMs } : {}),
   });
@@ -225,12 +294,21 @@ export function createApp({
     store,
     config,
     events,
+    notifications,
     // Closed over the store and config rather than imported by the worker, which has no business
     // knowing what a policy is. Every send is decided here, at the moment it happens.
     dispatchTranscript: ({ job, transcript }) => dispatchVoiceTranscript({ store, config, job, transcript }),
     ...(config.transcriptionWorkerIntervalMs ? { intervalMs: config.transcriptionWorkerIntervalMs } : {}),
     ...(config.transcriptionLeaseMs ? { leaseMs: config.transcriptionLeaseMs } : {}),
     ...(config.transcriptionBatchSize ? { batchSize: config.transcriptionBatchSize } : {}),
+  });
+  const mediaRetentionRunner = createMediaRetentionRunner({ store, config });
+  const environmentRetentionRunner = createEnvironmentRetentionRunner({ store });
+  const releaseRolloutRunner = createReleaseRolloutRunner({ store, events });
+  const webPushDeliveryRunner = createWebPushDeliveryRunner({
+    store,
+    config: config.webPush,
+    intervalMs: config.webPushWorkerIntervalMs,
   });
   let remoteAccessCache = null;
   let remoteAccessCacheExpiresAt = 0;
@@ -285,6 +363,7 @@ export function createApp({
         return sendJson(res, 200, {
           authProvider: config.authProvider,
           demoMode: config.demoMode,
+          deploymentMode: config.deploymentMode ?? "self-hosted",
           developmentTokens: {
             enabled: isDevTokenCreationEnabled(config),
           },
@@ -318,6 +397,8 @@ export function createApp({
           capabilities: candidate.profile.capabilities,
         });
         if (!created) throw new HttpError(409, `Profile "${candidate.profile.id}" already exists.`);
+        await publishDeviceRefreshForAll({ store, events, userId: user.id,
+          resources: ["controls", "display"] });
         return sendJson(res, 201, { profile: toPublicProfile(created) });
       }
 
@@ -342,6 +423,8 @@ export function createApp({
           ...(body.capabilities !== undefined ? { capabilities: body.capabilities } : {}),
         });
         if (!updated) throw new HttpError(404, "Device profile not found.");
+        await publishDeviceRefreshForAll({ store, events, userId: user.id,
+          resources: ["controls", "display"] });
         return sendJson(res, 200, { profile: toPublicProfile(updated) });
       }
 
@@ -376,6 +459,88 @@ export function createApp({
           custom = [];
         }
         return sendJson(res, 200, { profiles: [...builtins, ...custom] });
+      }
+
+      if (req.method === "GET" && url.pathname === "/v1/release-rollouts") {
+        const user = await authenticateUser(req, store, config, null, clerkAuth);
+        await enforceUserRead(req, res, rateLimiter, config, user);
+        return sendJson(res, 200, { rollouts: await store.listReleaseRollouts(user.id) });
+      }
+
+      if (req.method === "GET" && url.pathname === "/v1/firmware/releases") {
+        const user = await authenticateUser(req, store, config, null, clerkAuth);
+        await enforceUserRead(req, res, rateLimiter, config, user);
+        const releases = await store.listFirmwareReleases({
+          ...(url.searchParams.get("channel") ? { channel: url.searchParams.get("channel") } : {}),
+        });
+        return sendJson(res, 200, {
+          releases: releases.map((release) => ({
+            id: release.id,
+            version: release.version,
+            channel: release.channel,
+            hardwareModel: release.hardwareModel,
+            mandatory: release.mandatory,
+            releaseNotes: release.releaseNotes,
+            createdAt: release.createdAt,
+          })),
+        });
+      }
+
+      if (req.method === "POST" && url.pathname === "/v1/release-rollouts") {
+        const user = await authenticateUser(req, store, config, null, clerkAuth);
+        await enforceUserWrite(req, res, rateLimiter, config, user);
+        const body = await readJson(req);
+        const input = await validateReleaseRolloutInput({ store, userId: user.id, body });
+        const rollout = await store.createReleaseRollout({ userId: user.id, ...input });
+        return sendJson(res, 201, { rollout });
+      }
+
+      const releaseRolloutMatch = url.pathname.match(/^\/v1\/release-rollouts\/([^/]+)$/u);
+      if (req.method === "GET" && releaseRolloutMatch) {
+        const user = await authenticateUser(req, store, config, null, clerkAuth);
+        await enforceUserRead(req, res, rateLimiter, config, user);
+        const rollout = await store.getReleaseRolloutForUser(user.id, releaseRolloutMatch[1]);
+        if (!rollout) throw new HttpError(404, "Release rollout not found.");
+        const assignments = await store.listRolloutAssignments({ userId: user.id, rolloutId: rollout.id });
+        return sendJson(res, 200, { rollout, assignments });
+      }
+
+      const releaseRolloutActionMatch = url.pathname.match(/^\/v1\/release-rollouts\/([^/]+)\/actions$/u);
+      if (req.method === "POST" && releaseRolloutActionMatch) {
+        const user = await authenticateUser(req, store, config, null, clerkAuth);
+        await enforceUserWrite(req, res, rateLimiter, config, user);
+        const body = await readJson(req);
+        const action = requireString(body.action, "action");
+        if (!["start", "pause", "resume", "expand", "cancel", "rollback", "complete"].includes(action)) {
+          throw new HttpError(400, "Unsupported rollout action.");
+        }
+        const evidenceRef = validateRolloutEvidenceRef(body.evidenceRef);
+        const current = await store.getReleaseRolloutForUser(user.id, releaseRolloutActionMatch[1]);
+        if (!current) throw new HttpError(404, "Release rollout not found.");
+        if (action === "complete") validateRolloutCompletion(current);
+        const transition = await store.transitionReleaseRollout({
+          userId: user.id,
+          rolloutId: current.id,
+          action,
+          evidenceRef,
+          percentage: body.percentage,
+        });
+        if (transition?.conflict) {
+          throw new HttpError(409, rolloutTransitionMessage(transition.reason));
+        }
+        const rollout = transition.rollout;
+        if (["start", "resume", "expand", "rollback"].includes(action)) {
+          await releaseRolloutRunner.reconcile(rollout);
+        } else if (action === "cancel") {
+          await releaseRolloutRunner.reverseAssignments(rollout);
+        }
+        events.broadcastToUser(user.id, "release-rollout.changed", {
+          rolloutId: rollout.id, state: rollout.state, action, changedAt: new Date().toISOString(),
+        });
+        return sendJson(res, 200, {
+          rollout: await store.getReleaseRolloutForUser(user.id, rollout.id),
+          assignments: await store.listRolloutAssignments({ userId: user.id, rolloutId: rollout.id }),
+        });
       }
 
       if (req.method === "POST" && url.pathname === "/v1/users/dev") {
@@ -450,6 +615,8 @@ export function createApp({
         }
         const input = normalizeGatewayProfileInput(await readJson(req));
         const profile = await store.createGatewayProfile({ userId: user.id, ...input });
+        await publishDeviceRefreshForAll({ store, events, userId: user.id,
+          resources: ["gateway"] });
         return sendJson(res, 201, { profile: publicGatewayProfile(profile) });
       }
 
@@ -471,6 +638,8 @@ export function createApp({
         if (profile?.conflict) throw new HttpError(409, "Create and stage a new profile before changing an assigned gateway URL.", {
           deviceIds: profile.deviceIds,
         });
+        await publishDeviceRefreshForAll({ store, events, userId: user.id,
+          resources: ["gateway"] });
         return sendJson(res, 200, { profile: publicGatewayProfile(profile) });
       }
       if (gatewayProfileMatch && req.method === "DELETE") {
@@ -479,6 +648,8 @@ export function createApp({
         const result = await store.deleteGatewayProfile({ userId: user.id, profileId: gatewayProfileMatch[1] });
         if (!result) throw new HttpError(404, "Gateway profile not found.");
         if (result.conflict) throw new HttpError(409, "Gateway profile is assigned to a device.", { deviceIds: result.deviceIds });
+        await publishDeviceRefreshForAll({ store, events, userId: user.id,
+          resources: ["gateway"] });
         return sendJson(res, 200, { profile: publicGatewayProfile(result.profile), deleted: true });
       }
 
@@ -526,6 +697,8 @@ export function createApp({
               enableOtaApply: body.enableOtaApply === true,
               requireOtaSignature: body.requireOtaSignature === true,
               otaManifestVerifyKey: optionalString(body.otaManifestVerifyKey) ?? "",
+              gatewayTlsRootCaPem: config.gatewayTlsRootCaPem,
+              gatewayTlsNextRootCaPem: config.gatewayTlsNextRootCaPem,
             }),
           });
         }
@@ -550,6 +723,11 @@ export function createApp({
         const body = await readJson(req);
         const input = parseFirmwareRelease(body);
         const release = await store.createFirmwareRelease(input);
+        events.broadcastToAll("firmware.changed", {
+          action: "released", version: release.version, channel: release.channel,
+          hardwareModel: release.hardwareModel, mandatory: release.mandatory,
+          changedAt: new Date().toISOString(),
+        });
         return sendJson(res, 201, {
           release: sanitizeFirmwareRelease(release),
           manifest: buildFirmwareManifest(release, signingKey),
@@ -586,6 +764,11 @@ export function createApp({
           throw error;
         }
         const publicRelease = sanitizeFirmwareRelease(release);
+        events.broadcastToAll("firmware.changed", {
+          action: "released", version: release.version, channel: release.channel,
+          hardwareModel: release.hardwareModel, mandatory: release.mandatory,
+          changedAt: new Date().toISOString(),
+        });
         const manifestRelease = { ...publicRelease, url: new URL(publicRelease.url, requestBaseUrl(req)).toString() };
         return sendJson(res, 201, { release: publicRelease, manifest: buildFirmwareManifest(manifestRelease, signingKey), managedArtifact: true });
       }
@@ -607,6 +790,10 @@ export function createApp({
         const release = await store.deleteFirmwareRelease(factoryFirmwareReleaseMatch[1]);
         if (!release) throw new HttpError(404, "Firmware release not found.");
         await deleteFirmwareArtifact(release, config);
+        events.broadcastToAll("firmware.changed", {
+          action: "withdrawn", version: release.version, channel: release.channel,
+          hardwareModel: release.hardwareModel, changedAt: new Date().toISOString(),
+        });
         return sendJson(res, 200, { release: sanitizeFirmwareRelease(release), deleted: true });
       }
 
@@ -648,6 +835,10 @@ export function createApp({
         if (action === "revoke") {
           const device = await store.revokeDevice({ userId: user.id, deviceId });
           if (!device) throw new HttpError(404, "Device not found.");
+          events.broadcastToUser(user.id, "device.refresh", {
+            deviceId, resources: ["config", "controls", "display"], reason: "revoked",
+            changedAt: new Date().toISOString(),
+          });
           return sendJson(res, 200, { device });
         }
         if (action === "transfer-reset") {
@@ -659,11 +850,24 @@ export function createApp({
             label: optionalString(body.label),
           });
           if (!result) throw new HttpError(404, "Device not found or revoked.");
+          events.broadcastToUser(user.id, "device.refresh", {
+            deviceId, resources: ["config", "controls", "display"], reason: "transfer-reset",
+            changedAt: new Date().toISOString(),
+          });
           return sendJson(res, 200, result);
         }
         assertSecureTransport(req, config, "Device secret delivery");
-        const result = await store.rotateDeviceSecret({ userId: user.id, deviceId });
+        const body = await readJson(req).catch(() => ({}));
+        const result = await store.rotateDeviceSecret({
+          userId: user.id,
+          deviceId,
+          restart: body?.restart === true,
+        });
         if (!result) throw new HttpError(404, "Device not found or revoked.");
+        events.broadcastToUser(user.id, "device.refresh", {
+          deviceId, resources: ["config", "controls", "display"], reason: "secret-rotation-started",
+          changedAt: new Date().toISOString(),
+        });
         return sendJson(res, 200, result);
       }
 
@@ -724,6 +928,10 @@ export function createApp({
           config: body,
         });
         if (!device) throw new HttpError(404, "Device not found.");
+        events.broadcastToUser(user.id, "device.refresh", {
+          deviceId: device.id, resources: ["config", "threads", "controls", "display"],
+          changedAt: new Date().toISOString(),
+        });
         return sendJson(res, 200, { deviceId: device.id, config: device.config, device });
       }
 
@@ -745,6 +953,9 @@ export function createApp({
         if (!(await store.getGatewayProfileForUser(user.id, profileId))) throw new HttpError(404, "Gateway profile not found.");
         const selection = await store.stageDeviceGatewaySwitch({ userId: user.id, deviceId: device.id, profileId });
         if (!selection) throw new HttpError(409, "Gateway switch could not be staged.");
+        events.broadcastToUser(user.id, "device.refresh", {
+          deviceId: device.id, resources: ["gateway", "display"], changedAt: new Date().toISOString(),
+        });
         return sendJson(res, 200, await deviceGatewayResponse(store, device, selection));
       }
 
@@ -755,6 +966,9 @@ export function createApp({
         const device = await store.getDeviceForUser(user.id, ownerGatewayRollbackMatch[1]);
         if (!device) throw new HttpError(404, "Device not found.");
         const selection = await store.rollbackDeviceGatewaySwitch({ userId: user.id, deviceId: device.id });
+        events.broadcastToUser(user.id, "device.refresh", {
+          deviceId: device.id, resources: ["gateway", "display"], changedAt: new Date().toISOString(),
+        });
         return sendJson(res, 200, await deviceGatewayResponse(store, device, selection));
       }
 
@@ -783,6 +997,10 @@ export function createApp({
         await validateDeviceControlAssignments({ store, device, items, config });
         const layout = await store.updateDeviceControls({ userId: user.id, deviceId: device.id, items });
         if (!layout) throw new HttpError(404, "Device not found or revoked.");
+        events.broadcastToUser(user.id, "device.refresh", {
+          deviceId: device.id, resources: ["controls", "display"],
+          changedAt: new Date().toISOString(),
+        });
         return sendJson(res, 200, {
           deviceId: device.id,
           controls: await resolveDeviceControls({ store, device, stored: layout, config }),
@@ -832,6 +1050,10 @@ export function createApp({
           policy: policyInput,
         });
         if (!policy) throw new HttpError(404, "Device not found or revoked.");
+        events.broadcastToUser(user.id, "firmware.changed", {
+          action: "policy", deviceId: device.id, desiredVersion: policy.desiredVersion ?? null,
+          channel: policy.channel, updateMode: policy.updateMode, changedAt: new Date().toISOString(),
+        });
         return sendJson(res, 200, await firmwarePolicyResponse({ store, device, policy, config }));
       }
 
@@ -880,6 +1102,10 @@ export function createApp({
           profile,
         });
         if (!device) throw new HttpError(404, "Device not found or revoked.");
+        events.broadcastToUser(user.id, "device.refresh", {
+          deviceId: device.id, resources: ["config", "controls", "display"],
+          changedAt: new Date().toISOString(),
+        });
         return sendJson(res, 200, { device });
       }
 
@@ -919,14 +1145,223 @@ export function createApp({
           session: created.session,
           code: created.code,
           gatewayUrl,
-          command: buildConnectCommand({ gatewayUrl, code: created.code, accessMode }),
+          command: buildConnectCommand({ gatewayUrl, code: created.code }),
         });
+      }
+
+      // Connector enrollment is code-authenticated but, unlike the legacy redeem route below,
+      // never accepts a T3 URL or token. Those credentials remain on the user's machine.
+      if (req.method === "POST" && url.pathname === "/v1/connectors/enroll") {
+        await enforceConnectRedeem(req, res, rateLimiter, config);
+        const body = await readJson(req);
+        const code = requireString(body.code, "code");
+        if (body.accessToken != null || body.pairingToken != null) {
+          throw new HttpError(400, "T3 credentials are not accepted during connector enrollment.");
+        }
+        const protocolVersion = Number(body.protocolVersion ?? CONNECTOR_PROTOCOL_VERSION);
+        if (protocolVersion !== CONNECTOR_PROTOCOL_VERSION) {
+          throw new HttpError(400, `protocolVersion must be ${CONNECTOR_PROTOCOL_VERSION}.`);
+        }
+        const capabilities = optionalStringArray(body.capabilities, "capabilities");
+        const claimed = await store.claimConnectSession({ code });
+        if (!claimed?.session) throw connectCodeError(claimed?.reason);
+        const session = claimed.session;
+        try {
+          if (session.purpose !== "t3_enrollment") throw new HttpError(403, "This code is not authorized for connector enrollment.");
+          if (!session.environmentId) await assertWithinPlan(store, session.userId, "environments", config);
+          const environment = await store.upsertEnvironment({
+            ...(session.environmentId ? { id: session.environmentId } : {}),
+            userId: session.userId,
+            label: session.label || optionalString(body.label) || "T3 Code",
+            transportMode: "connector",
+            scopes: STANDARD_T3_SCOPES,
+            status: "paired",
+          });
+          if (!environment) throw new HttpError(404, "Environment not found.");
+          // Re-enrollment is credential replacement, not a second live authority. Close and
+          // tombstone every current edge session before revoking its standing Store credential and
+          // returning the replacement secret. Doing this before createConnector() means a router
+          // failure leaves the old credential/session coherent and the user can mint another code;
+          // it never returns two usable connectors for one environment.
+          const supersededConnectors = (await store.listConnectors(session.userId)).filter((connector) => (
+            connector.environmentId === environment.id
+            && !connector.revokedAt
+            && connector.status !== "revoked"
+          ));
+          if (connectorRouter) {
+            for (const superseded of supersededConnectors) {
+              try {
+                await connectorRouter.revoke({
+                  environmentId: environment.id,
+                  connectorId: superseded.id,
+                  reason: "superseded_by_reenrollment",
+                });
+              } catch (error) {
+                const status = Number.isInteger(error?.status) && error.status >= 400 && error.status <= 599
+                  ? error.status
+                  : 502;
+                throw new HttpError(status, "The existing connector session could not be closed; create a new enrollment code and retry.");
+              }
+            }
+          }
+          const enrolled = await store.createConnector({
+            userId: session.userId,
+            environmentId: environment.id,
+            label: optionalString(body.label) ?? `${environment.label} Connector`,
+            scopes: CONNECTOR_CREDENTIAL_SCOPES,
+            protocolVersion,
+            connectorVersion: optionalString(body.connectorVersion),
+            platform: optionalString(body.platform),
+            capabilities,
+          });
+          if (!enrolled) throw new HttpError(404, "Environment not found.");
+          const completed = await store.completeConnectSession({
+            sessionId: session.id,
+            environmentId: environment.id,
+          });
+          const environments = await store.listEnvironments(session.userId);
+          const currentEnvironment = environments.find((item) => item.id === environment.id) ?? environment;
+          return sendJson(res, 201, {
+            session: completed,
+            environment: currentEnvironment,
+            connector: enrolled.connector,
+            secret: enrolled.secret,
+          });
+        } catch (error) {
+          await store.completeConnectSession({ sessionId: session.id, error: error?.message || "Enrollment failed." });
+          throw error;
+        }
+      }
+
+      if (req.method === "POST" && url.pathname === "/v1/connectors/ticket") {
+        const connector = await authenticateConnector(req, store, config);
+        await enforceConnectorWrite(req, res, rateLimiter, config, connector);
+        const minted = await store.createConnectorTicket({
+          connectorId: connector.id,
+          credentialVersion: connector.authenticatedCredentialVersion,
+          rotationId: connector.authenticatedRotationId,
+          audience: config.connectorTicketAudience ?? CONNECTOR_TICKET_AUDIENCE,
+        });
+        if (!minted) throw new HttpError(401, "Connector is revoked or unavailable.");
+        return sendJson(res, 201, minted);
+      }
+
+      if (req.method === "POST" && url.pathname === "/v1/connectors/self/revoke") {
+        const credential = connectorCredential(req, config);
+        const authenticated = await store.authenticateConnectorForRevocation(credential.connectorId, credential.secret);
+        if (!authenticated) throw new HttpError(401, "Invalid connector credential.");
+        await enforceConnectorWrite(req, res, rateLimiter, config, authenticated);
+        const connector = await store.revokeConnectorByCredential({
+          connectorId: credential.connectorId,
+          secret: credential.secret,
+          reason: "revoked_by_connector",
+        });
+        if (!connector) throw new HttpError(401, "Invalid connector credential.");
+        if (connectorRouter) {
+          try {
+            await connectorRouter.revoke({
+              environmentId: authenticated.environmentId,
+              connectorId: authenticated.id,
+              reason: "revoked_by_connector",
+            });
+          } catch (error) {
+            const status = Number.isInteger(error?.status) && error.status >= 400 && error.status <= 599 ? error.status : 502;
+            throw new HttpError(status, "Connector was revoked, but its live session could not be closed yet. Retry disconnect before deleting local credentials.");
+          }
+        }
+        return sendJson(res, 200, { connector });
+      }
+
+      if (req.method === "GET" && url.pathname === "/v1/connectors") {
+        const user = await authenticateUser(req, store, config, null, clerkAuth);
+        await enforceUserRead(req, res, rateLimiter, config, user);
+        return sendJson(res, 200, { connectors: await store.listConnectors(user.id) });
+      }
+
+      const connectorMatch = url.pathname.match(/^\/v1\/connectors\/([^/]+)$/u);
+      const connectorRotationSessionMatch = url.pathname.match(/^\/v1\/connectors\/([^/]+)\/rotation-sessions$/u);
+      if (connectorRotationSessionMatch && req.method === "POST") {
+        const user = await authenticateUser(req, store, config, null, clerkAuth);
+        await enforceUserWrite(req, res, rateLimiter, config, user);
+        const connector = await store.getConnectorForUser(user.id, connectorRotationSessionMatch[1]);
+        if (!connector || connector.revokedAt || connector.status === "revoked") throw new HttpError(404, "Connector not found.");
+        const created = await store.createConnectSession({
+          userId: user.id,
+          label: connector.label,
+          accessMode: "local",
+          environmentId: connector.environmentId,
+          purpose: "connector_rotation",
+        });
+        const gatewayUrl = config.publicBaseUrl ?? requestBaseUrl(req);
+        return sendJson(res, 201, {
+          session: created.session,
+          code: created.code,
+          gatewayUrl,
+          command: buildConnectorRotateCommand({ gatewayUrl, code: created.code }),
+        });
+      }
+      const connectorRotateMatch = url.pathname.match(/^\/v1\/connectors\/([^/]+)\/rotate$/u);
+      if (connectorRotateMatch && req.method === "POST") {
+        const connector = await authenticateConnector(req, store, config);
+        await enforceConnectorWrite(req, res, rateLimiter, config, connector);
+        await enforceConnectRedeem(req, res, rateLimiter, config);
+        if (connector.id !== connectorRotateMatch[1]) throw new HttpError(403, "Connector credential does not match the rotation target.");
+        const body = await readJson(req);
+        const code = requireString(body.code, "code");
+        const claimed = await store.claimConnectSession({ code });
+        if (!claimed?.session) throw connectCodeError(claimed?.reason);
+        const session = claimed.session;
+        try {
+          if (session.userId !== connector.userId || session.environmentId !== connector.environmentId) {
+            throw new HttpError(403, "Rotation code does not belong to this connector environment.");
+          }
+          if (session.purpose !== "connector_rotation") throw new HttpError(403, "This code is not authorized for credential rotation.");
+          const rotated = await store.beginConnectorCredentialRotation({
+            userId: session.userId,
+            connectorId: connector.id,
+          });
+          if (!rotated) throw new HttpError(404, "Connector not found.");
+          await store.completeConnectSession({ sessionId: session.id, environmentId: connector.environmentId });
+          return sendJson(res, 201, rotated);
+        } catch (error) {
+          await store.completeConnectSession({ sessionId: session.id, error: error?.message || "Credential rotation failed." });
+          throw error;
+        }
+      }
+      if (connectorMatch && req.method === "DELETE") {
+        const user = await authenticateUser(req, store, config, null, clerkAuth);
+        await enforceUserWrite(req, res, rateLimiter, config, user);
+        const owned = await store.getConnectorForUser(user.id, connectorMatch[1]);
+        if (!owned) throw new HttpError(404, "Connector not found.");
+        const connector = await store.revokeConnector({ userId: user.id, connectorId: connectorMatch[1] });
+        if (!connector) throw new HttpError(404, "Connector not found.");
+        if (connectorRouter) {
+          try {
+            await connectorRouter.revoke({
+              environmentId: owned.environmentId,
+              connectorId: owned.id,
+              reason: "revoked_by_user",
+            });
+          } catch (error) {
+            const status = Number.isInteger(error?.status) && error.status >= 400 && error.status <= 599 ? error.status : 502;
+            throw new HttpError(status, "Connector was revoked, but its live session could not be closed yet.");
+          }
+        }
+        return sendJson(res, 200, { connector });
       }
 
       // Code-authenticated, no platform session: scripts/setup-t3.mjs runs on the T3 host and has
       // no Clerk credential. Registered before the /:id route so the literal path wins.
       if (req.method === "POST" && url.pathname === "/v1/t3/connect-sessions/redeem") {
         await enforceConnectRedeem(req, res, rateLimiter, config);
+        // A cloud gateway must not accept a caller-chosen URL or a T3 credential. Return before
+        // parsing or claiming the one-time code, and before token exchange can make an outbound
+        // request. The same code remains usable by /v1/connectors/enroll.
+        if (isCloudDeployment(config)) {
+          throw new HttpError(404, "Direct T3 enrollment is not available in cloud deployments.", {
+            reason: "direct_t3_disabled",
+          });
+        }
         const body = await readJson(req);
         // Validated before the code is consumed — a malformed body must not burn the enrollment.
         const code = requireString(body.code, "code");
@@ -946,6 +1381,7 @@ export function createApp({
         }
         const session = claimed.session;
         try {
+          if (session.purpose !== "t3_enrollment") throw new HttpError(403, "This code is not authorized for T3 enrollment.");
           if (!session.environmentId) {
             await assertWithinPlan(store, session.userId, "environments", config);
           }
@@ -1012,6 +1448,13 @@ export function createApp({
       if (req.method === "POST" && url.pathname === "/v1/t3/environments") {
         const user = await authenticateUser(req, store, config, null, clerkAuth);
         await enforceUserWrite(req, res, rateLimiter, config, user);
+        // Authentication and actor-scoped throttling still run, but cloud mode rejects the legacy
+        // direct path before reading a baseUrl/token or attempting an OAuth exchange.
+        if (isCloudDeployment(config)) {
+          throw new HttpError(409, "Use connector enrollment to add a T3 environment in cloud deployments.", {
+            reason: "connector_required",
+          });
+        }
         const body = await readJson(req);
         if (!optionalString(body.id)) await assertWithinPlan(store, user.id, "environments", config);
         const baseUrl = requireString(body.baseUrl, "baseUrl");
@@ -1038,13 +1481,19 @@ export function createApp({
           scopes,
           status: "paired",
         });
+        await publishDeviceRefreshForAll({ store, events, userId: user.id,
+          resources: ["environments"] });
         return sendJson(res, 201, { environment });
       }
 
       if (req.method === "GET" && url.pathname === "/v1/t3/environments") {
         const user = await authenticateUser(req, store, config, null, clerkAuth);
         await enforceUserRead(req, res, rateLimiter, config, user);
-        return sendJson(res, 200, { environments: await store.listEnvironments(user.id) });
+        const [active, archived] = await Promise.all([
+          store.listEnvironments(user.id),
+          store.listArchivedEnvironments?.(user.id) ?? [],
+        ]);
+        return sendJson(res, 200, { environments: [...active, ...archived] });
       }
 
       const environmentCapabilitiesMatch = url.pathname.match(/^\/v1\/t3\/environments\/([^/]+)\/capabilities$/u);
@@ -1053,17 +1502,21 @@ export function createApp({
         await enforceUserRead(req, res, rateLimiter, config, user);
         const environment = await store.getEnvironmentForUser(user.id, environmentCapabilitiesMatch[1]);
         if (!environment) throw new HttpError(404, "Environment not found.");
-        const scopes = new Set(environment.scopes ?? []);
+        const adapter = runtimeT3TransportResolver.forEnvironment(environment);
+        const manifest = await adapter.capabilities(environment, {
+          force: url.searchParams.get("refresh") === "1",
+          allowStale: true,
+        });
+        const projected = ownerSafeT3CapabilityProjection(manifest);
+        await store.updateEnvironmentHealth({
+          userId: user.id,
+          environmentId: environment.id,
+          health: { capabilities: projected },
+        });
         return sendJson(res, 200, {
           environmentId: environment.id,
-          capabilities: {
-            orchestrationRead: scopes.has("orchestration:read"),
-            orchestrationOperate: scopes.has("orchestration:operate"),
-            terminalDirect: scopes.has(TERMINAL_SCOPE),
-            attachments: scopes.has("orchestration:operate"),
-            savedActions: "gateway",
-            macros: "gateway",
-          },
+          manifest: projected,
+          capabilities: legacyCapabilityProjection(projected),
         });
       }
 
@@ -1087,12 +1540,86 @@ export function createApp({
       }
 
       const environmentMatch = url.pathname.match(/^\/v1\/t3\/environments\/([^/]+)$/u);
+      const environmentArchiveMatch = url.pathname.match(/^\/v1\/t3\/environments\/([^/]+)\/archive$/u);
+      const environmentRestoreMatch = url.pathname.match(/^\/v1\/t3\/environments\/([^/]+)\/restore$/u);
+      if (environmentArchiveMatch && req.method === "POST") {
+        const user = await authenticateUser(req, store, config, null, clerkAuth);
+        await enforceUserWrite(req, res, rateLimiter, config, user);
+        const activeEnvironment = await store.getEnvironmentForUser(user.id, environmentArchiveMatch[1]);
+        if (activeEnvironment && connectorRouter) {
+          const liveConnectors = (await store.listConnectors(user.id)).filter((connector) => (
+            connector.environmentId === activeEnvironment.id && !connector.revokedAt && connector.status !== "revoked"
+          ));
+          for (const connector of liveConnectors) {
+            await connectorRouter.revoke({
+              environmentId: activeEnvironment.id,
+              connectorId: connector.id,
+              reason: "environment_archived",
+            });
+          }
+        }
+        const result = await store.archiveEnvironment({
+          userId: user.id,
+          environmentId: environmentArchiveMatch[1],
+          retentionDays: config.environmentRetentionDays,
+        });
+        if (!result) throw new HttpError(404, "Environment not found.");
+        snapshotPoller?.forgetEnvironment?.(environmentArchiveMatch[1]);
+        await publishDeviceRefreshForAll({ store, events, userId: user.id,
+          resources: ["environments", "projects", "config", "threads", "controls", "display"] });
+        return sendJson(res, 200, result);
+      }
+
+      if (environmentRestoreMatch && req.method === "POST") {
+        const user = await authenticateUser(req, store, config, null, clerkAuth);
+        await enforceUserWrite(req, res, rateLimiter, config, user);
+        const result = await store.restoreEnvironment({ userId: user.id, environmentId: environmentRestoreMatch[1] });
+        if (!result) throw new HttpError(404, "Environment tombstone not found.");
+        if (result.expired) throw new HttpError(410, "The environment recovery window has expired.", {
+          reason: "environment_retention_expired",
+          purgeAfter: result.environment?.purgeAfter ?? null,
+        });
+        await publishDeviceRefreshForAll({ store, events, userId: user.id,
+          resources: ["environments", "projects", "config", "threads", "controls", "display"] });
+        return sendJson(res, 200, result);
+      }
+
       if (environmentMatch && req.method === "PUT") {
         const user = await authenticateUser(req, store, config, null, clerkAuth);
         await enforceUserWrite(req, res, rateLimiter, config, user);
         const current = await store.getEnvironmentForUser(user.id, environmentMatch[1]);
         if (!current) throw new HttpError(404, "Environment not found.");
+        if (current.archivedAt) {
+          throw new HttpError(409, "Archived environments must be paired again before they can be edited.", {
+            environmentId: current.id,
+            reason: "environment_archived",
+          });
+        }
+        if (isCloudDeployment(config) && current.transportMode !== "connector") {
+          throw new HttpError(409, "Direct T3 environments cannot be edited in cloud deployments.", {
+            environmentId: current.id,
+            reason: "connector_required",
+          });
+        }
         const body = await readJson(req);
+        if (isCloudDeployment(config)) {
+          assertCloudConnectorMetadataUpdate(body);
+          const environment = await store.upsertEnvironment({
+            id: current.id,
+            userId: user.id,
+            label: Object.hasOwn(body, "label") ? requireString(body.label, "label") : current.label,
+            transportMode: "connector",
+            connectorId: current.connectorId,
+            scopes: current.scopes,
+            status: current.status,
+            health: current.health,
+            createdAt: current.createdAt,
+          });
+          if (!environment) throw new HttpError(404, "Environment not found.");
+          await publishDeviceRefreshForAll({ store, events, userId: user.id,
+            resources: ["environments", "projects", "config", "threads", "controls", "display"] });
+          return sendJson(res, 200, { environment });
+        }
         const baseUrl = optionalString(body.baseUrl) ?? current.baseUrl;
         const scopes = Array.isArray(body.scopes) && body.scopes.length > 0
           ? body.scopes.map((scope) => requireString(scope, "scope"))
@@ -1125,13 +1652,47 @@ export function createApp({
           createdAt: current.createdAt,
         });
         if (!environment) throw new HttpError(404, "Environment not found.");
+        await publishDeviceRefreshForAll({ store, events, userId: user.id,
+          resources: ["environments", "projects", "config", "threads", "controls", "display"] });
         return sendJson(res, 200, { environment });
       }
 
       if (environmentMatch && req.method === "DELETE") {
         const user = await authenticateUser(req, store, config, null, clerkAuth);
         await enforceUserWrite(req, res, rateLimiter, config, user);
-        const result = await store.deleteEnvironment({ userId: user.id, environmentId: environmentMatch[1] });
+        const environmentId = environmentMatch[1];
+        const environment = await store.getEnvironmentForUser(user.id, environmentId);
+        if (!environment) {
+          const archived = (await store.listArchivedEnvironments(user.id)).find((item) => item.id === environmentId);
+          return sendJson(res, 200, {
+            environment: archived ?? null,
+            removed: emptyEnvironmentRemoval(),
+            alreadyRemoved: true,
+          });
+        }
+        const dependencies = await collectEnvironmentDependencies(store, user.id, environmentId);
+        const dependencyCount = dependencies.devices.length + dependencies.actions.length
+          + dependencies.macros.length + (dependencies.onboarding ? 1 : 0);
+        const body = await readJson(req);
+        if (dependencyCount > 0 && body.confirmationLabel !== environment.label) {
+          throw new HttpError(409, "Type the current environment label to confirm removal.", {
+            reason: "environment_label_confirmation_required",
+            expectedLabel: environment.label,
+          });
+        }
+        const liveConnectors = (await store.listConnectors(user.id)).filter((connector) => (
+          connector.environmentId === environmentId && !connector.revokedAt && connector.status !== "revoked"
+        ));
+        if (connectorRouter) {
+          for (const connector of liveConnectors) {
+            await connectorRouter.revoke({ environmentId, connectorId: connector.id, reason: "environment_removed" });
+          }
+        }
+        const result = await store.archiveEnvironment({
+          userId: user.id,
+          environmentId,
+          retentionDays: config.environmentRetentionDays,
+        });
         // Removal is idempotent: a repeated DELETE reports the same end state rather than 404ing,
         // so a retry (or a second console tab) cannot strand the owner on an error.
         if (!result) {
@@ -1141,9 +1702,13 @@ export function createApp({
             alreadyRemoved: true,
           });
         }
+        snapshotPoller?.forgetEnvironment?.(environmentId);
+        await publishDeviceRefreshForAll({ store, events, userId: user.id,
+          resources: ["environments", "projects", "config", "threads", "controls", "display"] });
         return sendJson(res, 200, {
           environment: result.environment,
           removed: result.removed ?? emptyEnvironmentRemoval(),
+          revokedConnectorIds: result.revokedConnectorIds ?? [],
           alreadyRemoved: false,
         });
       }
@@ -1425,7 +1990,7 @@ export function createApp({
         assertEnvironmentTokenActive(environment);
         const body = await readJson(req);
         const projectId = requireString(body.projectId, "projectId");
-        const text = optionalString(body.text) ?? "Open this project and report that the session is ready.";
+        let text = optionalString(body.text) ?? "Open this project and report that the session is ready.";
         const snapshot = await readT3Snapshot({ ...environment, timeoutMs: 5000 });
         const project = snapshot.projects?.find((candidate) => candidate.id === projectId);
         if (!project) throw new HttpError(404, "T3 project not found.");
@@ -1465,13 +2030,18 @@ export function createApp({
         // A first turn carries media on exactly the same terms as a follow-up turn: same
         // ownership, kind and count validation, same signed-link-plus-inline attachment shape.
         const mediaUploadIds = collectMediaUploadIds(null, body);
-        const attachments = await buildMediaAttachments({
+        const launchManifest = await requireFreshT3CapabilityForStore(store, environment, "launch");
+        const preparedMedia = prepareCapabilityAwareAttachments(await buildMediaAttachments({
           store,
           userId: user.id,
           mediaUploadIds,
           config,
           baseUrl: config.publicBaseUrl ?? requestBaseUrl(req),
-        });
+        }), launchManifest);
+        const attachments = preparedMedia.attachments;
+        if (preparedMedia.audioTranscripts.length > 0) {
+          text = [text, "Audio transcript:", ...preparedMedia.audioTranscripts].join("\n\n");
+        }
         const launch = buildT3ProjectLaunchCommands({
           project,
           text,
@@ -1485,11 +2055,67 @@ export function createApp({
           text,
           ...(mediaUploadIds.length > 0 ? { mediaUploadIds } : {}),
         };
+        const suppliedClientRequestId = body.clientRequestId !== undefined && body.clientRequestId !== null;
+        const clientRequestId = suppliedClientRequestId
+          ? normalizeClientRequestId(body.clientRequestId)
+          : createId("req");
+        if (!clientRequestId) {
+          throw new HttpError(400, "clientRequestId must be 8-128 URL-safe characters.");
+        }
+        const requestHash = commandRequestHash({
+          operation: THREAD_LAUNCH_REQUEST_OPERATION,
+          environmentId: environment.id,
+          intent: {
+            type: "thread_launch",
+            projectId,
+            text,
+            modelSelection,
+            runtimeMode: normalizeT3RuntimeMode(body.runtimeMode),
+            interactionMode: normalizeT3InteractionMode(body.interactionMode),
+            mediaUploadIds,
+          },
+        });
+        const requestIdentity = {
+          userId: user.id,
+          actorType: "user",
+          actorId: user.id,
+          operation: THREAD_LAUNCH_REQUEST_OPERATION,
+          clientRequestId,
+          requestHash,
+        };
+        const claim = await store.claimCommandRequest(requestIdentity);
+        if (claim.capacity) {
+          throw new HttpError(503, "Too many agent requests are still in progress. Wait for one to settle before retrying.");
+        }
+        if (claim.conflict) {
+          throw new HttpError(409, "clientRequestId was already used for a different agent request.", {
+            code: "idempotency_conflict",
+            request: claim.request,
+          });
+        }
+        if (!claim.claimed) {
+          const replay = await replayCommandRequest({ store, actor: { userId: user.id }, request: claim.request });
+          return sendJson(res, 202, {
+            project,
+            threadId: replay.command?.threadId ?? null,
+            modelSelection,
+            modelRecovery,
+            ...replay,
+          });
+        }
         const dispatchStartedAt = Date.now();
         let result;
         try {
-          const createResult = await dispatchT3Command(environment, launch.createThread);
-          const turnResult = await dispatchT3Command(environment, launch.startTurn);
+          const createResult = await dispatchT3Command(
+            environment,
+            launch.createThread,
+            connectorRequestOptions(clientRequestId, "thread.create"),
+          );
+          const turnResult = await dispatchT3Command(
+            environment,
+            launch.startTurn,
+            connectorRequestOptions(clientRequestId, "thread.start"),
+          );
           result = { createThread: createResult, startTurn: turnResult };
         } catch (error) {
           const command = await store.createCommand({
@@ -1511,9 +2137,17 @@ export function createApp({
             },
             metrics: commandMetrics({ startedAt, dispatchStartedAt, failure: true }),
           });
+          const request = await store.settleCommandRequest({
+            ...requestIdentity,
+            status: "failed",
+            commandId: command.id,
+            httpStatus: 502,
+          });
           throw new HttpError(502, "T3 project launch failed.", {
             command,
             cause: errorMessage(error),
+            request,
+            clientRequestId,
           });
         }
         const command = await store.createCommand({
@@ -1535,19 +2169,250 @@ export function createApp({
           },
           metrics: commandMetrics({ startedAt, dispatchStartedAt, completed: true }),
         });
+        const request = await store.settleCommandRequest({
+          ...requestIdentity,
+          status: command.status,
+          commandId: command.id,
+          httpStatus: 202,
+        });
+        await publishThreadMutation({
+          store,
+          events,
+          userId: user.id,
+          environmentId: environment.id,
+          threadId: launch.threadId,
+          action: "created",
+        });
         return sendJson(res, 202, {
           project,
           threadId: launch.threadId,
           modelSelection,
           modelRecovery,
           command,
+          request,
+          clientRequestId,
         });
+      }
+
+      // User-owned thread management. These are ordinary T3 orchestration commands, kept behind
+      // the same platform-user write boundary as launching a thread. The gateway never mirrors a
+      // second copy of the title/archive state; the following snapshot remains authoritative.
+      const environmentThreadMatch = url.pathname.match(
+        /^\/v1\/t3\/environments\/([^/]+)\/threads\/([^/]+)$/u,
+      );
+      if ((req.method === "PATCH" || req.method === "DELETE") && environmentThreadMatch) {
+        const user = await authenticateUser(req, store, config, null, clerkAuth);
+        await enforceUserWrite(req, res, rateLimiter, config, user);
+        const environment = await store.getEnvironmentForUser(user.id, environmentThreadMatch[1]);
+        if (!environment) throw new HttpError(404, "Environment not found.");
+        assertEnvironmentTokenActive(environment);
+        const threadId = decodeURIComponent(environmentThreadMatch[2]);
+        let command;
+        let action;
+        if (req.method === "PATCH") {
+          const body = await readJson(req);
+          const title = normalizeTitle(body.title);
+          if (!title) throw new HttpError(400, "title must contain visible text.");
+          command = {
+            type: "thread.meta.update",
+            commandId: createId("t3cmd"),
+            threadId,
+            title,
+          };
+          action = "renamed";
+        } else {
+          command = { type: "thread.delete", commandId: createId("t3cmd"), threadId };
+          action = "deleted";
+        }
+        try {
+          const result = await dispatchT3Command(environment, command);
+          await publishThreadMutation({
+            store,
+            events,
+            userId: user.id,
+            environmentId: environment.id,
+            threadId,
+            action,
+            ...(action === "renamed" ? { title: command.title } : {}),
+          });
+          return sendJson(res, 202, {
+            environmentId: environment.id,
+            threadId,
+            action,
+            ...(action === "renamed" ? { title: command.title } : {}),
+            result,
+          });
+        } catch (error) {
+          throw new HttpError(502, `T3 thread ${action.replace(/d$/u, "")} failed.`, {
+            cause: errorMessage(error),
+          });
+        }
+      }
+
+      const environmentThreadArchiveMatch = url.pathname.match(
+        /^\/v1\/t3\/environments\/([^/]+)\/threads\/([^/]+)\/archive$/u,
+      );
+      if (req.method === "POST" && environmentThreadArchiveMatch) {
+        const user = await authenticateUser(req, store, config, null, clerkAuth);
+        await enforceUserWrite(req, res, rateLimiter, config, user);
+        const environment = await store.getEnvironmentForUser(user.id, environmentThreadArchiveMatch[1]);
+        if (!environment) throw new HttpError(404, "Environment not found.");
+        assertEnvironmentTokenActive(environment);
+        const threadId = decodeURIComponent(environmentThreadArchiveMatch[2]);
+        const command = { type: "thread.archive", commandId: createId("t3cmd"), threadId };
+        try {
+          const result = await dispatchT3Command(environment, command);
+          await publishThreadMutation({
+            store,
+            events,
+            userId: user.id,
+            environmentId: environment.id,
+            threadId,
+            action: "archived",
+          });
+          return sendJson(res, 202, {
+            environmentId: environment.id,
+            threadId,
+            action: "archived",
+            result,
+          });
+        } catch (error) {
+          throw new HttpError(502, "T3 thread archive failed.", { cause: errorMessage(error) });
+        }
       }
 
       if (req.method === "GET" && url.pathname === "/v1/audit") {
         const user = await authenticateUser(req, store, config, null, clerkAuth);
         await enforceUserRead(req, res, rateLimiter, config, user);
         return sendJson(res, 200, { events: await store.listAuditLogs(user.id) });
+      }
+
+      if (req.method === "GET" && url.pathname === "/v1/push/config") {
+        const user = await authenticateUser(req, store, config, null, clerkAuth);
+        await enforceUserRead(req, res, rateLimiter, config, user);
+        return sendJson(res, 200, publicWebPushConfig(config.webPush));
+      }
+
+      if (req.method === "GET" && url.pathname === "/v1/push/subscriptions") {
+        const user = await authenticateUser(req, store, config, null, clerkAuth);
+        await enforceUserRead(req, res, rateLimiter, config, user);
+        return sendJson(res, 200, { subscriptions: await store.listPushSubscriptions({ userId: user.id }) });
+      }
+
+      if (req.method === "POST" && url.pathname === "/v1/push/subscriptions") {
+        const user = await authenticateUser(req, store, config, null, clerkAuth);
+        await enforceUserWrite(req, res, rateLimiter, config, user);
+        const body = await readJson(req);
+        let subscription;
+        try { subscription = validatePushSubscription(body.subscription, config.webPush); }
+        catch (error) { throw new HttpError(400, error.message, { code: error.code }); }
+        const result = await store.upsertPushSubscription({
+          userId: user.id,
+          ...subscription,
+          vapidKeyId: config.webPush.activeKeyId,
+        });
+        return sendJson(res, result.created ? 201 : 200, result);
+      }
+
+      if (req.method === "POST" && url.pathname === "/v1/push/subscriptions/revoke") {
+        const user = await authenticateUser(req, store, config, null, clerkAuth);
+        await enforceUserWrite(req, res, rateLimiter, config, user);
+        const body = await readJson(req);
+        let endpoint;
+        try {
+          const parsed = new URL(body.endpoint);
+          if (parsed.protocol !== "https:") throw new Error();
+          endpoint = parsed.toString();
+        } catch {
+          throw new HttpError(400, "Push endpoint is invalid.");
+        }
+        const result = await store.revokePushSubscriptionByEndpoint({ userId: user.id, endpoint });
+        if (!result) throw new HttpError(404, "Push subscription not found.");
+        return sendJson(res, 200, result);
+      }
+
+      const pushSubscriptionMatch = url.pathname.match(/^\/v1\/push\/subscriptions\/([^/]+)$/u);
+      if (req.method === "DELETE" && pushSubscriptionMatch) {
+        const user = await authenticateUser(req, store, config, null, clerkAuth);
+        await enforceUserWrite(req, res, rateLimiter, config, user);
+        const result = await store.revokePushSubscription({
+          userId: user.id,
+          subscriptionId: decodeURIComponent(pushSubscriptionMatch[1]),
+        });
+        if (!result) throw new HttpError(404, "Push subscription not found.");
+        return sendJson(res, 200, result);
+      }
+
+      if (req.method === "GET" && url.pathname === "/v1/notifications") {
+        const user = await authenticateUser(req, store, config, null, clerkAuth);
+        await enforceUserRead(req, res, rateLimiter, config, user);
+        const after = url.searchParams.get("after");
+        const before = url.searchParams.get("before");
+        if (after !== null && (!/^\d+$/u.test(after) || !Number.isSafeInteger(Number(after)))) {
+          throw new HttpError(400, "after must be a notification cursor.");
+        }
+        if (before !== null && (!/^\d+$/u.test(before) || !Number.isSafeInteger(Number(before)))) {
+          throw new HttpError(400, "before must be a notification cursor.");
+        }
+        if (after !== null && before !== null) {
+          throw new HttpError(400, "after and before cannot be combined.");
+        }
+        const rawLimit = url.searchParams.get("limit");
+        const limit = rawLimit === null ? 50 : Number(rawLimit);
+        if (!Number.isSafeInteger(limit) || limit < 1 || limit > 100) {
+          throw new HttpError(400, "limit must be an integer from 1 to 100.");
+        }
+        const includeDismissed = url.searchParams.get("includeDismissed") === "true";
+        const result = await store.listNotifications({
+          userId: user.id,
+          afterCursor: after,
+          beforeCursor: before,
+          limit,
+          includeDismissed,
+        });
+        return sendJson(res, 200, {
+          ...result,
+          notifications: result.notifications.map(notificationView),
+        });
+      }
+
+      if (req.method === "POST" && url.pathname === "/v1/notifications/read-all") {
+        const user = await authenticateUser(req, store, config, null, clerkAuth);
+        await enforceUserWrite(req, res, rateLimiter, config, user);
+        const result = await store.markAllNotificationsRead({ userId: user.id });
+        return sendJson(res, 200, result);
+      }
+
+      const notificationReadMatch = url.pathname.match(/^\/v1\/notifications\/([^/]+)\/read$/u);
+      const notificationDismissMatch = url.pathname.match(/^\/v1\/notifications\/([^/]+)$/u);
+      if ((req.method === "POST" && notificationReadMatch)
+        || (req.method === "DELETE" && notificationDismissMatch)) {
+        const user = await authenticateUser(req, store, config, null, clerkAuth);
+        await enforceUserWrite(req, res, rateLimiter, config, user);
+        const notificationId = decodeURIComponent((notificationReadMatch ?? notificationDismissMatch)[1]);
+        const result = req.method === "POST"
+          ? await store.markNotificationRead({ userId: user.id, notificationId })
+          : await store.dismissNotification({ userId: user.id, notificationId });
+        if (!result) throw new HttpError(404, "Notification not found.");
+        const notification = notificationView(result.notification);
+        if (!result.duplicate) events.broadcastToUser(user.id, "notification.updated", notification);
+        return sendJson(res, 200, { notification, duplicate: result.duplicate });
+      }
+
+      if (req.method === "GET" && url.pathname === "/v1/background/liveness") {
+        const user = await authenticateUser(req, store, config, null, clerkAuth);
+        await enforceUserRead(req, res, rateLimiter, config, user);
+        const record = await store.getBackgroundLiveness("scheduled-worker");
+        const configured = Boolean(
+          config.cloudMediaConsumerEnabled
+          || config.cloudSnapshotConsumerEnabled
+          || config.cloudConnectorEventConsumerEnabled
+          || config.cloudRetentionConsumerEnabled,
+        );
+        return sendJson(res, 200, {
+          scheduledWorker: buildBackgroundLiveness({ record, configured }),
+          observedAt: new Date().toISOString(),
+        });
       }
 
       if (req.method === "GET" && url.pathname === "/v1/commands") {
@@ -1603,6 +2468,8 @@ export function createApp({
         const input = normalizeActionInput(await readJson(req));
         await validateSavedActionInput(store, user.id, input);
         const action = await store.createAction({ userId: user.id, ...input });
+        await publishDeviceRefreshForAll({ store, events, userId: user.id,
+          resources: ["controls", "display"] });
         return sendJson(res, 201, { action });
       }
 
@@ -1615,6 +2482,8 @@ export function createApp({
           throw new HttpError(404, "Environment not found.");
         }
         const macro = await store.createMacro({ userId: user.id, ...input });
+        await publishDeviceRefreshForAll({ store, events, userId: user.id,
+          resources: ["controls", "display"] });
         return sendJson(res, 201, { macro });
       }
 
@@ -1763,6 +2632,7 @@ export function createApp({
           if (!environment) continue;
           const result = await runT3CompatibilityCheck({
             environment,
+            transport: runtimeT3TransportResolver.forEnvironment(environment),
             latestVersion: release.latestVersion,
             previous: listedEnvironment.health?.compatibility ?? null,
             rpcImpl: t3CompatibilityRpc,
@@ -1770,7 +2640,10 @@ export function createApp({
           await store.updateEnvironmentHealth({
             userId: user.id,
             environmentId: environment.id,
-            health: { compatibility: result },
+            health: {
+              compatibility: result,
+              ...(result.capabilities ? { capabilities: result.capabilities } : {}),
+            },
           });
           results.push(result);
         }
@@ -1865,6 +2738,8 @@ export function createApp({
         }
         await validateSavedActionInput(store, user.id, input, existing.id);
         const action = await store.updateAction({ userId: user.id, actionId: existing.id, ...input });
+        await publishDeviceRefreshForAll({ store, events, userId: user.id,
+          resources: ["controls", "display"] });
         return sendJson(res, 200, { action });
       }
 
@@ -1877,6 +2752,8 @@ export function createApp({
         }
         const result = await store.deleteAction({ userId: user.id, actionId: savedActionMatch[1] });
         if (!result) throw new HttpError(404, "Action not found.");
+        await publishDeviceRefreshForAll({ store, events, userId: user.id,
+          resources: ["controls", "display"] });
         return sendJson(res, 200, { ...result, deleted: true });
       }
 
@@ -1910,6 +2787,8 @@ export function createApp({
         await enforceUserWrite(req, res, rateLimiter, config, user);
         const macro = await store.deleteMacro({ userId: user.id, macroId: macroActionMatch[1] });
         if (!macro) throw new HttpError(404, "Macro not found.");
+        await publishDeviceRefreshForAll({ store, events, userId: user.id,
+          resources: ["controls", "display"] });
         return sendJson(res, 200, { macro });
       }
 
@@ -1933,6 +2812,7 @@ export function createApp({
             environmentId,
             threadId: optionalString(body.threadId) ?? optionalString(macro.threadId),
             intent: macro.intent,
+            clientRequestId: body.clientRequestId,
           },
           actor: { type: "user", id: user.id, userId: user.id, profile: "power-controller" },
           config,
@@ -1945,7 +2825,7 @@ export function createApp({
               : {}),
           },
         });
-        return sendJson(res, output.command.status === "dispatched" ? 202 : 200, {
+        return sendJson(res, output.command?.status === "dispatched" || output.recovery === "processing" ? 202 : 200, {
           macro,
           ...output,
         });
@@ -1971,6 +2851,123 @@ export function createApp({
         return sendJson(res, 200, {
           media: await nameMediaRecords(store, user.id, await store.listMediaUploads(user.id), config),
         });
+      }
+
+      if (req.method === "POST" && url.pathname === "/v1/companion-handoffs/claim") {
+        const user = await authenticateUser(req, store, config, null, clerkAuth);
+        await enforceUserWrite(req, res, rateLimiter, config, user);
+        const body = await readJson(req);
+        const code = requireString(body.code, "code");
+        if (!/^[A-Za-z0-9_-]{24,128}$/u.test(code)) throw new HttpError(404, "Companion handoff not found.");
+        const handoff = await store.claimCompanionHandoff({ userId: user.id, code });
+        if (!handoff) throw new HttpError(404, "Companion handoff not found.");
+        if (handoff.status === "expired") throw new HttpError(410, "Companion handoff has expired.");
+        return sendJson(res, 200, { handoff });
+      }
+
+      if (req.method === "POST" && url.pathname === "/v1/companion-handoffs") {
+        const user = await authenticateUser(req, store, config, null, clerkAuth);
+        await enforceUserWrite(req, res, rateLimiter, config, user);
+        const body = await readJson(req);
+        const scope = await normalizeCompanionHandoffScope(store, user.id, body);
+        const output = await createCompanionHandoffResponse({
+          store,
+          userId: user.id,
+          scope,
+          baseUrl: config.publicBaseUrl ?? requestBaseUrl(req),
+          includeQrSvg: true,
+        });
+        return sendJson(res, 201, output);
+      }
+
+      const companionHandoffMatch = url.pathname.match(/^\/v1\/companion-handoffs\/([^/]+)$/u);
+      if (companionHandoffMatch && req.method === "GET") {
+        const user = await authenticateUser(req, store, config, null, clerkAuth);
+        await enforceUserRead(req, res, rateLimiter, config, user);
+        const handoff = await store.getCompanionHandoffForUser(user.id, companionHandoffMatch[1]);
+        if (!handoff) throw new HttpError(404, "Companion handoff not found.");
+        return sendJson(res, 200, { handoff: currentCompanionHandoff(handoff) });
+      }
+      if (companionHandoffMatch && req.method === "DELETE") {
+        const user = await authenticateUser(req, store, config, null, clerkAuth);
+        await enforceUserWrite(req, res, rateLimiter, config, user);
+        const handoff = await store.cancelCompanionHandoff({ userId: user.id, handoffId: companionHandoffMatch[1] });
+        if (!handoff) throw new HttpError(404, "Companion handoff not found.");
+        return sendJson(res, 200, { handoff });
+      }
+
+      if (req.method === "POST" && url.pathname === "/v1/media/uploads") {
+        const user = await authenticateUser(req, store, config, null, clerkAuth);
+        await enforceUserWrite(req, res, rateLimiter, config, user);
+        const body = await readJson(req);
+        const result = await createMediaUploadIntent({
+          store,
+          config,
+          actor: { type: "user", id: user.id, userId: user.id },
+          payload: body,
+        });
+        return sendJson(res, result.created ? 201 : 200, {
+          session: mediaUploadSessionResponse(result.session, "user"),
+        });
+      }
+
+      const userMediaUploadContentMatch = url.pathname.match(/^\/v1\/media\/uploads\/([^/]+)\/content$/u);
+      if (req.method === "PUT" && userMediaUploadContentMatch) {
+        const user = await authenticateUser(req, store, config, null, clerkAuth);
+        await enforceUserWrite(req, res, rateLimiter, config, user);
+        const sessionId = userMediaUploadContentMatch[1];
+        const session = await store.getMediaUploadSessionForActor({ userId: user.id, sessionId });
+        if (!session) throw new HttpError(404, "Media upload session not found.");
+        assertMediaUploadContentType(req, session.contentType);
+        const buffer = await readRawBody(req, session.expectedSizeBytes);
+        const updated = await writeMediaUploadSession({
+          store,
+          config,
+          actor: { type: "user", id: user.id, userId: user.id },
+          sessionId,
+          buffer,
+        });
+        return sendJson(res, 200, { session: mediaUploadSessionResponse(updated, "user") });
+      }
+
+      const userMediaUploadFinalizeMatch = url.pathname.match(/^\/v1\/media\/uploads\/([^/]+)\/finalize$/u);
+      if (req.method === "POST" && userMediaUploadFinalizeMatch) {
+        const user = await authenticateUser(req, store, config, null, clerkAuth);
+        await enforceUserWrite(req, res, rateLimiter, config, user);
+        const result = await finalizeMediaUpload({
+          store,
+          config,
+          actor: { type: "user", id: user.id, userId: user.id },
+          sessionId: userMediaUploadFinalizeMatch[1],
+        });
+        if (!result?.media) throw new HttpError(409, "Media upload could not be finalized.");
+        return sendJson(res, 200, {
+          session: mediaUploadSessionResponse(result.session, "user"),
+          media: await nameMediaRecord(store, user.id, publicMediaRecord(result.media), config),
+        });
+      }
+
+      const userMediaUploadMatch = url.pathname.match(/^\/v1\/media\/uploads\/([^/]+)$/u);
+      if (req.method === "GET" && userMediaUploadMatch) {
+        const user = await authenticateUser(req, store, config, null, clerkAuth);
+        await enforceUserRead(req, res, rateLimiter, config, user);
+        const session = await store.getMediaUploadSessionForActor({
+          userId: user.id,
+          sessionId: userMediaUploadMatch[1],
+        });
+        if (!session) throw new HttpError(404, "Media upload session not found.");
+        return sendJson(res, 200, { session: mediaUploadSessionResponse(session, "user") });
+      }
+      if (req.method === "DELETE" && userMediaUploadMatch) {
+        const user = await authenticateUser(req, store, config, null, clerkAuth);
+        await enforceUserWrite(req, res, rateLimiter, config, user);
+        const session = await abortMediaUpload({
+          store,
+          config,
+          actor: { type: "user", id: user.id, userId: user.id },
+          sessionId: userMediaUploadMatch[1],
+        });
+        return sendJson(res, 200, { session: mediaUploadSessionResponse(session, "user") });
       }
 
       if (req.method === "POST" && url.pathname === "/v1/media") {
@@ -2117,7 +3114,7 @@ export function createApp({
       if (req.method === "POST" && url.pathname === "/v1/media/purge-expired") {
         const user = await authenticateUser(req, store, config, null, clerkAuth);
         await enforceUserWrite(req, res, rateLimiter, config, user);
-        return sendJson(res, 200, await purgeExpiredMedia({ store, userId: user.id, config }));
+        return sendJson(res, 200, await mediaRetentionRunner.runOnce({ userId: user.id }));
       }
 
       const mediaMatch = url.pathname.match(/^\/v1\/media\/([^/]+)$/u);
@@ -2139,15 +3136,76 @@ export function createApp({
         await enforceUserWrite(req, res, rateLimiter, config, user);
         const media = await store.getMediaForUser(user.id, mediaMatch[1]);
         if (!media) throw new HttpError(404, "Media upload not found.");
-        await deleteStoredMedia(media, config);
+        await deleteStoredMediaRecord({ store, userId: user.id, media, config });
         const deleted = await store.deleteMediaUpload({ userId: user.id, mediaId: media.id });
         return sendJson(res, 200, { media: await nameMediaRecord(store, user.id, deleted, config) });
       }
 
+      if (req.method === "POST" && url.pathname === "/v1/device/credentials/stage") {
+        const device = await authenticateDevice(req, store, null, config, { allowTransferPending: true });
+        await enforceDeviceWrite(req, res, rateLimiter, config, device);
+        if (device.credentialState !== "active") {
+          throw new HttpError(409, "The active device credential must stage its replacement.");
+        }
+        const body = await readJson(req);
+        const secret = requireString(body.secret, "secret");
+        if (secret.length < 32 || secret.length > 128 || !/^[A-Za-z0-9_-]+$/u.test(secret)) {
+          throw new HttpError(400, "secret must be a 32-128 character URL-safe value.");
+        }
+        const credentialVersion = Number(body.credentialVersion);
+        if (!Number.isInteger(credentialVersion) || credentialVersion < 2) {
+          throw new HttpError(400, "credentialVersion must be an integer greater than one.");
+        }
+        const result = await store.stageDeviceSecret({
+          deviceId: device.id,
+          secret,
+          rotationId: requireString(body.rotationId, "rotationId"),
+          credentialVersion,
+          authenticatedCredentialVersion: device.authenticatedCredentialVersion,
+        });
+        if (result.reason) throw deviceCredentialRotationError(result.reason, result.rotation);
+        return sendJson(res, 200, { device: result.device, rotation: result.rotation, staged: true });
+      }
+
+      if (req.method === "POST" && url.pathname === "/v1/device/credentials/ack") {
+        const device = await authenticateDevice(req, store, null, config, {
+          allowPending: true,
+          allowTransferPending: true,
+        });
+        await enforceDeviceWrite(req, res, rateLimiter, config, device);
+        const body = await readJson(req);
+        const credentialVersion = Number(body.credentialVersion);
+        if (!Number.isInteger(credentialVersion) || credentialVersion < 2) {
+          throw new HttpError(400, "credentialVersion must be an integer greater than one.");
+        }
+        const result = await store.acknowledgeDeviceSecret({
+          deviceId: device.id,
+          rotationId: requireString(body.rotationId, "rotationId"),
+          credentialVersion,
+          authenticatedCredentialVersion: device.authenticatedCredentialVersion,
+        });
+        if (result.reason) throw deviceCredentialRotationError(result.reason, result.rotation);
+        if (result.device?.userId) {
+          events.broadcastToUser(result.device.userId, "device.refresh", {
+            deviceId: result.device.id,
+            resources: ["config", "controls", "display"],
+            reason: "secret-rotation-completed",
+            changedAt: new Date().toISOString(),
+          });
+        }
+        return sendJson(res, 200, {
+          device: result.device,
+          rotation: result.rotation,
+          promoted: true,
+          replayed: result.replayed === true,
+          resetForTransfer: result.rotation?.purpose === "transfer",
+        });
+      }
+
       if (req.method === "POST" && url.pathname === "/v1/device/heartbeat") {
-        const device = await authenticateDevice(req, store, null, config);
+        const device = await authenticateDevice(req, store, null, config, { allowTransferPending: true });
         await enforceDeviceHeartbeat(req, res, rateLimiter, config, device);
-        snapshotPoller.trackUser(device.userId);
+        if (device.userId) snapshotPoller.trackUser(device.userId);
         const body = await readJson(req);
         const updatedDevice = await store.recordDeviceHeartbeat({
           deviceId: device.id,
@@ -2393,6 +3451,7 @@ export function createApp({
             environmentId: device.config?.environmentId,
             threadId: device.config?.threadId,
             mediaUploadId: optionalString(body.mediaUploadId),
+            clientRequestId: optionalString(body.clientRequestId),
             __followUpInstruction: followUpInstruction,
           },
           actor: { type: "device", id: device.id, userId: device.userId, profile: device.profile },
@@ -2416,13 +3475,13 @@ export function createApp({
         await enforceDeviceRead(req, res, rateLimiter, config, device);
         requireClaimedDevice(device);
         const environment = await boundDeviceEnvironment(store, device);
-        const snapshot = await fetchDeviceSnapshot(environment);
+        const snapshot = await fetchDeviceSnapshot(store, environment);
         const threads = deviceSelectableThreads(snapshot, device.config?.threadId, device.config?.projectId);
         return sendJson(res, 200, {
           environmentId: environment.id,
           projectId: device.config?.projectId ?? null,
           threadId: device.config?.threadId ?? null,
-          threads: await refineSelectedThreadVerb(environment, threads),
+          threads: await refineSelectedThreadVerb(store, environment, threads),
         });
       }
 
@@ -2471,7 +3530,7 @@ export function createApp({
           });
         }
 
-        const snapshot = await fetchDeviceSnapshot(environment);
+        const snapshot = await fetchDeviceSnapshot(store, environment);
         const project = (Array.isArray(snapshot?.projects) ? snapshot.projects : [])
           .find((candidate) => optionalString(candidate?.id) === projectId);
         // Validated against the live snapshot for the same reason selection is: the bound project
@@ -2494,6 +3553,60 @@ export function createApp({
           });
         }
 
+        const suppliedClientRequestId = body.clientRequestId !== undefined && body.clientRequestId !== null;
+        const clientRequestId = suppliedClientRequestId
+          ? normalizeClientRequestId(body.clientRequestId)
+          : createId("req");
+        if (!clientRequestId) {
+          throw new HttpError(400, "clientRequestId must be 8-128 URL-safe characters.");
+        }
+        const requestHash = commandRequestHash({
+          operation: THREAD_CREATE_REQUEST_OPERATION,
+          environmentId: environment.id,
+          intent: { type: "thread_create", projectId, requestedTitle, modelSelection },
+        });
+        const requestIdentity = {
+          userId: device.userId,
+          actorType: "device",
+          actorId: device.id,
+          operation: THREAD_CREATE_REQUEST_OPERATION,
+          clientRequestId,
+          requestHash,
+        };
+        const claim = await store.claimCommandRequest(requestIdentity);
+        if (claim.capacity) {
+          throw new HttpError(503, "Too many agent requests are still in progress. Wait for one to settle before retrying.");
+        }
+        if (claim.conflict) {
+          throw new HttpError(409, "clientRequestId was already used for a different agent request.", {
+            code: "idempotency_conflict",
+            request: claim.request,
+          });
+        }
+        if (!claim.claimed) {
+          const replay = await replayCommandRequest({
+            store,
+            actor: { userId: device.userId },
+            request: claim.request,
+          });
+          const current = await store.getDeviceForUser(device.userId, device.id);
+          return sendJson(res, replay.recovery === "processing" ? 202 : 200, {
+            environmentId: environment.id,
+            projectId,
+            threadId: replay.command?.threadId ?? null,
+            ...(replay.command ? {
+              thread: {
+                id: replay.command.threadId,
+                title: replay.command.intent?.title ?? "New thread",
+                status: "idle",
+                selected: true,
+              },
+            } : {}),
+            config: current?.config ?? device.config,
+            ...replay,
+          });
+        }
+
         const threadId = createId("thread");
         const title = mintDeviceThreadTitle({
           environmentId: environment.id,
@@ -2513,7 +3626,11 @@ export function createApp({
         const dispatchStartedAt = Date.now();
         let result;
         try {
-          result = await dispatchT3Command(environment, createThread);
+          result = await dispatchT3Command(
+            environment,
+            createThread,
+            connectorRequestOptions(clientRequestId, "thread.create"),
+          );
         } catch (error) {
           const command = await store.createCommand({
             userId: device.userId,
@@ -2527,6 +3644,12 @@ export function createApp({
             result: t3FailureResult(error),
             metrics: commandMetrics({ startedAt, dispatchStartedAt, failure: true }),
           });
+          const request = await store.settleCommandRequest({
+            ...requestIdentity,
+            status: "failed",
+            commandId: command.id,
+            httpStatus: 502,
+          });
           // The same error contract every other device route that reaches T3 answers with, so the
           // firmware branches on one code rather than four.
           throw new HttpError(502, "T3 environment is unavailable.", {
@@ -2534,6 +3657,8 @@ export function createApp({
             environmentId: environment.id,
             cause: errorMessage(error),
             command,
+            request,
+            clientRequestId,
           });
         }
 
@@ -2564,6 +3689,12 @@ export function createApp({
           result: result ?? { accepted: true },
           metrics: commandMetrics({ startedAt, dispatchStartedAt, completed: true }),
         });
+        const request = await store.settleCommandRequest({
+          ...requestIdentity,
+          status: command.status,
+          commandId: command.id,
+          httpStatus: 201,
+        });
 
         return sendJson(res, 201, {
           environmentId: environment.id,
@@ -2574,6 +3705,8 @@ export function createApp({
           thread: { id: threadId, title, status: "idle", selected: true },
           config: updated.config,
           command,
+          request,
+          clientRequestId,
         });
       }
 
@@ -2586,10 +3719,19 @@ export function createApp({
         requireClaimedDevice(device);
         // Scoped to the owner, not to the platform: listEnvironments() is a per-user read,
         // so a device can only ever see what the account that claimed it owns.
-        const environments = await store.listEnvironments(device.userId);
+        const [environments, connectors] = await Promise.all([
+          store.listEnvironments(device.userId),
+          store.listConnectors(device.userId),
+        ]);
+        const projection = deviceSelectableEnvironments(
+          environments,
+          device.config?.environmentId,
+          connectors,
+        );
         return sendJson(res, 200, {
           environmentId: device.config?.environmentId ?? null,
-          environments: deviceSelectableEnvironments(environments, device.config?.environmentId),
+          environments: projection.environments,
+          environmentsTruncated: projection.truncated,
         });
       }
 
@@ -2600,7 +3742,7 @@ export function createApp({
         await enforceDeviceRead(req, res, rateLimiter, config, device);
         requireClaimedDevice(device);
         const environment = await boundDeviceEnvironment(store, device);
-        const snapshot = await fetchDeviceSnapshot(environment);
+        const snapshot = await fetchDeviceSnapshot(store, environment);
         return sendJson(res, 200, {
           environmentId: environment.id,
           projectId: device.config?.projectId ?? null,
@@ -2628,7 +3770,7 @@ export function createApp({
         // while the hardware is looking at it, and the subscription lapses on its own once the
         // device stops polling.
         threadStreams.watch({ userId: device.userId, environmentId: environment.id, threadId });
-        const snapshot = await fetchDeviceSnapshot(environment);
+        const snapshot = await fetchDeviceSnapshot(store, environment);
         const thread = (Array.isArray(snapshot?.threads) ? snapshot.threads : [])
           .find((candidate) => optionalString(candidate?.id) === threadId);
         if (!thread) throw new HttpError(404, "Selected thread was not found in the bound environment.");
@@ -2654,7 +3796,7 @@ export function createApp({
         const body = await readJson(req);
         const threadId = requireString(body.threadId, "threadId");
         const environment = await boundDeviceEnvironment(store, device);
-        const snapshot = await fetchDeviceSnapshot(environment);
+        const snapshot = await fetchDeviceSnapshot(store, environment);
         const threads = deviceSelectableThreads(snapshot, device.config?.threadId, device.config?.projectId);
         // Validated against the live snapshot, so a device cannot invent a thread id
         // or reach one belonging to a different environment — or, once a project is
@@ -2714,7 +3856,7 @@ export function createApp({
         const body = await readJson(req);
         const projectId = requireString(body.projectId, "projectId");
         const environment = await boundDeviceEnvironment(store, device);
-        const snapshot = await fetchDeviceSnapshot(environment);
+        const snapshot = await fetchDeviceSnapshot(store, environment);
         const projects = deviceSelectableProjects(snapshot, device.config?.projectId);
         if (!projects.some((project) => project.id === projectId)) {
           throw new HttpError(404, "Project not found in the bound environment.");
@@ -2806,7 +3948,8 @@ export function createApp({
             policy,
           });
         }
-        if (!isNewerVersion(release.version, currentVersion)) {
+        const explicitTarget = Boolean(policy?.desiredVersion && release.version === policy.desiredVersion);
+        if (release.version === currentVersion || (!explicitTarget && !isNewerVersion(release.version, currentVersion))) {
           return sendJson(res, 200, {
             updateAvailable: false,
             currentVersion,
@@ -3048,16 +4191,161 @@ export function createApp({
               ?? optionalString(macro.threadId)
               ?? optionalString(device.config?.threadId),
             intent: macro.intent,
+            clientRequestId: body.clientRequestId,
           },
           actor: { type: "device", id: device.id, userId: device.userId, profile: device.profile },
           config,
           baseUrl: requestBaseUrl(req),
           policyContext: { networkLocation: classifyNetworkLocation(req, config) },
         });
-        return sendJson(res, output.command.status === "dispatched" ? 202 : 200, {
+        return sendJson(res, output.command?.status === "dispatched" || output.recovery === "processing" ? 202 : 200, {
           macro,
           ...output,
         });
+      }
+
+      if (req.method === "POST" && url.pathname === "/v1/device/companion-handoffs") {
+        const device = await authenticateDevice(req, store, null, config);
+        await enforceDeviceWrite(req, res, rateLimiter, config, device);
+        requireClaimedDevice(device);
+        const body = await readJson(req);
+        const scope = await normalizeCompanionHandoffScope(store, device.userId, {
+          environmentId: optionalString(body.environmentId) ?? optionalString(device.config?.environmentId),
+          threadId: optionalString(body.threadId) ?? optionalString(device.config?.threadId),
+          action: body.action,
+        });
+        const output = await createCompanionHandoffResponse({
+          store,
+          userId: device.userId,
+          deviceId: device.id,
+          scope,
+          baseUrl: config.publicBaseUrl ?? requestBaseUrl(req),
+        });
+        return sendJson(res, 201, output);
+      }
+
+      const deviceCompanionHandoffMatch = url.pathname.match(/^\/v1\/device\/companion-handoffs\/([^/]+)$/u);
+      if (deviceCompanionHandoffMatch && req.method === "GET") {
+        const device = await authenticateDevice(req, store, null, config);
+        await enforceDeviceRead(req, res, rateLimiter, config, device);
+        requireClaimedDevice(device);
+        const handoff = await store.getCompanionHandoffForDevice({
+          userId: device.userId,
+          deviceId: device.id,
+          handoffId: deviceCompanionHandoffMatch[1],
+        });
+        if (!handoff) throw new HttpError(404, "Companion handoff not found.");
+        return sendJson(res, 200, { handoff: currentCompanionHandoff(handoff) });
+      }
+      if (deviceCompanionHandoffMatch && req.method === "DELETE") {
+        const device = await authenticateDevice(req, store, null, config);
+        await enforceDeviceWrite(req, res, rateLimiter, config, device);
+        requireClaimedDevice(device);
+        const handoff = await store.cancelCompanionHandoff({
+          userId: device.userId,
+          deviceId: device.id,
+          handoffId: deviceCompanionHandoffMatch[1],
+        });
+        if (!handoff) throw new HttpError(404, "Companion handoff not found.");
+        return sendJson(res, 200, { handoff });
+      }
+
+      if (req.method === "POST" && url.pathname === "/v1/device/media/uploads") {
+        const device = await authenticateDevice(req, store, null, config);
+        await enforceDeviceWrite(req, res, rateLimiter, config, device);
+        requireClaimedDevice(device);
+        const body = await readJson(req);
+        const result = await createMediaUploadIntent({
+          store,
+          config,
+          actor: { type: "device", id: device.id, userId: device.userId },
+          payload: body,
+        });
+        return sendJson(res, result.created ? 201 : 200, {
+          session: mediaUploadSessionResponse(result.session, "device"),
+        });
+      }
+
+      const deviceMediaUploadContentMatch = url.pathname.match(
+        /^\/v1\/device\/media\/uploads\/([^/]+)\/content$/u,
+      );
+      if (req.method === "PUT" && deviceMediaUploadContentMatch) {
+        const device = await authenticateDevice(req, store, null, config);
+        await enforceDeviceWrite(req, res, rateLimiter, config, device);
+        requireClaimedDevice(device);
+        const sessionId = deviceMediaUploadContentMatch[1];
+        const session = await store.getMediaUploadSessionForActor({
+          userId: device.userId,
+          deviceId: device.id,
+          sessionId,
+        });
+        if (!session) throw new HttpError(404, "Media upload session not found.");
+        assertMediaUploadContentType(req, session.contentType);
+        const buffer = await readRawBody(req, session.expectedSizeBytes);
+        const updated = await writeMediaUploadSession({
+          store,
+          config,
+          actor: { type: "device", id: device.id, userId: device.userId },
+          sessionId,
+          buffer,
+        });
+        return sendJson(res, 200, { session: mediaUploadSessionResponse(updated, "device") });
+      }
+
+      const deviceMediaUploadFinalizeMatch = url.pathname.match(
+        /^\/v1\/device\/media\/uploads\/([^/]+)\/finalize$/u,
+      );
+      if (req.method === "POST" && deviceMediaUploadFinalizeMatch) {
+        const device = await authenticateDevice(req, store, null, config);
+        await enforceDeviceWrite(req, res, rateLimiter, config, device);
+        requireClaimedDevice(device);
+        const body = await readJson(req);
+        const result = await finalizeMediaUpload({
+          store,
+          config,
+          actor: { type: "device", id: device.id, userId: device.userId },
+          sessionId: deviceMediaUploadFinalizeMatch[1],
+        });
+        if (!result?.media) throw new HttpError(409, "Media upload could not be finalized.");
+        const queued = await enqueueDeviceTranscription({
+          store,
+          config,
+          events,
+          device,
+          media: result.media,
+          body,
+        });
+        return sendJson(res, 200, {
+          session: mediaUploadSessionResponse(result.session, "device"),
+          media: queued.media,
+          job: deviceJobStatus(queued.job),
+        });
+      }
+
+      const deviceMediaUploadMatch = url.pathname.match(/^\/v1\/device\/media\/uploads\/([^/]+)$/u);
+      if (req.method === "GET" && deviceMediaUploadMatch) {
+        const device = await authenticateDevice(req, store, null, config);
+        await enforceDeviceRead(req, res, rateLimiter, config, device);
+        requireClaimedDevice(device);
+        const session = await store.getMediaUploadSessionForActor({
+          userId: device.userId,
+          deviceId: device.id,
+          sessionId: deviceMediaUploadMatch[1],
+        });
+        if (!session) throw new HttpError(404, "Media upload session not found.");
+        return sendJson(res, 200, { session: mediaUploadSessionResponse(session, "device") });
+      }
+      if (req.method === "DELETE" && deviceMediaUploadMatch) {
+        const device = await authenticateDevice(req, store, null, config);
+        await enforceDeviceWrite(req, res, rateLimiter, config, device);
+        requireClaimedDevice(device);
+        const session = await abortMediaUpload({
+          store,
+          config,
+          actor: { type: "device", id: device.id, userId: device.userId },
+          sessionId: deviceMediaUploadMatch[1],
+        });
+        return sendJson(res, 200, { session: mediaUploadSessionResponse(session, "device") });
       }
 
       if (req.method === "POST" && url.pathname === "/v1/device/media") {
@@ -3105,6 +4393,29 @@ export function createApp({
         return sendJson(res, 200, { device, environmentId, screen: compressSnapshot(snapshot) });
       }
 
+      const deviceRequestMatch = url.pathname.match(/^\/v1\/device\/requests\/([^/]+)$/u);
+      if (req.method === "GET" && deviceRequestMatch) {
+        const device = await authenticateDevice(req, store, null, config);
+        await enforceDeviceRead(req, res, rateLimiter, config, device);
+        requireClaimedDevice(device);
+        const clientRequestId = normalizeClientRequestId(decodeURIComponent(deviceRequestMatch[1]));
+        if (!clientRequestId) throw new HttpError(400, "Invalid clientRequestId.");
+        const operation = url.searchParams.get("operation") ?? COMMAND_REQUEST_OPERATION;
+        if (![COMMAND_REQUEST_OPERATION, THREAD_CREATE_REQUEST_OPERATION].includes(operation)) {
+          throw new HttpError(400, "Unsupported agent request operation.");
+        }
+        const request = await store.getCommandRequest({
+          userId: device.userId,
+          actorType: "device",
+          actorId: device.id,
+          operation,
+          clientRequestId,
+        });
+        if (!request) throw new HttpError(404, "Agent request not found.");
+        const command = request.commandId ? await store.getCommandForUser(device.userId, request.commandId) : null;
+        return sendJson(res, 200, { request, ...(command ? { command } : {}) });
+      }
+
       if (req.method === "POST" && url.pathname === "/v1/device/intents") {
         const device = await authenticateDevice(req, store, null, config);
         await enforceDeviceWrite(req, res, rateLimiter, config, device);
@@ -3117,10 +4428,7 @@ export function createApp({
         const environment = await store.getEnvironmentForUser(device.userId, environmentId);
         if (!environment) throw new HttpError(404, "Environment not found.");
 
-        return sendJson(
-          res,
-          200,
-          await submitIntent({
+        const output = await submitIntent({
             store,
             environment,
             body: {
@@ -3132,8 +4440,30 @@ export function createApp({
             config,
             baseUrl: requestBaseUrl(req),
             policyContext: { networkLocation: classifyNetworkLocation(req, config) },
-          }),
-        );
+          });
+        return sendJson(res, output.command?.status === "dispatched" || output.recovery === "processing" ? 202 : 200, output);
+      }
+
+      const userRequestMatch = url.pathname.match(/^\/v1\/requests\/([^/]+)$/u);
+      if (req.method === "GET" && userRequestMatch) {
+        const user = await authenticateUser(req, store, config, null, clerkAuth);
+        await enforceUserRead(req, res, rateLimiter, config, user);
+        const clientRequestId = normalizeClientRequestId(decodeURIComponent(userRequestMatch[1]));
+        if (!clientRequestId) throw new HttpError(400, "Invalid clientRequestId.");
+        const operation = url.searchParams.get("operation") ?? COMMAND_REQUEST_OPERATION;
+        if (![COMMAND_REQUEST_OPERATION, THREAD_LAUNCH_REQUEST_OPERATION].includes(operation)) {
+          throw new HttpError(400, "Unsupported agent request operation.");
+        }
+        const request = await store.getCommandRequest({
+          userId: user.id,
+          actorType: "user",
+          actorId: user.id,
+          operation,
+          clientRequestId,
+        });
+        if (!request) throw new HttpError(404, "Agent request not found.");
+        const command = request.commandId ? await store.getCommandForUser(user.id, request.commandId) : null;
+        return sendJson(res, 200, { request, ...(command ? { command } : {}) });
       }
 
       if (req.method === "POST" && url.pathname === "/v1/intents") {
@@ -3158,7 +4488,7 @@ export function createApp({
               : {}),
           },
         });
-        return sendJson(res, output.command.status === "dispatched" ? 202 : 200, output);
+        return sendJson(res, output.command?.status === "dispatched" || output.recovery === "processing" ? 202 : 200, output);
       }
 
       throw new HttpError(404, "Route not found.");
@@ -3188,9 +4518,14 @@ export function createApp({
   return {
     store,
     events,
+    notifications,
     snapshotPoller,
     threadStreams,
     mediaJobRunner,
+    mediaRetentionRunner,
+    environmentRetentionRunner,
+    releaseRolloutRunner,
+    webPushDeliveryRunner,
     server: createServer((req, res) => void handle(req, res)),
   };
 }
@@ -3267,6 +4602,71 @@ async function referencingMacroActionIds(store, userId, actionId) {
     .filter((action) => action.type === "macro"
       && (action.steps ?? []).some((step) => step.actionId === actionId))
     .map((action) => action.id);
+}
+
+/**
+ * Fan an accepted T3 thread mutation out to every live controller owned by the user.
+ *
+ * Create wakes thread lists after T3 accepts a new task. Archive/delete also clear device bindings
+ * before publishing. A controller must never keep
+ * offering prompt, capture, or stop actions against a thread T3 has accepted for removal. Rename
+ * leaves bindings alone and only changes the label devices render.
+ */
+async function publishThreadMutation({
+  store,
+  events,
+  userId,
+  environmentId,
+  threadId,
+  action,
+  title = null,
+}) {
+  let clearedDeviceCount = 0;
+  let bindingRepairFailureCount = 0;
+  if (action === "archived" || action === "deleted") {
+    try {
+      const devices = await store.listDevices(userId);
+      for (const device of devices) {
+        if (device.config?.environmentId !== environmentId || device.config?.threadId !== threadId) continue;
+        try {
+          const updated = await store.updateDeviceConfig({
+            userId,
+            deviceId: device.id,
+            config: { threadId: null },
+            actorType: "user",
+            actorId: userId,
+          });
+          if (updated) clearedDeviceCount += 1;
+          else bindingRepairFailureCount += 1;
+        } catch (error) {
+          bindingRepairFailureCount += 1;
+          console.error(`[thread-sync] could not clear device ${device.id}: ${errorMessage(error)}`);
+        }
+      }
+    } catch (error) {
+      bindingRepairFailureCount += 1;
+      console.error(`[thread-sync] could not list device bindings: ${errorMessage(error)}`);
+    }
+  }
+
+  events.broadcastToUser(userId, "threads.changed", {
+    environmentId,
+    threadId,
+    action,
+    ...(title ? { title } : {}),
+    clearedDeviceCount,
+    bindingRepairFailureCount,
+    changedAt: new Date().toISOString(),
+  });
+}
+
+async function publishDeviceRefreshForAll({ store, events, userId, resources }) {
+  const changedAt = new Date().toISOString();
+  const devices = await store.listDevices(userId);
+  for (const device of devices) {
+    if (device.revokedAt) continue;
+    events.broadcastToUser(userId, "device.refresh", { deviceId: device.id, resources, changedAt });
+  }
 }
 
 async function assertMacroStepSupported(store, userId, action, seen) {
@@ -3374,6 +4774,12 @@ async function savedActionAvailability({
   if (!environmentId) return { enabled: false, reason: "No T3 environment is selected." };
   const environment = await store.getEnvironmentForUser(device.userId, environmentId);
   if (!environment) return { enabled: false, reason: "The selected T3 environment is unavailable." };
+  const requiredCapability = action.type === "media" && action.payload?.mediaKind === "image"
+    ? "image"
+    : "dispatch";
+  const capability = storedEnvironmentCapabilityAvailability(environment, requiredCapability,
+    requiredCapability === "image");
+  if (!capability.enabled) return capability;
   const threadId = action.targetMode === "fixed"
     ? action.threadId
     : inheritedThreadId ?? device.config?.threadId;
@@ -3418,6 +4824,11 @@ async function systemControlAvailability({ store, device, kind, config }) {
   if (!environmentId) return { enabled: false, reason: "No T3 environment is selected." };
   const environment = await store.getEnvironmentForUser(device.userId, environmentId);
   if (!environment) return { enabled: false, reason: "The selected T3 environment is unavailable." };
+  const capability = storedEnvironmentCapabilityAvailability(
+    environment,
+    kind === "stop" ? "sessionStop" : "shellSnapshot",
+  );
+  if (!capability.enabled) return capability;
   if (kind === "stop" && !device.config?.threadId) {
     return { enabled: false, reason: "No T3 task is selected." };
   }
@@ -3433,6 +4844,19 @@ async function systemControlAvailability({ store, device, kind, config }) {
   return policy.allowed || policy.requiresApproval
     ? { enabled: true, reason: policy.requiresApproval ? "Execution requires owner approval." : null }
     : { enabled: false, reason: policy.reason };
+}
+
+function storedEnvironmentCapabilityAvailability(environment, name, attachment = false) {
+  const manifest = environment.health?.capabilities;
+  if (!capabilityManifestIsFresh(manifest)) {
+    return { enabled: false, reason: "T3 capabilities are stale. Reconnect the local connector." };
+  }
+  const supported = attachment
+    ? attachmentCapabilitySupported(manifest, name)
+    : capabilitySupported(manifest, name);
+  return supported
+    ? { enabled: true, reason: null }
+    : { enabled: false, reason: "The connected T3 does not support this control." };
 }
 
 async function executeSavedAction({
@@ -3476,7 +4900,15 @@ async function executeSavedAction({
         const output = await executeSavedAction({
           store,
           action: nested,
-          runtime: { ...runtime, environmentId, threadId },
+          runtime: {
+            ...runtime,
+            environmentId,
+            threadId,
+            clientRequestId: deriveClientRequestId(
+              runtime.clientRequestId,
+              `action:${action.id}:step:${index}:${nested.id}`,
+            ),
+          },
           actor,
           config,
           baseUrl,
@@ -3588,6 +5020,7 @@ async function executeSavedAction({
         intent,
         mediaUploadId: runtime.mediaUploadId,
         followUpInstruction: runtime.__followUpInstruction,
+        clientRequestId: runtime.clientRequestId,
       },
       actor,
       config,
@@ -3675,6 +5108,107 @@ function validateFirmwarePolicyInput(body) {
   }
 }
 
+async function validateReleaseRolloutInput({ store, userId, body }) {
+  const name = requireString(body.name, "name");
+  if (name.length > 80) throw new HttpError(400, "name must be 80 characters or fewer.");
+  const targetKind = requireString(body.targetKind, "targetKind");
+  if (!["firmware", "connector"].includes(targetKind)) {
+    throw new HttpError(400, "targetKind must be firmware or connector.");
+  }
+  const channel = optionalString(body.channel) ?? "stable";
+  if (!["stable", "beta"].includes(channel)) throw new HttpError(400, "channel must be stable or beta.");
+  const targetVersion = requireString(body.targetVersion, "targetVersion");
+  if (!/^\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?$/u.test(targetVersion)) {
+    throw new HttpError(400, "targetVersion must be a semantic version.");
+  }
+  const rollbackVersion = optionalString(body.rollbackVersion);
+  if (rollbackVersion && !/^\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?$/u.test(rollbackVersion)) {
+    throw new HttpError(400, "rollbackVersion must be a semantic version.");
+  }
+  const minimumProtocolVersion = body.minimumProtocolVersion === undefined ? 1 : Number(body.minimumProtocolVersion);
+  if (!Number.isInteger(minimumProtocolVersion) || minimumProtocolVersion < 1 || minimumProtocolVersion > 100) {
+    throw new HttpError(400, "minimumProtocolVersion must be an integer from 1 to 100.");
+  }
+  const requiredCapabilities = optionalStringArray(body.requiredCapabilities ?? [], "requiredCapabilities");
+  if (requiredCapabilities.length > 16 || requiredCapabilities.some((value) => !/^[a-z][a-z0-9_.:-]{0,63}$/u.test(value))) {
+    throw new HttpError(400, "requiredCapabilities must contain at most 16 capability identifiers.");
+  }
+  const cohortInput = body.cohort && typeof body.cohort === "object" && !Array.isArray(body.cohort)
+    ? body.cohort : {};
+  const cohortType = optionalString(cohortInput.type) ?? "percentage";
+  let cohort;
+  if (cohortType === "percentage") {
+    const percentage = Number(cohortInput.percentage);
+    if (!Number.isInteger(percentage) || percentage < 1 || percentage > 100) {
+      throw new HttpError(400, "A percentage cohort must be an integer from 1 to 100.");
+    }
+    cohort = { type: "percentage", percentage };
+  } else if (cohortType === "allowlist") {
+    const targetIds = optionalStringArray(cohortInput.targetIds, "cohort.targetIds");
+    if (targetIds.length < 1 || targetIds.length > 100) {
+      throw new HttpError(400, "An allowlist cohort must contain 1 to 100 target ids.");
+    }
+    const owned = targetKind === "firmware" ? await store.listDevices(userId) : await store.listConnectors(userId);
+    const ownedIds = new Set(owned.filter((target) => !target.revokedAt).map((target) => target.id));
+    if (targetIds.some((targetId) => !ownedIds.has(targetId))) {
+      throw new HttpError(404, "A rollout target was not found in this account.");
+    }
+    cohort = { type: "allowlist", targetIds: [...new Set(targetIds)] };
+  } else {
+    throw new HttpError(400, "cohort.type must be percentage or allowlist.");
+  }
+  let releaseId = optionalString(body.releaseId);
+  if (targetKind === "firmware") {
+    if (!releaseId) throw new HttpError(400, "releaseId is required for firmware rollouts.");
+    const releases = await store.listFirmwareReleases({ channel });
+    const release = releases.find((candidate) => candidate.id === releaseId);
+    if (!release || release.version !== targetVersion) {
+      throw new HttpError(404, "The firmware release does not match this channel and target version.");
+    }
+    if (rollbackVersion && !releases.some((candidate) => (
+      candidate.hardwareModel === release.hardwareModel && candidate.version === rollbackVersion
+    ))) {
+      throw new HttpError(404, "The rollback firmware is not available for the same hardware and channel.");
+    }
+  } else {
+    releaseId = null;
+  }
+  return {
+    name,
+    targetKind,
+    targetVersion,
+    rollbackVersion,
+    releaseId,
+    channel,
+    cohort,
+    minimumProtocolVersion,
+    requiredCapabilities,
+  };
+}
+
+function validateRolloutEvidenceRef(value) {
+  const evidenceRef = requireString(value, "evidenceRef");
+  if (evidenceRef.length > 128 || !/^[A-Za-z0-9][A-Za-z0-9._:/-]*$/u.test(evidenceRef)) {
+    throw new HttpError(400, "evidenceRef must be a non-secret operator evidence identifier of 128 characters or fewer.");
+  }
+  return evidenceRef;
+}
+
+function validateRolloutCompletion(rollout) {
+  const counts = rollout.progress?.counts ?? {};
+  if (!rollout.progress?.total) throw new HttpError(409, "The rollout has no observed assignments to complete.");
+  const expected = rollout.state === "rolling_back" ? counts.rolled_back ?? 0 : counts.succeeded ?? 0;
+  if (expected !== rollout.progress.total) {
+    throw new HttpError(409, "Every rollout assignment must report the expected terminal version before completion.");
+  }
+}
+
+function rolloutTransitionMessage(reason) {
+  if (reason === "rollback_version_required") return "This rollout has no validated rollback version.";
+  if (reason === "percentage_must_increase") return "Expansion must increase a percentage cohort without exceeding 100%.";
+  return "The rollout action is not valid from its current state.";
+}
+
 async function compatibleFirmwareReleases(store, device, policy, config) {
   const hardwareModel = optionalString(device.status?.hardwareModel) ?? config.defaultHardwareModel;
   return await store.listFirmwareReleases({ hardwareModel, channel: policy?.channel ?? "stable" });
@@ -3703,13 +5237,128 @@ async function submitIntent({
   baseUrl = null,
   policyContext = {},
 }) {
-  const startedAt = Date.now();
+  const suppliedClientRequestId = body.clientRequestId !== undefined && body.clientRequestId !== null;
+  const clientRequestId = suppliedClientRequestId
+    ? normalizeClientRequestId(body.clientRequestId)
+    : createId("req");
+  if (!clientRequestId) {
+    throw new HttpError(400, "clientRequestId must be 8-128 URL-safe characters.");
+  }
+
   const intent = await normalizeIntent(body.intent ?? {}, {
     store,
     userId: actor.userId,
   });
   const followUpInstruction = actor.type === "device" ? optionalString(body.followUpInstruction) : null;
   if (followUpInstruction) intent.deviceFollowUpInstruction = followUpInstruction.slice(0, 4096);
+  const threadId = optionalString(body.threadId) ?? null;
+  const requestHash = commandRequestHash({
+    operation: COMMAND_REQUEST_OPERATION,
+    environmentId: environment.id,
+    threadId,
+    intent,
+    mediaUploadIds: collectMediaUploadIds(intent, body),
+  });
+  const requestIdentity = {
+    userId: actor.userId,
+    actorType: actor.type,
+    actorId: actor.id,
+    operation: COMMAND_REQUEST_OPERATION,
+    clientRequestId,
+    requestHash,
+  };
+  const claim = await store.claimCommandRequest(requestIdentity);
+  if (claim.capacity) {
+    throw new HttpError(503, "Too many agent requests are still in progress. Wait for one to settle before retrying.");
+  }
+  if (claim.conflict) {
+    throw new HttpError(409, "clientRequestId was already used for a different agent request.", {
+      code: "idempotency_conflict",
+      request: claim.request,
+    });
+  }
+  if (!claim.claimed) {
+    return await replayCommandRequest({ store, actor, request: claim.request });
+  }
+
+  try {
+    const output = await executeIntent({
+      store,
+      environment,
+      body: { ...body, intent, clientRequestId },
+      actor,
+      config,
+      baseUrl,
+      policyContext,
+      normalizedIntent: intent,
+    });
+    await publishCommandNotificationForStore(store, output.command);
+    const httpStatus = output.command?.status === "dispatched" ? 202 : 200;
+    const request = await store.settleCommandRequest({
+      ...requestIdentity,
+      status: output.command?.status ?? "completed",
+      commandId: output.command?.id ?? null,
+      httpStatus,
+    });
+    return { ...output, request, clientRequestId };
+  } catch (error) {
+    const command = error?.details?.command ?? null;
+    await publishCommandNotificationForStore(store, command);
+    const request = await store.settleCommandRequest({
+      ...requestIdentity,
+      status: "failed",
+      commandId: command?.id ?? null,
+      httpStatus: Number.isInteger(error?.status) ? error.status : 500,
+    });
+    if (error instanceof HttpError) {
+      throw new HttpError(error.status, error.message, {
+        ...(error.details ?? {}),
+        request,
+        clientRequestId,
+      });
+    }
+    throw error;
+  }
+}
+
+async function replayCommandRequest({ store, actor, request }) {
+  if (request.status === "processing") {
+    return { request, clientRequestId: request.clientRequestId, duplicate: true, recovery: "processing" };
+  }
+  const command = request.commandId
+    ? await store.getCommandForUser(actor.userId, request.commandId)
+    : null;
+  if ((request.httpStatus ?? 500) >= 400) {
+    throw new HttpError(request.httpStatus ?? 409, "The original agent request failed; this retry was not dispatched again.", {
+      code: "idempotent_replay",
+      request,
+      ...(command ? { command } : {}),
+    });
+  }
+  return {
+    ...(command ? { command } : {}),
+    ...(command?.intent?.type === "status" ? { screen: command.result } : {}),
+    request,
+    clientRequestId: request.clientRequestId,
+    duplicate: true,
+  };
+}
+
+async function executeIntent({
+  store,
+  environment,
+  body,
+  actor,
+  config = loadConfig(),
+  baseUrl = null,
+  policyContext = {},
+  normalizedIntent = null,
+}) {
+  const startedAt = Date.now();
+  const intent = normalizedIntent ?? await normalizeIntent(body.intent ?? {}, {
+    store,
+    userId: actor.userId,
+  });
   const policy = evaluateIntentPolicy({
     device: { profile: await resolveActorProfile(store, actor.userId, actor.profile) },
     intent,
@@ -3761,7 +5410,8 @@ async function submitIntent({
     const dispatchStartedAt = Date.now();
     let snapshot;
     try {
-      snapshot = await readT3Snapshot(environment);
+      await requireFreshT3CapabilityForStore(store, environment, "shellSnapshot");
+      snapshot = await readT3SnapshotForStore(store, environment);
     } catch (error) {
       const command = await store.createCommand({
         userId: actor.userId,
@@ -3818,12 +5468,13 @@ async function submitIntent({
 
     const dispatchStartedAt = Date.now();
     try {
-      const result = await writeTerminalInput(environment, {
+      await requireFreshT3CapabilityForStore(store, environment, "terminal");
+      const result = await writeTerminalInputForStore(store, environment, {
         threadId,
         terminalId: intent.terminalId,
         data: intent.data,
         cwd: intent.cwd,
-      });
+      }, body.clientRequestId);
       const command = await store.createCommand({
         userId: actor.userId,
         deviceId: actor.type === "device" ? actor.id : null,
@@ -3855,13 +5506,23 @@ async function submitIntent({
   }
 
   const mediaUploadIds = collectMediaUploadIds(intent, body);
-  const attachments = await buildMediaAttachments({
+  const requiredCapability = intent.type === "session_control" && intent.action === "stop"
+    ? "sessionStop"
+    : intent.type === "session_control" && intent.action === "interrupt"
+      ? "interrupt"
+      : intent.type === "approval_response"
+        ? "providerApprovals"
+        : intent.type === "user_input_response"
+          ? "structuredUserInput"
+          : "dispatch";
+  const dispatchManifest = await requireFreshT3CapabilityForStore(store, environment, requiredCapability);
+  const attachments = prepareCapabilityAwareAttachments(await buildMediaAttachments({
     store,
     userId: actor.userId,
     mediaUploadIds,
     config,
     baseUrl: config.publicBaseUrl ?? baseUrl,
-  });
+  }), dispatchManifest).attachments;
   // Phase 11 measures audio-to-prompt dispatch, which spans upload -> dispatch. Only the upload
   // timestamp makes that computable, so it rides along on the command.
   const mediaCapturedAt = await earliestMediaCreatedAt(store, actor.userId, mediaUploadIds);
@@ -3869,7 +5530,12 @@ async function submitIntent({
   const dispatchStartedAt = Date.now();
   let result;
   try {
-    result = await dispatchT3Command(environment, t3Command);
+    result = await dispatchT3CommandForStore(
+      store,
+      environment,
+      t3Command,
+      connectorRequestOptions(body.clientRequestId, "dispatch"),
+    );
   } catch (error) {
     if (intent.type === "session_control" && intent.action === "stop" && isAlreadyStoppedT3Error(error)) {
       const command = await store.createCommand({
@@ -4053,7 +5719,7 @@ function toPublicProfile(profile) {
  */
 async function readProviderApprovals({ store, userId, environment, threadId }) {
   const [thread, decisions] = await Promise.all([
-    fetchT3ThreadDetail(environment, threadId),
+    fetchT3ThreadDetailForStore(store, environment, threadId),
     store.listProviderApprovalDecisions({ userId, environmentId: environment.id, threadId }),
   ]);
   const byRequestId = new Map((decisions ?? []).map((row) => [row.requestId, row]));
@@ -4273,7 +5939,7 @@ async function answerProviderApproval({
  */
 async function readUserInputRequests({ store, userId, environment, threadId }) {
   const [thread, answers] = await Promise.all([
-    fetchT3ThreadDetail(environment, threadId),
+    fetchT3ThreadDetailForStore(store, environment, threadId),
     store.listProviderUserInputAnswers({ userId, environmentId: environment.id, threadId }),
   ]);
   const byRequestId = new Map((answers ?? []).map((row) => [row.requestId, row]));
@@ -4611,7 +6277,7 @@ async function checkEnvironmentHealth({ store, userId, environment }) {
   }
   let snapshot;
   try {
-    snapshot = await readT3Snapshot({ ...environment, timeoutMs: 5000 });
+    snapshot = await readT3SnapshotForStore(store, { ...environment, timeoutMs: 5000 });
   } catch (error) {
     const reason = classifyEnvironmentFailure(error);
     return recordEnvironmentFailure({
@@ -4682,21 +6348,6 @@ function buildEnvironmentFailure({ environment, reason, message }) {
       }
       : {}),
   };
-}
-
-async function purgeExpiredMedia({ store, userId, config = null, now = new Date().toISOString() }) {
-  const expired = await store.listExpiredMediaUploads({ userId, now });
-  const purged = [];
-  for (const media of expired) {
-    await deleteStoredMedia(media, config);
-    const deleted = await store.deleteMediaUpload({
-      userId,
-      mediaId: media.id,
-      reason: "retention_expired",
-    });
-    if (deleted) purged.push(deleted);
-  }
-  return { purged, count: purged.length, checkedAt: now };
 }
 
 /**
@@ -5052,8 +6703,12 @@ async function nameMediaRecords(store, userId, records, config = null) {
     return {
       media,
       device,
-      environmentId: optionalString(job?.environmentId) ?? optionalString(device?.config?.environmentId),
-      threadId: optionalString(job?.threadId) ?? optionalString(device?.config?.threadId),
+      environmentId: optionalString(media.environmentId)
+        ?? optionalString(job?.environmentId)
+        ?? optionalString(device?.config?.environmentId),
+      threadId: optionalString(media.threadId)
+        ?? optionalString(job?.threadId)
+        ?? optionalString(device?.config?.threadId),
     };
   });
 
@@ -5102,7 +6757,7 @@ async function warmThreadTitles(store, userId, targets, config) {
         markThreadTitlesUnavailable(environmentId);
         continue;
       }
-      await readT3Snapshot({
+      await readT3SnapshotForStore(store, {
         ...environment,
         timeoutMs: config?.mediaNameSnapshotTimeoutMs ?? 1500,
       });
@@ -5114,8 +6769,102 @@ async function warmThreadTitles(store, userId, targets, config) {
 
 /** getMediaForUser hands back the raw record; storagePath must never leave the gateway. */
 function publicMediaRecord(media) {
-  const { storagePath, ...rest } = media;
+  const { storagePath, uploadSessionId, ...rest } = media;
   return rest;
+}
+
+function mediaUploadSessionResponse(session, realm = "user") {
+  if (!session) return null;
+  const base = realm === "device" ? "/v1/device/media/uploads" : "/v1/media/uploads";
+  const sizeBytes = session.sizeBytes ?? session.expectedSizeBytes;
+  const sha256 = session.sha256 ?? session.expectedSha256;
+  return {
+    id: session.id,
+    kind: session.kind,
+    contentType: session.contentType,
+    sizeBytes,
+    sha256,
+    status: session.status,
+    mediaId: session.mediaId ?? null,
+    createdAt: session.createdAt,
+    expiresAt: session.expiresAt,
+    uploadedAt: session.uploadedAt ?? null,
+    finalizedAt: session.finalizedAt ?? null,
+    abortedAt: session.abortedAt ?? null,
+    upload: {
+      method: "PUT",
+      url: `${base}/${encodeURIComponent(session.id)}/content`,
+      contentType: session.contentType,
+      sizeBytes,
+    },
+    finalizeUrl: `${base}/${encodeURIComponent(session.id)}/finalize`,
+    statusUrl: `${base}/${encodeURIComponent(session.id)}`,
+  };
+}
+
+const COMPANION_HANDOFF_TTL_MS = 5 * 60 * 1000;
+const COMPANION_HANDOFF_ACTIONS = new Set(["record_audio", "capture_image"]);
+
+async function normalizeCompanionHandoffScope(store, userId, body) {
+  const environmentId = requireString(body?.environmentId, "environmentId");
+  const threadId = requireString(body?.threadId, "threadId");
+  const action = requireString(body?.action, "action");
+  if (!COMPANION_HANDOFF_ACTIONS.has(action)) {
+    throw new HttpError(400, "action must be record_audio or capture_image.");
+  }
+  if (threadId.length > 256) throw new HttpError(400, "threadId must be at most 256 characters.");
+  const environment = await store.getEnvironmentForUser(userId, environmentId);
+  if (!environment) throw new HttpError(404, "Environment not found.");
+  return { environmentId, threadId, action };
+}
+
+async function createCompanionHandoffResponse({
+  store,
+  userId,
+  deviceId = null,
+  scope,
+  baseUrl,
+  includeQrSvg = false,
+}) {
+  const code = createSecret(24);
+  const expiresAt = new Date(Date.now() + COMPANION_HANDOFF_TTL_MS).toISOString();
+  const result = await store.createCompanionHandoff({ userId, deviceId, ...scope, code, expiresAt });
+  if (result?.limitExceeded) {
+    throw new HttpError(429, "Too many active companion handoffs. Cancel one or wait for it to expire.");
+  }
+  const launchUrl = new URL(baseUrl);
+  // The bearer stays after `#`, so browsers do not send it in the HTTP request, Referer header,
+  // server access logs, or service-worker cache key. The PWA removes it immediately after reading.
+  launchUrl.hash = `/media?handoff=${encodeURIComponent(code)}`;
+  const qrPayload = launchUrl.toString();
+  return {
+    handoff: result.handoff,
+    launchUrl: qrPayload,
+    qrPayload,
+    ...(includeQrSvg ? {
+      qrSvg: renderQrSvg(qrPayload, {
+        ecc: "M",
+        scale: 4,
+        border: 4,
+        title: "Open Agent Controller companion capture",
+        xmlDeclaration: false,
+      }),
+    } : {}),
+  };
+}
+
+function currentCompanionHandoff(handoff) {
+  if (handoff?.status === "waiting" && Date.parse(handoff.expiresAt) <= Date.now()) {
+    return { ...handoff, status: "expired" };
+  }
+  return handoff;
+}
+
+function assertMediaUploadContentType(req, expected) {
+  const actual = String(req.headers["content-type"] ?? "").split(";", 1)[0].trim().toLowerCase();
+  if (actual !== expected) {
+    throw new HttpError(415, `Upload content type must be ${expected}.`);
+  }
 }
 
 function normalizePrivacySettingsInput(body) {
@@ -5366,7 +7115,8 @@ async function approveCommand({ store, userId, commandId, config }) {
     }
     const terminalStartedAt = Date.now();
     try {
-      const result = await writeTerminalInput(environment, {
+      await requireFreshT3CapabilityForStore(store, environment, "terminal");
+      const result = await writeTerminalInputForStore(store, environment, {
         threadId,
         terminalId: command.intent.terminalId,
         data: command.intent.data,
@@ -5385,6 +7135,7 @@ async function approveCommand({ store, userId, commandId, config }) {
           existing: command.metrics,
         }),
       });
+      await publishCommandNotificationForStore(store, updated);
       return { command: updated, macroResume: await resumeMacroRunAfterApproval({ store, userId, commandId, config }) };
     } catch (error) {
       const updated = await store.updateCommand({
@@ -5399,15 +7150,29 @@ async function approveCommand({ store, userId, commandId, config }) {
           existing: command.metrics,
         }),
       });
+      await publishCommandNotificationForStore(store, updated);
       throw new HttpError(502, "T3 terminal write failed.", { command: updated, cause: errorMessage(error) });
     }
   }
 
-  const t3Command = buildT3Command({ intent: command.intent, threadId });
+  const approvedCapability = command.intent?.type === "session_control" && command.intent.action === "stop"
+    ? "sessionStop"
+    : command.intent?.type === "session_control" && command.intent.action === "interrupt"
+      ? "interrupt"
+      : "dispatch";
+  const approvedManifest = await requireFreshT3CapabilityForStore(store, environment, approvedCapability);
+  const approvedAttachments = prepareCapabilityAwareAttachments(await buildMediaAttachments({
+    store,
+    userId,
+    mediaUploadIds: collectMediaUploadIds(command.intent, command.intent),
+    config,
+    baseUrl: config.publicBaseUrl,
+  }), approvedManifest).attachments;
+  const t3Command = buildT3Command({ intent: command.intent, threadId, attachments: approvedAttachments });
   const dispatchStartedAt = Date.now();
   let result;
   try {
-    result = await dispatchT3Command(environment, t3Command);
+    result = await dispatchT3CommandForStore(store, environment, t3Command);
   } catch (error) {
     const updated = await store.updateCommand({
       userId,
@@ -5422,6 +7187,7 @@ async function approveCommand({ store, userId, commandId, config }) {
         existing: command.metrics,
       }),
     });
+    await publishCommandNotificationForStore(store, updated);
     throw new HttpError(502, "T3 approval dispatch failed.", { command: updated, cause: errorMessage(error) });
   }
   const updated = await store.updateCommand({
@@ -5437,6 +7203,7 @@ async function approveCommand({ store, userId, commandId, config }) {
       existing: command.metrics,
     }),
   });
+  await publishCommandNotificationForStore(store, updated);
   return { command: updated, macroResume: await resumeMacroRunAfterApproval({ store, userId, commandId, config }) };
 }
 
@@ -5520,6 +7287,7 @@ async function rejectCommand({ store, userId, commandId }) {
     status: "rejected",
     result: { reason: "Rejected by user." },
   });
+  await publishCommandNotificationForStore(store, updated);
   return { command: updated };
 }
 
@@ -5701,7 +7469,7 @@ async function deviceGatewayResponse(store, device, suppliedSelection = null) {
   };
 }
 
-async function authenticateDevice(req, store, url = null, config = {}) {
+async function authenticateDevice(req, store, url = null, config = {}, options = {}) {
   // A device secret travels on every one of these requests.
   assertSecureTransport(req, config, "Device authentication");
   const deviceId = optionalString(req.headers["x-device-id"])
@@ -5712,7 +7480,49 @@ async function authenticateDevice(req, store, url = null, config = {}) {
   requireString(deviceSecret, "x-device-secret header");
   const device = await store.authenticateDevice(deviceId, deviceSecret);
   if (!device) throw new HttpError(401, "Invalid device credentials.");
+  if (device.credentialState === "pending" && options.allowPending !== true) {
+    throw new HttpError(401, "Pending device credentials may only acknowledge their rotation.");
+  }
+  const transferInProgress = device.credentialRotation?.purpose === "transfer"
+    && device.credentialRotation?.state !== "completed";
+  if (transferInProgress && options.allowTransferPending !== true) {
+    throw new HttpError(409, "Device transfer is waiting for credential acknowledgement.", {
+      reason: "device_transfer_pending",
+      rotation: device.credentialRotation,
+    });
+  }
   return device;
+}
+
+function deviceCredentialRotationError(reason, rotation) {
+  const status = reason === "expired" ? 410 : reason === "revoked" ? 401 : 409;
+  const messages = {
+    expired: "The pending device credential has expired; retry with the active credential.",
+    revoked: "Device credentials were revoked.",
+    rotation_mismatch: "The device credential rotation no longer matches this request.",
+    candidate_conflict: "A different pending device credential is already staged for this rotation.",
+    active_credential_required: "The active device credential must stage its replacement.",
+    pending_credential_required: "The pending device credential must acknowledge promotion.",
+  };
+  return new HttpError(status, messages[reason] ?? "Device credential rotation could not be completed.", {
+    reason,
+    rotation,
+  });
+}
+
+async function authenticateConnector(req, store, config = {}) {
+  const credential = connectorCredential(req, config);
+  const connector = await store.authenticateConnector(credential.connectorId, credential.secret);
+  if (!connector) throw new HttpError(401, "Invalid or revoked connector credential.");
+  return connector;
+}
+
+function connectorCredential(req, config = {}) {
+  assertSecureTransport(req, config, "Connector authentication");
+  const auth = optionalString(req.headers.authorization);
+  const match = auth?.match(/^Connector ([^.\s]+)\.([^\s]+)$/u);
+  if (!match) throw new HttpError(401, "Missing connector credential.");
+  return { connectorId: match[1], secret: match[2] };
 }
 
 async function enforceFactoryWrite(req, res, rateLimiter, config) {
@@ -5731,6 +7541,31 @@ async function enforceConnectRedeem(req, res, rateLimiter, config) {
     actorId: clientKey(req),
     limit: config.rateLimits?.connectRedeem,
   });
+}
+
+async function enforceConnectorWrite(req, res, rateLimiter, config, connector) {
+  await enforceRateLimit(req, res, rateLimiter, config, {
+    scope: "connector:write",
+    actorId: connector.id,
+    limit: config.rateLimits?.connectorWrite ?? config.rateLimits?.deviceWrite,
+  });
+}
+
+function optionalStringArray(value, field) {
+  if (value == null) return [];
+  if (!Array.isArray(value) || value.some((item) => typeof item !== "string" || !item.trim())) {
+    throw new HttpError(400, `${field} must be an array of non-empty strings.`);
+  }
+  return [...new Set(value.map((item) => item.trim()))];
+}
+
+function connectCodeError(reason) {
+  return new HttpError(
+    reason === "expired" ? 410 : 404,
+    reason === "expired"
+      ? "This connect code has expired. Mint a new one from the console."
+      : "Connect code is invalid, expired, or already used.",
+  );
 }
 
 async function enforceUserRead(req, res, rateLimiter, config, user) {
@@ -5810,6 +7645,12 @@ function tokenExpiresAt(tokenResponse) {
 }
 
 function assertEnvironmentTokenActive(environment) {
+  if (environment?.archivedAt || environment?.status === "archived") {
+    throw new HttpError(409, "This environment is archived and fully disconnected.", {
+      environmentId: environment.id,
+      reason: "environment_archived",
+    });
+  }
   if (isEnvironmentTokenExpired(environment)) {
     // `reason` is the discriminator the console branches on; the message stays human copy.
     throw new HttpError(409, "T3 access token has expired. Re-pair this environment.", {
@@ -5848,6 +7689,39 @@ function normalizeT3InteractionMode(value) {
 function isDevTokenCreationEnabled(config) {
   if (typeof config.devTokenCreationEnabled === "boolean") return config.devTokenCreationEnabled;
   return config.authProvider !== "clerk" || config.demoMode === true;
+}
+
+function isCloudDeployment(config) {
+  return config?.deploymentMode === "cloud";
+}
+
+const CLOUD_CONNECTOR_METADATA_FIELDS = new Set(["label"]);
+
+function assertCloudConnectorMetadataUpdate(body) {
+  if (!body || typeof body !== "object" || Array.isArray(body)) {
+    throw new HttpError(400, "Environment update body must be an object.");
+  }
+  const rejected = Object.keys(body).filter((field) => !CLOUD_CONNECTOR_METADATA_FIELDS.has(field));
+  if (rejected.length === 0) return;
+  throw new HttpError(409, "Cloud connector environments only accept safe metadata updates.", {
+    reason: "connector_metadata_only",
+    rejectedFields: rejected.sort(),
+  });
+}
+
+function cloudSafeT3TransportResolver(config, transportResolver) {
+  if (!isCloudDeployment(config)) return transportResolver;
+  return {
+    forEnvironment(environment) {
+      if (environment?.transportMode !== "connector") {
+        throw new HttpError(409, "Direct T3 transport is disabled in cloud deployments.", {
+          environmentId: environment?.id ?? null,
+          reason: "connector_required",
+        });
+      }
+      return transportResolver.forEnvironment(environment);
+    },
+  };
 }
 
 function requireClaimedDevice(device) {
@@ -5908,12 +7782,12 @@ function deviceSelectableThreads(snapshot, selectedThreadId = null, projectId = 
 // a slow host, or a thread that settled between the two reads all leave the row at plain
 // `running`, which is exactly what this route answered before. The thread list must not fail
 // because a decoration could not be computed.
-async function refineSelectedThreadVerb(environment, threads) {
+async function refineSelectedThreadVerb(store, environment, threads) {
   const selected = threads.find((thread) => thread.selected && thread.status === "running");
   if (!selected) return threads;
   let detail = null;
   try {
-    detail = await fetchT3ThreadDetail(environment, selected.id, { turnLimit: 1 });
+    detail = await fetchT3ThreadDetailForStore(store, environment, selected.id, { turnLimit: 1 });
   } catch {
     return threads;
   }
@@ -5924,20 +7798,201 @@ async function refineSelectedThreadVerb(environment, threads) {
 }
 
 // The owner's environments, as much of one as a bezel can render. Deliberately not
-// publicEnvironment(): baseUrl, scopes, health timestamps and pairing state are console
-// material, and the token-bearing fields must never reach the hardware realm at all.
+// publicEnvironment(): baseUrl, scopes, raw health detail and pairing state are console material,
+// and token-bearing fields must never reach the hardware realm at all. One bounded observation
+// timestamp is retained so the device can distinguish a current fact from cached truth.
 // `tokenExpired` is carried because selecting such an environment is a dead end the
 // device should be able to show *before* the owner walks to it.
-function deviceSelectableEnvironments(environments, selectedEnvironmentId = null) {
-  return (Array.isArray(environments) ? environments : [])
-    .map((environment) => ({
-      id: optionalString(environment?.id) ?? null,
-      label: optionalString(environment?.label) ?? "Untitled environment",
-      status: optionalString(environment?.status) ?? "unknown",
-      tokenExpired: isEnvironmentTokenExpired(environment),
-      selected: optionalString(environment?.id) === optionalString(selectedEnvironmentId),
-    }))
-    .filter((environment) => environment.id !== null);
+const DEVICE_ENVIRONMENT_LIMIT = 8;
+const DEVICE_ENVIRONMENT_LABEL_LIMIT = 64;
+const DEVICE_OBSERVATION_MAX_AGE_MS = 90_000;
+
+function deviceSelectableEnvironments(environments, selectedEnvironmentId = null, connectors = []) {
+  const source = (Array.isArray(environments) ? environments : [])
+    .filter((environment) => deviceEnvironmentId(environment?.id) !== null);
+  const connectorRows = Array.isArray(connectors) ? connectors : [];
+  return {
+    environments: source.slice(0, DEVICE_ENVIRONMENT_LIMIT).map((environment) => {
+      const id = deviceEnvironmentId(environment.id);
+      const tokenExpired = isEnvironmentTokenExpired(environment);
+      const connector = connectorForDeviceEnvironment(environment, connectorRows);
+      const health = deviceEnvironmentHealth(environment, connector, tokenExpired);
+      return {
+        id,
+        label: boundedDeviceLabel(environment?.label),
+        status: boundedDeviceState(environment?.status),
+        tokenExpired,
+        selected: id === deviceEnvironmentId(selectedEnvironmentId),
+        health,
+      };
+    }),
+    truncated: source.length > DEVICE_ENVIRONMENT_LIMIT,
+  };
+}
+
+function deviceEnvironmentHealth(environment, connector, tokenExpired) {
+  const transport = environment?.transportMode === "connector" ? "connector" : "direct";
+  const connectorState = transport === "connector" ? deviceConnectorState(connector) : "not_applicable";
+  const t3 = deviceT3State(environment, connector, tokenExpired);
+  const provider = deviceProviderState(environment?.providerCatalogue);
+  const transportObservedAt = transport === "connector"
+    ? latestDeviceObservation(connector?.lastSeenAt, environment?.lastConnectorSeenAt)
+    : latestDeviceObservation(environment?.health?.lastCheckedAt);
+  const observedAt = latestDeviceObservation(
+    connector?.lastT3HealthAt,
+    transportObservedAt,
+    environment?.providerCatalogue?.updatedAt,
+  );
+  const freshness = deviceEnvironmentFreshness(environment, transport, connectorState, transportObservedAt);
+  const capability = deviceCapabilityState(environment?.health?.capabilities);
+  return {
+    transport,
+    freshness,
+    connector: connectorState,
+    t3,
+    provider,
+    capability,
+    observedAt,
+    action: deviceEnvironmentAction({
+      tokenExpired,
+      transport,
+      freshness,
+      connector: connectorState,
+      t3,
+      provider,
+      capabilityRecovery: environment?.health?.capabilities?.recovery?.action,
+    }),
+  };
+}
+
+function connectorForDeviceEnvironment(environment, connectors) {
+  if (environment?.transportMode !== "connector") return null;
+  const connectorId = optionalString(environment?.connectorId);
+  return connectors.find((connector) => optionalString(connector?.id) === connectorId
+      && optionalString(connector?.environmentId) === optionalString(environment?.id))
+    ?? connectors.find((connector) => optionalString(connector?.environmentId) === optionalString(environment?.id)
+      && !connector?.revokedAt)
+    ?? connectors.find((connector) => optionalString(connector?.environmentId) === optionalString(environment?.id))
+    ?? null;
+}
+
+function deviceConnectorState(connector) {
+  if (!connector) return "unknown";
+  if (connector.revokedAt || connector.status === "revoked") return "revoked";
+  if (connector.protocolVersion !== null && connector.protocolVersion !== undefined
+      && connector.protocolVersion !== 1) return "incompatible";
+  return ["enrolled", "waiting", "online", "reconnecting", "sleeping", "offline", "incompatible"]
+    .includes(connector.status) ? connector.status : "unknown";
+}
+
+function deviceT3State(environment, connector, tokenExpired) {
+  if (tokenExpired) return "auth_failed";
+  const reported = optionalString(connector?.lastT3Health);
+  if (["ready", "starting", "stopped", "auth_failed", "incompatible", "error"].includes(reported)) {
+    return reported;
+  }
+  if (environment?.status === "reachable") return "ready";
+  switch (environment?.health?.failureReason) {
+    case "process_not_running": return "stopped";
+    case "token_expired":
+    case "authentication_failed": return "auth_failed";
+    case "contract_incompatible": return "incompatible";
+    case "network_unreachable":
+    case "timeout":
+    case "tls_error":
+    case "unknown": return "error";
+    default: return environment?.status === "unreachable" ? "error" : "unknown";
+  }
+}
+
+function deviceProviderState(catalogue) {
+  const instances = Array.isArray(catalogue?.instances)
+    ? catalogue.instances.filter((instance) => instance && typeof instance === "object" && !Array.isArray(instance))
+    : [];
+  const ready = instances.some((instance) => instance.status === "ready"
+    && instance.auth?.status === "authenticated"
+    && Array.isArray(instance.models) && instance.models.length > 0);
+  if (ready) return "ready";
+  if (instances.some((instance) => ["auth_required", "unauthenticated"].includes(instance.status)
+      || ["required", "unauthenticated"].includes(instance.auth?.status))) return "auth_required";
+  if (instances.some((instance) => ["error", "failed"].includes(instance.status))) return "error";
+  if (instances.length > 0 && instances.every((instance) => Array.isArray(instance.models)
+      && instance.models.length === 0)) return "model_unavailable";
+  return "unknown";
+}
+
+function deviceEnvironmentFreshness(environment, transport, connectorState, observedAt) {
+  if (environment?.freshness === "stale") return "stale";
+  if (transport === "connector") {
+    if (["offline", "sleeping", "reconnecting", "revoked", "incompatible"].includes(connectorState)) return "stale";
+  }
+  if (!observedAt) return "unknown";
+  return Date.now() - Date.parse(observedAt) <= DEVICE_OBSERVATION_MAX_AGE_MS ? "live" : "stale";
+}
+
+function deviceEnvironmentAction({ tokenExpired, transport, freshness, connector, t3, provider, capabilityRecovery }) {
+  if (tokenExpired) return "RE-PAIR T3";
+  if (transport === "connector") {
+    if (connector === "revoked") return "RE-PAIR CONNECTOR";
+    if (connector === "incompatible") return "UPDATE CONNECTOR";
+    if (connector === "sleeping") return "WAKE COMPUTER";
+    if (["unknown", "enrolled", "waiting", "offline"].includes(connector)) return "START CONNECTOR";
+    if (connector === "reconnecting") return "CHECK CONNECTION";
+  }
+  if (t3 === "auth_failed") return "FIX T3 AUTH";
+  if (t3 === "stopped") return "START T3 CODE";
+  if (t3 === "incompatible") return "UPDATE T3 CODE";
+  if (t3 === "starting") return "T3 STARTING";
+  if (t3 === "error") return "CHECK T3 CODE";
+  if (["UPDATE CONNECTOR", "UPDATE T3 CODE", "CHECK T3 CODE"].includes(capabilityRecovery)) return capabilityRecovery;
+  if (provider === "auth_required") return "AUTH PROVIDER";
+  if (provider === "model_unavailable") return "ADD PROVIDER MODEL";
+  if (provider === "error") return "CHECK PROVIDER";
+  if (freshness === "stale") return "CHECK CONNECTION";
+  if (t3 === "ready" && provider === "ready") return "READY";
+  return "CHECK STATUS";
+}
+
+function deviceCapabilityState(manifest) {
+  if (!manifest) return "unknown";
+  if (manifest.freshness === "stale") return "stale";
+  if (manifest.recovery) return "incompatible";
+  return capabilitySupported(manifest, "dispatch") && capabilitySupported(manifest, "threadSubscription")
+    ? "ready"
+    : "limited";
+}
+
+function legacyCapabilityProjection(manifest) {
+  return {
+    orchestrationRead: capabilitySupported(manifest, "shellSnapshot"),
+    orchestrationOperate: capabilitySupported(manifest, "dispatch"),
+    terminalDirect: capabilitySupported(manifest, "terminal"),
+    attachments: capabilitySupported(manifest, "dispatch") && manifest?.attachments?.image?.state === "supported",
+    savedActions: "gateway",
+    macros: "gateway",
+  };
+}
+
+function latestDeviceObservation(...values) {
+  return values
+    .map((value) => optionalString(value))
+    .filter((value) => value !== null && Number.isFinite(Date.parse(value)) && value.length <= 40)
+    .sort((left, right) => Date.parse(right) - Date.parse(left))[0] ?? null;
+}
+
+function boundedDeviceLabel(value) {
+  const label = (optionalString(value) ?? "Untitled environment").replace(/\s+/gu, " ");
+  return label.slice(0, DEVICE_ENVIRONMENT_LABEL_LIMIT);
+}
+
+function boundedDeviceState(value) {
+  const state = optionalString(value)?.toLowerCase();
+  return state && /^[a-z][a-z0-9_]{0,23}$/u.test(state) ? state : "unknown";
+}
+
+function deviceEnvironmentId(value) {
+  const id = optionalString(value);
+  return id && id.length <= 128 ? id : null;
 }
 
 // Projects ("folders") in the bound environment, straight from the T3 snapshot — the
@@ -5979,17 +8034,178 @@ function snapshotThreadProjectId(snapshot, threadId) {
  * thread title on a row without adding a T3 round trip of its own — see `src/mediaNaming.mjs`.
  * Purely a side effect: a caller that only wants the snapshot is unaffected.
  */
-async function readT3Snapshot(environment, options = {}) {
-  const snapshot = await fetchT3Snapshot(environment, options);
+async function readT3SnapshotWithTransport(environment, options, transportResolver) {
+  const snapshot = await transportResolver.forEnvironment(environment).snapshot(environment, options);
   rememberSnapshotThreadTitles(environment?.id, snapshot);
   return snapshot;
 }
 
+async function publishCommandNotificationForStore(store, command) {
+  if (!command) return null;
+  try {
+    return await notificationPublishersByStore.get(store)?.forCommand(command);
+  } catch (error) {
+    // Notification failure must not turn an already-dispatched idempotent command into a retryable
+    // API failure. The command/state refetch remains authoritative and the inbox can reconcile.
+    console.warn(`notification projection failed for command ${command.id}: ${errorMessage(error)}`);
+    return null;
+  }
+}
+
+function transportForStore(store, environment) {
+  return (t3TransportResolversByStore.get(store) ?? defaultT3TransportResolver).forEnvironment(environment);
+}
+
+async function readT3SnapshotForStore(store, environment, options = {}) {
+  const snapshot = await transportForStore(store, environment).snapshot(environment, options);
+  rememberSnapshotThreadTitles(environment?.id, snapshot);
+  return snapshot;
+}
+
+async function fetchT3ThreadDetailForStore(store, environment, threadId, options = {}) {
+  return await transportForStore(store, environment).threadDetail(environment, threadId, options);
+}
+
+async function dispatchT3CommandForStore(store, environment, command, options = {}) {
+  const feature = capabilityForT3Command(command);
+  const manifest = await requireFreshT3CapabilityForStore(store, environment, feature);
+  validateT3CommandAttachments(command, manifest);
+  return await transportForStore(store, environment).dispatch(environment, command, options);
+}
+
+const capabilityAdapters = new WeakMap();
+
+async function requireFreshT3CapabilityForStore(store, environment, feature) {
+  const transport = transportForStore(store, environment);
+  let adapter = transport;
+  if (typeof transport.capabilities !== "function") {
+    adapter = capabilityAdapters.get(transport);
+    if (!adapter) {
+      adapter = new T3Adapter(transport);
+      capabilityAdapters.set(transport, adapter);
+    }
+  }
+  let manifest;
+  try {
+    manifest = await adapter.capabilities(environment, { allowStale: true });
+  } catch {
+    throw new HttpError(503, "T3 capabilities could not be verified.", {
+      code: "t3_capabilities_unavailable", action: "CHECK T3 CODE",
+    });
+  }
+  if (!capabilityManifestIsFresh(manifest) || !capabilitySupported(manifest, feature)) {
+    throw new HttpError(409, "T3 does not currently support this action.", {
+      code: capabilityManifestIsFresh(manifest) ? "t3_capability_unsupported" : "t3_capabilities_stale",
+      capability: feature,
+      action: capabilityManifestIsFresh(manifest) ? "UPDATE T3 CODE" : "RECONNECT T3 CODE",
+    });
+  }
+  try {
+    await store.updateEnvironmentHealth?.({
+      userId: environment.userId,
+      environmentId: environment.id,
+      health: { capabilities: ownerSafeT3CapabilityProjection(manifest) },
+    });
+  } catch {
+    // The fresh probe remains authoritative for this request; health persistence is a projection.
+  }
+  return manifest;
+}
+
+function capabilityForT3Command(command) {
+  if (command?.type === "thread.create") return "launch";
+  if (command?.type === "thread.session.stop") return "sessionStop";
+  if (command?.type === "thread.turn.interrupt") return "interrupt";
+  if (command?.type === "thread.approval.respond") return "providerApprovals";
+  if (command?.type === "thread.user-input.respond") return "structuredUserInput";
+  return "dispatch";
+}
+
+function validateT3CommandAttachments(command, manifest) {
+  const attachments = command?.message?.attachments;
+  if (!Array.isArray(attachments) || attachments.length === 0) return;
+  for (const attachment of attachments) {
+    if (!attachmentCapabilitySupported(manifest, attachment?.type)) {
+      throw new HttpError(409, "T3 does not currently support this attachment type.", {
+        code: "t3_attachment_unsupported", attachment: attachment?.type ?? "unknown", action: "REMOVE ATTACHMENT",
+      });
+    }
+  }
+}
+
+function prepareCapabilityAwareAttachments(attachments, manifest) {
+  const prepared = [];
+  const audioTranscripts = [];
+  for (const attachment of attachments) {
+    if (attachmentCapabilitySupported(manifest, attachment.type)) {
+      prepared.push(attachment);
+      continue;
+    }
+    // The certified T3 adapter does not accept raw audio. A reviewed transcript can still be
+    // useful prompt context, but the private bytes must never cross the adapter boundary.
+    if (attachment.type === "audio" && typeof attachment.transcript === "string" && attachment.transcript.trim()) {
+      audioTranscripts.push(attachment.transcript.trim());
+      continue;
+    }
+    throw new HttpError(409, attachment.type === "audio"
+      ? "Audio must have a ready transcript before it can be sent to T3."
+      : "T3 does not currently support this attachment type.", {
+      code: attachment.type === "audio" ? "t3_audio_transcript_required" : "t3_attachment_unsupported",
+      attachment: attachment.type ?? "unknown",
+      action: attachment.type === "audio" ? "TRANSCRIBE AUDIO" : "REMOVE ATTACHMENT",
+    });
+  }
+  if (prepared.length > (manifest.attachments?.maxCount ?? 0)) {
+    throw new HttpError(409, "T3 attachment limit exceeded.", {
+      code: "t3_attachment_limit_exceeded", action: "REMOVE ATTACHMENT",
+    });
+  }
+  return { attachments: prepared, audioTranscripts };
+}
+
+async function writeTerminalInputForStore(store, environment, { threadId, terminalId, data, cwd }, clientRequestId = null) {
+  const transport = transportForStore(store, environment);
+  if (cwd) {
+    await transport.callRpc(
+      environment,
+      T3_WS_METHODS.terminalOpen,
+      { threadId, terminalId, cwd },
+      connectorRequestOptions(clientRequestId, "terminal.open"),
+    );
+  }
+  return await transport.callRpc(
+    environment,
+    T3_WS_METHODS.terminalWrite,
+    { threadId, terminalId, data },
+    connectorRequestOptions(clientRequestId, "terminal.write"),
+  );
+}
+
+function connectorRequestOptions(clientRequestId, stage) {
+  if (!clientRequestId) return {};
+  // Connector request ids are bounded protocol fields. A stable digest preserves the originating
+  // client request across Container/router retries without exposing that caller-chosen id in edge
+  // storage or overflowing it when the client used the 128-character maximum.
+  const stableId = `cmdreq_${createHash("sha256")
+    .update(`${clientRequestId}\u0000${stage}`, "utf8")
+    .digest("hex")
+    .slice(0, 40)}`;
+  return { requestId: stableId, idempotencyKey: stableId };
+}
+
+function deriveClientRequestId(clientRequestId, scope) {
+  if (!clientRequestId) return undefined;
+  return `derived:${createHash("sha256")
+    .update(`${clientRequestId}\u0000${scope}`, "utf8")
+    .digest("hex")
+    .slice(0, 48)}`;
+}
+
 // Every device route that reads T3 reports an unreachable host the same way, so the
 // firmware has one error contract to branch on instead of four.
-async function fetchDeviceSnapshot(environment) {
+async function fetchDeviceSnapshot(store, environment) {
   try {
-    return await readT3Snapshot(environment);
+    return await readT3SnapshotForStore(store, environment);
   } catch (error) {
     throw new HttpError(502, "T3 environment is unavailable.", {
       code: "t3_unreachable",

@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { access } from "node:fs/promises";
+import { access, readdir } from "node:fs/promises";
 import { dirname, join } from "node:path";
 import test from "node:test";
 import { fileURLToPath } from "node:url";
@@ -50,6 +50,20 @@ test("the gateway serves the PWA manifest, service worker and icons", async (t) 
   assert.equal(icon.headers.get("content-type"), "image/png");
   // PNG magic number, so a placeholder or an error page would fail here.
   assert.deepEqual([...iconBody.subarray(0, 4)], [0x89, 0x50, 0x4e, 0x47]);
+});
+
+test("the public production bundle does not contain source maps", async (t) => {
+  if (!(await distBuilt())) {
+    t.skip("dist/web is not built; run npm run build:app");
+    return;
+  }
+
+  const files = await readdir(WEB_DIST_DIR, { recursive: true });
+  assert.deepEqual(
+    files.filter((file) => file.endsWith(".map")),
+    [],
+    "source maps must be uploaded out-of-band, never served with the console",
+  );
 });
 
 test("static serving does not escape the web dist directory", async (t) => {

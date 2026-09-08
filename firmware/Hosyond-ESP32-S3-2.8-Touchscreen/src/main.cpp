@@ -40,6 +40,10 @@
 #ifndef FIRMWARE_VERSION
 #define FIRMWARE_VERSION "0.1.0"
 #endif
+#ifdef BUILD_FIRMWARE_VERSION
+#undef FIRMWARE_VERSION
+#define FIRMWARE_VERSION BUILD_FIRMWARE_VERSION
+#endif
 
 namespace {
 
@@ -207,6 +211,7 @@ void setup() {
   gateway.setLimits(limits);
 
   gateway.begin(store, HARDWARE_MODEL, FIRMWARE_VERSION);
+  gateway.handleOtaBootAttempt();
   gateway.startNetworkTask();
   gatewayProbeBegin();
   provisioning.begin(store, store.deviceId());
@@ -218,8 +223,6 @@ void setup() {
   // -----------------------------------------------------------------------------------------
   // Not yet implemented, in dependency order:
   //
-  //   OTA                  — partitions_ota.csv is in place and the manifest poll, download, and
-  //                          rollback confirm still live in the CrowPanel's main.cpp.
   //   Gateway profiles     — the LAN/tailnet switch protocol, likewise unported.
   //   RGB LED indicator    — GPIO42, recording state.
   //   Camera               — no sensor on this board; capture_image controls report as much.

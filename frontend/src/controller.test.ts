@@ -1,12 +1,53 @@
 import { ApiError } from "./api";
 import {
   T3_SNAPSHOT_UNAVAILABLE_MESSAGE,
+  applyPendingThreadMutations,
   dedupeEnvironments,
   genericEnvironmentFailure,
   isT3SnapshotUnavailableError,
   normalizeThread,
   parseEnvironmentFailure,
+  runWithConcurrency,
+  selectWorkspacePrefetchIds,
+  setBoundedCacheEntry,
 } from "./controller";
+
+const projects = [{ id: "project_1", title: "Agent Controller" }];
+
+test("does not resurrect a deleted thread from a stale T3 snapshot", () => {
+  const staleThreads = [
+    { id: "thread_deleted", title: "Old task", label: "Old task — Agent Controller", projectId: "project_1" },
+    { id: "thread_keep", title: "Current task", label: "Current task — Agent Controller", projectId: "project_1" },
+  ];
+  const pending = new Map([["thread_deleted", { kind: "remove" as const }]]);
+
+  const stale = applyPendingThreadMutations(staleThreads, projects, pending);
+  expect(stale.threads.map((thread) => thread.id)).toEqual(["thread_keep"]);
+  expect(stale.settledIds).toEqual([]);
+
+  const caughtUp = applyPendingThreadMutations([staleThreads[1]], projects, pending);
+  expect(caughtUp.threads.map((thread) => thread.id)).toEqual(["thread_keep"]);
+  expect(caughtUp.settledIds).toEqual(["thread_deleted"]);
+});
+
+test("keeps an accepted rename until T3 reports the new title", () => {
+  const staleThread = {
+    id: "thread_1",
+    title: "Old title",
+    label: "Old title — Agent Controller",
+    projectId: "project_1",
+  };
+  const pending = new Map([["thread_1", { kind: "rename" as const, title: "New title" }]]);
+
+  const stale = applyPendingThreadMutations([staleThread], projects, pending);
+  expect(stale.threads[0]).toMatchObject({ title: "New title", label: "New title — Agent Controller" });
+  expect(stale.settledIds).toEqual([]);
+
+  const caughtUp = applyPendingThreadMutations([
+    { ...staleThread, title: "New title", label: "New title — Agent Controller" },
+  ], projects, pending);
+  expect(caughtUp.settledIds).toEqual(["thread_1"]);
+});
 
 test("identifies only the T3 snapshot failure that needs recovery guidance", () => {
   expect(isT3SnapshotUnavailableError(
@@ -36,6 +77,15 @@ test("deduplicates repeated pairings while preserving the original environment i
 
   expect(environments).toHaveLength(1);
   expect(environments[0]?.id).toBe("env_original");
+});
+
+test("keeps connector environments distinct without requiring a direct URL", () => {
+  const environments = dedupeEnvironments([
+    { id: "env_a", label: "Studio Mac", baseUrl: null, transportMode: "connector", connectorId: "con_a" },
+    { id: "env_b", label: "Build Mac", baseUrl: null, transportMode: "connector", connectorId: "con_b" },
+  ]);
+
+  expect(environments.map((environment) => environment.id)).toEqual(["env_a", "env_b"]);
 });
 
 test("normalizes the messages that belong to a T3 thread", () => {
@@ -112,4 +162,44 @@ test("falls back to a generic retryable failure when nothing was classified", ()
     message: T3_SNAPSHOT_UNAVAILABLE_MESSAGE,
     retryable: true,
   });
+});
+
+test("caps background workspace prefetch concurrency", async () => {
+  let active = 0;
+  let peak = 0;
+  const completed: string[] = [];
+
+  await runWithConcurrency(["env_1", "env_2", "env_3", "env_4", "env_5"], 2, async (id) => {
+    active += 1;
+    peak = Math.max(peak, active);
+    await new Promise((resolve) => setTimeout(resolve, 2));
+    completed.push(id);
+    active -= 1;
+  });
+
+  expect(peak).toBe(2);
+  expect(completed).toHaveLength(5);
+  expect(new Set(completed).size).toBe(5);
+});
+
+test("bounds speculative workspace reads independently of account size", () => {
+  expect(selectWorkspacePrefetchIds([
+    "env_1",
+    "env_2",
+    "env_2",
+    "env_3",
+    "env_4",
+    "env_5",
+  ], 3)).toEqual(["env_1", "env_2", "env_3"]);
+  expect(selectWorkspacePrefetchIds(["env_1"], 0)).toEqual([]);
+});
+
+test("evicts least-recently-used workspace projections", () => {
+  const cache = new Map<string, number>();
+  setBoundedCacheEntry(cache, "env_1", 1, 2);
+  setBoundedCacheEntry(cache, "env_2", 2, 2);
+  setBoundedCacheEntry(cache, "env_1", 10, 2);
+  setBoundedCacheEntry(cache, "env_3", 3, 2);
+
+  expect([...cache.entries()]).toEqual([["env_1", 10], ["env_3", 3]]);
 });

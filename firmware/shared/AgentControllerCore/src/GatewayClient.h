@@ -23,6 +23,28 @@
 #include "DeviceStore.h"
 #include "OperateModel.h"
 
+#ifndef ENABLE_OTA_APPLY
+#if SECURE_BUILD_ENABLE_OTA_APPLY
+#define ENABLE_OTA_APPLY 1
+#else
+#define ENABLE_OTA_APPLY 0
+#endif
+#endif
+#ifndef REQUIRE_OTA_SIGNATURE
+#if SECURE_BUILD_REQUIRE_OTA_SIGNATURE
+#define REQUIRE_OTA_SIGNATURE 1
+#else
+#define REQUIRE_OTA_SIGNATURE 0
+#endif
+#endif
+#ifndef OTA_MANIFEST_VERIFY_KEY
+#ifdef BUILD_OTA_MANIFEST_VERIFY_KEY
+#define OTA_MANIFEST_VERIFY_KEY BUILD_OTA_MANIFEST_VERIFY_KEY
+#else
+#define OTA_MANIFEST_VERIFY_KEY ""
+#endif
+#endif
+
 enum class GatewayLink : uint8_t {
   NoIdentity,    // never provisioned: terminal, and the owner cannot fix it
   Idle,          // no network yet, or nothing asked since
@@ -50,7 +72,15 @@ class GatewayClient {
   // froze the animation for 384-1823 ms at a time, measured on hardware — a heartbeat, a config
   // fetch or a display poll each stopping the orb dead. The renderer must never wait on a socket.
 
-  // One iteration of the network task. Public only so the task function can reach it.
+  // Holds the authenticated device event stream on its own task. A threads.changed event applies
+  // the tiny local list delta immediately and schedules an authoritative refresh; neither the
+  // render loop nor the ordinary request scheduler waits on this long-lived connection.
+  void eventTaskLoop();
+
+  // OTA is polled by the network task and can be made immediately due by firmware.changed.
+  // Automatic/mandatory releases are verified, streamed to the inactive slot, and only confirmed
+  // after a healthy gateway heartbeat. Manual releases remain dashboard-visible and untouched.
+  void handleOtaBootAttempt();
 
   // State guard. The network task holds this while it mutates; the UI takes it with a ZERO timeout
   // and simply skips its observation for that frame when the task is mid-request. Reusing the
@@ -65,7 +95,7 @@ class GatewayClient {
   // still drive runCycle() from their loop rely on.
   void startNetworkTask();
 
-  // One pass of the cycle, taking the lock itself. Public only because the task calls it.
+  // One iteration of the network task, taking the lock itself. Public only because the task calls it.
   void networkTick();
 
   // Set while the microphone is open. The I2S ring holds only tens of milliseconds, and although
@@ -96,7 +126,16 @@ class GatewayClient {
   // What this board can do and how much of a payload it can render. Call before begin() runs its
   // first heartbeat; the gateway truncates the controls layout and wraps assistant text against
   // these numbers, so wrong values here show up as clipped labels rather than as an error.
+  // Existing display controllers call the two-argument form. It preserves the historical
+  // contract: those boards have a rendered display and a thread picker, with microphone/camera
+  // availability supplied by their board drivers.
   void setCapabilities(bool microphone, bool camera);
+
+  // Bring-up targets must be able to use the authenticated claim/health path before their panel
+  // or input silicon is proven. Advertising display/thread_picker unconditionally made such a
+  // target look usable to the gateway and could assign controls it had no way to render or invoke.
+  // Keep every capability independently evidence-gated instead.
+  void setCapabilities(bool display, bool threadPicker, bool microphone, bool camera);
   void setLimits(const GatewayLimits& limits);
 
   // ---------------------------------------------------------------------------------------------
@@ -191,11 +230,12 @@ class GatewayClient {
   // the HTTP status in `httpStatusOut` (413 is set locally, without a request, when the decoded
   // size exceeds `mediaUploadBytes`).
   //
-  // The bytes are streamed as base64 straight out of the caller's buffers — nothing is copied, and
-  // the buffers must stay alive for the call. `headerBytes` exists so a WAV header can precede PCM
-  // without the recording being memmoved to make room for it; pass nullptr when there is none.
+  // The bytes are SHA-256 checked and streamed through the gateway's raw upload-session PUT straight
+  // out of the caller's buffers — nothing is copied, and the buffers must stay alive for the call.
+  // `headerBytes` exists so a WAV header can precede PCM without the recording being memmoved to
+  // make room for it; pass nullptr when there is none.
   //
-  // The slowest call in this class by a wide margin: a megabyte of base64 over a domestic uplink
+  // The slowest call in this class by a wide margin: a megabyte of media over a domestic uplink
   // gets a 30 s timeout, against 5 s for everything else. Paint before calling, and mean it.
   String uploadMedia(const char* kind, const char* contentType, const char* originalName,
                      const uint8_t* headerBytes, size_t headerLength, const uint8_t* bodyBytes,
@@ -210,8 +250,11 @@ class GatewayClient {
   DispatchResult answerApproval(const String& commandId, bool approve);
 
  private:
-  int request(const char* method, const char* path, const String& body, String& response);
+  int request(const char* method, const char* path, const String& body, String& response,
+              const String* credentialOverride = nullptr, bool trackAuthState = true);
   void sendHeartbeat();
+  void observeCredentialRotation(const String& heartbeatPayload);
+  bool processPendingDeviceCredential();
   void fetchConfig();
   void fetchSetupCode(bool rotate);
 
@@ -225,6 +268,13 @@ class GatewayClient {
   DispatchResult postIntent(const String& intentJson, const String& label);
   DispatchResult readDispatch(int code, const String& response, const String& label);
   void markOperateDue(uint32_t now);
+  void applyThreadChangedEvent(const String& payload);
+  void applyRefreshEvent(const String& event, const String& payload);
+  void pollFirmwareManifest();
+  bool applyFirmwareUpdate(const String& manifestPayload);
+  void confirmFirmwareIfPendingVerify();
+  void reportFirmwareStatus(const char* state, const char* targetVersion, const char* detail,
+                            int progress = -1);
   void touch() { revision_ += 1; }
 
   DeviceStore* store_ = nullptr;
@@ -243,6 +293,9 @@ class GatewayClient {
   uint32_t nextSetupCodeAt_ = 0;
   uint32_t backoffUntil_ = 0;   // honours 429 retry-after
   bool revoked_ = false;
+  // RAM-only progress. NVS contains the candidate and its server rotation identity, so rebooting
+  // safely repeats the idempotent stage call before attempting acknowledgement.
+  String stagedCredentialRotationId_;
   void* stateMutex_ = nullptr;      // SemaphoreHandle_t, kept opaque so the header stays portable
 
   // Who holds the lock and how deep. A recursive mutex will not tell us either, and request() has
@@ -256,6 +309,8 @@ class GatewayClient {
   uint32_t releaseStateForBlockingCall();
   void reacquireStateAfterBlockingCall(uint32_t depth);
 
+  bool hasDisplay_ = true;
+  bool hasThreadPicker_ = true;
   bool hasMicrophone_ = false;
   bool hasCamera_ = false;
   GatewayLimits limits_;
@@ -277,6 +332,15 @@ class GatewayClient {
   size_t threadCount_ = 0;
   int selectedThreadIndex_ = 0;
   String threadsDetail_;
+  struct PendingDeviceThreadMutation {
+    String threadId;
+    String title;
+    bool remove = false;
+    uint32_t expiresAt = 0;
+  };
+  static constexpr size_t kMaxPendingThreadMutations = 8;
+  PendingDeviceThreadMutation pendingThreadMutations_[kMaxPendingThreadMutations];
+  size_t pendingThreadMutationCount_ = 0;
 
   SavedMacro macros_[kMaxMacros];
   size_t macroCount_ = 0;
@@ -293,6 +357,7 @@ class GatewayClient {
   uint32_t nextThreadsAt_ = 0;
   uint32_t nextControlsAt_ = 0;
   uint32_t nextApprovalsAt_ = 0;
+  uint32_t nextFirmwareAt_ = 0;
 };
 
 const char* gatewayLinkName(GatewayLink link);

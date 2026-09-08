@@ -8,13 +8,14 @@
 // build must not pull in the drivers, the pin definitions, or the RAM.
 //
 // Everything here is guarded by ENABLE_AUDIO_CAPTURE / ENABLE_CAMERA_CAPTURE.
-// With both at 0 this translation unit compiles to nothing but the base64
-// body stream, which is header-only and costs no flash unless referenced.
+// With both at 0 this translation unit compiles to no capture implementation. Transport belongs
+// to shared AgentControllerCore and is linked only when a capture surface calls it.
 
 #include <Arduino.h>
-#include <Stream.h>
 
-#if __has_include("controller_config.h")
+#if defined(CONTROLLER_CONFIG_PLACEHOLDER_BUILD)
+#include "controller_config.example.h"
+#elif __has_include("controller_config.h")
 #include "controller_config.h"
 #else
 #include "controller_config.example.h"
@@ -200,141 +201,6 @@
 #endif
 
 namespace capture {
-
-// Length of the base64 encoding of rawLength bytes, including '=' padding.
-inline size_t base64EncodedLength(size_t rawLength) {
-  return ((rawLength + 2) / 3) * 4;
-}
-
-// Streams `prefix + base64(headerBytes ++ bodyBytes) + suffix` on demand.
-//
-// This exists so the JSON upload body is never materialised: the capture buffer
-// is the only full copy of the payload in RAM, and its ~1.33x base64 expansion
-// is produced 4 characters at a time straight into HTTPClient's 1460-byte TCP
-// buffer. Holding a second String would cost more than the recording itself.
-//
-// HTTPClient::sendRequest(type, Stream*, size) drives this through available()
-// and readBytes(), so contentLength() must be exact or the send is aborted as a
-// short write.
-class Base64JsonBodyStream : public Stream {
- public:
-  Base64JsonBodyStream(
-    const String& prefix,
-    const String& suffix,
-    const uint8_t* headerBytes,
-    size_t headerLength,
-    const uint8_t* bodyBytes,
-    size_t bodyLength
-  )
-    : prefix_(prefix),
-      suffix_(suffix),
-      header_(headerBytes),
-      headerLength_(headerBytes ? headerLength : 0),
-      body_(bodyBytes),
-      bodyLength_(bodyBytes ? bodyLength : 0) {}
-
-  size_t contentLength() const {
-    return prefix_.length() + base64EncodedLength(headerLength_ + bodyLength_) + suffix_.length();
-  }
-
-  int available() override {
-    const size_t total = contentLength();
-    if (produced_ >= total) return 0;
-    return static_cast<int>(total - produced_);
-  }
-
-  int read() override {
-    const int value = nextChar(true);
-    if (value >= 0) produced_ += 1;
-    return value;
-  }
-
-  int peek() override { return nextChar(false); }
-
-  size_t readBytes(char* buffer, size_t length) override {
-    size_t count = 0;
-    while (count < length) {
-      const int value = nextChar(true);
-      if (value < 0) break;
-      buffer[count] = static_cast<char>(value);
-      count += 1;
-      produced_ += 1;
-    }
-    return count;
-  }
-
-  // Write side is unused; this stream is read-only input for HTTPClient.
-  size_t write(uint8_t) override { return 0; }
-  void flush() override {}
-
- private:
-  size_t rawTotal() const { return headerLength_ + bodyLength_; }
-
-  uint8_t rawByte(size_t index) const {
-    if (index < headerLength_) return header_[index];
-    return body_[index - headerLength_];
-  }
-
-  // Encodes the next 3 raw bytes into quad_ when the current quad is spent.
-  bool fillQuad() {
-    if (quadPos_ < quadLength_) return true;
-    const size_t total = rawTotal();
-    if (rawIndex_ >= total) return false;
-
-    static const char kAlphabet[] =
-      "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-
-    uint8_t chunk[3] = {0, 0, 0};
-    uint8_t chunkLength = 0;
-    while (chunkLength < 3 && rawIndex_ < total) {
-      chunk[chunkLength] = rawByte(rawIndex_);
-      chunkLength += 1;
-      rawIndex_ += 1;
-    }
-
-    quad_[0] = kAlphabet[chunk[0] >> 2];
-    quad_[1] = kAlphabet[((chunk[0] & 0x03) << 4) | (chunk[1] >> 4)];
-    quad_[2] = chunkLength > 1 ? kAlphabet[((chunk[1] & 0x0F) << 2) | (chunk[2] >> 6)] : '=';
-    quad_[3] = chunkLength > 2 ? kAlphabet[chunk[2] & 0x3F] : '=';
-    quadLength_ = 4;
-    quadPos_ = 0;
-    return true;
-  }
-
-  int nextChar(bool consume) {
-    if (prefixPos_ < prefix_.length()) {
-      const char value = prefix_.charAt(prefixPos_);
-      if (consume) prefixPos_ += 1;
-      return static_cast<unsigned char>(value);
-    }
-    if (fillQuad()) {
-      const char value = quad_[quadPos_];
-      if (consume) quadPos_ += 1;
-      return static_cast<unsigned char>(value);
-    }
-    if (suffixPos_ < suffix_.length()) {
-      const char value = suffix_.charAt(suffixPos_);
-      if (consume) suffixPos_ += 1;
-      return static_cast<unsigned char>(value);
-    }
-    return -1;
-  }
-
-  String prefix_;
-  String suffix_;
-  const uint8_t* header_ = nullptr;
-  size_t headerLength_ = 0;
-  const uint8_t* body_ = nullptr;
-  size_t bodyLength_ = 0;
-
-  size_t prefixPos_ = 0;
-  size_t suffixPos_ = 0;
-  size_t rawIndex_ = 0;
-  size_t produced_ = 0;
-  char quad_[4] = {0, 0, 0, 0};
-  uint8_t quadLength_ = 0;
-  uint8_t quadPos_ = 0;
-};
 
 #if ENABLE_AUDIO_CAPTURE
 

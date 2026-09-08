@@ -28,7 +28,7 @@ const readiness: OnboardingReadiness = {
     environmentReachable: false,
     workspaceSelected: false,
     providerConfigured: false,
-    firstRunDispatched: false,
+    firstRunCompleted: false,
     deviceReady: false,
   },
   ready: false,

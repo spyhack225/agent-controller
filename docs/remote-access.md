@@ -1,140 +1,216 @@
 # Remote access
 
-Agent Controller has two network paths that can need remote access:
+Agent Controller has two deliberately different remote-access models:
 
-1. **Agent Controller gateway** — the console and device API in this repository, normally on port `3996`.
-2. **T3 Code environment** — the workstation agent server, normally on port `3773`.
+1. **Managed cloud (the production design):** controllers and browsers connect to the stable Agent
+   Controller HTTPS/WSS origin. A connector running beside T3 Code initiates an authenticated
+   outbound connection to that cloud service and proxies T3 commands and events.
+2. **Self-hosted/advanced:** an operator exposes a locally running gateway or T3 server through
+   Tailscale Serve, Funnel, or another independently secured network path.
 
-Tunneling one does not automatically tunnel the other. Configure the gateway when you want to open Agent Controller from a phone or another computer. Configure the T3 environment when the gateway must reach a T3 Code host on another network.
+Do not combine the two into one setup contract. Managed cloud does not require the cloud service to
+join a user's Tailnet, reach a LAN address, or accept a standing T3 token. Direct Tailscale/Funnel
+gateway access remains useful for development and self-hosting, but it is not the production cloud
+topology.
 
-The Settings workspace and initial onboarding inspect the machine running the gateway and identify the next missing step: install Tailscale, sign in, enable Serve or Funnel, restart after `.env` changes, or open the ready HTTPS URL. Use **Refresh** after changing Tailscale outside the browser. A separate T3 host still needs Tailscale configured on that host because the gateway cannot inspect another machine's local installation.
+## Production: cloud service plus outbound connector
 
-## Recommended: private Tailscale Serve
+The intended path is:
 
-[T3 Code recommends a trusted private network](https://github.com/pingdotgg/t3code/blob/main/docs/user/remote-access.md) for remote access. Tailscale Serve gives the gateway a stable MagicDNS HTTPS URL and limits access to devices and users allowed by the Tailnet policy.
+```text
+controller or browser ── HTTPS/WSS ── Agent Controller cloud
+                                         │
+                                         └── authenticated WSS ── connector CLI ── local/Tailnet T3
+```
+
+The local connector:
+
+- redeems a short-lived, single-use code created by the signed-in user;
+- receives a revocable environment-scoped credential, separate from platform, device, factory, and
+  T3 credentials;
+- discovers or safely launches T3 on the user's machine;
+- stores the T3 access material locally rather than sending it to the cloud;
+- maintains heartbeat, reconnect, replay, backpressure, and truthful offline/reconnecting state;
+- proxies commands, events, terminal results, approvals, questions, cancellation, and thread
+  subscriptions over the outbound channel.
+
+The repository contains the connector package and its `bin` entry. The eventual install-free command
+has this shape:
+
+```bash
+npx @agent-controller/connector connect \
+  --server 'https://controller.example.com' \
+  --code 'one-time-code'
+```
+
+The package has not been published, and the managed cloud has not been deployed from this checkout.
+Until publication, developers can run the package from a repository checkout; that is local evidence,
+not proof of the install-free production journey.
+
+When `DEPLOYMENT_MODE=cloud`, connector enrollment is the supported T3 path. Direct environment URL
+and token creation are disabled, and onboarding intentionally hides gateway Serve/Funnel controls.
+Readiness is proof-gated: a socket acknowledgement alone does not count as a working environment.
+The flow must observe the selected environment, project, provider and model, then a completed command
+with a newer T3 reply before presenting the journey as ready. That contract is locally tested; a
+deployed first-reply journey remains unproven.
+
+## Where Tailscale belongs in production
+
+Tailscale may run on the same user machine as T3 and the connector. It can provide a private route
+from the connector to a T3 process elsewhere in that user's Tailnet, but it is not required when T3
+is reachable over loopback.
+
+Production rules:
+
+- ESP32 controllers do not run Tailscale.
+- The Agent Controller cloud account does not join the user's Tailnet.
+- No inbound port or public T3 endpoint is required for the common path.
+- Tailscale access does not replace Agent Controller authentication or connector authorization.
+- Cached environment state must be shown as stale/offline until the connector proves liveness.
+
+The packaged connector reports this optional layer through `status` and `doctor`. It performs only a
+bounded `tailscale status --json` read and emits a privacy-minimal projection; raw peer, user,
+Tailnet, hostname, and address data never enters its report. Missing or disconnected Tailscale adds
+static, operator-directed guidance but does not make connector health fail by itself. The actual T3
+reachability check remains authoritative.
+
+The connector does not install Tailscale, run `tailscale up`, authenticate the machine, or inspect or
+change Serve/Funnel configuration. Those are explicit operator actions. This keeps the managed cloud
+path outbound-only and prevents a diagnostic or enrollment command from changing an independently
+managed network boundary.
+
+## Self-hosted/advanced: expose a local gateway
+
+The commands in this section apply to a gateway that the operator runs locally. They are not needed
+for the managed-cloud service.
+
+### Private Tailscale Serve
+
+Tailscale Serve gives a self-hosted gateway a stable MagicDNS HTTPS URL and limits access to devices
+and users permitted by the Tailnet policy.
 
 Prerequisites:
 
 - Install [Tailscale](https://tailscale.com/download) on the gateway host.
 - Sign in and confirm `tailscale status` reports the device as connected.
 - Install Tailscale on each remote phone or computer that should open the private URL.
-- Keep Agent Controller authentication enabled. Tailnet access is an additional boundary, not a replacement for Clerk.
+- Keep Agent Controller authentication enabled. Tailnet access is an additional boundary, not a
+  replacement for Clerk.
 
-From this repository, run:
+Run:
 
 ```bash
 npm run setup:tunnel -- --mode serve --write-env
 ```
 
-The command:
-
-- checks that Tailscale is installed and connected;
-- runs a persistent HTTPS reverse proxy to `http://127.0.0.1:3996`;
-- prints the `https://machine.tailnet.ts.net` URL;
-- updates `PUBLIC_BASE_URL` in `.env`;
-- appends the HTTPS origin to `CLERK_AUTHORIZED_PARTIES` without replacing existing origins.
-
-Restart Agent Controller after the environment file changes:
+The command checks Tailscale, proxies HTTPS to `http://127.0.0.1:3996`, prints the MagicDNS URL,
+updates `PUBLIC_BASE_URL`, and appends the origin to `CLERK_AUTHORIZED_PARTIES`. Restart the gateway
+after `.env` changes:
 
 ```bash
 npm start
 ```
 
-Open the printed HTTPS URL from a device signed in to the permitted Tailnet.
-
-Disable the mapping later with:
+Disable the persistent mapping with:
 
 ```bash
 npm run setup:tunnel -- --mode serve-off
 ```
 
-Tailscale Serve uses background mode, so its mapping resumes after a reboot or Tailscale restart until it is disabled.
+### Public Tailscale Funnel
 
-## Public internet: Tailscale Funnel
-
-Funnel publishes the gateway to the broader internet. Use it only when the client cannot join your Tailnet and public reachability is truly required.
+Funnel publishes the self-hosted gateway to the public internet. Use it only when the client cannot
+join the Tailnet and public reachability is intentionally required:
 
 ```bash
 npm run setup:tunnel -- --mode funnel --write-env
 ```
 
-The setup command refuses Funnel when Agent Controller is using development authentication. Configure Clerk first. The `--allow-public` override exists for operators who have independently installed another production authentication layer; it should not be used to bypass the warning on an unprotected gateway.
+The setup command refuses Funnel when Agent Controller uses development authentication. The
+`--allow-public` override is for operators who have independently installed another production
+authentication layer; it is not a safe bypass for an unprotected gateway.
 
-Disable Funnel with:
+Before using Funnel, verify Clerk at the public origin, retain rate limits, keep all credentials out
+of URLs and screenshots, and revoke unrecognized sessions. Disable the mapping with:
 
 ```bash
 npm run setup:tunnel -- --mode funnel-off
 ```
 
-Before using Funnel:
+## Self-hosted/advanced: direct T3 compatibility path
 
-- Confirm Clerk sign-in works at the Funnel URL.
-- Add the HTTPS origin to the Clerk application’s allowed origins if Clerk rejects the new domain.
-- Keep rate limits enabled.
-- Never put device credentials, API tokens, T3 pairing tokens, or session tokens in shared URLs or screenshots.
-- Revoke sessions you no longer recognize.
-
-Tailscale Funnel is HTTPS-only and supports public ports `443`, `8443`, and `10000`. Agent Controller uses public HTTPS port `443` by default while the local gateway stays on `3996`.
-
-## T3 Code environment access
-
-For a T3 server that is already running, T3 Code can configure Serve and mint a new one-time pairing credential without restarting:
+The repository retains a direct environment transport for development and self-hosting. A running T3
+server can configure Tailscale Serve and mint a one-time pairing credential with:
 
 ```bash
 npx t3 pair --tailscale
 ```
 
-For a new T3 environment managed by this repository, use Initial setup in the console and choose **Tailscale Serve**, or run:
+A repository-managed local environment can use:
 
 ```bash
 npm run setup:t3 -- --project '/path/to/project' --tunnel tailscale
 ```
 
-The setup wrapper launches `t3 serve --tailscale-serve`, captures the stable HTTPS endpoint and pairing token, and can register the environment with Agent Controller when gateway credentials are supplied.
+This path requires the self-hosted gateway to reach the T3 Serve URL. If they run on different
+machines, both machines need an allowed Tailnet path. It also means the gateway participates in the
+T3 trust boundary, so protect T3 credentials and keep authentication enabled.
 
-The Agent Controller gateway must be able to reach the T3 Serve URL. If the gateway and T3 host are different machines, both need to participate in a Tailnet path permitted by its access-control rules.
+Do not use this direct URL/token flow as a workaround in cloud mode. The public cloud service must
+not make arbitrary requests into LAN, Tailnet, or user-supplied origins; the connector is the
+application bridge and SSRF boundary.
 
-## LAN hardware and listener settings
+## LAN hardware in self-hosted mode
 
-ESP32 controllers do not normally run Tailscale. If they reach the gateway over Wi-Fi, keep:
+ESP32 controllers do not normally run Tailscale. For a self-hosted gateway reached over local Wi-Fi,
+listen on the LAN interface:
 
 ```env
 HOST=0.0.0.0
 ```
 
-and keep their stored gateway URL pointed at the gateway host’s LAN address, for example `http://192.168.1.162:3996`. Tailscale proxies to the loopback address on the same host even while the server listens on all interfaces.
-
-If there are no LAN devices and every client uses Tailscale, binding Agent Controller to `127.0.0.1` reduces direct LAN exposure.
+Point the device at the gateway host's LAN URL, for example `http://192.168.1.162:3996`. Use HTTPS
+with verified trust anchors for any production credential path; plain HTTP is a local-bench path.
+If no LAN devices need the gateway, binding to `127.0.0.1` reduces direct LAN exposure.
 
 ## Troubleshooting
 
-### The setup command cannot find Tailscale
+### The managed-cloud connector will not become ready
 
-Install Tailscale, launch the app, sign in, and verify:
+- Confirm the connector is using the exact cloud origin and an unexpired one-time code.
+- Check that local T3 is running or that the connector can launch it.
+- Distinguish `offline`, `reconnecting`, `accepted`, `completed`, approval, and user-input states;
+  an accepted dispatch is not a completed agent turn.
+- Re-enroll after credential revocation or rotation. The old socket should be closed and must not
+  resume with the replaced credential.
+- A local contract test does not prove hosted Service Binding, WAN, sleep/wake, or live-T3 behavior.
 
-```bash
-tailscale status
-```
+Run `agent-controller-connect doctor --json` for the redacted cloud, T3, service, credential-storage,
+and optional Tailscale projection. If its `tailscale.guidance` array contains an action and this T3
+path actually uses the Tailnet, complete that action yourself and rerun doctor. Do not configure
+Serve for the managed-cloud connector; its cloud channel is outbound.
 
-On macOS, the setup command checks both `PATH` and the standard Tailscale application CLI location.
+### The self-hosted setup command cannot find Tailscale
 
-### The HTTPS URL exists but sign-in fails
+Install Tailscale, launch the app, sign in, and run `tailscale status`. On macOS, the setup command
+checks both `PATH` and the standard Tailscale application CLI location.
 
-- Restart Agent Controller after `--write-env` updates `.env`.
+### The self-hosted HTTPS URL exists but sign-in fails
+
+- Restart Agent Controller after `--write-env` changes `.env`.
 - Confirm `PUBLIC_BASE_URL` is the printed HTTPS origin.
 - Confirm `CLERK_AUTHORIZED_PARTIES` includes that origin.
-- Add the origin in the Clerk dashboard if the frontend reports an origin or redirect restriction.
+- Add the origin in Clerk if the frontend reports an origin or redirect restriction.
 
-### Serve works locally but not from the phone
+### Serve works on the host but not the phone
 
-- Confirm the phone is signed in to Tailscale.
-- Confirm both devices appear in `tailscale status`.
-- Check Tailnet access-control rules.
-- Use `tailscale serve status` to confirm the proxy is active.
+Confirm the phone is signed in to Tailscale, both devices appear in `tailscale status`, Tailnet ACLs
+allow the path, and `tailscale serve status` reports the proxy.
 
-### Funnel is not reachable immediately
+### Funnel is not immediately reachable
 
-The first Funnel setup can require an admin consent page, MagicDNS, HTTPS certificates, and the Funnel node attribute. Public DNS propagation can also take several minutes. Follow the URL printed by the Tailscale CLI and retry after approval.
+The first Funnel setup can require administrator consent, MagicDNS, HTTPS certificates, and the
+Funnel node attribute. Follow the URL printed by the Tailscale CLI and retry after approval.
 
 ## References
 

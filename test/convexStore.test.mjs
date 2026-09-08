@@ -15,8 +15,14 @@ test("Convex store adapter maps Store API calls to configured Convex functions",
       calls.push({ type: "mutation", name, args });
       if (name === "gatewayStore:createDevice") return { id: "dev_1" };
       if (name === "gatewayStore:createUserToken") return { id: "tok_1" };
-      if (name === "gatewayStore:rotateDeviceSecret") return { id: "dev_1" };
-      if (name === "gatewayStore:resetDeviceForTransfer") return { id: "dev_1" };
+      if (name === "gatewayStore:rotateDeviceSecret") {
+        return { device: { id: "dev_1" }, rotation: { id: "dcr_1", pendingCredentialVersion: 2 } };
+      }
+      if (name === "gatewayStore:resetDeviceForTransfer") {
+        return { device: { id: "dev_1" }, rotation: { id: "dcr_transfer", purpose: "transfer" } };
+      }
+      if (name === "gatewayStore:stageDeviceSecret") return { staged: true };
+      if (name === "gatewayStore:acknowledgeDeviceSecret") return { promoted: true };
       if (name === "gatewayStore:ensureUnclaimedDeviceClaimCode") {
         return { device: { id: "dev_1", claimed: false }, rotated: true };
       }
@@ -94,6 +100,20 @@ test("Convex store adapter maps Store API calls to configured Convex functions",
   const commandEvents = await store.listCommandEvents({ userId: "user_1", commandId: "cmd_1" });
   const deletedEnvironment = await store.deleteEnvironment({ userId: "user_1", environmentId: "env_1" });
   const setupCode = await store.ensureUnclaimedDeviceClaimCode({ deviceId: "dev_1" });
+  const rotation = await store.rotateDeviceSecret({ userId: "user_1", deviceId: "dev_1" });
+  const stagedCredential = await store.stageDeviceSecret({
+    deviceId: "dev_1",
+    secret: "pending-device-secret",
+    rotationId: "dcr_1",
+    credentialVersion: 2,
+    authenticatedCredentialVersion: 1,
+  });
+  const acknowledgedCredential = await store.acknowledgeDeviceSecret({
+    deviceId: "dev_1",
+    rotationId: "dcr_1",
+    credentialVersion: 2,
+    authenticatedCredentialVersion: 2,
+  });
 
   assert.deepEqual(created.device, { id: "dev_1" });
   assert.match(created.secret, /^[A-Za-z0-9_-]+$/u);
@@ -116,13 +136,16 @@ test("Convex store adapter maps Store API calls to configured Convex functions",
   assert.deepEqual(macros, [{ id: "dev_1" }]);
   assert.deepEqual(deletedMacro, { ok: true });
   assert.deepEqual(transferReset.device, { id: "dev_1" });
-  assert.match(transferReset.secret, /^[A-Za-z0-9_-]+$/u);
-  assert.match(transferReset.claimCode, /^[A-Z0-9]{5}-[A-Z0-9]{5}$/u);
+  assert.equal(transferReset.secret, undefined);
+  assert.equal(transferReset.claimCode, undefined);
   assert.deepEqual(profileUpdate, { id: "dev_1", profile: "read-only" });
   assert.deepEqual(commandEvents, [{ id: "dev_1" }]);
   assert.deepEqual(deletedEnvironment, { ok: true });
   assert.deepEqual(setupCode.device, { id: "dev_1", claimed: false });
   assert.match(setupCode.claimCode, /^[A-Z0-9]{5}-[A-Z0-9]{5}$/u);
+  assert.equal(rotation.secret, undefined);
+  assert.deepEqual(stagedCredential, { staged: true });
+  assert.deepEqual(acknowledgedCredential, { promoted: true });
 
   assert.equal(calls[0].type, "mutation");
   assert.equal(calls[0].name, "gatewayStore:createDevice");
@@ -276,10 +299,8 @@ test("Convex store adapter maps Store API calls to configured Convex functions",
   assert.equal(calls[18].args.deviceId, "dev_1");
   assert.equal(calls[18].args.label, "Transfer controller");
   assert.equal(calls[18].args.gatewaySecret, "gateway-secret");
-  assert.match(calls[18].args.secretHash, /^[a-f0-9]{64}$/u);
-  assert.match(calls[18].args.claimCodeHash, /^[a-f0-9]{64}$/u);
-  assert.notEqual(calls[18].args.secretHash, transferReset.secret);
-  assert.notEqual(calls[18].args.claimCodeHash, transferReset.claimCode);
+  assert.equal(calls[18].args.secretHash, undefined);
+  assert.equal(calls[18].args.claimCodeHash, undefined);
   assert.deepEqual(calls[19], {
     type: "mutation",
     name: "gatewayStore:updateDeviceProfile",
@@ -309,6 +330,27 @@ test("Convex store adapter maps Store API calls to configured Convex functions",
   assert.notEqual(calls[22].args.claimCodeHash, setupCode.claimCode);
   // The expiry is computed in Node, like every other timestamp the adapter sends.
   assert.match(calls[22].args.claimCodeExpiresAt, /^\d{4}-\d{2}-\d{2}T/u);
+  assert.deepEqual(calls[23], {
+    type: "mutation",
+    name: "gatewayStore:rotateDeviceSecret",
+    args: { userId: "user_1", deviceId: "dev_1", gatewaySecret: "gateway-secret" },
+  });
+  assert.equal(calls[24].name, "gatewayStore:stageDeviceSecret");
+  assert.equal(calls[24].args.deviceId, "dev_1");
+  assert.equal(calls[24].args.secret, undefined);
+  assert.equal(calls[24].args.secretHash, sha256("pending-device-secret"));
+  assert.equal(calls[24].args.gatewaySecret, "gateway-secret");
+  assert.deepEqual(calls[25], {
+    type: "mutation",
+    name: "gatewayStore:acknowledgeDeviceSecret",
+    args: {
+      deviceId: "dev_1",
+      rotationId: "dcr_1",
+      credentialVersion: 2,
+      authenticatedCredentialVersion: 2,
+      gatewaySecret: "gateway-secret",
+    },
+  });
 });
 
 test("Convex store requires CONVEX_URL", async () => {
@@ -322,6 +364,62 @@ test("Convex store requires a gateway service secret", async () => {
   await assert.rejects(
     () => createConvexStore({ convexUrl: "https://convex.example" }),
     /GATEWAY_CONVEX_SECRET is required/u,
+  );
+});
+
+test("Convex store errors never expose the shared credential or remote arguments", async () => {
+  const gatewaySecret = "gateway-secret-must-not-enter-logs";
+  const privateArgument = "private-health-detail-must-not-enter-logs";
+  const remoteError = Object.assign(new Error([
+    "ArgumentValidationError: Object contains extra field",
+    `gatewaySecret: ${gatewaySecret}`,
+    `lastError: ${privateArgument}`,
+  ].join("\n")), {
+    code: "INVALID_ARGUMENT",
+    status: 422,
+    retryable: false,
+    data: { gatewaySecret, lastError: privateArgument },
+  });
+  const store = createConvexStoreAdapter({
+    client: {
+      query: async () => {
+        throw Object.assign(new Error(`remote code: ${gatewaySecret}`), { code: gatewaySecret });
+      },
+      mutation: async () => { throw remoteError; },
+    },
+    gatewaySecret,
+  });
+
+  await assert.rejects(
+    () => store.updateEnvironmentHealth({
+      userId: "user_1",
+      environmentId: "env_1",
+      status: "unreachable",
+      health: { lastError: privateArgument },
+    }),
+    (error) => {
+      assert.equal(error.name, "ConvexStoreRemoteError");
+      assert.equal(error.message, "Convex Store call failed (updateEnvironmentHealth).");
+      assert.equal(error.code, "INVALID_ARGUMENT");
+      assert.equal(error.status, 422);
+      assert.equal(error.retryable, false);
+      assert.equal(error.cause, undefined);
+      const logged = `${String(error)}\n${error.stack ?? ""}\n${JSON.stringify(error)}`;
+      assert.equal(logged.includes(gatewaySecret), false);
+      assert.equal(logged.includes(privateArgument), false);
+      assert.equal(logged.includes("gatewayStore:updateEnvironmentHealth"), false);
+      return true;
+    },
+  );
+
+  await assert.rejects(
+    () => store.listDevices("user_1"),
+    (error) => {
+      assert.equal(error.message, "Convex Store call failed (listDevices).");
+      assert.equal(error.code, "convex_store_call_failed");
+      assert.equal(String(error.stack).includes(gatewaySecret), false);
+      return true;
+    },
   );
 });
 
@@ -432,6 +530,89 @@ test("Convex store adapter hashes connect codes in Node and never sends the plai
     error: null,
     gatewaySecret: "gateway-secret",
   });
+});
+
+test("Convex connector credentials and tickets are hashed before crossing the adapter", async () => {
+  const calls = [];
+  const client = {
+    query: async (name, args) => {
+      calls.push({ type: "query", name, args });
+      if (name === "gatewayStore:listConnectors") return [];
+      return null;
+    },
+    mutation: async (name, args) => {
+      calls.push({ type: "mutation", name, args });
+      if (name === "gatewayStore:createConnector") return { id: "ctr_1", environmentId: args.environmentId };
+      if (name === "gatewayStore:authenticateConnector") return { id: args.connectorId };
+      if (name === "gatewayStore:authenticateConnectorForRevocation") return { id: args.connectorId };
+      if (name === "gatewayStore:revokeConnectorByCredential") return { id: args.connectorId, status: "revoked" };
+      if (name === "gatewayStore:beginConnectorCredentialRotation") return {
+        connector: { id: "ctr_1", environmentId: "env_1" },
+        rotation: { id: args.rotationId, expiresAt: args.expiresAt },
+      };
+      if (name === "gatewayStore:createConnectorTicket") return { expiresAt: args.expiresAt };
+      return { ok: true };
+    },
+  };
+  const store = createConvexStoreAdapter({ client, gatewaySecret: "gateway-secret" });
+  const enrolled = await store.createConnector({
+    userId: "user_1",
+    environmentId: "env_1",
+    label: "Studio Connector",
+    scopes: ["orchestration:read"],
+    protocolVersion: 1,
+    capabilities: ["snapshot"],
+  });
+  assert.equal(enrolled.connector.id, "ctr_1");
+  assert.ok(enrolled.secret.length >= 32);
+  const create = calls.find((call) => call.name === "gatewayStore:createConnector");
+  assert.equal(create.args.secret, undefined);
+  assert.equal(create.args.secretHash, sha256(enrolled.secret));
+  assert.equal(create.args.secretPrefix, enrolled.secret.slice(0, 8));
+
+  await store.authenticateConnector("ctr_1", enrolled.secret);
+  const auth = calls.find((call) => call.name === "gatewayStore:authenticateConnector");
+  assert.equal(auth.type, "mutation");
+  assert.equal(auth.args.secret, undefined);
+  assert.equal(auth.args.secretHash, sha256(enrolled.secret));
+
+  await store.authenticateConnectorForRevocation("ctr_1", enrolled.secret);
+  const revokeAuth = calls.find((call) => call.name === "gatewayStore:authenticateConnectorForRevocation");
+  assert.equal(revokeAuth.args.secret, undefined);
+  assert.equal(revokeAuth.args.secretHash, sha256(enrolled.secret));
+  await store.revokeConnectorByCredential({ connectorId: "ctr_1", secret: enrolled.secret });
+  const selfRevoke = calls.find((call) => call.name === "gatewayStore:revokeConnectorByCredential");
+  assert.equal(selfRevoke.args.secret, undefined);
+  assert.equal(selfRevoke.args.secretHash, sha256(enrolled.secret));
+
+  const rotation = await store.beginConnectorCredentialRotation({ userId: "user_1", connectorId: "ctr_1" });
+  const begin = calls.find((call) => call.name === "gatewayStore:beginConnectorCredentialRotation");
+  assert.equal(begin.args.pendingSecret, undefined);
+  assert.equal(begin.args.pendingSecretHash, sha256(rotation.secret));
+  assert.equal(begin.args.pendingSecretPrefix, rotation.secret.slice(0, 8));
+  assert.equal(rotation.rotation.id, begin.args.rotationId);
+
+  const ticket = await store.createConnectorTicket({ connectorId: "ctr_1", credentialVersion: 2, rotationId: rotation.rotation.id });
+  const mint = calls.find((call) => call.name === "gatewayStore:createConnectorTicket");
+  assert.equal(mint.args.ticket, undefined);
+  assert.equal(mint.args.tokenHash, sha256(ticket.ticket));
+  assert.equal(mint.args.audience, "agent-controller-connectors");
+  assert.equal(mint.args.credentialVersion, 2);
+  assert.equal(mint.args.rotationId, rotation.rotation.id);
+  assert.ok(Date.parse(ticket.expiresAt) > Date.now());
+
+  await store.recordConnectorPresence({
+    connectorId: "ctr_1",
+    environmentId: "env_1",
+    t3Version: "0.0.32",
+    activeRequests: 2,
+    queueDepth: 1,
+    providerCatalogue: { updatedAt: "2026-08-27T00:00:00.000Z", source: "connector-hello", instances: [] },
+  });
+  const presence = calls.find((call) => call.name === "gatewayStore:recordConnectorPresence");
+  assert.equal(presence.args.environmentId, "env_1");
+  assert.equal(presence.args.t3Version, "0.0.32");
+  assert.equal(presence.args.providerCatalogue.source, "connector-hello");
 });
 
 test("Convex store uses direct HTTP endpoints without the Convex runtime package", async () => {
@@ -553,6 +734,44 @@ test("every media job store method exists on the Convex adapter and the memory s
     assert.equal(typeof store[method], "function", `Convex adapter is missing ${method}().`);
     assert.equal(typeof memory[method], "function", `memory store is missing ${method}().`);
   }
+});
+
+test("release rollout Store methods retain memory and Convex adapter parity", async () => {
+  const calls = [];
+  const store = createConvexStoreAdapter({
+    client: {
+      query: async (name, args) => { calls.push({ type: "query", name, args }); return []; },
+      mutation: async (name, args) => { calls.push({ type: "mutation", name, args }); return { id: "rol_1" }; },
+    },
+    gatewaySecret: "gateway-secret",
+  });
+  const { createMemoryStore } = await import("../src/store.mjs");
+  const memory = createMemoryStore();
+  const methods = [
+    "createReleaseRollout", "listReleaseRollouts", "listRunnableReleaseRollouts",
+    "getReleaseRolloutForUser", "transitionReleaseRollout", "upsertRolloutAssignment",
+    "listRolloutAssignments",
+  ];
+  for (const method of methods) {
+    assert.equal(typeof store[method], "function", `Convex adapter is missing ${method}().`);
+    assert.equal(typeof memory[method], "function", `memory store is missing ${method}().`);
+  }
+  await store.createReleaseRollout({ userId: "user_1", name: "Canary" });
+  await store.listReleaseRollouts("user_1");
+  await store.listRunnableReleaseRollouts({ limit: 5 });
+  await store.getReleaseRolloutForUser("user_1", "rol_1");
+  await store.transitionReleaseRollout({ userId: "user_1", rolloutId: "rol_1", action: "start", evidenceRef: "test:1" });
+  await store.upsertRolloutAssignment({ userId: "user_1", rolloutId: "rol_1", targetId: "dev_1", patch: { status: "queued" } });
+  await store.listRolloutAssignments({ userId: "user_1", rolloutId: "rol_1" });
+  assert.deepEqual(calls.map((call) => `${call.type} ${call.name}`), [
+    "mutation gatewayStore:createReleaseRollout",
+    "query gatewayStore:listReleaseRollouts",
+    "query gatewayStore:listRunnableReleaseRollouts",
+    "query gatewayStore:getReleaseRolloutForUser",
+    "mutation gatewayStore:transitionReleaseRollout",
+    "mutation gatewayStore:upsertRolloutAssignment",
+    "query gatewayStore:listRolloutAssignments",
+  ]);
 });
 
 function sha256(value) {

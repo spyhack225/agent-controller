@@ -30,7 +30,7 @@ import {
 } from "react";
 
 import type { Controller } from "../controller";
-import { fileToBase64 } from "../format";
+import { clearDurableMutationRequest, durableMutationRequest } from "../requestId";
 import type { JsonRecord, MediaItem } from "../types";
 import { Button } from "../ui";
 import {
@@ -174,12 +174,19 @@ export async function sendComposerIntent(
     return undefined;
   }
   return c.run("send-intent", successMessage, async () => {
+    const pending = await durableMutationRequest({
+      environmentId: c.selectedEnvironmentId,
+      threadId: c.selectedThreadId,
+      intent,
+    });
     const body: JsonRecord = {
       environmentId: c.selectedEnvironmentId,
       intent,
+      clientRequestId: pending.clientRequestId,
     };
     if (intent.type !== "status") body.threadId = c.selectedThreadId;
     const result = await c.api("/v1/intents", { method: "POST", body });
+    clearDurableMutationRequest(pending.storageKey);
     await c.refreshAll();
     // The message has already been accepted at this point. A snapshot outage should open the
     // existing recovery flow without making the composer imply that the user needs to resend it.
@@ -191,6 +198,7 @@ export async function sendComposerIntent(
     return result;
   });
 }
+
 
 export function AttachmentChips({
   attachments,
@@ -275,7 +283,7 @@ export function useFileAttachment({
           const media = await c.uploadMedia({
             kind: file.type.startsWith("audio/") ? "audio" : "image",
             contentType: file.type,
-            dataBase64: await fileToBase64(file),
+            blob: file,
             originalName: file.name,
           });
           added.push(media.id);

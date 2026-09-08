@@ -3,9 +3,22 @@ import { createHash, timingSafeEqual } from "node:crypto";
 import { ENVIRONMENT_REMOVED_REASON } from "./actions.mjs";
 import { defaultSubscription, normalizeSubscription } from "./billing.mjs";
 import { CONNECT_SESSION_TTL_MS, normalizeConnectAccessMode } from "./connectSession.mjs";
+import {
+  CONNECTOR_PROTOCOL_VERSION,
+  CONNECTOR_ROTATION_TTL_MS,
+  CONNECTOR_TICKET_AUDIENCE,
+  CONNECTOR_TICKET_TTL_MS,
+} from "./connectorProtocol.mjs";
 import { ENVIRONMENT_FAILURE_REASONS } from "./environmentFailure.mjs";
 import { createId, createSecret, nowIso } from "./ids.mjs";
 import { normalizeOnboarding, normalizeStoredOnboarding } from "./onboarding.mjs";
+import {
+  COMMAND_REQUEST_MAX_PER_OWNER,
+  COMMAND_REQUEST_TTL_MS,
+  commandRequestKey,
+  commandRequestOwnerKey,
+  publicCommandRequest,
+} from "./requestEnvelope.mjs";
 import { createSecretBox } from "./secretBox.mjs";
 
 const DEFAULT_PRIVACY_SETTINGS = {
@@ -33,10 +46,25 @@ export const MEDIA_JOB_TERMINAL_STAGES = new Set(["dispatched", "failed"]);
 const MEDIA_JOB_FAILURE_CAUSES = ["configuration", "input", "provider", "unknown"];
 const DEFAULT_MEDIA_JOB_MAX_ATTEMPTS = 3;
 const DEVICE_ONLINE_THRESHOLD_MS = 90_000;
+const NOTIFICATION_MAX_PER_OWNER = 1000;
+const NOTIFICATION_RETENTION_MS = 30 * 24 * 60 * 60 * 1000;
+const NOTIFICATION_KIND_SET = new Set([
+  "turn.completed",
+  "turn.failed",
+  "gateway.approval_required",
+  "provider.approval_required",
+  "user_input.required",
+  "connector.offline",
+  "connector.recovered",
+  "t3.offline",
+  "t3.recovered",
+]);
+const NOTIFICATION_SEVERITY_SET = new Set(["info", "attention", "error"]);
 // A claim code has to outlive warehouse-to-customer transit, because the printed label is issued at
 // manufacture and read by the owner weeks later. Units that sit in inventory past this refresh from
 // the device menu (`rotate: true`) rather than silently on every boot.
 const CLAIM_CODE_TTL_MS = 30 * 24 * 60 * 60 * 1000;
+export const DEVICE_CREDENTIAL_ROTATION_TTL_MS = 10 * 60 * 1000;
 
 function claimCodeExpiryFrom(issuedAtMs) {
   return new Date(issuedAtMs + CLAIM_CODE_TTL_MS).toISOString();
@@ -69,13 +97,29 @@ export function emptyEnvironmentRemoval() {
 
 export function createStore(seed = {}, options = {}) {
   const t3TokenBox = createSecretBox(options.t3TokenEncryptionKey);
+  const pushSecretBox = createSecretBox(options.pushEncryptionKey ?? options.t3TokenEncryptionKey);
+  const requestNow = options.now ?? (() => Date.now());
+  const deviceRotationForRequest = (device) => publicDeviceCredentialRotation(device, requestNow());
+  const publicDeviceForRequest = (device) => publicDevice(device, requestNow());
   const users = new Map((seed.users ?? []).map((user) => [user.id, user]));
   const apiTokens = new Map((seed.apiTokens ?? []).map((token) => [token.id, token]));
   const devices = new Map((seed.devices ?? []).map((device) => [device.id, device]));
   const environments = new Map((seed.environments ?? []).map((environment) => [environment.id, environment]));
   const connectSessions = new Map((seed.connectSessions ?? []).map((session) => [session.id, session]));
+  const connectors = new Map((seed.connectors ?? []).map((connector) => [connector.id, connector]));
+  const connectorTickets = new Map((seed.connectorTickets ?? []).map((ticket) => [ticket.id, ticket]));
   const firmwareReleases = new Map((seed.firmwareReleases ?? []).map((release) => [release.id, release]));
+  const releaseRollouts = new Map((seed.releaseRollouts ?? []).map((rollout) => [rollout.id, rollout]));
+  const rolloutAssignments = new Map(
+    (seed.rolloutAssignments ?? []).map((assignment) => [`${assignment.rolloutId}:${assignment.targetId}`, assignment]),
+  );
   const gatewayProfiles = new Map((seed.gatewayProfiles ?? []).map((profile) => [profile.id, profile]));
+  const companionHandoffs = new Map(
+    (seed.companionHandoffs ?? []).map((handoff) => [handoff.id, handoff]),
+  );
+  const mediaUploadSessions = new Map(
+    (seed.mediaUploadSessions ?? []).map((session) => [session.id, session]),
+  );
   const mediaUploads = new Map((seed.mediaUploads ?? []).map((media) => [media.id, media]));
   const mediaJobs = new Map((seed.mediaJobs ?? []).map((job) => [job.id, job]));
   const macros = new Map((seed.macros ?? []).map((macro) => [macro.id, macro]));
@@ -92,6 +136,9 @@ export function createStore(seed = {}, options = {}) {
     (seed.deviceProfiles ?? []).map((profile) => [`${profile.userId}:${profile.profileId}`, profile]),
   );
   const commands = new Map((seed.commands ?? []).map((command) => [command.id, command]));
+  const commandRequests = new Map(
+    (seed.commandRequests ?? []).map((request) => [commandRequestKey(request), request]),
+  );
   // Keyed by user + environment + thread + T3 request id: the request id is the provider's, and
   // scoping it to the owner is what stops one account's answer from resolving another's.
   const providerApprovalDecisions = new Map(
@@ -104,6 +151,35 @@ export function createStore(seed = {}, options = {}) {
     (seed.providerUserInputAnswers ?? []).map((answer) => [providerApprovalKey(answer), answer]),
   );
   const commandEvents = new Map((seed.commandEvents ?? []).map((event) => [event.id, event]));
+  const notifications = new Map((seed.notifications ?? []).map((notification) => [notification.id, notification]));
+  const notificationDedupe = new Map(
+    [...notifications.values()].map((notification) => [notificationKey(notification), notification.id]),
+  );
+  let notificationSequence = Math.max(
+    0,
+    ...[...notifications.values()].map((notification) => Number(notification.sequence) || 0),
+  );
+  const backgroundLiveness = new Map(
+    (seed.backgroundLiveness ?? []).map((record) => [record.scope, record]),
+  );
+  const pushSubscriptions = new Map(
+    (seed.pushSubscriptions ?? []).map((subscription) => [subscription.id, subscription]),
+  );
+  const pushSubscriptionByOwnerEndpoint = new Map(
+    [...pushSubscriptions.values()].map((subscription) => [
+      `${subscription.userId}\u0000${subscription.endpointHash}`,
+      subscription.id,
+    ]),
+  );
+  const pushDeliveries = new Map(
+    (seed.pushDeliveries ?? []).map((delivery) => [delivery.id, delivery]),
+  );
+  const pushDeliveryDedupe = new Map(
+    [...pushDeliveries.values()].map((delivery) => [
+      `${delivery.subscriptionId}\u0000${delivery.notificationId}`,
+      delivery.id,
+    ]),
+  );
   const auditLogs = [...(seed.auditLogs ?? [])];
   const listeners = new Set();
 
@@ -124,8 +200,14 @@ export function createStore(seed = {}, options = {}) {
       devices: [...devices.values()],
       environments: [...environments.values()],
       connectSessions: [...connectSessions.values()],
+      connectors: [...connectors.values()],
+      connectorTickets: [...connectorTickets.values()],
       firmwareReleases: [...firmwareReleases.values()],
+      releaseRollouts: [...releaseRollouts.values()],
+      rolloutAssignments: [...rolloutAssignments.values()],
       gatewayProfiles: [...gatewayProfiles.values()],
+      companionHandoffs: [...companionHandoffs.values()],
+      mediaUploadSessions: [...mediaUploadSessions.values()],
       mediaUploads: [...mediaUploads.values()],
       mediaJobs: [...mediaJobs.values()],
       macros: [...macros.values()],
@@ -134,9 +216,14 @@ export function createStore(seed = {}, options = {}) {
       macroRuns: [...macroRuns.values()],
       deviceProfiles: [...deviceProfiles.values()],
       commands: [...commands.values()],
+      commandRequests: [...commandRequests.values()],
       providerApprovalDecisions: [...providerApprovalDecisions.values()],
       providerUserInputAnswers: [...providerUserInputAnswers.values()],
       commandEvents: [...commandEvents.values()],
+      notifications: [...notifications.values()],
+      backgroundLiveness: [...backgroundLiveness.values()],
+      pushSubscriptions: [...pushSubscriptions.values()],
+      pushDeliveries: [...pushDeliveries.values()],
       auditLogs,
     };
   }
@@ -294,6 +381,7 @@ export function createStore(seed = {}, options = {}) {
       label,
       profile,
       secretHash: hashSecret(secret),
+      credentialVersion: 1,
       claimCodeHash: null,
       claimedAt: nowIso(),
       revokedAt: null,
@@ -328,6 +416,7 @@ export function createStore(seed = {}, options = {}) {
       // firmware image to flash — of which there is now one per board.
       hardwareModel,
       secretHash: hashSecret(secret),
+      credentialVersion: 1,
       claimCodeHash: hashSecret(normalizeClaimCode(claimCode)),
       claimCodeExpiresAt: claimCodeExpiryFrom(Date.now()),
       claimedAt: null,
@@ -357,6 +446,10 @@ export function createStore(seed = {}, options = {}) {
     for (const device of devices.values()) {
       if (device.revokedAt || device.claimedAt || !device.claimCodeHash) continue;
       if (!safeEqual(device.claimCodeHash, claimHash)) continue;
+      // A transfer is ownerless immediately, but it is not safe to hand the record to a new owner
+      // while the former hardware credential is still the active one. The firmware must first
+      // prove its pending secret and complete promotion.
+      if (device.rotationPurpose === "transfer" && !device.rotationCompletedAt) return null;
       // An expired code is matched but refused, so the caller can say "expired" rather than the
       // indistinguishable "no such code" a `continue` would produce.
       if (!claimCodeIsLive(device)) return null;
@@ -378,10 +471,22 @@ export function createStore(seed = {}, options = {}) {
     return null;
   }
 
+  function beginDeviceCredentialRotation(device, purpose) {
+    const timestampMs = requestNow();
+    device.pendingSecretHash = null;
+    device.pendingCredentialVersion = (device.credentialVersion ?? 1) + 1;
+    device.rotationId = createId("dcr");
+    device.rotationPurpose = purpose;
+    device.rotationStartedAt = new Date(timestampMs).toISOString();
+    device.rotationExpiresAt = new Date(timestampMs + DEVICE_CREDENTIAL_ROTATION_TTL_MS).toISOString();
+    device.rotationCompletedAt = null;
+  }
+
   function revokeDevice({ userId, deviceId }) {
     const device = devices.get(deviceId);
     if (!device || device.userId !== userId) return null;
     device.revokedAt = nowIso();
+    clearPendingDeviceCredential(device);
     audit({
       userId,
       actorType: "user",
@@ -419,20 +524,29 @@ export function createStore(seed = {}, options = {}) {
     return { device: removed, reason: null };
   }
 
-  function rotateDeviceSecret({ userId, deviceId }) {
+  function rotateDeviceSecret({ userId, deviceId, restart = false }) {
     const device = devices.get(deviceId);
     if (!device || device.userId !== userId || device.revokedAt) return null;
-    const secret = createSecret();
-    device.secretHash = hashSecret(secret);
+    const existing = deviceRotationForRequest(device);
+    if (!restart && existing.state === "pending" && existing.purpose === "rotate") {
+      return { device: publicDeviceForRequest(device), rotation: existing, created: false };
+    }
+    beginDeviceCredentialRotation(device, "rotate");
     audit({
       userId,
       actorType: "user",
-      action: "device.secret_rotated",
+      action: "device.secret_rotation_started",
       targetId: device.id,
-      metadata: { label: device.label },
+      metadata: {
+        label: device.label,
+        purpose: "rotate",
+        credentialVersion: device.credentialVersion ?? 1,
+        pendingCredentialVersion: device.pendingCredentialVersion,
+        expiresAt: device.rotationExpiresAt,
+      },
     });
     notifyChanged();
-    return { device: publicDevice(device), secret };
+    return { device: publicDeviceForRequest(device), rotation: deviceRotationForRequest(device), created: true };
   }
 
   function updateDeviceProfile({ userId, deviceId, profile }) {
@@ -454,19 +568,17 @@ export function createStore(seed = {}, options = {}) {
   function resetDeviceForTransfer({ userId, deviceId, label }) {
     const device = devices.get(deviceId);
     if (!device || device.userId !== userId || device.revokedAt) return null;
-    const secret = createSecret();
-    const claimCode = createHumanCode();
     const previousLabel = device.label;
     device.userId = null;
     device.label = label ?? device.label;
-    device.secretHash = hashSecret(secret);
-    device.claimCodeHash = hashSecret(normalizeClaimCode(claimCode));
-    device.claimCodeExpiresAt = claimCodeExpiryFrom(Date.now());
+    device.claimCodeHash = null;
+    device.claimCodeExpiresAt = null;
     device.claimedAt = null;
     device.lastSeenAt = null;
     device.status = createDefaultDeviceStatus();
     device.config = createDefaultDeviceConfig();
     device.firmwarePolicy = createDefaultFirmwarePolicy();
+    beginDeviceCredentialRotation(device, "transfer");
     deviceControls.delete(device.id);
     audit({
       userId,
@@ -477,17 +589,130 @@ export function createStore(seed = {}, options = {}) {
         previousLabel,
         label: device.label,
         profile: device.profile,
+        credentialVersion: device.credentialVersion ?? 1,
+        pendingCredentialVersion: device.pendingCredentialVersion,
+        expiresAt: device.rotationExpiresAt,
       },
     });
+    notifyChanged();
+    return {
+      device: publicDeviceForRequest(device),
+      rotation: deviceRotationForRequest(device),
+    };
+  }
+
+  function stageDeviceSecret({
+    deviceId,
+    secret,
+    rotationId,
+    credentialVersion,
+    authenticatedCredentialVersion,
+  }) {
+    const device = devices.get(deviceId);
+    if (!device || device.revokedAt) return { device: null, rotation: null, reason: "revoked" };
+    const activeVersion = device.credentialVersion ?? 1;
+    if (authenticatedCredentialVersion !== activeVersion) {
+      return { device: publicDeviceForRequest(device), rotation: deviceRotationForRequest(device), reason: "active_credential_required" };
+    }
+    const expectedVersion = device.pendingCredentialVersion;
+    if (!device.rotationId || rotationId !== device.rotationId || credentialVersion !== expectedVersion) {
+      return { device: publicDeviceForRequest(device), rotation: deviceRotationForRequest(device), reason: "rotation_mismatch" };
+    }
+    const now = requestNow();
+    const expired = Date.parse(device.rotationExpiresAt ?? "") <= now;
+    if (expired && device.rotationPurpose !== "transfer") {
+      return { device: publicDeviceForRequest(device), rotation: deviceRotationForRequest(device), reason: "expired" };
+    }
+    if (expired) {
+      // Transfer already removed the owner, so expiry cannot strand the physical unit forever.
+      // The old credential remains rotation-only and may stage a fresh locally generated candidate;
+      // any candidate from the expired window is discarded first.
+      device.pendingSecretHash = null;
+      device.rotationStartedAt = new Date(now).toISOString();
+      device.rotationExpiresAt = new Date(now + DEVICE_CREDENTIAL_ROTATION_TTL_MS).toISOString();
+    }
+    const candidateHash = hashSecret(secret);
+    if (device.pendingSecretHash && !safeEqual(device.pendingSecretHash, candidateHash)) {
+      return { device: publicDeviceForRequest(device), rotation: deviceRotationForRequest(device), reason: "candidate_conflict" };
+    }
+    if (!device.pendingSecretHash) {
+      device.pendingSecretHash = candidateHash;
+      audit({
+        userId: device.userId ?? "system",
+        actorType: "device",
+        actorId: device.id,
+        action: "device.secret_rotation_staged",
+        targetId: device.id,
+        metadata: {
+          purpose: device.rotationPurpose,
+          credentialVersion: activeVersion,
+          pendingCredentialVersion: expectedVersion,
+          expiresAt: device.rotationExpiresAt,
+        },
+      });
+      notifyChanged();
+    }
+    return { device: publicDeviceForRequest(device), rotation: deviceRotationForRequest(device), reason: null };
+  }
+
+  function acknowledgeDeviceSecret({
+    deviceId,
+    rotationId,
+    credentialVersion,
+    authenticatedCredentialVersion,
+  }) {
+    const device = devices.get(deviceId);
+    if (!device || device.revokedAt) return { device: null, rotation: null, reason: "revoked" };
+    const activeVersion = device.credentialVersion ?? 1;
+    // The firmware may lose the success response after the server commits. Retrying with the now
+    // active secret returns the same terminal answer instead of failing or starting a new rotation.
+    if (authenticatedCredentialVersion === activeVersion
+        && credentialVersion === activeVersion
+        && rotationId === device.rotationId
+        && device.rotationCompletedAt) {
+      return {
+        device: publicDeviceForRequest(device),
+        rotation: deviceRotationForRequest(device),
+        promoted: true,
+        replayed: true,
+        reason: null,
+      };
+    }
+    if (authenticatedCredentialVersion !== device.pendingCredentialVersion
+        || credentialVersion !== device.pendingCredentialVersion
+        || rotationId !== device.rotationId
+        || !device.pendingSecretHash) {
+      return { device: publicDeviceForRequest(device), rotation: deviceRotationForRequest(device), reason: "pending_credential_required" };
+    }
+    if (Date.parse(device.rotationExpiresAt ?? "") <= requestNow()) {
+      return { device: publicDeviceForRequest(device), rotation: deviceRotationForRequest(device), reason: "expired" };
+    }
+    const previousVersion = activeVersion;
+    device.secretHash = device.pendingSecretHash;
+    device.credentialVersion = device.pendingCredentialVersion;
+    device.pendingSecretHash = null;
+    device.pendingCredentialVersion = null;
+    device.rotationCompletedAt = nowIso();
     audit({
-      userId: "system",
-      actorType: "system",
-      action: "device.claim_code_rotated",
+      userId: device.userId ?? "system",
+      actorType: "device",
+      actorId: device.id,
+      action: "device.secret_rotation_completed",
       targetId: device.id,
-      metadata: { label: device.label, profile: device.profile },
+      metadata: {
+        purpose: device.rotationPurpose,
+        previousCredentialVersion: previousVersion,
+        credentialVersion: device.credentialVersion,
+      },
     });
     notifyChanged();
-    return { device: publicDevice(device), secret, claimCode };
+    return {
+      device: publicDeviceForRequest(device),
+      rotation: deviceRotationForRequest(device),
+      promoted: true,
+      replayed: false,
+      reason: null,
+    };
   }
 
   // Rotating on every call is what invalidated the printed label the moment a unit was powered on:
@@ -530,10 +755,21 @@ export function createStore(seed = {}, options = {}) {
   function authenticateDevice(deviceId, secret) {
     const device = devices.get(deviceId);
     if (!device || device.revokedAt) return null;
-    if (!safeEqual(device.secretHash, hashSecret(secret))) return null;
+    const candidateHash = hashSecret(secret);
+    const activeVersion = device.credentialVersion ?? 1;
+    let credentialState = "active";
+    let authenticatedCredentialVersion = activeVersion;
+    if (!safeEqual(device.secretHash, candidateHash)) {
+      const pendingIsLive = device.pendingSecretHash
+        && safeEqual(device.pendingSecretHash, candidateHash)
+        && Date.parse(device.rotationExpiresAt ?? "") > requestNow();
+      if (!pendingIsLive) return null;
+      credentialState = "pending";
+      authenticatedCredentialVersion = device.pendingCredentialVersion;
+    }
     device.lastSeenAt = nowIso();
     notifyChanged();
-    return publicDevice(device);
+    return deviceForGateway(device, authenticatedCredentialVersion, credentialState, requestNow());
   }
 
   function recordDeviceHeartbeat({ deviceId, status = {} }) {
@@ -566,13 +802,13 @@ export function createStore(seed = {}, options = {}) {
   function listDevices(userId) {
     return [...devices.values()]
       .filter((device) => device.userId === userId)
-      .map(publicDevice);
+      .map(publicDeviceForRequest);
   }
 
   function getDeviceForUser(userId, deviceId) {
     const device = devices.get(deviceId);
     if (!device || device.userId !== userId) return null;
-    return publicDevice(device);
+    return publicDeviceForRequest(device);
   }
 
   // actorType defaults to "user" because the owner-facing PUT is the common path.
@@ -1019,11 +1255,15 @@ export function createStore(seed = {}, options = {}) {
 
   function upsertEnvironment(input) {
     const user = ensureUser({ userId: input.userId });
-    const normalizedBaseUrl = input.baseUrl.replace(/\/+$/u, "");
+    const transportMode = input.transportMode === "connector" ? "connector" : "direct";
+    const normalizedBaseUrl = transportMode === "direct" ? String(input.baseUrl).replace(/\/+$/u, "") : null;
     const existing = input.id
       ? environments.get(input.id)
       : [...environments.values()]
-        .filter((environment) => environment.userId === user.id && environment.baseUrl === normalizedBaseUrl)
+        .filter((environment) => environment.userId === user.id
+          && transportMode === "direct"
+          && (environment.transportMode ?? "direct") === "direct"
+          && environment.baseUrl === normalizedBaseUrl)
         .sort((left, right) => Date.parse(left.createdAt) - Date.parse(right.createdAt))[0] ?? null;
     if (input.id && (!existing || existing.userId !== user.id)) return null;
     const environment = {
@@ -1031,9 +1271,13 @@ export function createStore(seed = {}, options = {}) {
       userId: user.id,
       label: input.label,
       baseUrl: normalizedBaseUrl,
-      ...(t3TokenBox.enabled
-        ? { accessTokenCiphertext: t3TokenBox.seal(input.accessToken) }
-        : { accessToken: input.accessToken }),
+      transportMode,
+      connectorId: transportMode === "connector" ? (input.connectorId ?? existing?.connectorId ?? null) : null,
+      ...(transportMode === "direct"
+        ? (t3TokenBox.enabled
+          ? { accessTokenCiphertext: t3TokenBox.seal(input.accessToken) }
+          : { accessToken: input.accessToken })
+        : {}),
       scopes: input.scopes,
       accessTokenExpiresAt: normalizeNullableString(input.accessTokenExpiresAt) ?? null,
       status: input.status ?? "unknown",
@@ -1049,47 +1293,23 @@ export function createStore(seed = {}, options = {}) {
       actorType: "user",
       action: "environment.upserted",
       targetId: environment.id,
-      metadata: { label: environment.label, baseUrl: environment.baseUrl, scopes: environment.scopes },
-    });
-    notifyChanged();
-    return publicEnvironment(environment);
-  }
-
-  function updateEnvironmentCatalogue({ userId, environmentId, catalogue }) {
-    const environment = environments.get(environmentId);
-    if (!environment || environment.userId !== userId) return null;
-    environment.providerCatalogue = catalogue;
-    environment.updatedAt = nowIso();
-    audit({
-      userId,
-      actorType: "user",
-      action: "environment.catalogue_updated",
-      targetId: environment.id,
       metadata: {
-        source: catalogue?.source ?? null,
-        instanceCount: catalogue?.instances?.length ?? 0,
-        instanceIds: (catalogue?.instances ?? []).map((instance) => instance.instanceId),
+        label: environment.label,
+        baseUrl: environment.baseUrl,
+        transportMode: environment.transportMode,
+        scopes: environment.scopes,
       },
     });
     notifyChanged();
     return publicEnvironment(environment);
   }
 
-  // Nothing may keep pointing at a removed environment. A fixed-target action or macro without an
-  // environmentId is a row `normalizeActionInput` would refuse to create, so an orphan is disabled
-  // with a reason rather than silently retargeted at whatever the device happens to be using.
-  function deleteEnvironment({ userId, environmentId }) {
-    const environment = environments.get(environmentId);
-    if (!environment || environment.userId !== userId) return null;
-    environments.delete(environmentId);
+  function disconnectEnvironmentReferences({ userId, environmentId }) {
     const removed = emptyEnvironmentRemoval();
     for (const device of devices.values()) {
       if (device.userId !== userId || device.config?.environmentId !== environmentId) continue;
-      // The project lived inside the environment that just went away; leaving the id
-      // behind would silently filter the next environment's threads to a folder that
-      // does not exist there.
       device.config = normalizeDeviceConfig(
-        { ...device.config, environmentId: null, projectId: null },
+        { ...device.config, environmentId: null, projectId: null, threadId: null },
         device.config,
       );
       removed.devices.push(device.id);
@@ -1124,6 +1344,140 @@ export function createStore(seed = {}, options = {}) {
       };
       removed.onboarding = true;
     }
+    return removed;
+  }
+
+  function archiveEnvironment({ userId, environmentId, retentionDays = 30, at = nowIso() }) {
+    const environment = environments.get(environmentId);
+    if (!environment || environment.userId !== userId) return null;
+    if (environment.archivedAt) {
+      return { environment: publicEnvironment(environment), removed: emptyEnvironmentRemoval(), alreadyArchived: true };
+    }
+    const removed = disconnectEnvironmentReferences({ userId, environmentId });
+    const archivedAt = at;
+    environment.archivedAt = archivedAt;
+    environment.deletedAt = archivedAt;
+    environment.purgeAfter = new Date(Date.parse(archivedAt) + Math.max(1, retentionDays) * 86_400_000).toISOString();
+    environment.status = "archived";
+    environment.accessTokenExpiresAt = null;
+    environment.updatedAt = archivedAt;
+    delete environment.accessToken;
+    delete environment.accessTokenCiphertext;
+    delete environment.providerCatalogue;
+    const revokedConnectorIds = [];
+    for (const connector of connectors.values()) {
+      if (connector.userId !== userId || connector.environmentId !== environmentId || connector.revokedAt) continue;
+      connector.revokedAt = archivedAt;
+      connector.updatedAt = archivedAt;
+      connector.status = "revoked";
+      connector.lastDisconnectReason = "environment_removed";
+      connector.secretHash = null;
+      connector.pendingSecretHash = null;
+      connector.pendingSecretPrefix = null;
+      connector.pendingCredentialVersion = null;
+      connector.rotationId = null;
+      connector.rotationExpiresAt = null;
+      for (const ticket of connectorTickets.values()) {
+        if (ticket.connectorId === connector.id && !ticket.consumedAt) ticket.consumedAt = archivedAt;
+      }
+      revokedConnectorIds.push(connector.id);
+    }
+    audit({
+      userId,
+      actorType: "user",
+      action: "environment.archived",
+      targetId: environment.id,
+      metadata: {
+        label: environment.label,
+        retentionUntil: environment.purgeAfter,
+        revokedConnectorIds,
+        clearedDeviceIds: removed.devices,
+        disabledActionIds: removed.actions,
+        disabledMacroIds: removed.macros,
+        clearedOnboarding: removed.onboarding,
+      },
+    });
+    notifyChanged();
+    return { environment: publicEnvironment(environment), removed, revokedConnectorIds, alreadyArchived: false };
+  }
+
+  function restoreEnvironment({ userId, environmentId, at = nowIso() }) {
+    const environment = environments.get(environmentId);
+    if (!environment || environment.userId !== userId) return null;
+    if (!environment.archivedAt) return { expired: false, alreadyRestored: true, environment: publicEnvironment(environment) };
+    if (Date.parse(environment.purgeAfter ?? "") <= Date.parse(at)) return { expired: true, environment: publicEnvironment(environment) };
+    delete environment.archivedAt;
+    delete environment.deletedAt;
+    delete environment.purgeAfter;
+    environment.connectorId = null;
+    environment.status = "needs_repair";
+    environment.freshness = "unknown";
+    environment.updatedAt = at;
+    audit({
+      userId,
+      actorType: "user",
+      action: "environment.restored",
+      targetId: environment.id,
+      metadata: { label: environment.label, requiresRepair: true },
+    });
+    notifyChanged();
+    return { expired: false, alreadyRestored: false, environment: publicEnvironment(environment) };
+  }
+
+  function listExpiredEnvironments({ userId, now = nowIso() }) {
+    const timestamp = Date.parse(now);
+    return [...environments.values()]
+      .filter((environment) => environment.userId === userId
+        && Boolean(environment.archivedAt)
+        && Number.isFinite(Date.parse(environment.purgeAfter ?? ""))
+        && Date.parse(environment.purgeAfter) <= timestamp)
+      .map(publicEnvironment);
+  }
+
+  function purgeEnvironment({ userId, environmentId, now = nowIso(), force = false }) {
+    const environment = environments.get(environmentId);
+    if (!environment || environment.userId !== userId || !environment.archivedAt) return null;
+    if (!force && Date.parse(environment.purgeAfter ?? "") > Date.parse(now)) return { notDue: true, environment: publicEnvironment(environment) };
+    environments.delete(environmentId);
+    audit({
+      userId,
+      actorType: "system",
+      action: "environment.purged",
+      targetId: environment.id,
+      metadata: { label: environment.label, retentionExpired: !force },
+    });
+    notifyChanged();
+    return { notDue: false, environment: publicEnvironment(environment) };
+  }
+
+  function updateEnvironmentCatalogue({ userId, environmentId, catalogue }) {
+    const environment = environments.get(environmentId);
+    if (!environment || environment.userId !== userId || environment.archivedAt) return null;
+    environment.providerCatalogue = catalogue;
+    environment.updatedAt = nowIso();
+    audit({
+      userId,
+      actorType: "user",
+      action: "environment.catalogue_updated",
+      targetId: environment.id,
+      metadata: {
+        source: catalogue?.source ?? null,
+        instanceCount: catalogue?.instances?.length ?? 0,
+        instanceIds: (catalogue?.instances ?? []).map((instance) => instance.instanceId),
+      },
+    });
+    notifyChanged();
+    return publicEnvironment(environment);
+  }
+
+  // Nothing may keep pointing at a removed environment. A fixed-target action or macro without an
+  // environmentId is a row `normalizeActionInput` would refuse to create, so an orphan is disabled
+  // with a reason rather than silently retargeted at whatever the device happens to be using.
+  function deleteEnvironment({ userId, environmentId }) {
+    const environment = environments.get(environmentId);
+    if (!environment || environment.userId !== userId) return null;
+    environments.delete(environmentId);
+    const removed = disconnectEnvironmentReferences({ userId, environmentId });
     audit({
       userId,
       actorType: "user",
@@ -1144,7 +1498,7 @@ export function createStore(seed = {}, options = {}) {
 
   function updateEnvironmentHealth({ userId, environmentId, status, health }) {
     const environment = environments.get(environmentId);
-    if (!environment || environment.userId !== userId) return null;
+    if (!environment || environment.userId !== userId || environment.archivedAt) return null;
     const nextHealth = normalizeEnvironmentHealth(health, environment.health);
     environment.status = status ?? environment.status;
     environment.health = nextHealth;
@@ -1166,24 +1520,34 @@ export function createStore(seed = {}, options = {}) {
 
   function getEnvironmentForUser(userId, environmentId) {
     const environment = environments.get(environmentId);
-    if (!environment || environment.userId !== userId) return null;
+    if (!environment || environment.userId !== userId || environment.archivedAt) return null;
     return environmentForGateway(environment, t3TokenBox);
   }
 
   function listEnvironments(userId) {
-    const uniqueByUrl = new Map();
+    const uniqueByTransportTarget = new Map();
     for (const environment of [...environments.values()]
-      .filter((item) => item.userId === userId)
+      .filter((item) => item.userId === userId && !item.archivedAt)
       .sort((left, right) => Date.parse(left.createdAt) - Date.parse(right.createdAt))) {
-      if (!uniqueByUrl.has(environment.baseUrl)) uniqueByUrl.set(environment.baseUrl, environment);
+      const key = (environment.transportMode ?? "direct") === "connector"
+        ? `connector:${environment.id}`
+        : `direct:${environment.baseUrl}`;
+      if (!uniqueByTransportTarget.has(key)) uniqueByTransportTarget.set(key, environment);
     }
-    return [...uniqueByUrl.values()].map(publicEnvironment);
+    return [...uniqueByTransportTarget.values()].map(publicEnvironment);
+  }
+
+  function listArchivedEnvironments(userId) {
+    return [...environments.values()]
+      .filter((item) => item.userId === userId && Boolean(item.archivedAt))
+      .sort((left, right) => Date.parse(right.archivedAt) - Date.parse(left.archivedAt))
+      .map(publicEnvironment);
   }
 
   // Console-first pairing. The console mints one of these while the user is signed in; the setup
   // script on the T3 host redeems it with no platform credential of its own. See
   // src/connectSession.mjs for why the code — not a token — is what travels.
-  function createConnectSession({ userId, label, accessMode, environmentId = null }) {
+  function createConnectSession({ userId, label, accessMode, environmentId = null, purpose = "t3_enrollment" }) {
     const user = ensureUser({ userId });
     const code = createHumanCode();
     const timestamp = nowIso();
@@ -1192,6 +1556,7 @@ export function createStore(seed = {}, options = {}) {
       userId: user.id,
       label: label || "T3 Code",
       accessMode: normalizeConnectAccessMode(accessMode),
+      purpose: purpose === "connector_rotation" ? "connector_rotation" : "t3_enrollment",
       // Set only when re-pairing. It is what keeps a re-pair updating the existing row instead of
       // adding a second one for the same host.
       environmentId: environmentId ?? null,
@@ -1263,6 +1628,387 @@ export function createStore(seed = {}, options = {}) {
     });
     notifyChanged();
     return publicConnectSession(session);
+  }
+
+  function createConnector({ userId, environmentId, label = "T3 Connector", scopes = [], protocolVersion = CONNECTOR_PROTOCOL_VERSION, connectorVersion = null, platform = null, capabilities = [] }) {
+    const environment = environments.get(environmentId);
+    if (!environment || environment.userId !== userId || environment.archivedAt) return null;
+    const secret = createSecret();
+    const timestamp = nowIso();
+    // Re-enrollment is rotation-by-replacement: at most one standing credential may route an
+    // environment. Keeping the old connector active would let a copied secret survive repair.
+    for (const existingConnector of connectors.values()) {
+      if (existingConnector.environmentId !== environmentId || existingConnector.revokedAt) continue;
+      existingConnector.revokedAt = timestamp;
+      existingConnector.updatedAt = timestamp;
+      existingConnector.status = "revoked";
+      existingConnector.lastDisconnectReason = "superseded_by_reenrollment";
+      existingConnector.secretHash = null;
+      existingConnector.pendingSecretHash = null;
+      existingConnector.pendingSecretPrefix = null;
+      existingConnector.pendingCredentialVersion = null;
+      existingConnector.rotationId = null;
+      existingConnector.rotationExpiresAt = null;
+      for (const ticket of connectorTickets.values()) {
+        if (ticket.connectorId === existingConnector.id && !ticket.consumedAt) ticket.consumedAt = timestamp;
+      }
+    }
+    const connector = {
+      id: createId("ctr"),
+      userId,
+      environmentId,
+      label,
+      secretHash: hashSecret(secret),
+      secretPrefix: secret.slice(0, 8),
+      credentialVersion: 1,
+      pendingSecretHash: null,
+      pendingSecretPrefix: null,
+      pendingCredentialVersion: null,
+      rotationId: null,
+      rotationStartedAt: null,
+      rotationExpiresAt: null,
+      rotationCompletedAt: null,
+      scopes: [...new Set(scopes)],
+      status: "enrolled",
+      protocolVersion,
+      connectorVersion,
+      t3Version: null,
+      platform,
+      capabilities: [...new Set(capabilities)],
+      createdAt: timestamp,
+      updatedAt: timestamp,
+      lastSeenAt: null,
+      lastConnectedAt: null,
+      revokedAt: null,
+      lastDisconnectReason: null,
+      lastT3Health: null,
+      lastT3HealthAt: null,
+      activeRequests: 0,
+      queueDepth: 0,
+      lastPresenceEventAt: null,
+      lastPresenceEventKey: null,
+      lastConnectionId: null,
+    };
+    connectors.set(connector.id, connector);
+    environment.transportMode = "connector";
+    environment.connectorId = connector.id;
+    environment.lastConnectorSeenAt = null;
+    environment.freshness = "unknown";
+    environment.updatedAt = timestamp;
+    audit({
+      userId,
+      actorType: "user",
+      action: "connector.enrolled",
+      targetId: connector.id,
+      metadata: { environmentId, protocolVersion, scopes: connector.scopes },
+    });
+    notifyChanged();
+    return { connector: publicConnector(connector), secret };
+  }
+
+  function authenticateConnector(connectorId, secret) {
+    const connector = connectors.get(connectorId);
+    if (!connector || connector.revokedAt || !secret) return null;
+    const candidateHash = hashSecret(secret);
+    const activeVersion = connector.credentialVersion ?? 1;
+    if (safeEqual(connector.secretHash, candidateHash)) {
+      return connectorForGateway(connector, activeVersion, "active", null);
+    }
+    const pendingIsLive = connector.pendingSecretHash
+      && connector.pendingCredentialVersion === activeVersion + 1
+      && Date.parse(connector.rotationExpiresAt ?? "") > Date.now();
+    if (!pendingIsLive || !safeEqual(connector.pendingSecretHash, candidateHash)) return null;
+    return connectorForGateway(connector, connector.pendingCredentialVersion, "pending", connector.rotationId);
+  }
+
+  // Self-revocation is the sole operation for which a revoked credential remains a
+  // verifier. Keeping the final high-entropy hash (never the secret) makes a lost
+  // HTTP response safely retryable; normal connector authentication still rejects
+  // revoked rows before comparing either credential generation.
+  function authenticateConnectorForRevocation(connectorId, secret) {
+    const connector = connectors.get(connectorId);
+    if (!connector || !secret) return null;
+    const candidateHash = hashSecret(secret);
+    if (safeEqual(connector.secretHash, candidateHash)) {
+      return connectorForGateway(connector, connector.credentialVersion ?? 1, "active", null);
+    }
+    if (connector.revokedAt) return null;
+    const activeVersion = connector.credentialVersion ?? 1;
+    const pendingIsLive = connector.pendingSecretHash
+      && connector.pendingCredentialVersion === activeVersion + 1
+      && Date.parse(connector.rotationExpiresAt ?? "") > Date.now();
+    if (!pendingIsLive || !safeEqual(connector.pendingSecretHash, candidateHash)) return null;
+    return connectorForGateway(connector, connector.pendingCredentialVersion, "pending", connector.rotationId);
+  }
+
+  function beginConnectorCredentialRotation({ userId, connectorId, expiresAt = null }) {
+    const connector = connectors.get(connectorId);
+    if (!connector || connector.userId !== userId || connector.revokedAt) return null;
+    const secret = createSecret();
+    const timestamp = nowIso();
+    const requestedExpiry = Date.parse(expiresAt ?? "");
+    const boundedExpiry = new Date(Math.min(
+      Number.isFinite(requestedExpiry) ? requestedExpiry : Date.now() + CONNECTOR_ROTATION_TTL_MS,
+      Date.now() + CONNECTOR_ROTATION_TTL_MS,
+    )).toISOString();
+    const activeVersion = connector.credentialVersion ?? 1;
+    connector.pendingSecretHash = hashSecret(secret);
+    connector.pendingSecretPrefix = secret.slice(0, 8);
+    connector.pendingCredentialVersion = activeVersion + 1;
+    connector.rotationId = createId("crt");
+    connector.rotationStartedAt = timestamp;
+    connector.rotationExpiresAt = boundedExpiry;
+    connector.rotationCompletedAt = null;
+    connector.updatedAt = timestamp;
+    // Tickets from an abandoned staged generation are invalid. Active-generation
+    // tickets remain usable until the new credential proves a socket connection.
+    for (const ticket of connectorTickets.values()) {
+      if (ticket.connectorId === connectorId
+        && (ticket.credentialVersion ?? 1) !== activeVersion
+        && !ticket.consumedAt) ticket.consumedAt = timestamp;
+    }
+    audit({
+      userId,
+      actorType: "user",
+      action: "connector.rotation-started",
+      targetId: connectorId,
+      metadata: { rotationId: connector.rotationId, expiresAt: boundedExpiry },
+    });
+    notifyChanged();
+    return {
+      connector: publicConnector(connector),
+      rotation: { id: connector.rotationId, expiresAt: boundedExpiry },
+      secret,
+    };
+  }
+
+  function listConnectors(userId) {
+    return [...connectors.values()]
+      .filter((connector) => connector.userId === userId)
+      .sort((left, right) => Date.parse(left.createdAt) - Date.parse(right.createdAt))
+      .map(publicConnector);
+  }
+
+  function listBackgroundWorkUsers({ afterUserId = null, limit = 100 } = {}) {
+    const bounded = Number.isSafeInteger(limit) ? Math.max(1, Math.min(100, limit)) : 100;
+    const ordered = [...users.keys()].sort();
+    const remaining = afterUserId ? ordered.filter((userId) => userId > afterUserId) : ordered;
+    const page = remaining.slice(0, bounded);
+    return {
+      userIds: page,
+      nextCursor: remaining.length > bounded ? page.at(-1) : null,
+    };
+  }
+
+  function getConnectorForUser(userId, connectorId) {
+    const connector = connectors.get(connectorId);
+    return connector?.userId === userId ? publicConnector(connector) : null;
+  }
+
+  function revokeConnector({ userId, connectorId, reason = "revoked_by_user" }) {
+    const connector = connectors.get(connectorId);
+    if (!connector || connector.userId !== userId) return null;
+    if (!connector.revokedAt) {
+      connector.revokedAt = nowIso();
+      connector.updatedAt = connector.revokedAt;
+      connector.status = "revoked";
+      connector.lastDisconnectReason = reason;
+      connector.secretHash = null;
+      connector.pendingSecretHash = null;
+      connector.pendingSecretPrefix = null;
+      connector.pendingCredentialVersion = null;
+      connector.rotationId = null;
+      connector.rotationExpiresAt = null;
+      for (const ticket of connectorTickets.values()) {
+        if (ticket.connectorId === connectorId && !ticket.consumedAt) ticket.consumedAt = connector.revokedAt;
+      }
+      audit({ userId, actorType: "user", action: "connector.revoked", targetId: connectorId, metadata: { reason } });
+      notifyChanged();
+    }
+    return publicConnector(connector);
+  }
+
+  function revokeConnectorByCredential({ connectorId, secret, reason = "revoked_by_connector" }) {
+    const connector = connectors.get(connectorId);
+    if (!connector || !secret) return null;
+    const candidateHash = hashSecret(secret);
+    const activeVersion = connector.credentialVersion ?? 1;
+    const activeMatches = safeEqual(connector.secretHash, candidateHash);
+    const pendingMatches = !connector.revokedAt
+      && connector.pendingSecretHash
+      && connector.pendingCredentialVersion === activeVersion + 1
+      && Date.parse(connector.rotationExpiresAt ?? "") > Date.now()
+      && safeEqual(connector.pendingSecretHash, candidateHash);
+    if (!activeMatches && !pendingMatches) return null;
+    if (!connector.revokedAt) {
+      connector.revokedAt = nowIso();
+      connector.updatedAt = connector.revokedAt;
+      connector.status = "revoked";
+      connector.lastDisconnectReason = reason;
+      // Preserve only the credential hash that authorized this operation so the
+      // exact self-revocation can be retried after an interrupted response.
+      connector.secretHash = candidateHash;
+      connector.pendingSecretHash = null;
+      connector.pendingSecretPrefix = null;
+      connector.pendingCredentialVersion = null;
+      connector.rotationId = null;
+      connector.rotationExpiresAt = null;
+      for (const ticket of connectorTickets.values()) {
+        if (ticket.connectorId === connectorId && !ticket.consumedAt) ticket.consumedAt = connector.revokedAt;
+      }
+      audit({ userId: connector.userId, actorType: "connector", action: "connector.self-revoked", targetId: connectorId, metadata: { reason } });
+      notifyChanged();
+    }
+    return publicConnector(connector);
+  }
+
+  function createConnectorTicket({ connectorId, audience = CONNECTOR_TICKET_AUDIENCE, credentialVersion = null, rotationId = null }) {
+    const connector = connectors.get(connectorId);
+    if (!connector || connector.revokedAt) return null;
+    const activeVersion = connector.credentialVersion ?? 1;
+    const requestedVersion = credentialVersion ?? activeVersion;
+    const validPending = requestedVersion === connector.pendingCredentialVersion
+      && rotationId === connector.rotationId
+      && Date.parse(connector.rotationExpiresAt ?? "") > Date.now();
+    if ((requestedVersion !== activeVersion || rotationId !== null) && !validPending) return null;
+    const token = createSecret();
+    const createdAt = nowIso();
+    const ticket = {
+      id: createId("ctk"),
+      connectorId,
+      environmentId: connector.environmentId,
+      audience,
+      credentialVersion: requestedVersion,
+      rotationId: validPending ? connector.rotationId : null,
+      tokenHash: hashSecret(token),
+      createdAt,
+      expiresAt: new Date(Date.now() + CONNECTOR_TICKET_TTL_MS).toISOString(),
+      consumedAt: null,
+    };
+    connectorTickets.set(ticket.id, ticket);
+    connector.lastSeenAt = createdAt;
+    connector.updatedAt = createdAt;
+    notifyChanged();
+    return { ticket: token, expiresAt: ticket.expiresAt };
+  }
+
+  function consumeConnectorTicket({ ticket, audience = null, now = Date.now() }) {
+    const candidateHash = hashSecret(ticket ?? "");
+    for (const record of connectorTickets.values()) {
+      if (!safeEqual(record.tokenHash, candidateHash)) continue;
+      if (record.consumedAt) return { connector: null, reason: "used" };
+      if (Date.parse(record.expiresAt) <= now) return { connector: null, reason: "expired" };
+      if (audience !== null && record.audience !== audience) return { connector: null, reason: "audience" };
+      const connector = connectors.get(record.connectorId);
+      if (!connector || connector.revokedAt) return { connector: null, reason: "revoked" };
+      const activeVersion = connector.credentialVersion ?? 1;
+      const ticketVersion = record.credentialVersion ?? 1;
+      const commitsRotation = Boolean(ticketVersion === connector.pendingCredentialVersion
+        && record.rotationId === connector.rotationId
+        && connector.pendingSecretHash
+        && Date.parse(connector.rotationExpiresAt ?? "") > now);
+      if (ticketVersion !== activeVersion && !commitsRotation) {
+        return { connector: null, reason: "stale_credential" };
+      }
+      record.consumedAt = nowIso();
+      if (commitsRotation) {
+        const previousVersion = activeVersion;
+        connector.secretHash = connector.pendingSecretHash;
+        connector.secretPrefix = connector.pendingSecretPrefix;
+        connector.credentialVersion = connector.pendingCredentialVersion;
+        connector.pendingSecretHash = null;
+        connector.pendingSecretPrefix = null;
+        connector.pendingCredentialVersion = null;
+        connector.rotationCompletedAt = record.consumedAt;
+        connector.rotationExpiresAt = null;
+        const completedRotationId = connector.rotationId;
+        connector.rotationId = null;
+        for (const other of connectorTickets.values()) {
+          if (other.id !== record.id && other.connectorId === connector.id
+            && (other.credentialVersion ?? 1) === previousVersion && !other.consumedAt) {
+            other.consumedAt = record.consumedAt;
+          }
+        }
+        audit({
+          userId: connector.userId,
+          actorType: "connector",
+          action: "connector.rotation-completed",
+          targetId: connector.id,
+          metadata: { rotationId: completedRotationId, credentialVersion: connector.credentialVersion },
+        });
+      }
+      connector.lastConnectedAt = record.consumedAt;
+      connector.lastSeenAt = record.consumedAt;
+      connector.status = "online";
+      connector.updatedAt = record.consumedAt;
+      const environment = environments.get(connector.environmentId);
+      if (environment) {
+        environment.lastConnectorSeenAt = record.consumedAt;
+        environment.freshness = "live";
+        environment.updatedAt = record.consumedAt;
+      }
+      notifyChanged();
+      return {
+        connector: connectorForGateway(connector, ticketVersion, commitsRotation ? "rotated" : "active"),
+        ticket: publicConnectorTicket(record),
+        reason: null,
+      };
+    }
+    return { connector: null, reason: "unknown" };
+  }
+
+  function recordConnectorPresence({
+    connectorId,
+    environmentId = null,
+    connectorVersion,
+    t3Version,
+    platform,
+    capabilities,
+    t3Health = null,
+    activeRequests = null,
+    queueDepth = null,
+    providerCatalogue = null,
+    connectionId = null,
+    occurredAt = null,
+    eventKey = null,
+    connected = true,
+    disconnectReason = null,
+  }) {
+    const connector = connectors.get(connectorId);
+    if (!connector || connector.revokedAt || (environmentId && connector.environmentId !== environmentId)) return null;
+    if (Number.isFinite(occurredAt)) {
+      if (Number.isFinite(connector.lastPresenceEventAt) && occurredAt < connector.lastPresenceEventAt) {
+        return publicConnector(connector);
+      }
+      if (eventKey && connector.lastPresenceEventKey === eventKey) return publicConnector(connector);
+    }
+    const previousStatus = connector.status;
+    const timestamp = nowIso();
+    connector.connectorVersion = connectorVersion ?? connector.connectorVersion;
+    connector.t3Version = t3Version ?? connector.t3Version;
+    connector.platform = platform ?? connector.platform;
+    connector.capabilities = Array.isArray(capabilities) ? [...new Set(capabilities)] : connector.capabilities;
+    connector.lastSeenAt = timestamp;
+    connector.status = connected ? "online" : "offline";
+    if (connected) connector.lastConnectedAt ??= timestamp;
+    connector.lastDisconnectReason = disconnectReason;
+    connector.lastT3Health = t3Health;
+    connector.lastT3HealthAt = t3Health ? timestamp : connector.lastT3HealthAt;
+    if (Number.isSafeInteger(activeRequests)) connector.activeRequests = activeRequests;
+    if (Number.isSafeInteger(queueDepth)) connector.queueDepth = queueDepth;
+    if (Number.isFinite(occurredAt)) connector.lastPresenceEventAt = occurredAt;
+    if (eventKey) connector.lastPresenceEventKey = eventKey;
+    if (connectionId) connector.lastConnectionId = connectionId;
+    connector.updatedAt = timestamp;
+    const environment = environments.get(connector.environmentId);
+    if (environment) {
+      if (providerCatalogue) environment.providerCatalogue = providerCatalogue;
+      environment.lastConnectorSeenAt = timestamp;
+      environment.freshness = connected ? "live" : "stale";
+      environment.updatedAt = timestamp;
+    }
+    notifyChanged();
+    return { ...publicConnector(connector), _previousStatus: previousStatus };
   }
 
   // The hash survives an expiry so a late redeem still reports "expired" rather than "unknown"; it
@@ -1341,7 +2087,355 @@ export function createStore(seed = {}, options = {}) {
     return release ? { ...release } : null;
   }
 
+  function createReleaseRollout(input) {
+    const timestamp = nowIso();
+    const rollout = {
+      id: createId("rol"),
+      userId: input.userId,
+      name: input.name,
+      targetKind: input.targetKind,
+      targetVersion: input.targetVersion,
+      rollbackVersion: input.rollbackVersion ?? null,
+      releaseId: input.releaseId ?? null,
+      channel: input.channel,
+      cohort: input.cohort,
+      minimumProtocolVersion: input.minimumProtocolVersion ?? 1,
+      requiredCapabilities: [...new Set(input.requiredCapabilities ?? [])],
+      state: "draft",
+      evidenceRef: null,
+      createdAt: timestamp,
+      updatedAt: timestamp,
+      startedAt: null,
+      completedAt: null,
+    };
+    releaseRollouts.set(rollout.id, rollout);
+    audit({
+      userId: input.userId,
+      actorType: "user",
+      action: "release_rollout.created",
+      targetId: rollout.id,
+      metadata: {
+        targetKind: rollout.targetKind,
+        targetVersion: rollout.targetVersion,
+        channel: rollout.channel,
+        cohortType: rollout.cohort.type,
+      },
+    });
+    notifyChanged();
+    return publicReleaseRollout(rollout, rolloutAssignments);
+  }
+
+  function listReleaseRollouts(userId, { states = null } = {}) {
+    const allowed = Array.isArray(states) ? new Set(states) : null;
+    return [...releaseRollouts.values()]
+      .filter((rollout) => rollout.userId === userId && (!allowed || allowed.has(rollout.state)))
+      .sort((left, right) => right.createdAt.localeCompare(left.createdAt))
+      .map((rollout) => publicReleaseRollout(rollout, rolloutAssignments));
+  }
+
+  function listRunnableReleaseRollouts({ limit = 25 } = {}) {
+    return [...releaseRollouts.values()]
+      .filter((rollout) => ["running", "rolling_back"].includes(rollout.state))
+      .sort((left, right) => left.updatedAt.localeCompare(right.updatedAt))
+      .slice(0, Math.max(1, Math.min(100, Number(limit) || 25)))
+      .map((rollout) => ({ ...rollout, cohort: cloneRolloutCohort(rollout.cohort), requiredCapabilities: [...rollout.requiredCapabilities] }));
+  }
+
+  function getReleaseRolloutForUser(userId, rolloutId) {
+    const rollout = releaseRollouts.get(rolloutId);
+    return rollout?.userId === userId ? publicReleaseRollout(rollout, rolloutAssignments) : null;
+  }
+
+  function transitionReleaseRollout({ userId, rolloutId, action, evidenceRef, percentage = null }) {
+    const rollout = releaseRollouts.get(rolloutId);
+    if (!rollout || rollout.userId !== userId) return null;
+    const transitions = {
+      start: { from: ["draft", "paused"], to: "running" },
+      resume: { from: ["paused"], to: "running" },
+      pause: { from: ["running"], to: "paused" },
+      cancel: { from: ["draft", "running", "paused"], to: "cancelled" },
+      rollback: { from: ["running", "paused", "completed"], to: "rolling_back" },
+      complete: { from: ["running", "rolling_back"], to: action === "complete" && rollout.state === "rolling_back" ? "rolled_back" : "completed" },
+      expand: { from: ["running", "paused"], to: rollout.state },
+    };
+    const transition = transitions[action];
+    if (!transition || !transition.from.includes(rollout.state)) {
+      return { conflict: true, rollout: publicReleaseRollout(rollout, rolloutAssignments) };
+    }
+    if (action === "rollback" && !rollout.rollbackVersion) {
+      return { conflict: true, reason: "rollback_version_required", rollout: publicReleaseRollout(rollout, rolloutAssignments) };
+    }
+    if (action === "expand") {
+      if (rollout.cohort.type !== "percentage" || !Number.isInteger(percentage)
+        || percentage <= rollout.cohort.percentage || percentage > 100) {
+        return { conflict: true, reason: "percentage_must_increase", rollout: publicReleaseRollout(rollout, rolloutAssignments) };
+      }
+      rollout.cohort = { type: "percentage", percentage };
+    }
+    const timestamp = nowIso();
+    rollout.state = transition.to;
+    rollout.evidenceRef = evidenceRef;
+    rollout.updatedAt = timestamp;
+    if (["start", "resume"].includes(action)) rollout.startedAt ??= timestamp;
+    if (["complete"].includes(action)) rollout.completedAt = timestamp;
+    audit({
+      userId,
+      actorType: "user",
+      action: `release_rollout.${action}`,
+      targetId: rollout.id,
+      metadata: {
+        state: rollout.state,
+        targetKind: rollout.targetKind,
+        targetVersion: rollout.targetVersion,
+        evidenceRef,
+        ...(action === "expand" ? { percentage } : {}),
+      },
+    });
+    notifyChanged();
+    return { conflict: false, rollout: publicReleaseRollout(rollout, rolloutAssignments) };
+  }
+
+  function upsertRolloutAssignment({ userId, rolloutId, targetId, patch }) {
+    const rollout = releaseRollouts.get(rolloutId);
+    if (!rollout || rollout.userId !== userId) return null;
+    const key = `${rolloutId}:${targetId}`;
+    const timestamp = nowIso();
+    const existing = rolloutAssignments.get(key);
+    const assignment = {
+      id: existing?.id ?? createId("ras"),
+      userId,
+      rolloutId,
+      targetId,
+      targetKind: rollout.targetKind,
+      status: patch.status ?? existing?.status ?? "pending",
+      reasonCode: patch.reasonCode ?? null,
+      observedVersion: patch.observedVersion ?? existing?.observedVersion ?? null,
+      progress: Number.isFinite(patch.progress) ? Math.max(0, Math.min(100, patch.progress)) : existing?.progress ?? null,
+      attempts: (existing?.attempts ?? 0) + (patch.attempted ? 1 : 0),
+      previousDesiredVersion: existing?.previousDesiredVersion ?? patch.previousDesiredVersion ?? null,
+      createdAt: existing?.createdAt ?? timestamp,
+      updatedAt: timestamp,
+      completedAt: ["succeeded", "failed", "cancelled", "rolled_back"].includes(patch.status)
+        ? timestamp : existing?.completedAt ?? null,
+    };
+    rolloutAssignments.set(key, assignment);
+    rollout.updatedAt = timestamp;
+    if (!existing || existing.status !== assignment.status || existing.reasonCode !== assignment.reasonCode) {
+      audit({
+        userId,
+        actorType: "system",
+        action: "release_rollout.assignment_changed",
+        targetId: assignment.id,
+        metadata: { rolloutId, targetId, status: assignment.status, reasonCode: assignment.reasonCode },
+      });
+    }
+    notifyChanged();
+    return { ...assignment };
+  }
+
+  function listRolloutAssignments({ userId, rolloutId }) {
+    const rollout = releaseRollouts.get(rolloutId);
+    if (!rollout || rollout.userId !== userId) return [];
+    return [...rolloutAssignments.values()]
+      .filter((assignment) => assignment.rolloutId === rolloutId && assignment.userId === userId)
+      .sort((left, right) => left.targetId.localeCompare(right.targetId))
+      .map((assignment) => ({ ...assignment }));
+  }
+
+  function createMediaUploadSession(input) {
+    const actorDeviceId = input.deviceId ?? null;
+    const existing = [...mediaUploadSessions.values()].find((session) => (
+      session.userId === input.userId
+      && session.deviceId === actorDeviceId
+      && session.clientRequestId === input.clientRequestId
+    ));
+    if (existing) {
+      const conflict = existing.kind !== input.kind
+        || existing.contentType !== input.contentType
+        || existing.expectedSizeBytes !== input.expectedSizeBytes
+        || existing.expectedSha256 !== input.expectedSha256;
+      return { created: false, conflict, session: publicMediaUploadSession(existing) };
+    }
+
+    const committedBytes = [...mediaUploads.values()]
+      .filter((media) => media.userId === input.userId)
+      .reduce((total, media) => total + media.sizeBytes, 0);
+    const reservedBytes = [...mediaUploadSessions.values()]
+      .filter((session) => session.userId === input.userId && ["pending", "uploaded"].includes(session.status))
+      .reduce((total, session) => total + session.expectedSizeBytes, 0);
+    if (Number.isFinite(input.ownerByteLimit)
+      && committedBytes + reservedBytes + input.expectedSizeBytes > input.ownerByteLimit) {
+      return { created: false, conflict: false, byteLimitExceeded: true, session: null };
+    }
+
+    const ownerSessions = [...mediaUploadSessions.values()]
+      .filter((session) => session.userId === input.userId)
+      .sort((left, right) => left.createdAt.localeCompare(right.createdAt));
+    if (input.companionHandoffId && ownerSessions.some((session) => (
+      session.companionHandoffId === input.companionHandoffId
+      && ["pending", "uploaded", "finalized"].includes(session.status)
+    ))) {
+      return { created: false, conflict: true, session: null };
+    }
+    while (ownerSessions.length >= 256) {
+      const terminalIndex = ownerSessions.findIndex((session) => (
+        ["finalized", "aborted", "expired"].includes(session.status)
+      ));
+      if (terminalIndex === -1) return { created: false, conflict: false, limitExceeded: true, session: null };
+      const [terminal] = ownerSessions.splice(terminalIndex, 1);
+      mediaUploadSessions.delete(terminal.id);
+    }
+
+    const session = {
+      id: createId("mup"),
+      userId: input.userId,
+      deviceId: actorDeviceId,
+      clientRequestId: input.clientRequestId,
+      kind: input.kind,
+      contentType: input.contentType,
+      expectedSizeBytes: input.expectedSizeBytes,
+      expectedSha256: input.expectedSha256,
+      storagePath: input.storagePath,
+      originalName: input.originalName ?? null,
+      captureSource: input.captureSource ?? null,
+      environmentId: input.environmentId ?? null,
+      threadId: input.threadId ?? null,
+      companionHandoffId: input.companionHandoffId ?? null,
+      transcript: input.kind === "audio" ? normalizeTranscript(input.transcript) ?? null : null,
+      status: "pending",
+      mediaId: null,
+      createdAt: input.createdAt ?? new Date(requestNow()).toISOString(),
+      expiresAt: input.expiresAt,
+      uploadedAt: null,
+      finalizedAt: null,
+      abortedAt: null,
+    };
+    mediaUploadSessions.set(session.id, session);
+    audit({
+      userId: session.userId,
+      actorType: session.deviceId ? "device" : "user",
+      actorId: session.deviceId,
+      action: "media.upload_session_created",
+      targetId: session.id,
+      metadata: {
+        kind: session.kind,
+        contentType: session.contentType,
+        expectedSizeBytes: session.expectedSizeBytes,
+        expiresAt: session.expiresAt,
+      },
+    });
+    notifyChanged();
+    return { created: true, conflict: false, session: publicMediaUploadSession(session) };
+  }
+
+  function getMediaUploadSessionForActor({ userId, deviceId = null, sessionId }) {
+    const session = mediaUploadSessions.get(sessionId);
+    if (!session || session.userId !== userId) return null;
+    if (deviceId !== null && session.deviceId !== deviceId) return null;
+    return { ...session };
+  }
+
+  function markMediaUploadSessionUploaded({ userId, deviceId = null, sessionId, uploadedAt = nowIso() }) {
+    const session = getMediaUploadSessionForActor({ userId, deviceId, sessionId });
+    if (!session) return null;
+    const stored = mediaUploadSessions.get(sessionId);
+    if (stored.status === "pending") {
+      stored.status = "uploaded";
+      stored.uploadedAt = uploadedAt;
+      notifyChanged();
+    }
+    return publicMediaUploadSession(stored);
+  }
+
+  function finalizeMediaUploadSession({
+    userId,
+    deviceId = null,
+    sessionId,
+    storagePath,
+    mediaExpiresAt = null,
+    finalizedAt = nowIso(),
+  }) {
+    const session = getMediaUploadSessionForActor({ userId, deviceId, sessionId });
+    if (!session) return null;
+    const stored = mediaUploadSessions.get(sessionId);
+    if (stored.status === "finalized" && stored.mediaId) {
+      const media = mediaUploads.get(stored.mediaId);
+      return { session: publicMediaUploadSession(stored), media: media ? publicMediaUpload(media) : null };
+    }
+    if (stored.status !== "uploaded") {
+      return { session: publicMediaUploadSession(stored), media: null };
+    }
+    let media = [...mediaUploads.values()].find((item) => item.uploadSessionId === stored.id);
+    if (!media) {
+      createMediaUpload({
+        userId: stored.userId,
+        deviceId: stored.deviceId,
+        kind: stored.kind,
+        contentType: stored.contentType,
+        sizeBytes: stored.expectedSizeBytes,
+        sha256: stored.expectedSha256,
+        storagePath,
+        originalName: stored.originalName ?? undefined,
+        transcript: stored.transcript ?? undefined,
+        captureSource: stored.captureSource ?? undefined,
+        environmentId: stored.environmentId ?? undefined,
+        threadId: stored.threadId ?? undefined,
+        companionHandoffId: stored.companionHandoffId ?? undefined,
+        expiresAt: mediaExpiresAt,
+        uploadSessionId: stored.id,
+      });
+      media = [...mediaUploads.values()].find((item) => item.uploadSessionId === stored.id);
+    }
+    stored.status = "finalized";
+    stored.mediaId = media?.id ?? null;
+    stored.finalizedAt = finalizedAt;
+    notifyChanged();
+    return { session: publicMediaUploadSession(stored), media: media ? publicMediaUpload(media) : null };
+  }
+
+  function abortMediaUploadSession({
+    userId,
+    deviceId = null,
+    sessionId,
+    status = "aborted",
+    at = nowIso(),
+  }) {
+    const session = getMediaUploadSessionForActor({ userId, deviceId, sessionId });
+    if (!session) return null;
+    const stored = mediaUploadSessions.get(sessionId);
+    if (stored.status === "finalized") return publicMediaUploadSession(stored);
+    if (stored.status !== "aborted" && stored.status !== "expired") {
+      stored.status = status === "expired" ? "expired" : "aborted";
+      stored.abortedAt = at;
+      notifyChanged();
+    }
+    return publicMediaUploadSession(stored);
+  }
+
+  function listExpiredMediaUploadSessions({ userId, now = nowIso() }) {
+    return [...mediaUploadSessions.values()]
+      .filter((session) => session.userId === userId
+        && ["pending", "uploaded"].includes(session.status)
+        && session.expiresAt <= now)
+      .map((session) => ({ ...session }));
+  }
+
   function createMediaUpload(input) {
+    if (input.uploadSessionId) {
+      const existing = [...mediaUploads.values()].find((media) => media.uploadSessionId === input.uploadSessionId);
+      if (existing) return publicMediaUpload(existing);
+    }
+    if (Number.isFinite(input.ownerByteLimit)) {
+      const committedBytes = [...mediaUploads.values()]
+        .filter((media) => media.userId === input.userId)
+        .reduce((total, media) => total + media.sizeBytes, 0);
+      const reservedBytes = [...mediaUploadSessions.values()]
+        .filter((session) => session.userId === input.userId && ["pending", "uploaded"].includes(session.status))
+        .reduce((total, session) => total + session.expectedSizeBytes, 0);
+      if (committedBytes + reservedBytes + input.sizeBytes > input.ownerByteLimit) {
+        return { byteLimitExceeded: true };
+      }
+    }
     const transcript = input.kind === "audio" ? normalizeTranscript(input.transcript) ?? null : null;
     const media = {
       id: createId("media"),
@@ -1352,7 +2446,12 @@ export function createStore(seed = {}, options = {}) {
       sizeBytes: input.sizeBytes,
       sha256: input.sha256,
       storagePath: input.storagePath,
+      uploadSessionId: input.uploadSessionId ?? null,
       originalName: input.originalName ?? null,
+      captureSource: input.captureSource ?? null,
+      environmentId: input.environmentId ?? null,
+      threadId: input.threadId ?? null,
+      companionHandoffId: input.companionHandoffId ?? null,
       transcript,
       processing: normalizeMediaProcessing(input.processing, input.kind, transcript),
       expiresAt: input.expiresAt ?? null,
@@ -1377,6 +2476,119 @@ export function createStore(seed = {}, options = {}) {
     });
     notifyChanged();
     return publicMediaUpload(media);
+  }
+
+  function createCompanionHandoff({ userId, deviceId = null, environmentId, threadId, action, code, expiresAt }) {
+    const now = requestNow();
+    for (const handoff of companionHandoffs.values()) {
+      if (handoff.status === "waiting" && Date.parse(handoff.expiresAt) <= now) {
+        handoff.status = "expired";
+        handoff.codeHash = null;
+      }
+    }
+    const ownerHandoffs = [...companionHandoffs.values()]
+      .filter((handoff) => handoff.userId === userId)
+      .sort((left, right) => left.createdAt.localeCompare(right.createdAt));
+    while (ownerHandoffs.length >= 256) {
+      const terminalIndex = ownerHandoffs.findIndex((handoff) => (
+        ["completed", "expired", "cancelled"].includes(handoff.status)
+      ));
+      if (terminalIndex === -1) return { limitExceeded: true, handoff: null };
+      const [terminal] = ownerHandoffs.splice(terminalIndex, 1);
+      companionHandoffs.delete(terminal.id);
+    }
+    const active = ownerHandoffs.filter((handoff) => ["waiting", "claimed"].includes(handoff.status));
+    if (active.length >= 32) return { limitExceeded: true, handoff: null };
+    const createdAt = new Date(now).toISOString();
+    const handoff = {
+      id: createId("handoff"),
+      userId,
+      deviceId,
+      environmentId,
+      threadId,
+      action,
+      status: "waiting",
+      codeHash: hashSecret(code),
+      createdAt,
+      expiresAt,
+      claimedAt: null,
+      completedAt: null,
+      cancelledAt: null,
+    };
+    companionHandoffs.set(handoff.id, handoff);
+    audit({
+      userId,
+      actorType: deviceId ? "device" : "user",
+      actorId: deviceId,
+      action: "companion_handoff.created",
+      targetId: handoff.id,
+      metadata: { action: handoff.action, expiresAt: handoff.expiresAt },
+    });
+    notifyChanged();
+    return { limitExceeded: false, handoff: publicCompanionHandoff(handoff) };
+  }
+
+  function getCompanionHandoffForUser(userId, handoffId) {
+    const handoff = companionHandoffs.get(handoffId);
+    if (!handoff || handoff.userId !== userId) return null;
+    expireCompanionHandoff(handoff, requestNow());
+    return publicCompanionHandoff(handoff);
+  }
+
+  function getCompanionHandoffForDevice({ userId, deviceId, handoffId }) {
+    const handoff = companionHandoffs.get(handoffId);
+    if (!handoff || handoff.userId !== userId || handoff.deviceId !== deviceId) return null;
+    expireCompanionHandoff(handoff, requestNow());
+    return publicCompanionHandoff(handoff);
+  }
+
+  function claimCompanionHandoff({ userId, code, claimedAt = nowIso() }) {
+    const codeHash = hashSecret(code);
+    const handoff = [...companionHandoffs.values()].find((candidate) => (
+      candidate.userId === userId && candidate.codeHash && safeEqual(candidate.codeHash, codeHash)
+    ));
+    if (!handoff) return null;
+    expireCompanionHandoff(handoff, Date.parse(claimedAt));
+    if (handoff.status !== "waiting") return publicCompanionHandoff(handoff);
+    handoff.status = "claimed";
+    handoff.claimedAt = claimedAt;
+    // The bearer code is single use. Removing even its digest also prevents a second claim from
+    // learning whether a consumed code ever existed.
+    handoff.codeHash = null;
+    audit({
+      userId,
+      actorType: "user",
+      action: "companion_handoff.claimed",
+      targetId: handoff.id,
+      metadata: { action: handoff.action },
+    });
+    notifyChanged();
+    return publicCompanionHandoff(handoff);
+  }
+
+  function cancelCompanionHandoff({ userId, handoffId, deviceId = null, cancelledAt = nowIso() }) {
+    const handoff = companionHandoffs.get(handoffId);
+    if (!handoff || handoff.userId !== userId) return null;
+    if (deviceId !== null && handoff.deviceId !== deviceId) return null;
+    expireCompanionHandoff(handoff, Date.parse(cancelledAt));
+    if (["waiting", "claimed"].includes(handoff.status)) {
+      handoff.status = "cancelled";
+      handoff.cancelledAt = cancelledAt;
+      handoff.codeHash = null;
+      notifyChanged();
+    }
+    return publicCompanionHandoff(handoff);
+  }
+
+  function completeCompanionHandoff({ userId, handoffId, completedAt = nowIso() }) {
+    const handoff = companionHandoffs.get(handoffId);
+    if (!handoff || handoff.userId !== userId) return null;
+    if (handoff.status === "claimed") {
+      handoff.status = "completed";
+      handoff.completedAt = completedAt;
+      notifyChanged();
+    }
+    return publicCompanionHandoff(handoff);
   }
 
   function getMediaForUser(userId, mediaId) {
@@ -1871,6 +3083,419 @@ export function createStore(seed = {}, options = {}) {
     return publicMacro(macro);
   }
 
+  // Durable idempotency lives beside commands rather than inside the connector transport. The
+  // receipt is claimed before policy or T3 can have an effect, and stores only a SHA-256 request
+  // fingerprint plus a command reference — never prompt, transcript, path, or provider output.
+  function claimCommandRequest(input) {
+    const nowMs = requestNow();
+    const now = new Date(nowMs).toISOString();
+    let changed = false;
+    for (const [key, request] of commandRequests) {
+      if (Date.parse(request.expiresAt) <= nowMs) {
+        commandRequests.delete(key);
+        changed = true;
+      }
+    }
+
+    const key = commandRequestKey(input);
+    const existing = commandRequests.get(key);
+    if (existing) {
+      if (changed) notifyChanged();
+      return {
+        claimed: false,
+        conflict: existing.requestHash !== input.requestHash,
+        capacity: false,
+        request: publicCommandRequest(existing),
+      };
+    }
+
+    const ownerKey = commandRequestOwnerKey(input);
+    const owned = [...commandRequests.entries()]
+      .filter(([, request]) => commandRequestOwnerKey(request) === ownerKey)
+      .sort((left, right) => Date.parse(left[1].createdAt) - Date.parse(right[1].createdAt));
+    while (owned.length >= COMMAND_REQUEST_MAX_PER_OWNER) {
+      const evictIndex = owned.findIndex(([, request]) => request.status !== "processing");
+      if (evictIndex < 0) {
+        if (changed) notifyChanged();
+        return { claimed: false, conflict: false, capacity: true, request: null };
+      }
+      const [[evictKey]] = owned.splice(evictIndex, 1);
+      commandRequests.delete(evictKey);
+      changed = true;
+    }
+
+    const request = {
+      userId: input.userId,
+      actorType: input.actorType,
+      actorId: input.actorId ?? input.userId,
+      operation: input.operation,
+      clientRequestId: input.clientRequestId,
+      requestHash: input.requestHash,
+      status: "processing",
+      commandId: null,
+      httpStatus: null,
+      createdAt: now,
+      updatedAt: now,
+      expiresAt: new Date(nowMs + COMMAND_REQUEST_TTL_MS).toISOString(),
+    };
+    commandRequests.set(key, request);
+    notifyChanged();
+    return { claimed: true, conflict: false, capacity: false, request: publicCommandRequest(request) };
+  }
+
+  function settleCommandRequest(input) {
+    const request = commandRequests.get(commandRequestKey(input));
+    if (!request || request.requestHash !== input.requestHash) return null;
+    const status = [
+      "approval_required", "blocked", "dispatched", "completed", "failed", "rejected", "cancelled",
+    ].includes(input.status) ? input.status : "failed";
+    if (request.status !== "processing") return publicCommandRequest(request);
+    request.status = status;
+    request.commandId = input.commandId ?? null;
+    request.httpStatus = Number.isInteger(input.httpStatus) ? input.httpStatus : (status === "failed" ? 500 : 200);
+    request.updatedAt = new Date(requestNow()).toISOString();
+    notifyChanged();
+    return publicCommandRequest(request);
+  }
+
+  function getCommandRequest(input) {
+    const request = commandRequests.get(commandRequestKey(input));
+    if (!request || Date.parse(request.expiresAt) <= requestNow()) return null;
+    return publicCommandRequest(request);
+  }
+
+  // A durable, privacy-minimal inbox. `dedupeKey` is an opaque fingerprint supplied by the
+  // notification projector; it is never returned. This makes a replayed T3 activity or connector
+  // presence event idempotent without retaining the provider request id that may itself contain
+  // question text.
+  function createNotification(input) {
+    if (!users.has(input.userId)) return null;
+    if (!NOTIFICATION_KIND_SET.has(input.kind)) throw new Error("Unsupported notification kind.");
+    if (!NOTIFICATION_SEVERITY_SET.has(input.severity)) throw new Error("Unsupported notification severity.");
+    const dedupeKey = normalizeNotificationText(input.dedupeKey, 128, "dedupeKey");
+    const key = notificationKey({ userId: input.userId, dedupeKey });
+    const existingId = notificationDedupe.get(key);
+    const existing = existingId ? notifications.get(existingId) : null;
+    if (existing) return { created: false, notification: existing };
+
+    const createdAt = normalizeNotificationTimestamp(input.occurredAt, requestNow());
+    const updatedAt = new Date(requestNow()).toISOString();
+    const notification = {
+      id: createId("notification"),
+      userId: input.userId,
+      sequence: ++notificationSequence,
+      dedupeKey,
+      kind: input.kind,
+      severity: input.severity,
+      title: normalizeNotificationText(input.title, 120, "title"),
+      environmentId: normalizeNullableNotificationText(input.environmentId, 160),
+      threadId: normalizeNullableNotificationText(input.threadId, 240),
+      commandId: normalizeNullableNotificationText(input.commandId, 160),
+      createdAt,
+      updatedAt,
+      readAt: null,
+      dismissedAt: null,
+    };
+    notifications.set(notification.id, notification);
+    notificationDedupe.set(key, notification.id);
+    pruneNotifications(input.userId);
+    notifyChanged();
+    return { created: true, notification };
+  }
+
+  function listNotifications({
+    userId,
+    afterCursor = null,
+    beforeCursor = null,
+    limit = 50,
+    includeDismissed = false,
+  }) {
+    const parsedLimit = Number.isSafeInteger(limit) ? Math.min(100, Math.max(1, limit)) : 50;
+    const after = parseNotificationCursor(afterCursor);
+    const before = parseNotificationCursor(beforeCursor);
+    if (after !== null && before !== null) throw new Error("Notification cursors are mutually exclusive.");
+    pruneNotifications(userId);
+    const all = [...notifications.values()].filter((notification) =>
+      notification.userId === userId
+      && (includeDismissed || !notification.dismissedAt));
+    const rows = all.filter((notification) =>
+      (after === null || notification.sequence > after)
+      && (before === null || notification.sequence < before));
+    // A replay cursor is chronological so advancing it can never skip a record. An initial inbox
+    // read and older-page request are newest-first, which is the useful inbox order.
+    rows.sort(after !== null
+      ? (left, right) => left.sequence - right.sequence
+      : (left, right) => right.sequence - left.sequence);
+    const page = rows.slice(0, parsedLimit);
+    const unreadCount = [...notifications.values()].filter((notification) =>
+      notification.userId === userId && !notification.readAt && !notification.dismissedAt).length;
+    return {
+      notifications: page,
+      nextCursor: before === null && page.length > 0
+        ? String(Math.max(...page.map((row) => row.sequence)))
+        : (afterCursor ?? null),
+      oldestCursor: page.length > 0 ? String(Math.min(...page.map((row) => row.sequence))) : beforeCursor,
+      hasMore: rows.length > page.length,
+      hasMoreBefore: before !== null || after === null ? rows.length > page.length : false,
+      hasMoreAfter: after !== null ? rows.length > page.length : false,
+      unreadCount,
+    };
+  }
+
+  function markNotificationRead({ userId, notificationId }) {
+    const notification = notifications.get(notificationId);
+    if (!notification || notification.userId !== userId) return null;
+    const duplicate = Boolean(notification.readAt);
+    if (!duplicate) {
+      notification.readAt = new Date(requestNow()).toISOString();
+      notification.updatedAt = notification.readAt;
+      notifyChanged();
+    }
+    return { notification, duplicate };
+  }
+
+  function dismissNotification({ userId, notificationId }) {
+    const notification = notifications.get(notificationId);
+    if (!notification || notification.userId !== userId) return null;
+    const duplicate = Boolean(notification.dismissedAt);
+    if (!duplicate) {
+      const timestamp = new Date(requestNow()).toISOString();
+      notification.dismissedAt = timestamp;
+      notification.readAt ??= timestamp;
+      notification.updatedAt = timestamp;
+      notifyChanged();
+    }
+    return { notification, duplicate };
+  }
+
+  function dismissNotificationByDedupe({ userId, dedupeKey, resolvedAt = null }) {
+    const normalizedDedupeKey = normalizeNotificationText(dedupeKey, 128, "dedupeKey");
+    const notificationId = notificationDedupe.get(notificationKey({
+      userId,
+      dedupeKey: normalizedDedupeKey,
+    }));
+    const notification = notificationId ? notifications.get(notificationId) : null;
+    if (!notification || notification.userId !== userId) return null;
+    const duplicate = Boolean(notification.dismissedAt);
+    if (!duplicate) {
+      const timestamp = normalizeNotificationTimestamp(resolvedAt, requestNow());
+      notification.dismissedAt = timestamp;
+      notification.readAt ??= timestamp;
+      notification.updatedAt = timestamp;
+      notifyChanged();
+    }
+    return { notification, duplicate };
+  }
+
+  function markAllNotificationsRead({ userId }) {
+    const updatedAt = new Date(requestNow()).toISOString();
+    let count = 0;
+    for (const notification of notifications.values()) {
+      if (notification.userId !== userId || notification.readAt || notification.dismissedAt) continue;
+      notification.readAt = updatedAt;
+      notification.updatedAt = updatedAt;
+      count += 1;
+    }
+    if (count > 0) notifyChanged();
+    return { updatedAt, count };
+  }
+
+  function recordBackgroundLiveness({
+    scope = "scheduled-worker",
+    attemptedAt,
+    succeeded = false,
+    failureCode = null,
+  } = {}) {
+    const normalizedScope = normalizeNotificationText(scope, 80, "scope");
+    const timestamp = normalizeNotificationTimestamp(attemptedAt, requestNow());
+    const previous = backgroundLiveness.get(normalizedScope) ?? { scope: normalizedScope };
+    const record = {
+      ...previous,
+      scope: normalizedScope,
+      lastAttemptAt: timestamp,
+      ...(succeeded ? { lastSuccessAt: timestamp, failureCode: null } : {}),
+      ...(failureCode
+        ? {
+            lastFailureAt: timestamp,
+            failureCode: normalizeBackgroundFailureCode(failureCode),
+          }
+        : {}),
+      updatedAt: new Date(requestNow()).toISOString(),
+    };
+    backgroundLiveness.set(normalizedScope, record);
+    notifyChanged();
+    return record;
+  }
+
+  function getBackgroundLiveness(scope = "scheduled-worker") {
+    return backgroundLiveness.get(scope) ?? null;
+  }
+
+  function upsertPushSubscription({ userId, endpoint, keys, vapidKeyId, userAgent = null }) {
+    const endpointHash = hashSecret(endpoint);
+    const ownerKey = `${userId}\u0000${endpointHash}`;
+    const existing = pushSubscriptionByOwnerEndpoint.get(ownerKey);
+    const timestamp = new Date(requestNow()).toISOString();
+    const subscription = existing ? pushSubscriptions.get(existing) : {
+      id: createId("push_subscription"), userId, endpointHash, createdAt: timestamp,
+    };
+    Object.assign(subscription, {
+      endpoint: pushSecretBox.seal(endpoint),
+      keys: { p256dh: pushSecretBox.seal(keys.p256dh), auth: pushSecretBox.seal(keys.auth) },
+      vapidKeyId,
+      userAgent: typeof userAgent === "string" ? userAgent.slice(0, 160) : null,
+      revokedAt: null,
+      lastAcceptedAt: subscription.lastAcceptedAt ?? null,
+      lastFailureCode: null,
+      updatedAt: timestamp,
+    });
+    pushSubscriptions.set(subscription.id, subscription);
+    pushSubscriptionByOwnerEndpoint.set(ownerKey, subscription.id);
+    notifyChanged();
+    return { subscription: publicPushSubscription(subscription), created: !existing };
+  }
+
+  function listPushSubscriptions({ userId }) {
+    return [...pushSubscriptions.values()]
+      .filter((subscription) => subscription.userId === userId && !subscription.revokedAt)
+      .sort((left, right) => right.createdAt.localeCompare(left.createdAt))
+      .map(publicPushSubscription);
+  }
+
+  function revokePushSubscription({ userId, subscriptionId, reason = "user_revoked" }) {
+    const subscription = pushSubscriptions.get(subscriptionId);
+    if (!subscription || subscription.userId !== userId) return null;
+    const duplicate = Boolean(subscription.revokedAt);
+    if (!duplicate) {
+      subscription.revokedAt = new Date(requestNow()).toISOString();
+      subscription.updatedAt = subscription.revokedAt;
+      subscription.lastFailureCode = reason;
+      notifyChanged();
+    }
+    return { subscription: publicPushSubscription(subscription), duplicate };
+  }
+
+  function revokePushSubscriptionByEndpoint({ userId, endpoint, reason = "user_revoked" }) {
+    const subscriptionId = pushSubscriptionByOwnerEndpoint.get(`${userId}\u0000${hashSecret(endpoint)}`);
+    return subscriptionId ? revokePushSubscription({ userId, subscriptionId, reason }) : null;
+  }
+
+  function enqueuePushDeliveries({ userId, notificationId }) {
+    const notification = notifications.get(notificationId);
+    if (!notification || notification.userId !== userId) return [];
+    const timestamp = new Date(requestNow()).toISOString();
+    const created = [];
+    for (const subscription of pushSubscriptions.values()) {
+      if (subscription.userId !== userId || subscription.revokedAt) continue;
+      const dedupeKey = `${subscription.id}\u0000${notificationId}`;
+      if (pushDeliveryDedupe.has(dedupeKey)) continue;
+      const delivery = {
+        id: createId("push_delivery"), userId, subscriptionId: subscription.id, notificationId,
+        status: "queued", attempts: 0, nextAttemptAt: timestamp, leaseUntil: null,
+        lastFailureCode: null, acceptedAt: null, createdAt: timestamp, updatedAt: timestamp,
+      };
+      pushDeliveries.set(delivery.id, delivery);
+      pushDeliveryDedupe.set(dedupeKey, delivery.id);
+      created.push(delivery.id);
+    }
+    if (created.length > 0) notifyChanged();
+    return created;
+  }
+
+  function claimPushDeliveries({ limit = 10, leaseMs = 30_000, now = requestNow() } = {}) {
+    const timestamp = new Date(now).toISOString();
+    const candidates = [...pushDeliveries.values()]
+      .filter((delivery) => (delivery.status === "queued" || delivery.status === "retry")
+        && Date.parse(delivery.nextAttemptAt) <= now
+        && (!delivery.leaseUntil || Date.parse(delivery.leaseUntil) <= now))
+      .sort((left, right) => left.nextAttemptAt.localeCompare(right.nextAttemptAt))
+      .slice(0, Math.max(1, Math.min(Number(limit) || 10, 50)));
+    const claimed = [];
+    for (const delivery of candidates) {
+      const subscription = pushSubscriptions.get(delivery.subscriptionId);
+      const notification = notifications.get(delivery.notificationId);
+      if (!subscription || subscription.revokedAt || !notification || notification.dismissedAt) {
+        delivery.status = "cancelled";
+        delivery.updatedAt = timestamp;
+        continue;
+      }
+      delivery.status = "sending";
+      delivery.attempts += 1;
+      delivery.leaseUntil = new Date(now + leaseMs).toISOString();
+      delivery.updatedAt = timestamp;
+      claimed.push({
+        delivery: { ...delivery },
+        subscription: {
+          ...subscription,
+          endpoint: pushSecretBox.open(subscription.endpoint),
+          keys: {
+            p256dh: pushSecretBox.open(subscription.keys.p256dh),
+            auth: pushSecretBox.open(subscription.keys.auth),
+          },
+        },
+        notification: { ...notification },
+      });
+    }
+    if (candidates.length > 0) notifyChanged();
+    return claimed;
+  }
+
+  function settlePushDelivery({ deliveryId, outcome, failureCode = null, retryAt = null }) {
+    const delivery = pushDeliveries.get(deliveryId);
+    if (!delivery || delivery.status !== "sending") return null;
+    const timestamp = new Date(requestNow()).toISOString();
+    delivery.leaseUntil = null;
+    delivery.updatedAt = timestamp;
+    delivery.lastFailureCode = failureCode;
+    if (outcome === "accepted") {
+      delivery.status = "accepted";
+      delivery.acceptedAt = timestamp;
+      const subscription = pushSubscriptions.get(delivery.subscriptionId);
+      if (subscription) {
+        subscription.lastAcceptedAt = timestamp;
+        subscription.lastFailureCode = null;
+        subscription.updatedAt = timestamp;
+      }
+    } else if (outcome === "retry" && delivery.attempts < 5) {
+      delivery.status = "retry";
+      delivery.nextAttemptAt = new Date(retryAt ?? requestNow() + Math.min(60_000, 1_000 * (2 ** delivery.attempts))).toISOString();
+    } else {
+      delivery.status = outcome === "gone" ? "gone" : "failed";
+      const subscription = pushSubscriptions.get(delivery.subscriptionId);
+      if (subscription) {
+        subscription.lastFailureCode = failureCode;
+        subscription.updatedAt = timestamp;
+        if (outcome === "gone") subscription.revokedAt = timestamp;
+      }
+    }
+    notifyChanged();
+    return { ...delivery };
+  }
+
+  function pruneNotifications(userId) {
+    const cutoff = requestNow() - NOTIFICATION_RETENTION_MS;
+    for (const notification of notifications.values()) {
+      if (notification.userId === userId && Date.parse(notification.createdAt) <= cutoff) {
+        removeNotification(notification);
+      }
+    }
+    const owned = [...notifications.values()].filter((notification) => notification.userId === userId);
+    if (owned.length <= NOTIFICATION_MAX_PER_OWNER) return;
+    owned.sort((left, right) => {
+      const leftPriority = left.dismissedAt ? 0 : left.readAt ? 1 : 2;
+      const rightPriority = right.dismissedAt ? 0 : right.readAt ? 1 : 2;
+      return leftPriority - rightPriority || left.sequence - right.sequence;
+    });
+    for (const notification of owned.slice(0, owned.length - NOTIFICATION_MAX_PER_OWNER)) {
+      removeNotification(notification);
+    }
+  }
+
+  function removeNotification(notification) {
+    notifications.delete(notification.id);
+    notificationDedupe.delete(notificationKey(notification));
+  }
+
   function createCommand(input) {
     const command = {
       id: createId("cmd"),
@@ -2215,7 +3840,7 @@ export function createStore(seed = {}, options = {}) {
 
     const environmentUrls = new Set();
     for (const environment of environments.values()) {
-      if (environment.userId === userId) environmentUrls.add(environment.baseUrl);
+      if (environment.userId === userId && !environment.archivedAt) environmentUrls.add(environment.baseUrl);
     }
 
     let mediaCount = 0;
@@ -2296,6 +3921,8 @@ export function createStore(seed = {}, options = {}) {
     rotateDeviceSecret,
     updateDeviceProfile,
     resetDeviceForTransfer,
+    stageDeviceSecret,
+    acknowledgeDeviceSecret,
     ensureUnclaimedDeviceClaimCode,
     authenticateDevice,
     recordDeviceHeartbeat,
@@ -2304,15 +3931,32 @@ export function createStore(seed = {}, options = {}) {
     updateDeviceConfig,
     setDeviceVoiceAutoSend,
     upsertEnvironment,
+    archiveEnvironment,
+    restoreEnvironment,
+    listExpiredEnvironments,
+    purgeEnvironment,
     deleteEnvironment,
     updateEnvironmentHealth,
     updateEnvironmentCatalogue,
     getEnvironmentForUser,
     listEnvironments,
+    listArchivedEnvironments,
     createConnectSession,
     getConnectSession,
     claimConnectSession,
     completeConnectSession,
+    createConnector,
+    authenticateConnector,
+    authenticateConnectorForRevocation,
+    beginConnectorCredentialRotation,
+    listConnectors,
+    listBackgroundWorkUsers,
+    getConnectorForUser,
+    revokeConnector,
+    revokeConnectorByCredential,
+    createConnectorTicket,
+    consumeConnectorTicket,
+    recordConnectorPresence,
     createGatewayProfile,
     listGatewayProfiles,
     getGatewayProfileForUser,
@@ -2327,6 +3971,25 @@ export function createStore(seed = {}, options = {}) {
     listFirmwareReleases,
     getLatestFirmwareRelease,
     getFirmwareArtifact,
+    createReleaseRollout,
+    listReleaseRollouts,
+    listRunnableReleaseRollouts,
+    getReleaseRolloutForUser,
+    transitionReleaseRollout,
+    upsertRolloutAssignment,
+    listRolloutAssignments,
+    createCompanionHandoff,
+    getCompanionHandoffForUser,
+    getCompanionHandoffForDevice,
+    claimCompanionHandoff,
+    cancelCompanionHandoff,
+    completeCompanionHandoff,
+    createMediaUploadSession,
+    getMediaUploadSessionForActor,
+    markMediaUploadSessionUploaded,
+    finalizeMediaUploadSession,
+    abortMediaUploadSession,
+    listExpiredMediaUploadSessions,
     createMediaUpload,
     getMediaForUser,
     createDeviceProfile,
@@ -2365,6 +4028,9 @@ export function createStore(seed = {}, options = {}) {
     getMacroForUser,
     listMacros,
     deleteMacro,
+    claimCommandRequest,
+    settleCommandRequest,
+    getCommandRequest,
     createCommand,
     getCommandForUser,
     claimCommandApproval,
@@ -2374,6 +4040,21 @@ export function createStore(seed = {}, options = {}) {
     claimProviderUserInputAnswer,
     updateProviderUserInputAnswer,
     listProviderUserInputAnswers,
+    createNotification,
+    listNotifications,
+    markNotificationRead,
+    dismissNotification,
+    dismissNotificationByDedupe,
+    markAllNotificationsRead,
+    recordBackgroundLiveness,
+    getBackgroundLiveness,
+    upsertPushSubscription,
+    listPushSubscriptions,
+    revokePushSubscription,
+    revokePushSubscriptionByEndpoint,
+    enqueuePushDeliveries,
+    claimPushDeliveries,
+    settlePushDelivery,
     updateCommand,
     listCommands,
     listCommandEvents,
@@ -2384,6 +4065,49 @@ export function createStore(seed = {}, options = {}) {
 
 function providerApprovalKey({ userId, environmentId, threadId, requestId }) {
   return [userId, environmentId, threadId, requestId].join("\u0000");
+}
+
+function notificationKey({ userId, dedupeKey }) {
+  return `${userId}\u0000${dedupeKey}`;
+}
+
+function parseNotificationCursor(value) {
+  if (value === null || value === undefined || value === "") return null;
+  const parsed = Number(value);
+  return Number.isSafeInteger(parsed) && parsed >= 0 ? parsed : null;
+}
+
+function normalizeNotificationTimestamp(value, fallbackMs) {
+  const parsed = Date.parse(typeof value === "string" ? value : "");
+  return new Date(Number.isFinite(parsed) ? parsed : fallbackMs).toISOString();
+}
+
+function normalizeNotificationText(value, maxLength, field) {
+  if (typeof value !== "string" || !value.trim()) throw new Error(`${field} is required.`);
+  return value.trim().slice(0, maxLength);
+}
+
+function normalizeNullableNotificationText(value, maxLength) {
+  if (typeof value !== "string" || !value.trim()) return null;
+  return value.trim().slice(0, maxLength);
+}
+
+function normalizeBackgroundFailureCode(value) {
+  return typeof value === "string" && /^[a-z][a-z0-9_.:-]{0,63}$/u.test(value)
+    ? value
+    : "background_task_failed";
+}
+
+function publicPushSubscription(subscription) {
+  return {
+    id: subscription.id,
+    vapidKeyId: subscription.vapidKeyId,
+    createdAt: subscription.createdAt,
+    updatedAt: subscription.updatedAt,
+    revokedAt: subscription.revokedAt ?? null,
+    lastAcceptedAt: subscription.lastAcceptedAt ?? null,
+    lastFailureCode: subscription.lastFailureCode ?? null,
+  };
 }
 
 function createHumanCode() {
@@ -2603,6 +4327,7 @@ function normalizeEnvironmentHealth(input = {}, existing = null) {
     failureReason: null,
     snapshot: null,
     compatibility: null,
+    capabilities: null,
     ...(existing ?? {}),
   };
   return {
@@ -2613,6 +4338,7 @@ function normalizeEnvironmentHealth(input = {}, existing = null) {
     ...(Object.hasOwn(input, "failureReason") ? { failureReason: normalizeEnvironmentFailureReason(input.failureReason) } : {}),
     ...(Object.hasOwn(input, "snapshot") ? { snapshot: input.snapshot ?? null } : {}),
     ...(Object.hasOwn(input, "compatibility") ? { compatibility: input.compatibility ?? null } : {}),
+    ...(Object.hasOwn(input, "capabilities") ? { capabilities: input.capabilities ?? null } : {}),
   };
 }
 
@@ -2736,10 +4462,23 @@ function publicUser(user) {
   };
 }
 
-function publicDevice(device) {
-  const { secretHash, claimCodeHash, pendingSecretHash, ...publicFields } = device;
+function publicDevice(device, rotationNow = Date.now()) {
+  const {
+    secretHash,
+    claimCodeHash,
+    pendingSecretHash,
+    pendingCredentialVersion,
+    rotationId,
+    rotationPurpose,
+    rotationStartedAt,
+    rotationExpiresAt,
+    rotationCompletedAt,
+    ...publicFields
+  } = device;
   return {
     ...publicFields,
+    credentialVersion: device.credentialVersion ?? 1,
+    credentialRotation: publicDeviceCredentialRotation(device, rotationNow),
     gatewaySelection: normalizeGatewaySelection(device.gatewaySelection),
     config: normalizeDeviceConfig({}, device.config),
     status: normalizeDeviceStatus({}, device.status, device.status?.lastHeartbeatAt ?? null),
@@ -2748,6 +4487,49 @@ function publicDevice(device) {
     actions: deviceActions(device),
     voiceAutoSend: normalizeVoiceAutoSend(device.voiceAutoSend, deviceReportsMicrophone(device)),
     claimed: Boolean(device.claimedAt),
+  };
+}
+
+function clearPendingDeviceCredential(device) {
+  device.pendingSecretHash = null;
+  device.pendingCredentialVersion = null;
+  device.rotationId = null;
+  device.rotationPurpose = null;
+  device.rotationStartedAt = null;
+  device.rotationExpiresAt = null;
+  device.rotationCompletedAt = null;
+}
+
+function publicDeviceCredentialRotation(device, now = Date.now()) {
+  if (!device?.rotationId) {
+    return {
+      id: null,
+      state: "idle",
+      purpose: null,
+      pendingCredentialVersion: null,
+      startedAt: null,
+      expiresAt: null,
+      completedAt: null,
+    };
+  }
+  const completed = Boolean(device.rotationCompletedAt);
+  const expired = !completed && Date.parse(device.rotationExpiresAt ?? "") <= now;
+  return {
+    id: device.rotationId,
+    state: completed ? "completed" : expired ? "expired" : "pending",
+    purpose: device.rotationPurpose ?? "rotate",
+    pendingCredentialVersion: device.pendingCredentialVersion ?? null,
+    startedAt: device.rotationStartedAt ?? null,
+    expiresAt: device.rotationExpiresAt ?? null,
+    completedAt: device.rotationCompletedAt ?? null,
+  };
+}
+
+function deviceForGateway(device, authenticatedCredentialVersion, credentialState, rotationNow = Date.now()) {
+  return {
+    ...publicDevice(device, rotationNow),
+    authenticatedCredentialVersion,
+    credentialState,
   };
 }
 
@@ -2815,6 +4597,25 @@ function publicFirmwareRelease(release) {
   if (!release) return null;
   const { artifactKey, artifactProvider, ...output } = release;
   return { ...output, channel: release.channel ?? "stable" };
+}
+
+function cloneRolloutCohort(cohort) {
+  return cohort?.type === "allowlist"
+    ? { type: "allowlist", targetIds: [...(cohort.targetIds ?? [])] }
+    : { type: "percentage", percentage: cohort?.percentage ?? 0 };
+}
+
+function publicReleaseRollout(rollout, assignments) {
+  if (!rollout) return null;
+  const rows = [...assignments.values()].filter((assignment) => assignment.rolloutId === rollout.id);
+  const counts = {};
+  for (const row of rows) counts[row.status] = (counts[row.status] ?? 0) + 1;
+  return {
+    ...rollout,
+    cohort: cloneRolloutCohort(rollout.cohort),
+    requiredCapabilities: [...rollout.requiredCapabilities],
+    progress: { total: rows.length, counts },
+  };
 }
 
 function normalizeGatewaySelection(input = null) {
@@ -2892,7 +4693,7 @@ function publicUserToken(token) {
 }
 
 function publicMediaUpload(media) {
-  const { storagePath, ...publicFields } = media;
+  const { storagePath, uploadSessionId, ...publicFields } = media;
   return {
     ...publicFields,
     // `description` matters: without it an image whose stored processing carries no visionStatus
@@ -2902,6 +4703,36 @@ function publicMediaUpload(media) {
     processing: normalizeMediaProcessing(media.processing, media.kind, media.transcript, media.description),
     expiresAt: media.expiresAt ?? null,
   };
+}
+
+function publicMediaUploadSession(session) {
+  return {
+    id: session.id,
+    kind: session.kind,
+    contentType: session.contentType,
+    sizeBytes: session.expectedSizeBytes,
+    sha256: session.expectedSha256,
+    status: session.status,
+    mediaId: session.mediaId ?? null,
+    createdAt: session.createdAt,
+    expiresAt: session.expiresAt,
+    uploadedAt: session.uploadedAt ?? null,
+    finalizedAt: session.finalizedAt ?? null,
+    abortedAt: session.abortedAt ?? null,
+  };
+}
+
+function expireCompanionHandoff(handoff, now) {
+  if (handoff.status !== "waiting" || !Number.isFinite(now)) return false;
+  if (Date.parse(handoff.expiresAt) > now) return false;
+  handoff.status = "expired";
+  handoff.codeHash = null;
+  return true;
+}
+
+function publicCompanionHandoff(handoff) {
+  const { codeHash, userId, ...publicFields } = handoff;
+  return { ...publicFields };
 }
 
 function publicMacro(macro) {
@@ -2961,7 +4792,31 @@ function publicEnvironment(environment) {
 
 function publicConnectSession(session) {
   const { codeHash, ...publicFields } = session;
-  return { ...publicFields };
+  return { purpose: session.purpose ?? "t3_enrollment", ...publicFields };
+}
+
+function publicConnector(connector) {
+  const { secretHash, pendingSecretHash, pendingSecretPrefix, pendingCredentialVersion, ...publicFields } = connector;
+  return {
+    ...publicFields,
+    rotationPending: Boolean(connector.pendingSecretHash && Date.parse(connector.rotationExpiresAt ?? "") > Date.now()),
+  };
+}
+
+function connectorForGateway(connector, authenticatedCredentialVersion = connector.credentialVersion ?? 1, credentialState = "active", authenticatedRotationId = null) {
+  return { ...publicConnector(connector), authenticatedCredentialVersion, credentialState, authenticatedRotationId };
+}
+
+function publicConnectorTicket(ticket) {
+  return {
+    id: ticket.id,
+    connectorId: ticket.connectorId,
+    environmentId: ticket.environmentId,
+    audience: ticket.audience ?? CONNECTOR_TICKET_AUDIENCE,
+    credentialVersion: ticket.credentialVersion ?? 1,
+    rotationId: ticket.rotationId ?? null,
+    expiresAt: ticket.expiresAt,
+  };
 }
 
 function environmentForGateway(environment, tokenBox) {

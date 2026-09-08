@@ -1,0 +1,170 @@
+{
+  "$schema": "./node_modules/wrangler/config-schema.json",
+  "name": "agent-controller-cloud",
+  "main": "src/index.ts",
+  "compatibility_date": "2026-08-22",
+  "observability": {
+    "enabled": true,
+    "head_sampling_rate": 0,
+    "logs": {
+      "enabled": true,
+      "head_sampling_rate": 0,
+      "invocation_logs": false
+    },
+    "traces": {
+      "enabled": true,
+      "head_sampling_rate": 0
+    }
+  },
+  "analytics_engine_datasets": [
+    { "binding": "TELEMETRY", "dataset": "agent_controller_edge_local" }
+  ],
+  "assets": {
+    "directory": "../dist/web",
+    "binding": "ASSETS",
+    "run_worker_first": ["/health", "/v1/*", "/internal/*", "/__dev/*"]
+  },
+  "durable_objects": {
+    "bindings": [
+      {
+        "name": "ENVIRONMENT_CONNECTOR_HUB",
+        "class_name": "EnvironmentConnectorHub"
+      },
+      {
+        "name": "DEV_CONNECTOR_TICKETS",
+        "class_name": "DevelopmentConnectorTicketStore"
+      }
+    ]
+  },
+  "migrations": [
+    {
+      "tag": "v1",
+      "new_sqlite_classes": ["EnvironmentConnectorHub", "DevelopmentConnectorTicketStore"]
+    }
+  ],
+  "queues": {
+    "producers": [
+      { "binding": "BACKGROUND_TASKS", "queue": "agent-controller-background-local" },
+      { "binding": "BACKGROUND_QUARANTINE", "queue": "agent-controller-dead-letter-local" }
+    ],
+    "consumers": [
+      {
+        "queue": "agent-controller-background-local",
+        "max_batch_size": 10,
+        "max_retries": 5,
+        "dead_letter_queue": "agent-controller-dead-letter-local"
+      }
+    ]
+  },
+  "triggers": { "crons": ["*/5 * * * *"] },
+  "vars": {
+    "DEPLOYMENT_ENVIRONMENT": "local",
+    "CONNECTOR_AUTH_MODE": "dev-do",
+    "CONNECTOR_TICKET_AUDIENCE": "agent-controller-connectors",
+    "TELEMETRY_SUCCESS_SAMPLE_RATE": "0.05"
+  },
+  "env": {
+    "staging": {
+      "name": "agent-controller-cloud-staging",
+      "durable_objects": {
+        "bindings": [
+          {
+            "name": "ENVIRONMENT_CONNECTOR_HUB",
+            "class_name": "EnvironmentConnectorHub"
+          }
+        ]
+      },
+      "services": [
+        {
+          "binding": "CONTROL_PLANE",
+          "service": "agent-controller-control-plane-staging"
+        }
+      ],
+      "analytics_engine_datasets": [
+        { "binding": "TELEMETRY", "dataset": "agent_controller_edge_staging" }
+      ],
+      "queues": {
+        "producers": [
+          {
+            "binding": "CONNECTOR_EVENTS",
+            "queue": "agent-controller-connector-events-staging"
+          },
+          { "binding": "BACKGROUND_TASKS", "queue": "agent-controller-background-staging" },
+          { "binding": "BACKGROUND_QUARANTINE", "queue": "agent-controller-dead-letter-staging" }
+        ],
+        "consumers": [
+          {
+            "queue": "agent-controller-connector-events-staging",
+            "max_batch_size": 10,
+            "max_retries": 5,
+            "dead_letter_queue": "agent-controller-dead-letter-staging"
+          },
+          {
+            "queue": "agent-controller-background-staging",
+            "max_batch_size": 10,
+            "max_retries": 5,
+            "dead_letter_queue": "agent-controller-dead-letter-staging"
+          }
+        ]
+      },
+      "triggers": { "crons": ["*/5 * * * *"] },
+      "vars": {
+        "DEPLOYMENT_ENVIRONMENT": "staging",
+        "CONNECTOR_AUTH_MODE": "control-plane",
+        "CONNECTOR_TICKET_AUDIENCE": "agent-controller-connectors",
+        "TELEMETRY_SUCCESS_SAMPLE_RATE": "0.05"
+      }
+    },
+    "production": {
+      "name": "agent-controller-cloud-production",
+      "durable_objects": {
+        "bindings": [
+          {
+            "name": "ENVIRONMENT_CONNECTOR_HUB",
+            "class_name": "EnvironmentConnectorHub"
+          }
+        ]
+      },
+      "services": [
+        {
+          "binding": "CONTROL_PLANE",
+          "service": "agent-controller-control-plane-production"
+        }
+      ],
+      "analytics_engine_datasets": [
+        { "binding": "TELEMETRY", "dataset": "agent_controller_edge_production" }
+      ],
+      "queues": {
+        "producers": [
+          {
+            "binding": "CONNECTOR_EVENTS",
+            "queue": "agent-controller-connector-events-production"
+          },
+          { "binding": "BACKGROUND_TASKS", "queue": "agent-controller-background-production" },
+          { "binding": "BACKGROUND_QUARANTINE", "queue": "agent-controller-dead-letter-production" }
+        ],
+        "consumers": [
+          {
+            "queue": "agent-controller-connector-events-production",
+            "max_batch_size": 10,
+            "max_retries": 5,
+            "dead_letter_queue": "agent-controller-dead-letter-production"
+          },
+          {
+            "queue": "agent-controller-background-production",
+            "max_batch_size": 10,
+            "max_retries": 5,
+            "dead_letter_queue": "agent-controller-dead-letter-production"
+          }
+        ]
+      },
+      "triggers": { "crons": ["*/5 * * * *"] },
+      "vars": {
+        "DEPLOYMENT_ENVIRONMENT": "production",
+        "CONNECTOR_AUTH_MODE": "control-plane",
+        "CONNECTOR_TICKET_AUDIENCE": "agent-controller-connectors",
+        "TELEMETRY_SUCCESS_SAMPLE_RATE": "0.05"
+      }
+    }
+  }
+}

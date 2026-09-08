@@ -197,6 +197,8 @@ export function T3CompatibilityPanel({ controller: c }: { controller: Controller
 }
 
 function CompatibilityRow({ result }: { result: T3CompatibilityResult }) {
+  const capabilityEntries = Object.values(result.capabilities?.features ?? {});
+  const supportedCapabilities = capabilityEntries.filter((entry) => entry.state === "supported").length;
   return (
     <article className="px-5 py-4">
       <div className="flex flex-col gap-3 sm:flex-row sm:items-start sm:justify-between">
@@ -210,6 +212,12 @@ function CompatibilityRow({ result }: { result: T3CompatibilityResult }) {
             Installed: {result.installedVersion ?? "not reported"}
           </p>
           <p className="mt-1 text-xs leading-relaxed text-ink-muted">{result.recommendation}</p>
+          {result.capabilities ? (
+            <p className="mt-1 text-xs text-ink-muted">
+              Adapter {result.capabilities.contractVersion} · {supportedCapabilities}/{capabilityEntries.length} probed features available
+              {result.capabilities.freshness === "stale" ? " · cached result is stale" : ""}
+            </p>
+          ) : null}
         </div>
         <span className="shrink-0 font-mono text-[10px] text-ink-faint">
           {result.checkedAt ? `Checked ${formatRelativeTime(result.checkedAt)}` : "Never checked"}

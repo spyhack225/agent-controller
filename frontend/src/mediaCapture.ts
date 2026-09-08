@@ -40,12 +40,15 @@ export interface AudioRecorder {
   status: CaptureStatus;
   supported: boolean;
   recording: boolean;
-  start: () => Promise<void>;
+  inputs: MediaDeviceInfo[];
+  refreshInputs: () => Promise<void>;
+  start: (deviceId?: string) => Promise<void>;
   stop: () => void;
 }
 
 export function useAudioRecorder({ onComplete, onError }: AudioRecorderOptions): AudioRecorder {
   const [status, setStatus] = useState<CaptureStatus>("idle");
+  const [inputs, setInputs] = useState<MediaDeviceInfo[]>([]);
   const recorderRef = useRef<MediaRecorder | null>(null);
   const chunksRef = useRef<Blob[]>([]);
   const completeRef = useRef(onComplete);
@@ -63,7 +66,13 @@ export function useAudioRecorder({ onComplete, onError }: AudioRecorderOptions):
     && Boolean(navigator.mediaDevices?.getUserMedia)
     && typeof MediaRecorder !== "undefined";
 
-  const start = useCallback(async () => {
+  const refreshInputs = useCallback(async () => {
+    if (!navigator.mediaDevices?.enumerateDevices) return;
+    const devices = await navigator.mediaDevices.enumerateDevices();
+    setInputs(devices.filter((device) => device.kind === "audioinput"));
+  }, []);
+
+  const start = useCallback(async (deviceId?: string) => {
     if (!navigator.mediaDevices?.getUserMedia || typeof MediaRecorder === "undefined") {
       setStatus("blocked");
       errorRef.current?.("Audio recording is unavailable in this browser.");
@@ -71,7 +80,10 @@ export function useAudioRecorder({ onComplete, onError }: AudioRecorderOptions):
     }
     if (recorderRef.current && recorderRef.current.state !== "inactive") return;
     try {
-      const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+      const stream = await navigator.mediaDevices.getUserMedia({
+        audio: deviceId ? { deviceId: { exact: deviceId } } : true,
+      });
+      await refreshInputs().catch(() => undefined);
       chunksRef.current = [];
       const recorder = new MediaRecorder(stream);
       recorderRef.current = recorder;
@@ -102,7 +114,7 @@ export function useAudioRecorder({ onComplete, onError }: AudioRecorderOptions):
       setStatus("blocked");
       errorRef.current?.(errorMessage(error, "Microphone access was blocked."));
     }
-  }, []);
+  }, [refreshInputs]);
 
   const stop = useCallback(() => {
     const recorder = recorderRef.current;
@@ -111,7 +123,7 @@ export function useAudioRecorder({ onComplete, onError }: AudioRecorderOptions):
     setStatus("saving");
   }, []);
 
-  return { status, supported, recording: status === "recording", start, stop };
+  return { status, supported, recording: status === "recording", inputs, refreshInputs, start, stop };
 }
 
 export interface CameraCaptureOptions {

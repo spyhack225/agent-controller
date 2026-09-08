@@ -305,6 +305,7 @@ interface ConfirmOptions {
   description: string;
   confirmLabel: string;
   tone?: "danger" | "primary";
+  requiredText?: string;
 }
 
 interface ConfirmState extends ConfirmOptions {
@@ -315,9 +316,11 @@ const ConfirmContext = createContext<((options: ConfirmOptions) => Promise<boole
 
 export function ConfirmProvider({ children }: { children: ReactNode }) {
   const [confirmation, setConfirmation] = useState<ConfirmState | null>(null);
+  const [confirmationText, setConfirmationText] = useState("");
   const confirmButtonRef = useRef<HTMLButtonElement>(null);
 
   const confirm = useCallback((options: ConfirmOptions) => new Promise<boolean>((resolve) => {
+    setConfirmationText("");
     setConfirmation({ ...options, resolve });
   }), []);
 
@@ -369,11 +372,24 @@ export function ConfirmProvider({ children }: { children: ReactNode }) {
                 </p>
               </div>
             </div>
+            {confirmation.requiredText ? (
+              <label className="mt-4 block text-sm text-ink-muted">
+                Type <strong className="text-ink">{confirmation.requiredText}</strong> to confirm
+                <input
+                  aria-label="Confirmation label"
+                  className="mt-2 w-full rounded-lg border border-control bg-surface px-3 py-2 text-ink"
+                  value={confirmationText}
+                  onChange={(event) => setConfirmationText(event.target.value)}
+                  autoComplete="off"
+                />
+              </label>
+            ) : null}
             <div className="mt-6 flex justify-end gap-2">
               <Button onClick={() => settle(false)}>Cancel</Button>
               <Button
                 ref={confirmButtonRef}
                 variant={confirmation.tone === "primary" ? "primary" : "danger"}
+                disabled={Boolean(confirmation.requiredText) && confirmationText !== confirmation.requiredText}
                 onClick={() => settle(true)}
               >
                 {confirmation.confirmLabel}

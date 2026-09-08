@@ -108,9 +108,12 @@
 // lib/ElecrowEPD (Elecrow's arduino-v1.2 sources) is the one that works.
 #define EINK_PANEL_JD79661 1
 
-// TLS certificate validation is intentionally disabled in this first firmware scaffold so
-// self-hosted HTTPS gateways work during bring-up. Pin the gateway certificate before production.
-#define INSECURE_SKIP_TLS_VERIFY 1
+// HTTPS fails closed unless the cloud gateway's issuing root is configured. Concatenate a current
+// and next root during rotation. Set INSECURE_SKIP_TLS_VERIFY=1 only in a local bench config; it
+// exposes the long-lived device credential to interception.
+#define GATEWAY_TLS_ROOT_CA_PEM ""
+#define GATEWAY_TLS_NEXT_ROOT_CA_PEM ""
+#define INSECURE_SKIP_TLS_VERIFY 0
 
 // ---------------------------------------------------------------------------
 // Optional media capture (roadmap Phase 6: push-to-talk audio and still images)
@@ -121,8 +124,8 @@
 // board entirely. Every macro below is wrapped in #ifndef, so a platformio.ini
 // env can override it with -D without a redefinition warning.
 //
-// Enabled captures upload to POST /v1/device/media and then submit an
-// audio_prompt / camera_prompt intent referencing the returned media id.
+// Enabled captures use AgentControllerCore's authenticated raw upload-session protocol and then
+// submit an audio_prompt / camera_prompt intent referencing the finalized media id.
 // ---------------------------------------------------------------------------
 
 #ifndef ENABLE_AUDIO_CAPTURE
@@ -133,8 +136,7 @@
 #define ENABLE_CAMERA_CAPTURE 0
 #endif
 
-// Mirror of the gateway's MAX_MEDIA_BYTES. The gateway checks the decoded size,
-// so this caps raw capture bytes, not the base64 body. Lower it if your gateway
+// Mirror of the gateway's MAX_MEDIA_BYTES. This caps the raw capture body. Lower it if your gateway
 // runs with a smaller MAX_MEDIA_BYTES.
 #ifndef MEDIA_UPLOAD_MAX_BYTES
 #define MEDIA_UPLOAD_MAX_BYTES (2UL * 1024UL * 1024UL)

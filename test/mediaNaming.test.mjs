@@ -19,7 +19,10 @@ import {
 // thread, a thread whose title T3 will not give up, a console upload with no device at all, and a
 // thread title far longer than a row.
 
-const AUDIO = Buffer.from("pretend this is a wav").toString("base64");
+const AUDIO = Buffer.from(
+  "524946462400000057415645666d74201000000001000100803e0000007d0000020010006461746100000000",
+  "hex",
+).toString("base64");
 const PNG_BASE64 =
   "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==";
 

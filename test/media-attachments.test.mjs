@@ -10,6 +10,8 @@ import { createMediaAccessToken, verifyMediaAccessToken } from "../src/mediaLink
 // A 1x1 PNG. Small enough to be inlined, real enough to round-trip byte for byte.
 const PNG_BASE64 =
   "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg==";
+const WEBM_BASE64 = Buffer.from([0x1a, 0x45, 0xdf, 0xa3]).toString("base64");
+const MP3_BASE64 = Buffer.from([0xff, 0xfb, 0x90, 0x64]).toString("base64");
 
 const MEDIA_CONFIG = {
   maxMediaBytes: 64 * 1024,
@@ -291,7 +293,7 @@ test("openai transcription provider transcribes stored audio", async (t) => {
     body: {
       kind: "audio",
       contentType: "audio/webm",
-      dataBase64: Buffer.from("fake audio bytes").toString("base64"),
+      dataBase64: WEBM_BASE64,
       originalName: "clip.webm",
     },
   });
@@ -325,7 +327,7 @@ test("openai transcription provider transcribes stored audio", async (t) => {
     headers: authHeaders,
   });
   assert.equal(audio.status, 200);
-  assert.equal(Buffer.from(await audio.arrayBuffer()).toString(), "fake audio bytes");
+  assert.deepEqual(Buffer.from(await audio.arrayBuffer()), Buffer.from(WEBM_BASE64, "base64"));
 
   const [call] = calls;
   assert.equal(call.url, "https://stt.example/v1/audio/transcriptions");
@@ -378,7 +380,7 @@ test("the parakeet sidecar drives the same job pipeline, over HTTP and off the r
     body: {
       kind: "audio",
       contentType: "audio/webm",
-      dataBase64: Buffer.from("fake opus bytes").toString("base64"),
+      dataBase64: WEBM_BASE64,
       originalName: "voice.webm",
     },
   });
@@ -461,7 +463,7 @@ test("a container the sidecar cannot open fails clearly and leaves the audio pla
     body: {
       kind: "audio",
       contentType: "audio/mpeg",
-      dataBase64: Buffer.from("fake mp3 bytes").toString("base64"),
+      dataBase64: MP3_BASE64,
       originalName: "voice.mp3",
     },
   });
@@ -487,7 +489,7 @@ test("a container the sidecar cannot open fails clearly and leaves the audio pla
     headers: authHeaders,
   });
   assert.equal(audio.status, 200);
-  assert.equal(Buffer.from(await audio.arrayBuffer()).toString(), "fake mp3 bytes");
+  assert.deepEqual(Buffer.from(await audio.arrayBuffer()), Buffer.from(MP3_BASE64, "base64"));
 
   const listed = await requestJson(originalFetch, baseUrl, "/v1/media", { headers: authHeaders });
   assert.equal(listed.media[0].transcript, null);
@@ -529,7 +531,7 @@ test("a rate-limited provider is retried until the budget runs out, then fails t
     body: {
       kind: "audio",
       contentType: "audio/webm",
-      dataBase64: Buffer.from("fake audio bytes").toString("base64"),
+      dataBase64: WEBM_BASE64,
     },
   });
 
@@ -605,7 +607,7 @@ test("a provider error that cannot succeed on retry fails on the first attempt",
     body: {
       kind: "audio",
       contentType: "audio/webm",
-      dataBase64: Buffer.from("fake audio bytes").toString("base64"),
+      dataBase64: WEBM_BASE64,
     },
   });
   const queued = await requestJson(originalFetch, baseUrl, `/v1/media/${upload.media.id}/transcribe`, {
@@ -650,7 +652,7 @@ test("transcription is refused up front when no provider is configured", async (
     body: {
       kind: "audio",
       contentType: "audio/webm",
-      dataBase64: Buffer.from("fake audio bytes").toString("base64"),
+      dataBase64: WEBM_BASE64,
     },
   });
 
@@ -694,7 +696,7 @@ test("transcript versions are redacted from a support bundle, the stage machine 
     body: {
       kind: "audio",
       contentType: "audio/webm",
-      dataBase64: Buffer.from("fake audio bytes").toString("base64"),
+      dataBase64: WEBM_BASE64,
       originalName: "standup.webm",
     },
   });

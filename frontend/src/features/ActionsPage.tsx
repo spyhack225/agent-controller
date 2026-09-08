@@ -18,6 +18,7 @@ import {
 import { useMemo, useState } from "react";
 
 import type { Controller } from "../controller";
+import { clearDurableMutationRequest, durableMutationRequest } from "../requestId";
 import type { JsonRecord, SavedAction, SavedActionStep, SavedActionType } from "../types";
 import { Button, EmptyState, Field, StatusBadge, cn, useConfirm } from "../ui";
 import { mediaLabel } from "./MediaCapture";
@@ -175,14 +176,23 @@ export function ActionsPage({ controller: c }: { controller: Controller }) {
       return;
     }
     await c.run(`test-action-${action.id}`, "Action dispatched.", async () => {
+      const pending = await durableMutationRequest({
+        operation: "action.run",
+        actionId: action.id,
+        environmentId: c.selectedEnvironmentId || null,
+        threadId: c.selectedThreadId || null,
+        mediaUploadId: mediaUpload?.id ?? null,
+      });
       const response = await c.api(`/v1/actions/${encodeURIComponent(action.id)}/run`, {
         method: "POST",
         body: {
           environmentId: c.selectedEnvironmentId || undefined,
           threadId: c.selectedThreadId || undefined,
           ...(mediaUpload ? { mediaUploadId: mediaUpload.id } : {}),
+          clientRequestId: pending.clientRequestId,
         },
       });
+      clearDurableMutationRequest(pending.storageKey);
       await c.refreshAll();
       return response;
     });

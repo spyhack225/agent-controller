@@ -131,6 +131,39 @@ test("contract_incompatible tolerates a host that never reported a version", () 
   expect(screen.getByText("unknown")).toBeVisible();
 });
 
+test("connector offline recovery keeps credentials local and uses status plus doctor", () => {
+  renderDialog({
+    reason: "connector_offline",
+    message: "No current connector heartbeat.",
+    retryable: true,
+  }, {
+    environment: { id: "env_1", label: "Studio Mac", baseUrl: null, transportMode: "connector" },
+    connector: { id: "con_1", environmentId: "env_1", label: "Studio Mac", status: "offline" },
+  });
+
+  expect(screen.getByRole("dialog", { name: /Bring the connector back online/u })).toBeVisible();
+  expect(screen.getByText("npx @agent-controller/connector status")).toBeVisible();
+  expect(screen.getByText("npx @agent-controller/connector doctor")).toBeVisible();
+  expect(screen.getByText(/without sending T3 or provider credentials/u)).toBeVisible();
+});
+
+test("revoked connector requires new enrollment and pauses futile retries", () => {
+  const handlers = renderDialog({
+    reason: "connector_revoked",
+    message: "Connector credential is revoked.",
+    retryable: true,
+  }, {
+    environment: { id: "env_1", label: "Studio Mac", baseUrl: null, transportMode: "connector" },
+    connector: { id: "con_1", environmentId: "env_1", label: "Studio Mac", status: "revoked", revokedAt: "2026-08-27T12:00:00Z" },
+  });
+
+  expect(screen.getByRole("dialog", { name: /Create a new connector enrollment/u })).toBeVisible();
+  expect(screen.getByText(/cannot be displayed or reused/u)).toBeVisible();
+  expect(screen.getByRole("status")).toHaveTextContent("Automatic checks are paused");
+  fireEvent.click(screen.getByRole("button", { name: /Create new enrollment/u }));
+  expect(handlers.onOpenEnvironments).toHaveBeenCalledOnce();
+});
+
 test("shows the active automatic check and prevents an overlapping manual retry", () => {
   renderDialog(null, { checking: true });
 

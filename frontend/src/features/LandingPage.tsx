@@ -132,7 +132,7 @@ const tiers: Array<{
     blurb: "We run the gateway. You bring the T3 host and provider keys.",
     items: [
       "Managed gateway and realtime",
-      "Approval push notifications",
+      "Durable in-app notifications",
       "90-day command history",
       "Signed OTA firmware channel",
     ],

@@ -1,4 +1,4 @@
-import { fireEvent, render, screen } from "@testing-library/react";
+import { fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { vi } from "vitest";
 
 import type { Controller } from "../controller";
@@ -18,13 +18,14 @@ function controller(overrides: Record<string, unknown> = {}) {
     },
     busyAction: null,
     environments: [],
+    connectors: [],
     privacyDays: 30,
     setPrivacyDays: vi.fn(),
     media: [],
-    approvalNotificationsEnabled: false,
+    localNotificationsEnabled: false,
     notificationSupport: "default",
-    enableApprovalNotifications: vi.fn(async () => "granted"),
-    disableApprovalNotifications: vi.fn(),
+    enableLocalNotifications: vi.fn(async () => "granted"),
+    disableLocalNotifications: vi.fn(),
     setNotice: vi.fn(),
     api: vi.fn(async () => undefined),
     refreshAll: vi.fn(),
@@ -52,10 +53,34 @@ function renderSettings(c = controller()) {
 test("recommends private Serve and gives a runnable setup command", () => {
   renderSettings();
 
-  expect(screen.getByRole("heading", { name: "Connect securely from anywhere" })).toBeVisible();
+  expect(screen.getByRole("heading", { name: "Open this console from another device" })).toBeVisible();
   expect(screen.getByRole("button", { name: /Tailscale Serve/i })).toHaveAttribute("aria-pressed", "true");
   expect(screen.getByText("npm run setup:tunnel -- --mode serve --write-env")).toBeVisible();
   expect(screen.getByText(/trusted private network/i)).toBeVisible();
+});
+
+test("shows connector fleet evidence and revokes a standing connector secret", async () => {
+  const c = renderSettings(controller({
+    environments: [{ id: "env_1", label: "Studio Mac", baseUrl: null, transportMode: "connector" }],
+    connectors: [{
+      id: "con_1",
+      environmentId: "env_1",
+      label: "Studio connector",
+      status: "online",
+      connectorVersion: "0.2.0",
+      platform: "darwin-arm64",
+      lastSeenAt: "2026-08-27T12:00:00Z",
+    }],
+  }));
+
+  expect(screen.getByRole("heading", { name: "Workspace computers" })).toBeVisible();
+  expect(screen.getByText("Studio connector")).toBeVisible();
+  expect(screen.getByText(/v0.2.0 · darwin-arm64/u)).toBeVisible();
+  expect(screen.getByText("npx @agent-controller/connector doctor")).toBeVisible();
+
+  fireEvent.click(screen.getByRole("button", { name: "Revoke" }));
+  fireEvent.click(await screen.findByRole("button", { name: "Revoke connector" }));
+  await waitFor(() => expect(c.api).toHaveBeenCalledWith("/v1/connectors/con_1", { method: "DELETE" }));
 });
 
 test("makes public Funnel exposure explicit before showing its command", () => {
@@ -67,6 +92,24 @@ test("makes public Funnel exposure explicit before showing its command", () => {
   expect(screen.getByText("npm run setup:tunnel -- --mode funnel --write-env")).toBeVisible();
   expect(screen.getByRole("note")).toHaveTextContent(/public internet/i);
   expect(screen.getByRole("note")).toHaveTextContent(/Clerk/i);
+});
+
+test("omits host-only tunnel controls in an explicitly cloud deployment", () => {
+  renderSettings(controller({ authConfig: { clerk: { enabled: true }, deploymentMode: "cloud" } }));
+
+  expect(screen.queryByRole("heading", { name: "Open this console from another device" })).toBeNull();
+  expect(screen.getByRole("heading", { name: "Workspace computers" })).toBeVisible();
+});
+
+test("describes opt-in browser delivery truthfully without claiming Web Push", async () => {
+  const c = renderSettings();
+
+  expect(screen.getByRole("heading", { name: "Local system notifications" })).toBeVisible();
+  expect(screen.getByText(/Nothing is sent to a push service/u)).toBeVisible();
+  expect(screen.getByText(/delivery stops when this browser and its installed PWA are closed/u)).toBeVisible();
+
+  fireEvent.click(screen.getByRole("button", { name: "Enable local notifications" }));
+  await waitFor(() => expect(c.enableLocalNotifications).toHaveBeenCalledOnce());
 });
 
 test("recognizes an existing tunnel and stops presenting setup as unfinished", () => {

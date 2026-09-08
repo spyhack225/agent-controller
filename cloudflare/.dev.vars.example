@@ -1,0 +1,3 @@
+# Copy to .dev.vars for `wrangler dev`. Never reuse these values outside local development.
+ROUTER_SHARED_SECRET="replace-with-local-router-secret"
+DEV_TICKET_ISSUER_SECRET="replace-with-local-ticket-issuer-secret"

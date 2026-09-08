@@ -28,7 +28,17 @@ namespace {
 // is constructed regardless of whether the display is ever used.
 Adafruit_ILI9341* panel = nullptr;
 bool ready = false;
-uint32_t panelFreq = 24000000;
+
+// 80 MHz works for the vendor's register-level demo, but it is not reliable through the Arduino
+// SPI/Adafruit transaction path on the real board. A lost clock in a long RAM write does not look
+// like random noise: the ILI9341 advances its address for every pixel it accepts, so every following
+// raster row starts a little farther left or right. That is the sheared text and button outline seen
+// after a page repaint. 40 MHz was verified during initial bring-up and leaves timing margin while
+// still being substantially faster than Adafruit's 24 MHz default.
+#ifndef LCD_SPI_FREQUENCY_HZ
+#define LCD_SPI_FREQUENCY_HZ 40000000UL
+#endif
+uint32_t panelFreq = LCD_SPI_FREQUENCY_HZ;
 
 }  // namespace
 
@@ -61,24 +71,16 @@ bool displayBegin() {
 #if !ENABLE_LCD
   return false;
 #else
-  // Remap the bus: these are not the S3's default SPI pins. MISO is passed because the panel
-  // shares the bus, though this driver never reads from it.
-  // The vendor drives this panel at 80 MHz in SPI mode 0 (docs/.../Example_01/spi_dev.h). Adafruit
-  // defaults to 24 MHz, which is safe but leaves most of the bandwidth unused — and this UI redraws
-  // an animated orb, so the bus is the budget. 40 MHz is the compromise: a real speed-up, with
-  // margin against the ribbon and the breadboard-grade routing on a module like this.
+  // Remap the bus through the GPIO matrix: these are not the S3's default SPI pins. MISO is passed
+  // because the panel shares the bus, though this driver never reads from it.
   SPI.begin(LCD_SCLK, LCD_MISO, LCD_MOSI, LCD_CS);
-  // 80 MHz, which is what the vendor's own driver uses (docs/.../Example_01/spi_dev.h) — so it is
-  // a rate this board's routing is known to carry, not an optimistic guess. Adafruit's 24 MHz
-  // default left the frame time dominated by the blit: a 148x148 push is ~9 ms at 40 MHz against a
-  // 33 ms budget that the orb maths had already mostly spent.
-  panelFreq = 80000000;
 
   // Built here, after Arduino's init and after SPI is known to exist.
   if (!panel) panel = new Adafruit_ILI9341(LCD_CS, LCD_DC, LCD_RST);
   if (!panel) return false;
 
   panel->begin(panelFreq);
+  Serial.printf("[display] SPI clock: %lu Hz\n", (unsigned long)panelFreq);
 
   // Inversion OFF. The vendor's init sends 0x21 (INVON), but that sequence is relative to their
   // own register setup, not to Adafruit's — whose ILI9341 init already leaves this panel the right

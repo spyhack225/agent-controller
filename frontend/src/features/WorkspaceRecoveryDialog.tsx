@@ -1,7 +1,7 @@
 import { AlertTriangle, Cable, Check, Clipboard, LoaderCircle, PauseCircle, RefreshCw, RotateCcw, X } from "lucide-react";
 import { useEffect, useRef, useState, type ReactNode } from "react";
 
-import type { EnvironmentFailure, EnvironmentFailureReason } from "../types";
+import type { Connector, Environment, EnvironmentFailure, EnvironmentFailureReason } from "../types";
 import { Button } from "../ui";
 
 const T3_SETUP_COMMAND = "npm run setup:t3";
@@ -24,6 +24,8 @@ interface WorkspaceRecoveryDialogProps {
   open: boolean;
   /** The gateway's classification. Null falls back to the generic unreachable copy. */
   failure: EnvironmentFailure | null;
+  environment?: Environment | null;
+  connector?: Connector | null;
   retrying?: boolean;
   checking?: boolean;
   onClose: () => void;
@@ -40,10 +42,84 @@ function versionLabel(value: string | null | undefined): string {
 function recoveryContent(
   failure: EnvironmentFailure | null,
   onOpenEnvironments: () => void,
+  environment: Environment | null,
+  connector: Connector | null,
 ): RecoveryContent {
   const reason: EnvironmentFailureReason = failure?.reason ?? "unknown";
   const summary = failure?.message ?? "T3 snapshot is unavailable.";
   const address = failure?.baseUrl ?? null;
+
+  if ((environment?.transportMode ?? "direct") === "connector") {
+    const revoked = reason === "connector_revoked" || connector?.status === "revoked" || Boolean(connector?.revokedAt);
+    const incompatible = reason === "connector_incompatible" || connector?.status === "incompatible";
+    if (revoked) {
+      return {
+        eyebrow: "Connector revoked",
+        title: "Create a new connector enrollment",
+        summary,
+        steps: [
+          {
+            title: "Open this environment's enrollment settings",
+            body: (
+              <>
+                <span>The revoked secret cannot be displayed or reused. Generate a new single-use command for this environment.</span>
+                <span className="mt-2 block">
+                  <Button size="sm" onClick={onOpenEnvironments}><Cable className="size-4" aria-hidden="true" /> Create new enrollment</Button>
+                </span>
+              </>
+            ),
+          },
+          {
+            title: "Run the new command on the workspace computer",
+            body: "Keep it running until the console reports a current connector heartbeat and local T3 health.",
+          },
+        ],
+      };
+    }
+    if (incompatible) {
+      return {
+        eyebrow: "Connector incompatible",
+        title: "Update the connector on the workspace computer",
+        summary,
+        steps: [
+          {
+            title: "Inspect the installed connector",
+            body: `This connector reports ${versionLabel(connector?.connectorVersion)} using protocol ${versionLabel(connector?.protocolVersion == null ? null : String(connector.protocolVersion))}.`,
+            command: "npx @agent-controller/connector status",
+          },
+          {
+            title: "Install a current published release",
+            body: "Use your normal npm or npx update workflow, then create a new enrollment if the connector says its credential is no longer valid.",
+            command: "npm view @agent-controller/connector version",
+          },
+        ],
+      };
+    }
+
+    const t3Health = connector?.lastT3Health;
+    const t3Problem = t3Health === "stopped" || t3Health === "auth_failed" || t3Health === "error";
+    return {
+      eyebrow: t3Problem ? "Local T3 needs attention" : "Connector offline",
+      title: t3Problem ? "Repair T3 on the workspace computer" : "Bring the connector back online",
+      summary,
+      steps: [
+        {
+          title: t3Problem ? "Check T3 and connector health locally" : "Wake the workspace computer and check the connector",
+          body: t3Health === "stopped"
+            ? "T3 is stopped on the workspace computer. Start it there, then confirm the connector is still running."
+            : t3Health === "auth_failed"
+              ? "The connector reached T3 but its local credential was rejected. Refresh that credential on the workspace computer; do not paste it into this console."
+              : "The cloud has no current connector heartbeat. Wake the computer, restore its network, and inspect the local process.",
+          command: "npx @agent-controller/connector status",
+        },
+        {
+          title: "Run local diagnostics",
+          body: "Doctor checks the outbound cloud route and local T3 access without sending T3 or provider credentials to Agent Controller.",
+          command: "npx @agent-controller/connector doctor",
+        },
+      ],
+    };
+  }
 
   const credentialSteps: RecoveryStep[] = [
     {
@@ -194,6 +270,8 @@ function recoveryContent(
 export function WorkspaceRecoveryDialog({
   open,
   failure,
+  environment = null,
+  connector = null,
   retrying = false,
   checking = false,
   onClose,
@@ -268,8 +346,10 @@ export function WorkspaceRecoveryDialog({
 
   if (!open) return null;
 
-  const content = recoveryContent(failure, onOpenEnvironments);
-  const retryable = failure?.retryable ?? true;
+  const content = recoveryContent(failure, onOpenEnvironments, environment, connector);
+  const retryable = ((environment?.transportMode ?? "direct") === "connector" && (connector?.status === "revoked" || connector?.revokedAt))
+    ? false
+    : failure?.retryable ?? true;
 
   return (
     <div

@@ -21,6 +21,8 @@ export type JsonRecord = Record<string, unknown>;
 export interface AuthConfig {
   authProvider?: string;
   demoMode?: boolean;
+  /** Lets the console omit host-only controls when served by the managed cloud runtime. */
+  deploymentMode?: "cloud" | "self-hosted";
   developmentTokens?: { enabled?: boolean };
   clerk?: {
     enabled?: boolean;
@@ -98,6 +100,9 @@ export interface DeviceProfile {
 
 /** Why an environment is not answering, as returned by the gateway. Never inferred from copy. */
 export type EnvironmentFailureReason =
+  | "connector_offline"
+  | "connector_revoked"
+  | "connector_incompatible"
   | "process_not_running"
   | "network_unreachable"
   | "timeout"
@@ -131,6 +136,32 @@ export interface EnvironmentHealth {
     line2?: string;
   } | null;
   compatibility?: T3CompatibilityResult | null;
+  capabilities?: T3CapabilityManifest | null;
+}
+
+export type T3CapabilityState = "supported" | "unsupported" | "unknown";
+
+export interface T3CapabilityManifest {
+  schema: "agent-controller.t3-capabilities.v1";
+  contractVersion: string;
+  installedVersion: string | null;
+  probedAt: string;
+  freshUntil: string;
+  freshness: "fresh" | "stale";
+  source: "direct_probe" | "connector_probe" | "cache";
+  probes: Record<string, "passed" | "failed" | "not_exercised">;
+  features: Record<string, { state: T3CapabilityState; evidence: string }>;
+  attachments: {
+    image: { state: T3CapabilityState; evidence: string };
+    audio: { state: T3CapabilityState; evidence: string };
+    file: { state: T3CapabilityState; evidence: string };
+    maxCount: number;
+    maxImageBytes: number;
+  };
+  runtimeModes: string[];
+  interactionModes: string[];
+  approvalDecisions: string[];
+  recovery: { code: string; action: string } | null;
 }
 
 export type T3CompatibilityStatus =
@@ -171,6 +202,7 @@ export interface T3CompatibilityResult {
   recommendation: string;
   checks: T3CompatibilityCheck[];
   findings: T3CompatibilityFinding[];
+  capabilities?: T3CapabilityManifest | null;
 }
 
 export interface T3ReleaseCompatibility {
@@ -203,11 +235,55 @@ export interface Environment {
   id: string;
   label: string;
   status?: string;
-  baseUrl: string;
+  /** Null for connector-mode environments: the cloud never dials the private T3 host. */
+  baseUrl: string | null;
+  transportMode?: "direct" | "connector";
+  connectorId?: string | null;
   accessTokenExpiresAt?: string | null;
   createdAt?: string;
   updatedAt?: string;
+  /** Set when the credential has been destroyed and all dependent runtime state detached. */
+  archivedAt?: string | null;
+  deletedAt?: string | null;
+  purgeAfter?: string | null;
+  /** Freshness of the cached cloud projection, not a synonym for connector presence. */
+  freshness?: "unknown" | "live" | "stale" | string;
+  lastProjectionAt?: string | null;
+  lastConnectorSeenAt?: string | null;
+  providerCatalogue?: JsonRecord | null;
   health?: EnvironmentHealth;
+}
+
+export type ConnectorStatus =
+  | "enrolled"
+  | "waiting"
+  | "online"
+  | "reconnecting"
+  | "sleeping"
+  | "offline"
+  | "revoked"
+  | "incompatible";
+
+/** Public connector metadata. Standing credentials are deliberately never returned to the console. */
+export interface Connector {
+  id: string;
+  environmentId: string;
+  label: string;
+  secretPrefix?: string;
+  scopes?: string[];
+  status: ConnectorStatus | string;
+  protocolVersion?: number;
+  connectorVersion?: string | null;
+  platform?: string | null;
+  capabilities?: string[];
+  createdAt?: string;
+  updatedAt?: string;
+  lastSeenAt?: string | null;
+  lastConnectedAt?: string | null;
+  revokedAt?: string | null;
+  lastDisconnectReason?: string | null;
+  lastT3Health?: "unknown" | "starting" | "ready" | "stopped" | "auth_failed" | "incompatible" | "error" | string | null;
+  lastT3HealthAt?: string | null;
 }
 
 export type ConnectSessionStatus = "pending" | "redeeming" | "completed" | "failed" | "expired";
@@ -349,6 +425,8 @@ export interface T3ThreadMessage {
 
 export interface T3Thread {
   id: string;
+  /** The title reported by T3, without the project suffix used by compact pickers. */
+  title?: string;
   label: string;
   projectId?: string | null;
   modelSelection?: ModelSelection | null;
@@ -427,6 +505,16 @@ export interface Device {
   claimed?: boolean;
   revokedAt?: string | null;
   lastSeenAt?: string | null;
+  credentialVersion?: number;
+  credentialRotation?: {
+    id?: string | null;
+    state?: "idle" | "pending" | "expired" | "completed" | string;
+    purpose?: "rotate" | "transfer" | null | string;
+    pendingCredentialVersion?: number | null;
+    startedAt?: string | null;
+    expiresAt?: string | null;
+    completedAt?: string | null;
+  };
   presence?: {
     state?: string;
     online?: boolean;
@@ -557,7 +645,14 @@ export interface DeviceFirmwarePolicy {
  * this from the live records every time it hands a media row out.
  */
 export interface MediaOrigin {
-  source: "device" | "console" | string;
+  source:
+    | "controller_capture"
+    | "browser_recording"
+    | "browser_camera"
+    | "companion_recording"
+    | "companion_camera"
+    | "upload"
+    | string;
   deviceId?: string | null;
   deviceLabel?: string | null;
   environmentId?: string | null;
@@ -590,6 +685,20 @@ export interface MediaItem {
     descriptionSource?: string | null;
     lastError?: string | null;
   };
+}
+
+export interface CompanionHandoff {
+  id: string;
+  deviceId?: string | null;
+  environmentId: string;
+  threadId: string;
+  action: "record_audio" | "capture_image";
+  status: "waiting" | "claimed" | "completed" | "expired" | "cancelled";
+  createdAt: string;
+  expiresAt: string;
+  claimedAt?: string | null;
+  completedAt?: string | null;
+  cancelledAt?: string | null;
 }
 
 /**
@@ -666,6 +775,65 @@ export interface AuditEvent {
   createdAt: string;
 }
 
+export type NotificationKind =
+  | "turn.completed"
+  | "turn.failed"
+  | "gateway.approval_required"
+  | "provider.approval_required"
+  | "user_input.required"
+  | "connector.offline"
+  | "connector.recovered"
+  | "t3.offline"
+  | "t3.recovered";
+
+/**
+ * A durable, privacy-minimal attention record. User content and upstream request ids never belong
+ * in this projection; the linked command/thread can be loaded through its separately authorized
+ * route when the operator deliberately opens it.
+ */
+export interface UserNotification {
+  id: string;
+  kind: NotificationKind;
+  severity: "info" | "attention" | "error";
+  title: string;
+  environmentId: string | null;
+  threadId: string | null;
+  commandId: string | null;
+  createdAt: string;
+  updatedAt: string;
+  readAt: string | null;
+  dismissedAt: string | null;
+  cursor: string;
+}
+
+export interface NotificationPage {
+  notifications: UserNotification[];
+  nextCursor: string | null;
+  hasMore: boolean;
+  unreadCount: number;
+}
+
+export type ScheduledWorkerStatus =
+  | "healthy"
+  | "degraded"
+  | "stale"
+  | "not_configured"
+  | "unknown";
+
+/** Scheduler execution evidence only. Connector/T3/provider liveness has separate projections. */
+export interface BackgroundLiveness {
+  scheduledWorker: {
+    status: ScheduledWorkerStatus;
+    lastAttemptAt: string | null;
+    lastSuccessAt: string | null;
+    lastFailureAt: string | null;
+    nextExpectedBy: string | null;
+    failureCode: string | null;
+    expectedIntervalMs: number;
+  };
+  observedAt: string;
+}
+
 export interface DisplayState extends JsonRecord {
   title?: string;
   state?: string;
@@ -735,7 +903,9 @@ export interface OnboardingReadiness {
     environmentReachable: boolean;
     workspaceSelected: boolean;
     providerConfigured: boolean;
-    firstRunDispatched: boolean;
+    firstRunCompleted: boolean;
+    /** @deprecated Compatibility alias; true only after completion, not dispatch acknowledgement. */
+    firstRunDispatched?: boolean;
     deviceReady: boolean;
   };
   ready: boolean;

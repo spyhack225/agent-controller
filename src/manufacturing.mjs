@@ -19,9 +19,10 @@ export function buildFlashConfig({
   enableOtaApply = false,
   requireOtaSignature = false,
   otaManifestVerifyKey = "",
-  // Still defaults to true so bench bring-up against a self-signed gateway keeps working.
-  // Phase 4 of docs/device-setup-flow.md flips this default and gates it in the factory script.
-  allowInsecureTls = true,
+  gatewayTlsRootCaPem = "",
+  gatewayTlsNextRootCaPem = "",
+  // Bench callers may opt out explicitly. Factory/product callers inherit the fail-closed default.
+  allowInsecureTls = false,
 }) {
   return [
     "#pragma once",
@@ -73,6 +74,8 @@ export function buildFlashConfig({
     "#define ENABLE_EINK 1",
     "// JD79661 controller, confirmed on hardware. Not SSD1680; GxEPD2 cannot drive it.",
     "#define EINK_PANEL_JD79661 1",
+    `#define GATEWAY_TLS_ROOT_CA_PEM "${cString(gatewayTlsRootCaPem)}"`,
+    `#define GATEWAY_TLS_NEXT_ROOT_CA_PEM "${cString(gatewayTlsNextRootCaPem)}"`,
     `#define INSECURE_SKIP_TLS_VERIFY ${allowInsecureTls ? 1 : 0}`,
     "",
   ].join("\n");

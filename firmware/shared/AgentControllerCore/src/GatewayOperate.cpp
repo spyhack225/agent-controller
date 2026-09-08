@@ -14,6 +14,9 @@
 #include <HTTPClient.h>
 #include <WiFi.h>
 #include <WiFiClientSecure.h>
+#include <esp_system.h>
+
+#include "GatewayTls.h"
 
 #include "MediaUpload.h"
 
@@ -42,26 +45,33 @@ String encodePathSegment(const String& value) {
 
 bool ok(int code) { return code >= 200 && code < 300; }
 
-// Minimal JSON string escaping for the three fields that go in the upload prefix. Only the file
-// name is caller-controlled and it is generated, not typed, but a raw quote in it would produce a
-// body the gateway rejects with no clue as to why.
-String jsonEscape(const String& value) {
-  String out;
-  out.reserve(value.length() + 8);
-  for (size_t i = 0; i < value.length(); i += 1) {
-    const char c = value[i];
-    switch (c) {
-      case '"':  out += "\\\""; break;
-      case '\\': out += "\\\\"; break;
-      case '\n': out += "\\n"; break;
-      case '\r': out += "\\r"; break;
-      case '\t': out += "\\t"; break;
-      default:
-        if (static_cast<uint8_t>(c) < 0x20) continue;
-        out += c;
-    }
+String requestFingerprint(const String& value) {
+  uint64_t hash = 1469598103934665603ULL;
+  for (size_t index = 0; index < value.length(); index += 1) {
+    hash ^= static_cast<uint8_t>(value[index]);
+    hash *= 1099511628211ULL;
   }
-  return out;
+  char output[17];
+  snprintf(output, sizeof(output), "%08lx%08lx",
+    static_cast<unsigned long>(hash >> 32), static_cast<unsigned long>(hash & 0xffffffffULL));
+  return String(output);
+}
+
+String newDeviceRequestId() {
+  char output[41];
+  snprintf(output, sizeof(output), "dev:%08lx-%08lx-%08lx-%08lx",
+    static_cast<unsigned long>(esp_random()), static_cast<unsigned long>(esp_random()),
+    static_cast<unsigned long>(esp_random()), static_cast<unsigned long>(esp_random()));
+  return String(output);
+}
+
+String beginDurableDeviceRequest(DeviceStore* store, const String& signature) {
+  const String hash = requestFingerprint(signature);
+  String requestId;
+  if (store && store->pendingRequestHash() == hash) requestId = store->pendingRequestId();
+  if (requestId.length() == 0) requestId = newDeviceRequestId();
+  if (store) store->setPendingRequest(requestId, hash);
+  return requestId;
 }
 
 // Turns a gateway status into something the person holding the device can act on. The full
@@ -381,10 +391,6 @@ void GatewayClient::adoptThreadBinding(const String& threadId) {
 
 bool GatewayClient::refreshThreads() {
   StateLock guard(this);
-  threadCount_ = 0;
-  selectedThreadIndex_ = 0;
-  threadsDetail_ = "";
-
   String response;
   const int code = request("GET", "/v1/device/threads", "", response);
   if (!ok(code)) {
@@ -400,17 +406,57 @@ bool GatewayClient::refreshThreads() {
     return false;
   }
 
+  threadsDetail_ = "";
+  JsonArray threads = doc["threads"].as<JsonArray>();
+
+  // An accepted mutation can lead its snapshot projection by a poll or two. Settle only when the
+  // raw list agrees; until then, the event's rename/removal remains authoritative on this device.
+  size_t pendingWrite = 0;
+  const uint32_t now = millis();
+  for (size_t i = 0; i < pendingThreadMutationCount_; i += 1) {
+    PendingDeviceThreadMutation& pending = pendingThreadMutations_[i];
+    bool rawFound = false;
+    bool rawAgrees = false;
+    for (JsonObject input : threads) {
+      const String id = String(input["id"] | "");
+      if (id != pending.threadId) continue;
+      rawFound = true;
+      if (!pending.remove) {
+        const String rawTitle = String(input["title"] | "Untitled thread");
+        rawAgrees = rawTitle == pending.title;
+      }
+      break;
+    }
+    const bool settled = pending.remove ? !rawFound : rawAgrees;
+    const bool expired = (int32_t)(now - pending.expiresAt) >= 0;
+    if (settled || expired) continue;
+    if (pendingWrite != i) pendingThreadMutations_[pendingWrite] = pending;
+    pendingWrite += 1;
+  }
+  pendingThreadMutationCount_ = pendingWrite;
+
   // The device never invents a current thread: the gateway names it, and the per-row `selected`
   // flag duplicates it for simple renderers.
   const String current = String(doc["threadId"] | context_.threadId.c_str());
-  JsonArray threads = doc["threads"].as<JsonArray>();
+  threadCount_ = 0;
+  selectedThreadIndex_ = -1;
   for (JsonObject input : threads) {
     if (threadCount_ >= kMaxThreadOptions) break;
     const String id = String(input["id"] | "");
     if (id.length() == 0) continue;
+    const PendingDeviceThreadMutation* pending = nullptr;
+    for (size_t i = 0; i < pendingThreadMutationCount_; i += 1) {
+      if (pendingThreadMutations_[i].threadId == id) {
+        pending = &pendingThreadMutations_[i];
+        break;
+      }
+    }
+    if (pending && pending->remove) continue;
     ThreadOption& row = threads_[threadCount_];
     row.id = id;
-    row.title = String(input["title"] | "Untitled thread");
+    row.title = pending && pending->title.length() > 0
+      ? pending->title
+      : String(input["title"] | "Untitled thread");
     row.status = String(input["status"] | "");
     row.status.toUpperCase();
     row.selected = (input["selected"] | false) || id == current;
@@ -531,6 +577,11 @@ DispatchResult GatewayClient::postIntent(const String& intentJson, const String&
   if (context_.environmentId.length() > 0) doc["environmentId"] = context_.environmentId;
   if (context_.threadId.length() > 0) doc["threadId"] = context_.threadId;
 
+  const String clientRequestId = beginDurableDeviceRequest(
+    store_, context_.environmentId + "\n" + context_.threadId + "\n" + intentJson
+  );
+  doc["clientRequestId"] = clientRequestId;
+
   JsonDocument intent;
   if (deserializeJson(intent, intentJson)) {
     DispatchResult bad;
@@ -543,6 +594,9 @@ DispatchResult GatewayClient::postIntent(const String& intentJson, const String&
   serializeJson(doc, body);
   String response;
   const int code = request("POST", "/v1/device/intents", body, response);
+  // A positive HTTP status proves the gateway answered. If the socket outcome is uncertain, keep
+  // the id/fingerprint in NVS so a reboot or second tap replays the same durable receipt.
+  if (code > 0 && store_) store_->clearPendingRequest();
   return readDispatch(code, response, label);
 }
 
@@ -609,12 +663,18 @@ DispatchResult GatewayClient::runAction(const String& actionId, const String& me
   }
   JsonDocument doc;
   if (mediaUploadId.length() > 0) doc["mediaUploadId"] = mediaUploadId;
+  const String clientRequestId = beginDurableDeviceRequest(
+    store_, String("action\n") + actionId + "\n" + context_.environmentId + "\n"
+      + context_.threadId + "\n" + mediaUploadId
+  );
+  doc["clientRequestId"] = clientRequestId;
   String body;
   serializeJson(doc, body);
 
   const String path = String("/v1/device/actions/") + encodePathSegment(actionId) + "/run";
   String response;
   const int code = request("POST", path.c_str(), body, response);
+  if (code > 0 && store_) store_->clearPendingRequest();
   return readDispatch(code, response, actionId);
 }
 
@@ -690,8 +750,16 @@ DispatchResult GatewayClient::runMacro(const String& macroId) {
     return bad;
   }
   const String path = String("/v1/device/macros/") + encodePathSegment(macroId) + "/run";
+  const String clientRequestId = beginDurableDeviceRequest(
+    store_, String("macro\n") + macroId + "\n" + context_.environmentId + "\n" + context_.threadId
+  );
+  JsonDocument doc;
+  doc["clientRequestId"] = clientRequestId;
+  String body;
+  serializeJson(doc, body);
   String response;
-  const int code = request("POST", path.c_str(), "{}", response);
+  const int code = request("POST", path.c_str(), body, response);
+  if (code > 0 && store_) store_->clearPendingRequest();
   return readDispatch(code, response, macroId);
 }
 
@@ -859,84 +927,19 @@ DispatchResult GatewayClient::answerApproval(const String& commandId, bool appro
 // Media upload
 // ---------------------------------------------------------------------------------------------
 
-// Does not go through request(): that helper reads the whole response into a String and posts a
-// String body, and this route's body is a stream measured in megabytes. The pieces that matter —
-// the local backoff gate, the device credentials, the retry-after handling — are repeated here
-// rather than skipped, because skipping any of them is how one 429 becomes a storm.
+// Metadata and finalize are compact JSON requests. The bytes themselves use the session's private,
+// authenticated raw PUT route so media never enters JSON or the WebSocket control channel.
 String GatewayClient::uploadMedia(const char* kind, const char* contentType,
                                   const char* originalName, const uint8_t* headerBytes,
                                   size_t headerLength, const uint8_t* bodyBytes, size_t bodyLength,
                                   int& httpStatusOut) {
   httpStatusOut = -1;
   if (!store_) return String();
-
-  const size_t rawBytes = (headerBytes ? headerLength : 0) + (bodyBytes ? bodyLength : 0);
-  if (rawBytes == 0) return String();
-
-  // The gateway measures the DECODED size against its own ceiling, so this is the same number it
-  // will check. Refusing here turns a wasted upload of 1.33x the clip into an instant local error.
-  if (limits_.mediaUploadBytes > 0 && rawBytes > (size_t)limits_.mediaUploadBytes) {
-    httpStatusOut = 413;
-    return String();
-  }
-
-  if (backoffUntil_ != 0 && (int32_t)(millis() - backoffUntil_) < 0) {
-    httpStatusOut = 429;
-    return String();
-  }
-
-  String base = store_->gatewayUrl();
-  if (base.length() == 0) return String();
-  const String url = base + "/v1/device/media";
-
-  String prefix = "{\"kind\":\"";
-  prefix += jsonEscape(kind);
-  prefix += "\",\"contentType\":\"";
-  prefix += jsonEscape(contentType);
-  prefix += "\",\"originalName\":\"";
-  prefix += jsonEscape(originalName);
-  prefix += "\",\"dataBase64\":\"";
-  media::Base64JsonBodyStream stream(prefix, "\"}", headerBytes, headerLength, bodyBytes,
-                                     bodyLength);
-  const size_t contentLength = stream.contentLength();
-
-  // Declaration order is load-bearing; see the note in GatewayClient::request().
-  WiFiClientSecure secure;
-  WiFiClient plain;
-  HTTPClient http;
-
-  bool began = false;
-  if (url.startsWith("https://")) {
-    secure.setInsecure();
-    began = http.begin(secure, url);
-  } else {
-    began = http.begin(plain, url);
-  }
-  if (!began) return String();
-
-  http.addHeader("content-type", "application/json");
-  http.addHeader("x-device-id", store_->deviceId());
-  http.addHeader("x-device-secret", store_->deviceSecret());
-  const char* kCollected[] = {"retry-after"};
-  http.collectHeaders(kCollected, 1);
-  // A base64 upload over a domestic uplink outlasts the 5 s every other call gets.
-  http.setTimeout(30000);
-
-  const int code = http.sendRequest("POST", &stream, contentLength);
-  httpStatusOut = code;
-  const String response = code > 0 ? http.getString() : String();
-  if (code == 401) revoked_ = true;
-  if (code == 429) {
-    const int retryAfter = http.header("retry-after").toInt();
-    backoffUntil_ = millis() + (uint32_t)max(1, retryAfter) * 1000UL;
-  }
-  http.end();
-
-  Serial.printf("[gateway] media upload kind=%s raw=%u encoded=%u code=%d\n", kind,
-                (unsigned)rawBytes, (unsigned)contentLength, code);
-  if (!ok(code)) return String();
-
-  JsonDocument doc;
-  if (deserializeJson(doc, response)) return String();
-  return String(doc["media"]["id"] | "");
+  const media::UploadSessionResult result = media::uploadSession(
+    *store_, "operate", kind, contentType, originalName, headerBytes, headerLength, bodyBytes,
+    bodyLength, limits_.mediaUploadBytes, &backoffUntil_
+  );
+  httpStatusOut = result.httpStatus;
+  if (result.httpStatus == 401) revoked_ = true;
+  return result.mediaId;
 }

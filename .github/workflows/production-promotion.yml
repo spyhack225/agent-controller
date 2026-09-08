@@ -1,0 +1,377 @@
+name: Production promotion
+
+on:
+  workflow_dispatch:
+    inputs:
+      target_commit_sha:
+        description: Exact staging-qualified 40-character commit SHA to promote.
+        required: true
+        type: string
+      current_production_commit_sha:
+        description: Exact source commit currently active on both production Workers.
+        required: true
+        type: string
+      current_edge_version:
+        description: Exact active 100% production edge Worker version ID.
+        required: true
+        type: string
+      current_control_plane_version:
+        description: Exact active 100% production control-plane Worker version ID.
+        required: true
+        type: string
+      evidence_run_id:
+        description: Completed same-repository workflow run containing the reviewed staging promotion evidence artifact.
+        required: true
+        type: string
+      evidence_artifact_name:
+        description: Exact artifact name containing promotion-manifest.json and its four evidence files.
+        required: true
+        type: string
+      evidence_manifest_sha256:
+        description: Exact lowercase SHA-256 of promotion-manifest.json reviewed out of band.
+        required: true
+        type: string
+      confirmation:
+        description: Enter promote:production:TARGET_SHA:MANIFEST_SHA256 exactly.
+        required: true
+        type: string
+
+permissions:
+  contents: read
+  actions: read
+
+concurrency:
+  group: agent-controller-production-promotion
+  cancel-in-progress: false
+
+jobs:
+  verify-evidence:
+    name: Verify immutable staging candidate
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - name: Check out protected automation source
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          ref: ${{ github.sha }}
+          path: automation
+          persist-credentials: false
+      - name: Check out exact promoted source
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          ref: ${{ inputs.target_commit_sha }}
+          fetch-depth: 0
+          path: release
+          persist-credentials: false
+      - name: Download reviewed staging evidence
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: ${{ inputs.evidence_artifact_name }}
+          run-id: ${{ inputs.evidence_run_id }}
+          github-token: ${{ github.token }}
+          path: evidence
+      - name: Set up Node.js
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: "22.21.1"
+          cache: npm
+          cache-dependency-path: release/package-lock.json
+      - name: Install locked verification dependencies
+        working-directory: release
+        run: npm ci --no-audit --no-fund
+      - name: Capture checked-out commit without credentials
+        working-directory: release
+        run: echo "PRODUCTION_PROMOTION_CHECKED_OUT_COMMIT=$(git rev-parse HEAD)" >> "$GITHUB_ENV"
+      - name: Validate ancestry, rollback compatibility, topology, evidence hashes, and confirmation
+        working-directory: release
+        env:
+          CI: "true"
+          NO_COLOR: "1"
+          PRODUCTION_PROMOTION_TARGET_COMMIT: ${{ inputs.target_commit_sha }}
+          PRODUCTION_PROMOTION_CURRENT_COMMIT: ${{ inputs.current_production_commit_sha }}
+          PRODUCTION_PROMOTION_CURRENT_EDGE_VERSION: ${{ inputs.current_edge_version }}
+          PRODUCTION_PROMOTION_CURRENT_CONTROL_PLANE_VERSION: ${{ inputs.current_control_plane_version }}
+          PRODUCTION_PROMOTION_MANIFEST_SHA256: ${{ inputs.evidence_manifest_sha256 }}
+          PRODUCTION_PROMOTION_CONFIRMATION: ${{ inputs.confirmation }}
+          PRODUCTION_PROMOTION_CHECKED_OUT_COMMIT: ${{ env.PRODUCTION_PROMOTION_CHECKED_OUT_COMMIT }}
+          PRODUCTION_PROMOTION_AUTOMATION_COMMIT: ${{ github.sha }}
+          PRODUCTION_PROMOTION_DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+          PRODUCTION_PROMOTION_DISPATCH_REF: ${{ github.ref_name }}
+          PRODUCTION_PROMOTION_REPOSITORY_ROOT: ${{ github.workspace }}/release
+          PRODUCTION_PROMOTION_EVIDENCE_ROOT: ${{ github.workspace }}/evidence
+          AGENT_CONTROLLER_STAGING_URL: ${{ vars.AGENT_CONTROLLER_STAGING_URL }}
+          AGENT_CONTROLLER_PRODUCTION_URL: ${{ vars.AGENT_CONTROLLER_PRODUCTION_URL }}
+          AGENT_CONTROLLER_PRODUCTION_MEDIA_BUCKET: ${{ vars.AGENT_CONTROLLER_PRODUCTION_MEDIA_BUCKET }}
+          AGENT_CONTROLLER_PRODUCTION_FIRMWARE_BUCKET: ${{ vars.AGENT_CONTROLLER_PRODUCTION_FIRMWARE_BUCKET }}
+        run: node ../automation/scripts/promote-production.mjs validate-local
+      - name: Run repository secret gate
+        working-directory: release
+        run: npm run security:repo
+      - name: Validate maintained documentation links
+        working-directory: release
+        run: npm run check:docs
+      - name: Test production promotion policy
+        working-directory: automation
+        run: npm run test:production-promotion
+
+  production-preflight:
+    name: Protected production read-only preflight
+    needs: verify-evidence
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    environment:
+      name: production
+      url: ${{ vars.AGENT_CONTROLLER_PRODUCTION_URL }}
+    steps:
+      - name: Check out protected automation source
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          ref: ${{ github.sha }}
+          path: automation
+          persist-credentials: false
+      - name: Check out exact promoted source
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          ref: ${{ inputs.target_commit_sha }}
+          fetch-depth: 0
+          path: release
+          persist-credentials: false
+      - name: Download reviewed staging evidence
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: ${{ inputs.evidence_artifact_name }}
+          run-id: ${{ inputs.evidence_run_id }}
+          github-token: ${{ github.token }}
+          path: evidence
+      - name: Set up Node.js
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: "22.21.1"
+      - name: Install locked provider CLIs
+        working-directory: release
+        run: |
+          npm ci --no-audit --no-fund
+          npm ci --prefix cloudflare --no-audit --no-fund
+          npm ci --prefix cloudflare-control-plane --no-audit --no-fund
+      - name: Capture checked-out commit
+        working-directory: release
+        run: echo "PRODUCTION_PROMOTION_CHECKED_OUT_COMMIT=$(git rev-parse HEAD)" >> "$GITHUB_ENV"
+      - name: Verify production versions, named resources, secrets, bindings, and dry-runs
+        working-directory: release
+        env: &promotion-protected-environment
+          CI: "true"
+          NO_COLOR: "1"
+          PRODUCTION_PROMOTION_TARGET_COMMIT: ${{ inputs.target_commit_sha }}
+          PRODUCTION_PROMOTION_CURRENT_COMMIT: ${{ inputs.current_production_commit_sha }}
+          PRODUCTION_PROMOTION_CURRENT_EDGE_VERSION: ${{ inputs.current_edge_version }}
+          PRODUCTION_PROMOTION_CURRENT_CONTROL_PLANE_VERSION: ${{ inputs.current_control_plane_version }}
+          PRODUCTION_PROMOTION_MANIFEST_SHA256: ${{ inputs.evidence_manifest_sha256 }}
+          PRODUCTION_PROMOTION_CONFIRMATION: ${{ inputs.confirmation }}
+          PRODUCTION_PROMOTION_CHECKED_OUT_COMMIT: ${{ env.PRODUCTION_PROMOTION_CHECKED_OUT_COMMIT }}
+          PRODUCTION_PROMOTION_AUTOMATION_COMMIT: ${{ github.sha }}
+          PRODUCTION_PROMOTION_DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+          PRODUCTION_PROMOTION_DISPATCH_REF: ${{ github.ref_name }}
+          PRODUCTION_PROMOTION_REPOSITORY_ROOT: ${{ github.workspace }}/release
+          PRODUCTION_PROMOTION_EVIDENCE_ROOT: ${{ github.workspace }}/evidence
+          PRODUCTION_PROMOTION_OUTPUT_PATH: ${{ github.workspace }}/release/production-promotion-evidence.json
+          AGENT_CONTROLLER_STAGING_URL: ${{ vars.AGENT_CONTROLLER_STAGING_URL }}
+          AGENT_CONTROLLER_PRODUCTION_URL: ${{ vars.AGENT_CONTROLLER_PRODUCTION_URL }}
+          AGENT_CONTROLLER_PRODUCTION_MEDIA_BUCKET: ${{ vars.AGENT_CONTROLLER_PRODUCTION_MEDIA_BUCKET }}
+          AGENT_CONTROLLER_PRODUCTION_FIRMWARE_BUCKET: ${{ vars.AGENT_CONTROLLER_PRODUCTION_FIRMWARE_BUCKET }}
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_PRODUCTION_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_PRODUCTION_ACCOUNT_ID }}
+          CONVEX_DEPLOY_KEY: ${{ secrets.CONVEX_PRODUCTION_DEPLOY_KEY }}
+        run: node ../automation/scripts/promote-production.mjs preflight
+
+  promote-private-plane:
+    name: Protected Convex and private-plane promotion
+    needs: production-preflight
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    environment:
+      name: production
+      url: ${{ vars.AGENT_CONTROLLER_PRODUCTION_URL }}
+    steps:
+      - name: Check out protected automation source
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          ref: ${{ github.sha }}
+          path: automation
+          persist-credentials: false
+      - name: Check out exact promoted source
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          ref: ${{ inputs.target_commit_sha }}
+          fetch-depth: 0
+          path: release
+          persist-credentials: false
+      - name: Download reviewed staging evidence
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: ${{ inputs.evidence_artifact_name }}
+          run-id: ${{ inputs.evidence_run_id }}
+          github-token: ${{ github.token }}
+          path: evidence
+      - name: Set up Node.js
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: "22.21.1"
+      - name: Install locked provider CLIs and build pinned console
+        working-directory: release
+        run: |
+          npm ci --no-audit --no-fund
+          npm ci --prefix cloudflare --no-audit --no-fund
+          npm ci --prefix cloudflare-control-plane --no-audit --no-fund
+          npm run build:app
+      - name: Capture checked-out commit
+        working-directory: release
+        run: echo "PRODUCTION_PROMOTION_CHECKED_OUT_COMMIT=$(git rev-parse HEAD)" >> "$GITHUB_ENV"
+      - name: Recheck current production immediately before mutation
+        working-directory: release
+        env: *promotion-protected-environment
+        run: node ../automation/scripts/promote-production.mjs preflight
+      - name: Promote Convex then the private Worker and Container
+        working-directory: release
+        env: *promotion-protected-environment
+        run: node ../automation/scripts/promote-production.mjs execute-private
+      - name: Upload redacted private-plane evidence
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: production-promotion-private-${{ inputs.target_commit_sha }}
+          path: release/production-promotion-evidence.json
+          if-no-files-found: error
+          retention-days: 90
+
+  promote-edge:
+    name: Protected edge checkpoint and promotion
+    needs: promote-private-plane
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    environment:
+      name: production
+      url: ${{ vars.AGENT_CONTROLLER_PRODUCTION_URL }}
+    steps:
+      - name: Check out protected automation source
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          ref: ${{ github.sha }}
+          path: automation
+          persist-credentials: false
+      - name: Check out exact promoted source
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          ref: ${{ inputs.target_commit_sha }}
+          fetch-depth: 0
+          path: release
+          persist-credentials: false
+      - name: Download reviewed staging evidence
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: ${{ inputs.evidence_artifact_name }}
+          run-id: ${{ inputs.evidence_run_id }}
+          github-token: ${{ github.token }}
+          path: evidence
+      - name: Set up Node.js and install locked CLIs
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: "22.21.1"
+      - name: Install and build exact candidate
+        working-directory: release
+        run: |
+          npm ci --no-audit --no-fund
+          npm ci --prefix cloudflare --no-audit --no-fund
+          npm ci --prefix cloudflare-control-plane --no-audit --no-fund
+          npm run build:app
+      - name: Capture checked-out commit
+        working-directory: release
+        run: echo "PRODUCTION_PROMOTION_CHECKED_OUT_COMMIT=$(git rev-parse HEAD)" >> "$GITHUB_ENV"
+      - name: Operator checkpoint verifies private plane moved and edge did not
+        working-directory: release
+        env: &promotion-cloudflare-environment
+          CI: "true"
+          NO_COLOR: "1"
+          PRODUCTION_PROMOTION_TARGET_COMMIT: ${{ inputs.target_commit_sha }}
+          PRODUCTION_PROMOTION_CURRENT_COMMIT: ${{ inputs.current_production_commit_sha }}
+          PRODUCTION_PROMOTION_CURRENT_EDGE_VERSION: ${{ inputs.current_edge_version }}
+          PRODUCTION_PROMOTION_CURRENT_CONTROL_PLANE_VERSION: ${{ inputs.current_control_plane_version }}
+          PRODUCTION_PROMOTION_MANIFEST_SHA256: ${{ inputs.evidence_manifest_sha256 }}
+          PRODUCTION_PROMOTION_CONFIRMATION: ${{ inputs.confirmation }}
+          PRODUCTION_PROMOTION_CHECKED_OUT_COMMIT: ${{ env.PRODUCTION_PROMOTION_CHECKED_OUT_COMMIT }}
+          PRODUCTION_PROMOTION_AUTOMATION_COMMIT: ${{ github.sha }}
+          PRODUCTION_PROMOTION_DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+          PRODUCTION_PROMOTION_DISPATCH_REF: ${{ github.ref_name }}
+          PRODUCTION_PROMOTION_REPOSITORY_ROOT: ${{ github.workspace }}/release
+          PRODUCTION_PROMOTION_EVIDENCE_ROOT: ${{ github.workspace }}/evidence
+          PRODUCTION_PROMOTION_OUTPUT_PATH: ${{ github.workspace }}/release/production-promotion-evidence.json
+          AGENT_CONTROLLER_STAGING_URL: ${{ vars.AGENT_CONTROLLER_STAGING_URL }}
+          AGENT_CONTROLLER_PRODUCTION_URL: ${{ vars.AGENT_CONTROLLER_PRODUCTION_URL }}
+          AGENT_CONTROLLER_PRODUCTION_MEDIA_BUCKET: ${{ vars.AGENT_CONTROLLER_PRODUCTION_MEDIA_BUCKET }}
+          AGENT_CONTROLLER_PRODUCTION_FIRMWARE_BUCKET: ${{ vars.AGENT_CONTROLLER_PRODUCTION_FIRMWARE_BUCKET }}
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_PRODUCTION_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_PRODUCTION_ACCOUNT_ID }}
+        run: node ../automation/scripts/promote-production.mjs preflight-edge
+      - name: Promote public edge and Static Assets
+        working-directory: release
+        env: *promotion-cloudflare-environment
+        run: node ../automation/scripts/promote-production.mjs execute-edge
+      - name: Upload redacted edge evidence
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: production-promotion-edge-${{ inputs.target_commit_sha }}
+          path: release/production-promotion-evidence.json
+          if-no-files-found: error
+          retention-days: 90
+
+  production-postflight:
+    name: Protected production postflight checkpoint
+    needs: promote-edge
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    environment:
+      name: production
+      url: ${{ vars.AGENT_CONTROLLER_PRODUCTION_URL }}
+    steps:
+      - name: Check out protected automation source
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          ref: ${{ github.sha }}
+          path: automation
+          persist-credentials: false
+      - name: Check out exact promoted source
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          ref: ${{ inputs.target_commit_sha }}
+          fetch-depth: 0
+          path: release
+          persist-credentials: false
+      - name: Download reviewed staging evidence
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: ${{ inputs.evidence_artifact_name }}
+          run-id: ${{ inputs.evidence_run_id }}
+          github-token: ${{ github.token }}
+          path: evidence
+      - name: Set up Node.js and install locked CLIs
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: "22.21.1"
+      - name: Install production status CLI
+        working-directory: release
+        run: npm ci --prefix cloudflare --no-audit --no-fund && npm ci --prefix cloudflare-control-plane --no-audit --no-fund
+      - name: Capture checked-out commit
+        working-directory: release
+        run: echo "PRODUCTION_PROMOTION_CHECKED_OUT_COMMIT=$(git rev-parse HEAD)" >> "$GITHUB_ENV"
+      - name: Verify both commits and credential-free production boundary
+        working-directory: release
+        env: *promotion-cloudflare-environment
+        run: node ../automation/scripts/promote-production.mjs postflight
+      - name: Upload redacted final evidence
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: production-promotion-final-${{ inputs.target_commit_sha }}
+          path: release/production-promotion-evidence.json
+          if-no-files-found: error
+          retention-days: 90

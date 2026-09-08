@@ -35,9 +35,20 @@ const defaultFirmwarePolicy = {
   targetVersion: null,
 };
 const deviceOnlineThresholdMs = 90_000;
+const DEVICE_CREDENTIAL_ROTATION_TTL_MS = 10 * 60 * 1000;
 // Mirrors ENVIRONMENT_REMOVED_REASON in src/actions.mjs. Convex functions cannot import from src/,
 // so the literal is duplicated here; change both together.
 const ENVIRONMENT_REMOVED_REASON = "environment_removed";
+// Mirrors src/requestEnvelope.mjs. Convex functions cannot import Node-domain modules.
+const COMMAND_REQUEST_TTL_MS = 24 * 60 * 60 * 1000;
+const COMMAND_REQUEST_MAX_PER_OWNER = 1000;
+const NOTIFICATION_MAX_PER_OWNER = 1000;
+const NOTIFICATION_RETENTION_MS = 30 * 24 * 60 * 60 * 1000;
+const notificationKinds = new Set([
+  "turn.completed", "turn.failed", "gateway.approval_required", "provider.approval_required",
+  "user_input.required", "connector.offline", "connector.recovered", "t3.offline", "t3.recovered",
+]);
+const notificationSeverities = new Set(["info", "attention", "error"]);
 
 const defaultEnvironmentHealth = {
   lastCheckedAt: null,
@@ -45,7 +56,8 @@ const defaultEnvironmentHealth = {
   lastError: null,
   failureReason: null,
   snapshot: null,
-  compatibility: null,
+    compatibility: null,
+    capabilities: null,
 };
 
 // Mirrors ENVIRONMENT_FAILURE_REASONS in src/environmentFailure.mjs.
@@ -307,6 +319,7 @@ export const createDevice = gatewayMutation({
       label: args.label,
       profile: args.profile ?? "agent-controller",
       secretHash: args.secretHash,
+      credentialVersion: 1,
       claimedAt: nowIso(),
       status: defaultStatus,
       config: defaultConfig,
@@ -343,6 +356,7 @@ export const preprovisionDevice = gatewayMutation({
       // the console uses it to name which firmware image belongs on this board.
       hardwareModel: args.hardwareModel ?? null,
       secretHash: args.secretHash,
+      credentialVersion: 1,
       claimCodeHash: args.claimCodeHash,
       claimCodeExpiresAt: args.claimCodeExpiresAt,
       status: defaultStatus,
@@ -376,6 +390,7 @@ export const claimDevice = gatewayMutation({
       .withIndex("byClaimCodeHash", (q) => q.eq("claimCodeHash", args.claimCodeHash))
       .first();
     if (!device || device.revokedAt || device.claimedAt || !device.claimCodeHash) return null;
+    if (device.rotationPurpose === "transfer" && !device.rotationCompletedAt) return null;
     // Matched but expired is refused here rather than treated as "no such code", so the caller can
     // report the difference. A code with no recorded expiry predates expiry tracking and stays live.
     if (device.claimCodeExpiresAt && Date.parse(device.claimCodeExpiresAt) <= Date.now()) return null;
@@ -407,7 +422,17 @@ export const revokeDevice = gatewayMutation({
   handler: async (ctx, args) => {
     const device = await getDeviceForOwner(ctx, args.userId, args.deviceId);
     if (!device) return null;
-    await ctx.db.patch(device._id, { revokedAt: nowIso(), updatedAt: nowIso() });
+    await ctx.db.patch(device._id, {
+      revokedAt: nowIso(),
+      pendingSecretHash: null,
+      pendingCredentialVersion: null,
+      rotationId: null,
+      rotationPurpose: null,
+      rotationStartedAt: null,
+      rotationExpiresAt: null,
+      rotationCompletedAt: null,
+      updatedAt: nowIso(),
+    });
     const revoked = await ctx.db.get(device._id);
     await audit(ctx, {
       userExternalId: args.userId,
@@ -456,21 +481,42 @@ export const rotateDeviceSecret = gatewayMutation({
   args: {
     userId: v.string(),
     deviceId: v.id("devices"),
-    secretHash: v.string(),
+    restart: v.optional(v.boolean()),
   },
   handler: async (ctx, args) => {
     const device = await getDeviceForOwner(ctx, args.userId, args.deviceId);
     if (!device || device.revokedAt) return null;
-    await ctx.db.patch(device._id, { secretHash: args.secretHash, updatedAt: nowIso() });
+    const existing = publicDeviceCredentialRotation(device);
+    if (!args.restart && existing.state === "pending" && existing.purpose === "rotate") {
+      return { device: publicDevice(device), rotation: existing, created: false };
+    }
+    const startedAt = nowIso();
+    const pendingCredentialVersion = (device.credentialVersion ?? 1) + 1;
+    await ctx.db.patch(device._id, {
+      pendingSecretHash: null,
+      pendingCredentialVersion,
+      rotationId: `dcr_${crypto.randomUUID()}`,
+      rotationPurpose: "rotate",
+      rotationStartedAt: startedAt,
+      rotationExpiresAt: new Date(Date.parse(startedAt) + DEVICE_CREDENTIAL_ROTATION_TTL_MS).toISOString(),
+      rotationCompletedAt: null,
+      updatedAt: startedAt,
+    });
     const rotated = await ctx.db.get(device._id);
     await audit(ctx, {
       userExternalId: args.userId,
       actorType: "user",
-      action: "device.secret_rotated",
+      action: "device.secret_rotation_started",
       targetId: device._id,
-      metadata: { label: device.label },
+      metadata: {
+        label: device.label,
+        purpose: "rotate",
+        credentialVersion: device.credentialVersion ?? 1,
+        pendingCredentialVersion,
+        expiresAt: rotated?.rotationExpiresAt,
+      },
     });
-    return publicDevice(rotated);
+    return { device: publicDevice(rotated), rotation: publicDeviceCredentialRotation(rotated), created: true };
   },
 });
 
@@ -505,25 +551,30 @@ export const resetDeviceForTransfer = gatewayMutation({
     userId: v.string(),
     deviceId: v.id("devices"),
     label: v.optional(v.string()),
-    secretHash: v.string(),
-    claimCodeHash: v.string(),
-    claimCodeExpiresAt: v.optional(v.string()),
   },
   handler: async (ctx, args) => {
     const device = await getDeviceForOwner(ctx, args.userId, args.deviceId);
     if (!device || device.revokedAt) return null;
+    const startedAt = nowIso();
+    const pendingCredentialVersion = (device.credentialVersion ?? 1) + 1;
     await ctx.db.patch(device._id, {
       userExternalId: undefined,
       ...(args.label ? { label: args.label } : {}),
-      secretHash: args.secretHash,
-      claimCodeHash: args.claimCodeHash,
-      claimCodeExpiresAt: args.claimCodeExpiresAt,
+      claimCodeHash: undefined,
+      claimCodeExpiresAt: undefined,
       claimedAt: undefined,
       lastSeenAt: undefined,
       status: defaultStatus,
       config: defaultConfig,
       firmwarePolicy: defaultFirmwarePolicy,
-      updatedAt: nowIso(),
+      pendingSecretHash: null,
+      pendingCredentialVersion,
+      rotationId: `dcr_${crypto.randomUUID()}`,
+      rotationPurpose: "transfer",
+      rotationStartedAt: startedAt,
+      rotationExpiresAt: new Date(Date.parse(startedAt) + DEVICE_CREDENTIAL_ROTATION_TTL_MS).toISOString(),
+      rotationCompletedAt: null,
+      updatedAt: startedAt,
     });
     const reset = await ctx.db.get(device._id);
     const controls = await ctx.db
@@ -540,16 +591,120 @@ export const resetDeviceForTransfer = gatewayMutation({
         previousLabel: device.label,
         label: reset?.label,
         profile: device.profile,
+        credentialVersion: device.credentialVersion ?? 1,
+        pendingCredentialVersion,
+        expiresAt: reset?.rotationExpiresAt,
       },
     });
-    await audit(ctx, {
-      userExternalId: "system",
-      actorType: "system",
-      action: "device.claim_code_rotated",
-      targetId: device._id,
-      metadata: { label: reset?.label, profile: device.profile },
+    return { device: publicDevice(reset), rotation: publicDeviceCredentialRotation(reset) };
+  },
+});
+
+export const stageDeviceSecret = gatewayMutation({
+  args: {
+    deviceId: v.id("devices"),
+    secretHash: v.string(),
+    rotationId: v.string(),
+    credentialVersion: v.number(),
+    authenticatedCredentialVersion: v.number(),
+  },
+  handler: async (ctx, args) => {
+    const device = await ctx.db.get(args.deviceId);
+    if (!device || device.revokedAt) return { device: null, rotation: null, reason: "revoked" };
+    const activeVersion = device.credentialVersion ?? 1;
+    if (args.authenticatedCredentialVersion !== activeVersion) {
+      return { device: publicDevice(device), rotation: publicDeviceCredentialRotation(device), reason: "active_credential_required" };
+    }
+    if (!device.rotationId || args.rotationId !== device.rotationId
+        || args.credentialVersion !== device.pendingCredentialVersion) {
+      return { device: publicDevice(device), rotation: publicDeviceCredentialRotation(device), reason: "rotation_mismatch" };
+    }
+    const expired = Date.parse(device.rotationExpiresAt ?? "") <= Date.now();
+    if (expired && device.rotationPurpose !== "transfer") {
+      return { device: publicDevice(device), rotation: publicDeviceCredentialRotation(device), reason: "expired" };
+    }
+    const patch: any = { updatedAt: nowIso() };
+    if (expired) {
+      patch.pendingSecretHash = null;
+      patch.rotationStartedAt = patch.updatedAt;
+      patch.rotationExpiresAt = new Date(Date.parse(patch.updatedAt) + DEVICE_CREDENTIAL_ROTATION_TTL_MS).toISOString();
+    }
+    const currentHash = expired ? null : device.pendingSecretHash;
+    if (currentHash && currentHash !== args.secretHash) {
+      return { device: publicDevice(device), rotation: publicDeviceCredentialRotation(device), reason: "candidate_conflict" };
+    }
+    if (!currentHash) {
+      patch.pendingSecretHash = args.secretHash;
+      await ctx.db.patch(device._id, patch);
+      const staged = await ctx.db.get(device._id);
+      await audit(ctx, {
+        userExternalId: device.userExternalId ?? "system",
+        actorType: "device",
+        actorId: device._id,
+        action: "device.secret_rotation_staged",
+        targetId: device._id,
+        metadata: {
+          purpose: device.rotationPurpose,
+          credentialVersion: activeVersion,
+          pendingCredentialVersion: device.pendingCredentialVersion,
+          expiresAt: staged?.rotationExpiresAt,
+        },
+      });
+      return { device: publicDevice(staged), rotation: publicDeviceCredentialRotation(staged), reason: null };
+    }
+    return { device: publicDevice(device), rotation: publicDeviceCredentialRotation(device), reason: null };
+  },
+});
+
+export const acknowledgeDeviceSecret = gatewayMutation({
+  args: {
+    deviceId: v.id("devices"),
+    rotationId: v.string(),
+    credentialVersion: v.number(),
+    authenticatedCredentialVersion: v.number(),
+  },
+  handler: async (ctx, args) => {
+    const device = await ctx.db.get(args.deviceId);
+    if (!device || device.revokedAt) return { device: null, rotation: null, reason: "revoked" };
+    const activeVersion = device.credentialVersion ?? 1;
+    if (args.authenticatedCredentialVersion === activeVersion
+        && args.credentialVersion === activeVersion
+        && args.rotationId === device.rotationId
+        && device.rotationCompletedAt) {
+      return { device: publicDevice(device), rotation: publicDeviceCredentialRotation(device), promoted: true, replayed: true, reason: null };
+    }
+    if (args.authenticatedCredentialVersion !== device.pendingCredentialVersion
+        || args.credentialVersion !== device.pendingCredentialVersion
+        || args.rotationId !== device.rotationId
+        || !device.pendingSecretHash) {
+      return { device: publicDevice(device), rotation: publicDeviceCredentialRotation(device), reason: "pending_credential_required" };
+    }
+    if (Date.parse(device.rotationExpiresAt ?? "") <= Date.now()) {
+      return { device: publicDevice(device), rotation: publicDeviceCredentialRotation(device), reason: "expired" };
+    }
+    const timestamp = nowIso();
+    await ctx.db.patch(device._id, {
+      secretHash: device.pendingSecretHash,
+      credentialVersion: device.pendingCredentialVersion,
+      pendingSecretHash: null,
+      pendingCredentialVersion: null,
+      rotationCompletedAt: timestamp,
+      updatedAt: timestamp,
     });
-    return publicDevice(reset);
+    const promoted = await ctx.db.get(device._id);
+    await audit(ctx, {
+      userExternalId: device.userExternalId ?? "system",
+      actorType: "device",
+      actorId: device._id,
+      action: "device.secret_rotation_completed",
+      targetId: device._id,
+      metadata: {
+        purpose: device.rotationPurpose,
+        previousCredentialVersion: activeVersion,
+        credentialVersion: promoted?.credentialVersion,
+      },
+    });
+    return { device: publicDevice(promoted), rotation: publicDeviceCredentialRotation(promoted), promoted: true, replayed: false, reason: null };
   },
 });
 
@@ -601,9 +756,19 @@ export const authenticateDevice = gatewayMutation({
     const deviceId = ctx.db.normalizeId("devices", args.deviceId);
     if (!deviceId) return null;
     const device = await ctx.db.get(deviceId);
-    if (!device || device.revokedAt || device.secretHash !== args.secretHash) return null;
+    if (!device || device.revokedAt) return null;
+    const activeVersion = device.credentialVersion ?? 1;
+    let credentialState = "active";
+    let authenticatedCredentialVersion = activeVersion;
+    if (device.secretHash !== args.secretHash) {
+      const pendingIsLive = device.pendingSecretHash === args.secretHash
+        && Date.parse(device.rotationExpiresAt ?? "") > Date.now();
+      if (!pendingIsLive) return null;
+      credentialState = "pending";
+      authenticatedCredentialVersion = device.pendingCredentialVersion ?? activeVersion + 1;
+    }
     await ctx.db.patch(device._id, { lastSeenAt: nowIso(), updatedAt: nowIso() });
-    return publicDevice(await ctx.db.get(device._id));
+    return deviceForGateway(await ctx.db.get(device._id), authenticatedCredentialVersion, credentialState);
   },
 });
 
@@ -869,8 +1034,10 @@ export const upsertEnvironment = gatewayMutation({
     id: v.optional(v.id("environments")),
     userId: v.string(),
     label: v.string(),
-    baseUrl: v.string(),
-    accessToken: v.string(),
+    baseUrl: v.optional(v.union(v.string(), v.null())),
+    accessToken: v.optional(v.string()),
+    transportMode: v.optional(v.union(v.literal("direct"), v.literal("connector"))),
+    connectorId: v.optional(v.union(v.id("connectors"), v.null())),
     accessTokenExpiresAt: v.optional(v.union(v.string(), v.null())),
     scopes: v.array(v.string()),
     status: v.optional(v.string()),
@@ -879,25 +1046,34 @@ export const upsertEnvironment = gatewayMutation({
   },
   handler: async (ctx, args) => {
     await ensureUserRecord(ctx, args.userId);
+    const transportMode = args.transportMode === "connector" ? "connector" : "direct";
     let existing: any = null;
     if (args.id) {
       existing = await ctx.db.get(args.id);
       if (!existing || existing.userExternalId !== args.userId) return null;
     } else {
-      const normalizedBaseUrl = args.baseUrl.replace(/\/+$/u, "");
+      const normalizedBaseUrl = String(args.baseUrl ?? "").replace(/\/+$/u, "");
       const matches = (await ctx.db
         .query("environments")
         .withIndex("byUserExternalId", (q) => q.eq("userExternalId", args.userId))
         .collect())
-        .filter((environment) => environment.baseUrl === normalizedBaseUrl)
+        .filter((environment) => (environment.transportMode ?? "direct") === "direct"
+          && transportMode === "direct"
+          && environment.baseUrl === normalizedBaseUrl)
         .sort((left, right) => left._creationTime - right._creationTime);
       existing = matches[0] ?? null;
     }
     const input = {
       userExternalId: args.userId,
       label: args.label,
-      baseUrl: args.baseUrl.replace(/\/+$/u, ""),
-      accessToken: args.accessToken,
+      baseUrl: transportMode === "direct" ? String(args.baseUrl ?? "").replace(/\/+$/u, "") : null,
+      transportMode,
+      connectorId: transportMode === "connector" ? (args.connectorId ?? existing?.connectorId ?? null) : null,
+      ...(transportMode === "direct" ? { accessToken: args.accessToken } : { accessToken: undefined }),
+      // Pairing the same host again restores an archived row instead of creating a duplicate.
+      archivedAt: undefined,
+      deletedAt: undefined,
+      purgeAfter: undefined,
       accessTokenExpiresAt: normalizeNullableString(args.accessTokenExpiresAt) ?? null,
       scopes: args.scopes,
       status: args.status ?? "unknown",
@@ -915,9 +1091,219 @@ export const upsertEnvironment = gatewayMutation({
       actorType: "user",
       action: "environment.upserted",
       targetId: id,
-      metadata: { label: input.label, baseUrl: input.baseUrl, scopes: input.scopes },
+      metadata: { label: input.label, baseUrl: input.baseUrl, transportMode, scopes: input.scopes },
     });
     return publicEnvironment(environment);
+  },
+});
+
+async function disconnectEnvironmentReferences(ctx: any, args: { userId: string; environmentId: string }) {
+  const removed: {
+    devices: string[];
+    actions: string[];
+    macros: string[];
+    onboarding: boolean;
+  } = { devices: [], actions: [], macros: [], onboarding: false };
+  const timestamp = nowIso();
+
+  const devices = await ctx.db
+    .query("devices")
+    .withIndex("byUserExternalId", (q: any) => q.eq("userExternalId", args.userId))
+    .collect();
+  for (const device of devices) {
+    if (device.config?.environmentId !== args.environmentId) continue;
+    await ctx.db.patch(device._id, {
+      config: normalizeDeviceConfig(
+        { ...device.config, environmentId: null, projectId: null, threadId: null },
+        device.config,
+      ),
+      updatedAt: timestamp,
+    });
+    removed.devices.push(String(device._id));
+  }
+
+  const actions = await ctx.db
+    .query("actions")
+    .withIndex("byUserExternalId", (q: any) => q.eq("userExternalId", args.userId))
+    .collect();
+  for (const action of actions) {
+    if (String(action.environmentId ?? "") !== args.environmentId) continue;
+    await ctx.db.patch(action._id, {
+      environmentId: undefined,
+      threadId: undefined,
+      targetMode: "device-current",
+      disabled: true,
+      disabledReason: ENVIRONMENT_REMOVED_REASON,
+      updatedAt: timestamp,
+    });
+    removed.actions.push(String(action._id));
+  }
+
+  const macros = await ctx.db
+    .query("macros")
+    .withIndex("byUserExternalId", (q: any) => q.eq("userExternalId", args.userId))
+    .collect();
+  for (const macro of macros) {
+    if (String(macro.environmentId ?? "") !== args.environmentId) continue;
+    await ctx.db.patch(macro._id, {
+      environmentId: undefined,
+      threadId: undefined,
+      disabled: true,
+      disabledReason: ENVIRONMENT_REMOVED_REASON,
+      updatedAt: timestamp,
+    });
+    removed.macros.push(String(macro._id));
+  }
+
+  const user = await findUser(ctx, args.userId);
+  const onboarding = normalizeOnboarding(user?.onboarding);
+  if (user && onboarding.environmentId === args.environmentId) {
+    await ctx.db.patch(user._id, {
+      onboarding: { ...onboarding, environmentId: null, firstThreadId: null, updatedAt: timestamp },
+      updatedAt: timestamp,
+    });
+    removed.onboarding = true;
+  }
+  return removed;
+}
+
+export const archiveEnvironment = gatewayMutation({
+  args: {
+    userId: v.string(),
+    environmentId: v.id("environments"),
+    retentionDays: v.optional(v.number()),
+    at: v.optional(v.string()),
+  },
+  handler: async (ctx, args) => {
+    const environment = await ctx.db.get(args.environmentId);
+    if (!environment || environment.userExternalId !== args.userId) return null;
+    if (environment.archivedAt) {
+      return {
+        environment: publicEnvironment(environment),
+        removed: { devices: [], actions: [], macros: [], onboarding: false },
+        alreadyArchived: true,
+      };
+    }
+    const removed = await disconnectEnvironmentReferences(ctx, {
+      userId: args.userId,
+      environmentId: String(environment._id),
+    });
+    const archivedAt = args.at ?? nowIso();
+    const purgeAfter = new Date(Date.parse(archivedAt) + Math.max(1, args.retentionDays ?? 30) * 86_400_000).toISOString();
+    await ctx.db.patch(environment._id, {
+      accessToken: undefined,
+      accessTokenExpiresAt: null,
+      archivedAt,
+      deletedAt: archivedAt,
+      purgeAfter,
+      status: "archived",
+      providerCatalogue: undefined,
+      updatedAt: archivedAt,
+    });
+    const revokedConnectorIds: string[] = [];
+    const connectors = await ctx.db
+      .query("connectors")
+      .withIndex("byUserExternalId", (q: any) => q.eq("userExternalId", args.userId))
+      .collect();
+    for (const connector of connectors) {
+      if (String(connector.environmentId) !== String(environment._id) || connector.revokedAt) continue;
+      await ctx.db.patch(connector._id, {
+        revokedAt: archivedAt,
+        updatedAt: archivedAt,
+        status: "revoked",
+        lastDisconnectReason: "environment_removed",
+        secretHash: null,
+        pendingSecretHash: null,
+        pendingSecretPrefix: null,
+        pendingCredentialVersion: null,
+        rotationId: null,
+        rotationExpiresAt: null,
+      });
+      const tickets = await ctx.db
+        .query("connectorTickets")
+        .withIndex("byConnectorId", (q: any) => q.eq("connectorId", connector._id))
+        .collect();
+      for (const ticket of tickets) {
+        if (!ticket.consumedAt) await ctx.db.patch(ticket._id, { consumedAt: archivedAt });
+      }
+      revokedConnectorIds.push(String(connector._id));
+    }
+    const archived = await ctx.db.get(environment._id);
+    await audit(ctx, {
+      userExternalId: args.userId,
+      actorType: "user",
+      action: "environment.archived",
+      targetId: environment._id,
+      metadata: {
+        label: environment.label,
+        retentionUntil: purgeAfter,
+        revokedConnectorIds,
+        clearedDeviceIds: removed.devices,
+        disabledActionIds: removed.actions,
+        disabledMacroIds: removed.macros,
+        clearedOnboarding: removed.onboarding,
+      },
+    });
+    return { environment: publicEnvironment(archived), removed, revokedConnectorIds, alreadyArchived: false };
+  },
+});
+
+export const restoreEnvironment = gatewayMutation({
+  args: { userId: v.string(), environmentId: v.id("environments"), at: v.optional(v.string()) },
+  handler: async (ctx, args) => {
+    const environment = await ctx.db.get(args.environmentId);
+    if (!environment || environment.userExternalId !== args.userId) return null;
+    if (!environment.archivedAt) return { expired: false, alreadyRestored: true, environment: publicEnvironment(environment) };
+    const at = args.at ?? nowIso();
+    if (Date.parse(environment.purgeAfter ?? "") <= Date.parse(at)) return { expired: true, environment: publicEnvironment(environment) };
+    await ctx.db.patch(environment._id, {
+      archivedAt: undefined,
+      deletedAt: undefined,
+      purgeAfter: undefined,
+      connectorId: null,
+      status: "needs_repair",
+      freshness: "unknown",
+      updatedAt: at,
+    });
+    const restored = await ctx.db.get(environment._id);
+    await audit(ctx, {
+      userExternalId: args.userId,
+      actorType: "user",
+      action: "environment.restored",
+      targetId: environment._id,
+      metadata: { label: environment.label, requiresRepair: true },
+    });
+    return { expired: false, alreadyRestored: false, environment: publicEnvironment(restored) };
+  },
+});
+
+export const listExpiredEnvironments = gatewayQuery({
+  args: { userId: v.string(), now: v.string() },
+  handler: async (ctx, args) => (await ctx.db
+    .query("environments")
+    .withIndex("byUserExternalId", (q: any) => q.eq("userExternalId", args.userId))
+    .collect())
+    .filter((environment: any) => environment.archivedAt && Date.parse(environment.purgeAfter ?? "") <= Date.parse(args.now))
+    .map(publicEnvironment),
+});
+
+export const purgeEnvironment = gatewayMutation({
+  args: { userId: v.string(), environmentId: v.id("environments"), now: v.string(), force: v.optional(v.boolean()) },
+  handler: async (ctx, args) => {
+    const environment = await ctx.db.get(args.environmentId);
+    if (!environment || environment.userExternalId !== args.userId || !environment.archivedAt) return null;
+    if (!args.force && Date.parse(environment.purgeAfter ?? "") > Date.parse(args.now)) {
+      return { notDue: true, environment: publicEnvironment(environment) };
+    }
+    await ctx.db.delete(environment._id);
+    await audit(ctx, {
+      userExternalId: args.userId,
+      actorType: "system",
+      action: "environment.purged",
+      targetId: environment._id,
+      metadata: { label: environment.label, retentionExpired: !args.force },
+    });
+    return { notDue: false, environment: publicEnvironment(environment) };
   },
 });
 
@@ -934,73 +1320,7 @@ export const deleteEnvironment = gatewayMutation({
     if (!environment || environment.userExternalId !== args.userId) return null;
     const environmentId = String(environment._id);
     await ctx.db.delete(environment._id);
-    const removed: {
-      devices: string[];
-      actions: string[];
-      macros: string[];
-      onboarding: boolean;
-    } = { devices: [], actions: [], macros: [], onboarding: false };
-    const timestamp = nowIso();
-
-    const devices = await ctx.db
-      .query("devices")
-      .withIndex("byUserExternalId", (q) => q.eq("userExternalId", args.userId))
-      .collect();
-    for (const device of devices) {
-      if (device.config?.environmentId !== environmentId) continue;
-      await ctx.db.patch(device._id, {
-        // The project lived inside the environment that just went away.
-        config: normalizeDeviceConfig(
-          { ...device.config, environmentId: null, projectId: null },
-          device.config,
-        ),
-        updatedAt: timestamp,
-      });
-      removed.devices.push(String(device._id));
-    }
-
-    const actions = await ctx.db
-      .query("actions")
-      .withIndex("byUserExternalId", (q) => q.eq("userExternalId", args.userId))
-      .collect();
-    for (const action of actions) {
-      if (String(action.environmentId ?? "") !== environmentId) continue;
-      await ctx.db.patch(action._id, {
-        environmentId: undefined,
-        threadId: undefined,
-        targetMode: "device-current",
-        disabled: true,
-        disabledReason: ENVIRONMENT_REMOVED_REASON,
-        updatedAt: timestamp,
-      });
-      removed.actions.push(String(action._id));
-    }
-
-    const macros = await ctx.db
-      .query("macros")
-      .withIndex("byUserExternalId", (q) => q.eq("userExternalId", args.userId))
-      .collect();
-    for (const macro of macros) {
-      if (String(macro.environmentId ?? "") !== environmentId) continue;
-      await ctx.db.patch(macro._id, {
-        environmentId: undefined,
-        threadId: undefined,
-        disabled: true,
-        disabledReason: ENVIRONMENT_REMOVED_REASON,
-        updatedAt: timestamp,
-      });
-      removed.macros.push(String(macro._id));
-    }
-
-    const user = await findUser(ctx, args.userId);
-    const onboarding = normalizeOnboarding(user?.onboarding);
-    if (user && onboarding.environmentId === environmentId) {
-      await ctx.db.patch(user._id, {
-        onboarding: { ...onboarding, environmentId: null, firstThreadId: null, updatedAt: timestamp },
-        updatedAt: timestamp,
-      });
-      removed.onboarding = true;
-    }
+    const removed = await disconnectEnvironmentReferences(ctx, { userId: args.userId, environmentId });
 
     await audit(ctx, {
       userExternalId: args.userId,
@@ -1029,7 +1349,7 @@ export const updateEnvironmentHealth = gatewayMutation({
   },
   handler: async (ctx, args) => {
     const environment = await ctx.db.get(args.environmentId);
-    if (!environment || environment.userExternalId !== args.userId) return null;
+    if (!environment || environment.userExternalId !== args.userId || environment.archivedAt) return null;
     const health = normalizeEnvironmentHealth(args.health, environment.health);
     await ctx.db.patch(environment._id, {
       ...(args.status ? { status: args.status } : {}),
@@ -1060,7 +1380,7 @@ export const updateEnvironmentCatalogue = gatewayMutation({
   },
   handler: async (ctx, args) => {
     const environment = await ctx.db.get(args.environmentId);
-    if (!environment || environment.userExternalId !== args.userId) return null;
+    if (!environment || environment.userExternalId !== args.userId || environment.archivedAt) return null;
     const catalogue = args.catalogue;
     await ctx.db.patch(environment._id, {
       providerCatalogue: catalogue,
@@ -1091,7 +1411,7 @@ export const getEnvironmentForUser = gatewayQuery({
   },
   handler: async (ctx, args) => {
     const environment = await ctx.db.get(args.environmentId);
-    if (!environment || environment.userExternalId !== args.userId) return null;
+    if (!environment || environment.userExternalId !== args.userId || environment.archivedAt) return null;
     return environmentForGateway(environment);
   },
 });
@@ -1105,11 +1425,30 @@ export const listEnvironments = gatewayQuery({
       .query("environments")
       .withIndex("byUserExternalId", (q) => q.eq("userExternalId", args.userId))
       .collect();
-    const uniqueByUrl = new Map<string, any>();
-    for (const environment of environments.sort((left, right) => left._creationTime - right._creationTime)) {
-      if (!uniqueByUrl.has(environment.baseUrl)) uniqueByUrl.set(environment.baseUrl, environment);
+    const uniqueByTransportTarget = new Map<string, any>();
+    for (const environment of environments
+      .filter((item) => !item.archivedAt)
+      .sort((left, right) => left._creationTime - right._creationTime)) {
+      const key = (environment.transportMode ?? "direct") === "connector"
+        ? `connector:${String(environment._id)}`
+        : `direct:${environment.baseUrl}`;
+      if (!uniqueByTransportTarget.has(key)) uniqueByTransportTarget.set(key, environment);
     }
-    return [...uniqueByUrl.values()].map(publicEnvironment);
+    return [...uniqueByTransportTarget.values()].map(publicEnvironment);
+  },
+});
+
+export const listArchivedEnvironments = gatewayQuery({
+  args: { userId: v.string() },
+  handler: async (ctx, args) => {
+    const environments = await ctx.db
+      .query("environments")
+      .withIndex("byUserExternalId", (q) => q.eq("userExternalId", args.userId))
+      .collect();
+    return environments
+      .filter((environment) => Boolean(environment.archivedAt))
+      .sort((left, right) => Date.parse(right.archivedAt ?? "") - Date.parse(left.archivedAt ?? ""))
+      .map(publicEnvironment);
   },
 });
 
@@ -1121,6 +1460,7 @@ export const createConnectSession = gatewayMutation({
     userId: v.string(),
     label: v.string(),
     accessMode: v.string(),
+    purpose: v.optional(v.string()),
     environmentId: v.optional(v.union(v.id("environments"), v.null())),
     codeHash: v.string(),
     expiresAt: v.string(),
@@ -1132,6 +1472,7 @@ export const createConnectSession = gatewayMutation({
       userExternalId: args.userId,
       label: args.label,
       accessMode: args.accessMode,
+      purpose: args.purpose ?? "t3_enrollment",
       environmentId: args.environmentId ?? null,
       status: "pending",
       codeHash: args.codeHash,
@@ -1221,6 +1562,474 @@ export const completeConnectSession = gatewayMutation({
       },
     });
     return publicConnectSession(await ctx.db.get(session._id));
+  },
+});
+
+export const createConnector = gatewayMutation({
+  args: {
+    userId: v.string(),
+    environmentId: v.id("environments"),
+    label: v.string(),
+    secretHash: v.string(),
+    secretPrefix: v.string(),
+    scopes: v.array(v.string()),
+    protocolVersion: v.number(),
+    connectorVersion: v.optional(v.union(v.string(), v.null())),
+    platform: v.optional(v.union(v.string(), v.null())),
+    capabilities: v.array(v.string()),
+  },
+  handler: async (ctx, args) => {
+    const environment = await ctx.db.get(args.environmentId);
+    if (!environment || environment.userExternalId !== args.userId || environment.archivedAt) return null;
+    const timestamp = nowIso();
+    const existingConnectors = await ctx.db.query("connectors")
+      .withIndex("byEnvironmentId", (q) => q.eq("environmentId", args.environmentId))
+      .collect();
+    for (const existingConnector of existingConnectors) {
+      if (existingConnector.revokedAt) continue;
+      await ctx.db.patch(existingConnector._id, {
+        secretHash: null,
+        pendingSecretHash: null,
+        pendingSecretPrefix: null,
+        pendingCredentialVersion: null,
+        rotationId: null,
+        rotationExpiresAt: null,
+        status: "revoked",
+        revokedAt: timestamp,
+        updatedAt: timestamp,
+        lastDisconnectReason: "superseded_by_reenrollment",
+      });
+      const tickets = await ctx.db.query("connectorTickets")
+        .withIndex("byConnectorId", (q) => q.eq("connectorId", existingConnector._id))
+        .collect();
+      for (const ticket of tickets) {
+        if (!ticket.consumedAt) await ctx.db.patch(ticket._id, { consumedAt: timestamp });
+      }
+    }
+    const id = await ctx.db.insert("connectors", {
+      userExternalId: args.userId,
+      environmentId: args.environmentId,
+      label: args.label,
+      secretHash: args.secretHash,
+      secretPrefix: args.secretPrefix,
+      credentialVersion: 1,
+      pendingSecretHash: null,
+      pendingSecretPrefix: null,
+      pendingCredentialVersion: null,
+      rotationId: null,
+      rotationStartedAt: null,
+      rotationExpiresAt: null,
+      rotationCompletedAt: null,
+      scopes: [...new Set(args.scopes)],
+      status: "enrolled",
+      protocolVersion: args.protocolVersion,
+      connectorVersion: args.connectorVersion ?? null,
+      t3Version: null,
+      platform: args.platform ?? null,
+      capabilities: [...new Set(args.capabilities)],
+      createdAt: timestamp,
+      updatedAt: timestamp,
+      lastSeenAt: null,
+      lastConnectedAt: null,
+      revokedAt: null,
+      lastDisconnectReason: null,
+      lastT3Health: null,
+      lastT3HealthAt: null,
+      activeRequests: 0,
+      queueDepth: 0,
+      lastPresenceEventAt: null,
+      lastPresenceEventKey: null,
+      lastConnectionId: null,
+    });
+    await ctx.db.patch(environment._id, {
+      transportMode: "connector",
+      connectorId: id,
+      accessToken: undefined,
+      baseUrl: null,
+      lastConnectorSeenAt: null,
+      freshness: "unknown",
+      updatedAt: timestamp,
+    });
+    await audit(ctx, {
+      userExternalId: args.userId,
+      actorType: "user",
+      action: "connector.enrolled",
+      targetId: id,
+      metadata: { environmentId: args.environmentId, protocolVersion: args.protocolVersion, scopes: args.scopes },
+    });
+    return publicConnector(await ctx.db.get(id));
+  },
+});
+
+// A mutation avoids Convex query caching across the pending-credential expiry
+// boundary. The function does not write, but authentication must observe time.
+export const authenticateConnector = gatewayMutation({
+  args: { connectorId: v.id("connectors"), secretHash: v.string() },
+  handler: async (ctx, args) => {
+    const connector = await ctx.db.get(args.connectorId);
+    if (!connector || connector.revokedAt) return null;
+    const activeVersion = connector.credentialVersion ?? 1;
+    if (connector.secretHash === args.secretHash) {
+      return { ...connectorForGateway(connector), authenticatedCredentialVersion: activeVersion, credentialState: "active", authenticatedRotationId: null };
+    }
+    const pendingIsLive = connector.pendingSecretHash === args.secretHash
+      && connector.pendingCredentialVersion === activeVersion + 1
+      && Date.parse(connector.rotationExpiresAt ?? "") > Date.now();
+    if (!pendingIsLive) return null;
+    return { ...connectorForGateway(connector), authenticatedCredentialVersion: connector.pendingCredentialVersion, credentialState: "pending", authenticatedRotationId: connector.rotationId };
+  },
+});
+
+// This verifier is intentionally narrower than ordinary authentication: after
+// revocation it authorizes only an idempotent repeat of self-revocation.
+export const authenticateConnectorForRevocation = gatewayMutation({
+  args: { connectorId: v.id("connectors"), secretHash: v.string() },
+  handler: async (ctx, args) => {
+    const connector = await ctx.db.get(args.connectorId);
+    if (!connector) return null;
+    const activeVersion = connector.credentialVersion ?? 1;
+    if (connector.secretHash === args.secretHash) {
+      return { ...connectorForGateway(connector), authenticatedCredentialVersion: activeVersion, credentialState: "active", authenticatedRotationId: null };
+    }
+    if (connector.revokedAt) return null;
+    const pendingIsLive = connector.pendingSecretHash === args.secretHash
+      && connector.pendingCredentialVersion === activeVersion + 1
+      && Date.parse(connector.rotationExpiresAt ?? "") > Date.now();
+    if (!pendingIsLive) return null;
+    return { ...connectorForGateway(connector), authenticatedCredentialVersion: connector.pendingCredentialVersion, credentialState: "pending", authenticatedRotationId: connector.rotationId };
+  },
+});
+
+export const beginConnectorCredentialRotation = gatewayMutation({
+  args: {
+    userId: v.string(),
+    connectorId: v.id("connectors"),
+    pendingSecretHash: v.string(),
+    pendingSecretPrefix: v.string(),
+    rotationId: v.string(),
+    expiresAt: v.string(),
+  },
+  handler: async (ctx, args) => {
+    const connector = await ctx.db.get(args.connectorId);
+    if (!connector || connector.userExternalId !== args.userId || connector.revokedAt) return null;
+    const timestamp = nowIso();
+    const activeVersion = connector.credentialVersion ?? 1;
+    const tickets = await ctx.db.query("connectorTickets")
+      .withIndex("byConnectorId", (q) => q.eq("connectorId", connector._id))
+      .collect();
+    for (const ticket of tickets) {
+      if ((ticket.credentialVersion ?? 1) !== activeVersion && !ticket.consumedAt) {
+        await ctx.db.patch(ticket._id, { consumedAt: timestamp });
+      }
+    }
+    await ctx.db.patch(connector._id, {
+      pendingSecretHash: args.pendingSecretHash,
+      pendingSecretPrefix: args.pendingSecretPrefix,
+      pendingCredentialVersion: activeVersion + 1,
+      rotationId: args.rotationId,
+      rotationStartedAt: timestamp,
+      rotationExpiresAt: args.expiresAt,
+      rotationCompletedAt: null,
+      updatedAt: timestamp,
+    });
+    await audit(ctx, {
+      userExternalId: connector.userExternalId,
+      actorType: "user",
+      action: "connector.rotation-started",
+      targetId: connector._id,
+      metadata: { rotationId: args.rotationId, expiresAt: args.expiresAt },
+    });
+    return {
+      connector: publicConnector(await ctx.db.get(connector._id)),
+      rotation: { id: args.rotationId, expiresAt: args.expiresAt },
+    };
+  },
+});
+
+export const listConnectors = gatewayQuery({
+  args: { userId: v.string() },
+  handler: async (ctx, args) => {
+    const connectors = await ctx.db.query("connectors")
+      .withIndex("byUserExternalId", (q) => q.eq("userExternalId", args.userId))
+      .collect();
+    return connectors.sort((left, right) => left._creationTime - right._creationTime).map(publicConnector);
+  },
+});
+
+export const listBackgroundWorkUsers = gatewayQuery({
+  args: {
+    afterUserId: v.optional(v.union(v.string(), v.null())),
+    limit: v.optional(v.number()),
+  },
+  handler: async (ctx, args) => {
+    const limit = Number.isSafeInteger(args.limit) ? Math.max(1, Math.min(100, args.limit as number)) : 100;
+    const rows = await ctx.db.query("users")
+      .withIndex("byExternalId", (q: any) => args.afterUserId ? q.gt("externalId", args.afterUserId) : q)
+      .order("asc")
+      .take(limit + 1);
+    const page = rows.slice(0, limit).map((row: any) => row.externalId);
+    return { userIds: page, nextCursor: rows.length > limit ? page.at(-1) ?? null : null };
+  },
+});
+
+export const getConnectorForUser = gatewayQuery({
+  args: { userId: v.string(), connectorId: v.id("connectors") },
+  handler: async (ctx, args) => {
+    const connector = await ctx.db.get(args.connectorId);
+    return connector?.userExternalId === args.userId ? publicConnector(connector) : null;
+  },
+});
+
+export const revokeConnector = gatewayMutation({
+  args: { userId: v.string(), connectorId: v.id("connectors"), reason: v.optional(v.string()) },
+  handler: async (ctx, args) => {
+    const connector = await ctx.db.get(args.connectorId);
+    if (!connector || connector.userExternalId !== args.userId) return null;
+    if (!connector.revokedAt) {
+      const timestamp = nowIso();
+      await ctx.db.patch(connector._id, {
+        secretHash: null,
+        pendingSecretHash: null,
+        pendingSecretPrefix: null,
+        pendingCredentialVersion: null,
+        rotationId: null,
+        rotationExpiresAt: null,
+        status: "revoked",
+        revokedAt: timestamp,
+        updatedAt: timestamp,
+        lastDisconnectReason: args.reason ?? "revoked_by_user",
+      });
+      const tickets = await ctx.db.query("connectorTickets")
+        .withIndex("byConnectorId", (q) => q.eq("connectorId", connector._id))
+        .collect();
+      for (const ticket of tickets) {
+        if (!ticket.consumedAt) await ctx.db.patch(ticket._id, { consumedAt: timestamp });
+      }
+      await audit(ctx, { userExternalId: args.userId, actorType: "user", action: "connector.revoked", targetId: connector._id, metadata: { reason: args.reason ?? "revoked_by_user" } });
+    }
+    return publicConnector(await ctx.db.get(connector._id));
+  },
+});
+
+export const revokeConnectorByCredential = gatewayMutation({
+  args: { connectorId: v.id("connectors"), secretHash: v.string(), reason: v.optional(v.string()) },
+  handler: async (ctx, args) => {
+    const connector = await ctx.db.get(args.connectorId);
+    if (!connector) return null;
+    const activeVersion = connector.credentialVersion ?? 1;
+    const activeMatches = connector.secretHash === args.secretHash;
+    const pendingMatches = !connector.revokedAt
+      && connector.pendingSecretHash === args.secretHash
+      && connector.pendingCredentialVersion === activeVersion + 1
+      && Date.parse(connector.rotationExpiresAt ?? "") > Date.now();
+    if (!activeMatches && !pendingMatches) return null;
+    if (!connector.revokedAt) {
+      const timestamp = nowIso();
+      const reason = args.reason ?? "revoked_by_connector";
+      await ctx.db.patch(connector._id, {
+        // Retain only the authorizing hash so a lost response can be retried.
+        // All ordinary auth paths reject revoked rows before hash comparison.
+        secretHash: args.secretHash,
+        pendingSecretHash: null,
+        pendingSecretPrefix: null,
+        pendingCredentialVersion: null,
+        rotationId: null,
+        rotationExpiresAt: null,
+        status: "revoked",
+        revokedAt: timestamp,
+        updatedAt: timestamp,
+        lastDisconnectReason: reason,
+      });
+      const tickets = await ctx.db.query("connectorTickets")
+        .withIndex("byConnectorId", (q) => q.eq("connectorId", connector._id))
+        .collect();
+      for (const ticket of tickets) {
+        if (!ticket.consumedAt) await ctx.db.patch(ticket._id, { consumedAt: timestamp });
+      }
+      await audit(ctx, { userExternalId: connector.userExternalId, actorType: "connector", action: "connector.self-revoked", targetId: connector._id, metadata: { reason } });
+    }
+    return publicConnector(await ctx.db.get(connector._id));
+  },
+});
+
+export const createConnectorTicket = gatewayMutation({
+  args: {
+    connectorId: v.id("connectors"),
+    tokenHash: v.string(),
+    audience: v.string(),
+    expiresAt: v.string(),
+    credentialVersion: v.optional(v.union(v.number(), v.null())),
+    rotationId: v.optional(v.union(v.string(), v.null())),
+  },
+  handler: async (ctx, args) => {
+    const connector = await ctx.db.get(args.connectorId);
+    if (!connector || connector.revokedAt) return null;
+    const activeVersion = connector.credentialVersion ?? 1;
+    const requestedVersion = args.credentialVersion ?? activeVersion;
+    const validPending = requestedVersion === connector.pendingCredentialVersion
+      && args.rotationId === connector.rotationId
+      && Date.parse(connector.rotationExpiresAt ?? "") > Date.now();
+    if ((requestedVersion !== activeVersion || args.rotationId != null) && !validPending) return null;
+    const createdAt = nowIso();
+    await ctx.db.insert("connectorTickets", {
+      connectorId: connector._id,
+      environmentId: connector.environmentId,
+      tokenHash: args.tokenHash,
+      credentialVersion: requestedVersion,
+      rotationId: validPending ? connector.rotationId : null,
+      audience: args.audience,
+      createdAt,
+      expiresAt: args.expiresAt,
+      consumedAt: null,
+    });
+    await ctx.db.patch(connector._id, { lastSeenAt: createdAt, updatedAt: createdAt });
+    return { expiresAt: args.expiresAt };
+  },
+});
+
+export const consumeConnectorTicket = gatewayMutation({
+  args: {
+    tokenHash: v.string(),
+    audience: v.optional(v.union(v.string(), v.null())),
+    now: v.optional(v.number()),
+  },
+  handler: async (ctx, args) => {
+    const ticket = await ctx.db.query("connectorTickets")
+      .withIndex("byTokenHash", (q) => q.eq("tokenHash", args.tokenHash))
+      .first();
+    if (!ticket) return { connector: null, reason: "unknown" };
+    if (ticket.consumedAt) return { connector: null, reason: "used" };
+    if (Date.parse(ticket.expiresAt) <= (args.now ?? Date.now())) return { connector: null, reason: "expired" };
+    if (args.audience !== null && args.audience !== undefined && ticket.audience !== args.audience) {
+      return { connector: null, reason: "audience" };
+    }
+    const connector = await ctx.db.get(ticket.connectorId);
+    if (!connector || connector.revokedAt) return { connector: null, reason: "revoked" };
+    const timestamp = nowIso();
+    const activeVersion = connector.credentialVersion ?? 1;
+    const ticketVersion = ticket.credentialVersion ?? 1;
+    const commitsRotation = Boolean(ticketVersion === connector.pendingCredentialVersion
+      && ticket.rotationId === connector.rotationId
+      && connector.pendingSecretHash
+      && Date.parse(connector.rotationExpiresAt ?? "") > (args.now ?? Date.now()));
+    if (ticketVersion !== activeVersion && !commitsRotation) {
+      return { connector: null, reason: "stale_credential" };
+    }
+    await ctx.db.patch(ticket._id, { consumedAt: timestamp });
+    if (commitsRotation) {
+      await ctx.db.patch(connector._id, {
+        secretHash: connector.pendingSecretHash,
+        secretPrefix: connector.pendingSecretPrefix ?? connector.secretPrefix,
+        credentialVersion: ticketVersion,
+        pendingSecretHash: null,
+        pendingSecretPrefix: null,
+        pendingCredentialVersion: null,
+        rotationCompletedAt: timestamp,
+        rotationExpiresAt: null,
+        rotationId: null,
+      });
+      const tickets = await ctx.db.query("connectorTickets")
+        .withIndex("byConnectorId", (q) => q.eq("connectorId", connector._id))
+        .collect();
+      for (const other of tickets) {
+        if (other._id !== ticket._id && (other.credentialVersion ?? 1) === activeVersion && !other.consumedAt) {
+          await ctx.db.patch(other._id, { consumedAt: timestamp });
+        }
+      }
+      await audit(ctx, {
+        userExternalId: connector.userExternalId,
+        actorType: "connector",
+        action: "connector.rotation-completed",
+        targetId: connector._id,
+        metadata: { credentialVersion: ticketVersion },
+      });
+    }
+    await ctx.db.patch(connector._id, {
+      lastConnectedAt: timestamp,
+      lastSeenAt: timestamp,
+      status: "online",
+      updatedAt: timestamp,
+    });
+    await ctx.db.patch(ticket.environmentId, {
+      lastConnectorSeenAt: timestamp,
+      freshness: "live",
+      updatedAt: timestamp,
+    });
+    return {
+      connector: {
+        ...connectorForGateway(await ctx.db.get(connector._id)),
+        authenticatedCredentialVersion: ticketVersion,
+        credentialState: commitsRotation ? "rotated" : "active",
+      },
+      ticket: {
+        id: ticket._id,
+        connectorId: ticket.connectorId,
+        environmentId: ticket.environmentId,
+        audience: ticket.audience ?? "agent-controller-connectors",
+        credentialVersion: ticketVersion,
+        rotationId: ticket.rotationId ?? null,
+        expiresAt: ticket.expiresAt,
+      },
+      reason: null,
+    };
+  },
+});
+
+export const recordConnectorPresence = gatewayMutation({
+  args: {
+    connectorId: v.id("connectors"),
+    environmentId: v.optional(v.union(v.id("environments"), v.null())),
+    connectorVersion: v.optional(v.union(v.string(), v.null())),
+    t3Version: v.optional(v.union(v.string(), v.null())),
+    platform: v.optional(v.union(v.string(), v.null())),
+    capabilities: v.optional(v.array(v.string())),
+    t3Health: v.optional(v.any()),
+    activeRequests: v.optional(v.union(v.number(), v.null())),
+    queueDepth: v.optional(v.union(v.number(), v.null())),
+    providerCatalogue: v.optional(v.union(providerCatalogueValidator, v.null())),
+    connectionId: v.optional(v.union(v.string(), v.null())),
+    occurredAt: v.optional(v.union(v.number(), v.null())),
+    eventKey: v.optional(v.union(v.string(), v.null())),
+    connected: v.optional(v.boolean()),
+    disconnectReason: v.optional(v.union(v.string(), v.null())),
+  },
+  handler: async (ctx, args) => {
+    const connector = await ctx.db.get(args.connectorId);
+    if (!connector || connector.revokedAt || (args.environmentId && connector.environmentId !== args.environmentId)) return null;
+    if (typeof args.occurredAt === "number") {
+      if (typeof connector.lastPresenceEventAt === "number" && args.occurredAt < connector.lastPresenceEventAt) {
+        return publicConnector(connector);
+      }
+      if (args.eventKey && connector.lastPresenceEventKey === args.eventKey) return publicConnector(connector);
+    }
+    const previousStatus = connector.status;
+    const timestamp = nowIso();
+    const connected = args.connected !== false;
+    await ctx.db.patch(connector._id, {
+      connectorVersion: args.connectorVersion ?? connector.connectorVersion ?? null,
+      t3Version: args.t3Version ?? connector.t3Version ?? null,
+      platform: args.platform ?? connector.platform ?? null,
+      capabilities: args.capabilities ? [...new Set(args.capabilities)] : connector.capabilities,
+      lastSeenAt: timestamp,
+      lastConnectedAt: connected ? (connector.lastConnectedAt ?? timestamp) : connector.lastConnectedAt,
+      status: connected ? "online" : "offline",
+      lastDisconnectReason: args.disconnectReason ?? null,
+      lastT3Health: args.t3Health ?? null,
+      lastT3HealthAt: args.t3Health ? timestamp : connector.lastT3HealthAt,
+      activeRequests: args.activeRequests ?? connector.activeRequests ?? 0,
+      queueDepth: args.queueDepth ?? connector.queueDepth ?? 0,
+      lastPresenceEventAt: args.occurredAt ?? connector.lastPresenceEventAt ?? null,
+      lastPresenceEventKey: args.eventKey ?? connector.lastPresenceEventKey ?? null,
+      lastConnectionId: args.connectionId ?? connector.lastConnectionId ?? null,
+      updatedAt: timestamp,
+    });
+    await ctx.db.patch(connector.environmentId, {
+      ...(args.providerCatalogue ? { providerCatalogue: args.providerCatalogue } : {}),
+      lastConnectorSeenAt: timestamp,
+      freshness: connected ? "live" : "stale",
+      updatedAt: timestamp,
+    });
+    return { ...publicConnector(await ctx.db.get(connector._id)), _previousStatus: previousStatus };
   },
 });
 
@@ -1340,6 +2149,546 @@ export const getFirmwareArtifact = gatewayQuery({
   },
 });
 
+export const createReleaseRollout = gatewayMutation({
+  args: {
+    userId: v.string(), name: v.string(), targetKind: v.string(), targetVersion: v.string(),
+    rollbackVersion: v.optional(v.union(v.string(), v.null())),
+    releaseId: v.optional(v.union(v.string(), v.null())), channel: v.string(), cohort: v.any(),
+    minimumProtocolVersion: v.number(), requiredCapabilities: v.array(v.string()),
+  },
+  handler: async (ctx, args) => {
+    const timestamp = nowIso();
+    const id = await ctx.db.insert("releaseRollouts", {
+      userExternalId: args.userId,
+      name: args.name,
+      targetKind: args.targetKind,
+      targetVersion: args.targetVersion,
+      rollbackVersion: args.rollbackVersion ?? null,
+      releaseId: args.releaseId ?? null,
+      channel: args.channel,
+      cohort: args.cohort,
+      minimumProtocolVersion: args.minimumProtocolVersion,
+      requiredCapabilities: [...new Set(args.requiredCapabilities)],
+      state: "draft",
+      evidenceRef: null,
+      createdAt: timestamp,
+      updatedAt: timestamp,
+      startedAt: null,
+      completedAt: null,
+    });
+    await audit(ctx, {
+      userExternalId: args.userId, actorType: "user", action: "release_rollout.created", targetId: id,
+      metadata: { targetKind: args.targetKind, targetVersion: args.targetVersion,
+        channel: args.channel, cohortType: args.cohort?.type ?? null },
+    });
+    return await publicReleaseRolloutWithProgress(ctx, await ctx.db.get(id));
+  },
+});
+
+export const listReleaseRollouts = gatewayQuery({
+  args: { userId: v.string(), states: v.optional(v.array(v.string())) },
+  handler: async (ctx, args) => {
+    const rows = await ctx.db.query("releaseRollouts")
+      .withIndex("byUserExternalId", (q) => q.eq("userExternalId", args.userId)).collect();
+    const filtered = args.states ? rows.filter((row) => args.states!.includes(row.state)) : rows;
+    return await Promise.all(filtered.sort((a, b) => b.createdAt.localeCompare(a.createdAt))
+      .map((row) => publicReleaseRolloutWithProgress(ctx, row)));
+  },
+});
+
+export const listRunnableReleaseRollouts = gatewayQuery({
+  args: { limit: v.optional(v.number()) },
+  handler: async (ctx, args) => {
+    const limit = Math.max(1, Math.min(100, args.limit ?? 25));
+    const rows = await ctx.db.query("releaseRollouts").collect();
+    return rows.filter((row) => ["running", "rolling_back"].includes(row.state))
+      .sort((a, b) => a.updatedAt.localeCompare(b.updatedAt)).slice(0, limit).map(publicReleaseRolloutRecord);
+  },
+});
+
+export const getReleaseRolloutForUser = gatewayQuery({
+  args: { userId: v.string(), rolloutId: v.string() },
+  handler: async (ctx, args) => {
+    const id = ctx.db.normalizeId("releaseRollouts", args.rolloutId);
+    const row = id ? await ctx.db.get(id) : null;
+    return row?.userExternalId === args.userId ? await publicReleaseRolloutWithProgress(ctx, row) : null;
+  },
+});
+
+export const transitionReleaseRollout = gatewayMutation({
+  args: { userId: v.string(), rolloutId: v.string(), action: v.string(), evidenceRef: v.string(),
+    percentage: v.optional(v.union(v.number(), v.null())) },
+  handler: async (ctx, args) => {
+    const id = ctx.db.normalizeId("releaseRollouts", args.rolloutId);
+    const rollout = id ? await ctx.db.get(id) : null;
+    if (!rollout || rollout.userExternalId !== args.userId) return null;
+    const transitions: Record<string, { from: string[]; to: string }> = {
+      start: { from: ["draft", "paused"], to: "running" }, resume: { from: ["paused"], to: "running" },
+      pause: { from: ["running"], to: "paused" }, cancel: { from: ["draft", "running", "paused"], to: "cancelled" },
+      rollback: { from: ["running", "paused", "completed"], to: "rolling_back" },
+      complete: { from: ["running", "rolling_back"], to: rollout.state === "rolling_back" ? "rolled_back" : "completed" },
+      expand: { from: ["running", "paused"], to: rollout.state },
+    };
+    const transition = transitions[args.action];
+    if (!transition || !transition.from.includes(rollout.state)) {
+      return { conflict: true, rollout: await publicReleaseRolloutWithProgress(ctx, rollout) };
+    }
+    if (args.action === "rollback" && !rollout.rollbackVersion) {
+      return { conflict: true, reason: "rollback_version_required", rollout: await publicReleaseRolloutWithProgress(ctx, rollout) };
+    }
+    let cohort = rollout.cohort;
+    if (args.action === "expand") {
+      if (cohort?.type !== "percentage" || !Number.isInteger(args.percentage)
+        || Number(args.percentage) <= Number(cohort.percentage) || Number(args.percentage) > 100) {
+        return { conflict: true, reason: "percentage_must_increase", rollout: await publicReleaseRolloutWithProgress(ctx, rollout) };
+      }
+      cohort = { type: "percentage", percentage: args.percentage };
+    }
+    const timestamp = nowIso();
+    await ctx.db.patch(rollout._id, {
+      state: transition.to, cohort, evidenceRef: args.evidenceRef, updatedAt: timestamp,
+      ...(["start", "resume"].includes(args.action) && !rollout.startedAt ? { startedAt: timestamp } : {}),
+      ...(args.action === "complete" ? { completedAt: timestamp } : {}),
+    });
+    await audit(ctx, {
+      userExternalId: args.userId, actorType: "user", action: `release_rollout.${args.action}`, targetId: rollout._id,
+      metadata: { state: transition.to, targetKind: rollout.targetKind,
+        targetVersion: rollout.targetVersion, evidenceRef: args.evidenceRef,
+        ...(args.action === "expand" ? { percentage: args.percentage } : {}) },
+    });
+    return { conflict: false, rollout: await publicReleaseRolloutWithProgress(ctx, await ctx.db.get(rollout._id)) };
+  },
+});
+
+export const upsertRolloutAssignment = gatewayMutation({
+  args: { userId: v.string(), rolloutId: v.string(), targetId: v.string(), patch: v.any() },
+  handler: async (ctx, args) => {
+    const rolloutId = ctx.db.normalizeId("releaseRollouts", args.rolloutId);
+    const rollout = rolloutId ? await ctx.db.get(rolloutId) : null;
+    if (!rollout || rollout.userExternalId !== args.userId) return null;
+    const existing = await ctx.db.query("rolloutAssignments")
+      .withIndex("byRolloutTarget", (q) => q.eq("rolloutId", rollout._id).eq("targetId", args.targetId)).unique();
+    const timestamp = nowIso();
+    const status = args.patch.status ?? existing?.status ?? "pending";
+    const values = {
+      status,
+      reasonCode: args.patch.reasonCode ?? null,
+      observedVersion: args.patch.observedVersion ?? existing?.observedVersion ?? null,
+      progress: Number.isFinite(args.patch.progress) ? Math.max(0, Math.min(100, args.patch.progress)) : existing?.progress ?? null,
+      attempts: (existing?.attempts ?? 0) + (args.patch.attempted ? 1 : 0),
+      previousDesiredVersion: existing?.previousDesiredVersion ?? args.patch.previousDesiredVersion ?? null,
+      updatedAt: timestamp,
+      completedAt: ["succeeded", "failed", "cancelled", "rolled_back"].includes(status)
+        ? timestamp : existing?.completedAt ?? null,
+    };
+    let id;
+    if (existing) {
+      await ctx.db.patch(existing._id, values);
+      id = existing._id;
+    } else {
+      id = await ctx.db.insert("rolloutAssignments", {
+        userExternalId: args.userId, rolloutId: rollout._id, targetId: args.targetId,
+        targetKind: rollout.targetKind, createdAt: timestamp, ...values,
+      });
+    }
+    await ctx.db.patch(rollout._id, { updatedAt: timestamp });
+    if (!existing || existing.status !== status || existing.reasonCode !== values.reasonCode) {
+      await audit(ctx, { userExternalId: args.userId, actorType: "system",
+        action: "release_rollout.assignment_changed", targetId: id,
+        metadata: { rolloutId: rollout._id, targetId: args.targetId, status, reasonCode: values.reasonCode } });
+    }
+    const row = await ctx.db.get(id);
+    return row ? publicRolloutAssignment(row) : null;
+  },
+});
+
+export const listRolloutAssignments = gatewayQuery({
+  args: { userId: v.string(), rolloutId: v.string() },
+  handler: async (ctx, args) => {
+    const rolloutId = ctx.db.normalizeId("releaseRollouts", args.rolloutId);
+    const rollout = rolloutId ? await ctx.db.get(rolloutId) : null;
+    if (!rollout || rollout.userExternalId !== args.userId) return [];
+    const rows = await ctx.db.query("rolloutAssignments")
+      .withIndex("byRolloutId", (q) => q.eq("rolloutId", rollout._id)).collect();
+    return rows.sort((a, b) => a.targetId.localeCompare(b.targetId)).map(publicRolloutAssignment);
+  },
+});
+
+export const createCompanionHandoff = gatewayMutation({
+  args: {
+    userId: v.string(),
+    deviceId: v.union(v.id("devices"), v.null()),
+    environmentId: v.id("environments"),
+    threadId: v.string(),
+    action: v.string(),
+    codeHash: v.string(),
+    expiresAt: v.string(),
+  },
+  handler: async (ctx, args) => {
+    const now = Date.now();
+    const rows = await ctx.db.query("companionHandoffs")
+      .withIndex("byUserExternalId", (q) => q.eq("userExternalId", args.userId)).take(257);
+    for (const row of rows) {
+      if (row.status === "waiting" && Date.parse(row.expiresAt) <= now) {
+        await ctx.db.patch(row._id, { status: "expired", codeHash: null });
+      }
+    }
+    rows.sort((left, right) => left.createdAt.localeCompare(right.createdAt));
+    while (rows.length >= 256) {
+      const terminalIndex = rows.findIndex((row) => ["completed", "expired", "cancelled"].includes(row.status)
+        || (row.status === "waiting" && Date.parse(row.expiresAt) <= now));
+      if (terminalIndex === -1) return { limitExceeded: true, handoff: null };
+      const [terminal] = rows.splice(terminalIndex, 1);
+      await ctx.db.delete(terminal._id);
+    }
+    const active = rows.filter((row) => ["waiting", "claimed"].includes(row.status)
+      && !(row.status === "waiting" && Date.parse(row.expiresAt) <= now));
+    if (active.length >= 32) return { limitExceeded: true, handoff: null };
+    const id = await ctx.db.insert("companionHandoffs", {
+      userExternalId: args.userId,
+      deviceId: args.deviceId,
+      environmentId: args.environmentId,
+      threadId: args.threadId,
+      action: args.action,
+      status: "waiting",
+      codeHash: args.codeHash,
+      createdAt: nowIso(),
+      expiresAt: args.expiresAt,
+      claimedAt: null,
+      completedAt: null,
+      cancelledAt: null,
+    });
+    const handoff = await ctx.db.get(id);
+    await audit(ctx, { userExternalId: args.userId, actorType: args.deviceId ? "device" : "user",
+      actorId: args.deviceId ?? undefined, action: "companion_handoff.created", targetId: id,
+      metadata: { action: args.action, expiresAt: args.expiresAt } });
+    return { limitExceeded: false, handoff: publicCompanionHandoff(handoff) };
+  },
+});
+
+export const getCompanionHandoffForUser = gatewayQuery({
+  args: { userId: v.string(), handoffId: v.id("companionHandoffs") },
+  handler: async (ctx, args) => {
+    const handoff = await ctx.db.get(args.handoffId);
+    if (!handoff || handoff.userExternalId !== args.userId) return null;
+    return publicCompanionHandoff(handoff);
+  },
+});
+
+export const getCompanionHandoffForDevice = gatewayQuery({
+  args: { userId: v.string(), deviceId: v.id("devices"), handoffId: v.id("companionHandoffs") },
+  handler: async (ctx, args) => {
+    const handoff = await ctx.db.get(args.handoffId);
+    if (!handoff || handoff.userExternalId !== args.userId || handoff.deviceId !== args.deviceId) return null;
+    return publicCompanionHandoff(handoff);
+  },
+});
+
+export const claimCompanionHandoff = gatewayMutation({
+  args: { userId: v.string(), codeHash: v.string(), claimedAt: v.optional(v.string()) },
+  handler: async (ctx, args) => {
+    const handoff = await ctx.db.query("companionHandoffs")
+      .withIndex("byCodeHash", (q) => q.eq("codeHash", args.codeHash)).unique();
+    if (!handoff || handoff.userExternalId !== args.userId) return null;
+    const claimedAt = args.claimedAt ?? nowIso();
+    if (handoff.status !== "waiting" || Date.parse(handoff.expiresAt) <= Date.parse(claimedAt)) {
+      if (handoff.status === "waiting") await ctx.db.patch(handoff._id, { status: "expired", codeHash: null });
+      return publicCompanionHandoff(await ctx.db.get(handoff._id));
+    }
+    await ctx.db.patch(handoff._id, { status: "claimed", claimedAt, codeHash: null });
+    await audit(ctx, { userExternalId: args.userId, actorType: "user",
+      action: "companion_handoff.claimed", targetId: handoff._id,
+      metadata: { action: handoff.action } });
+    return publicCompanionHandoff(await ctx.db.get(handoff._id));
+  },
+});
+
+export const cancelCompanionHandoff = gatewayMutation({
+  args: { userId: v.string(), handoffId: v.id("companionHandoffs"), deviceId: v.union(v.id("devices"), v.null()), cancelledAt: v.optional(v.string()) },
+  handler: async (ctx, args) => {
+    const handoff = await ctx.db.get(args.handoffId);
+    if (!handoff || handoff.userExternalId !== args.userId) return null;
+    if (args.deviceId !== null && handoff.deviceId !== args.deviceId) return null;
+    if (["waiting", "claimed"].includes(handoff.status)) {
+      await ctx.db.patch(handoff._id, { status: "cancelled", codeHash: null,
+        cancelledAt: args.cancelledAt ?? nowIso() });
+    }
+    return publicCompanionHandoff(await ctx.db.get(handoff._id));
+  },
+});
+
+export const completeCompanionHandoff = gatewayMutation({
+  args: { userId: v.string(), handoffId: v.id("companionHandoffs"), completedAt: v.optional(v.string()) },
+  handler: async (ctx, args) => {
+    const handoff = await ctx.db.get(args.handoffId);
+    if (!handoff || handoff.userExternalId !== args.userId) return null;
+    if (handoff.status === "claimed") {
+      await ctx.db.patch(handoff._id, { status: "completed", completedAt: args.completedAt ?? nowIso() });
+    }
+    return publicCompanionHandoff(await ctx.db.get(handoff._id));
+  },
+});
+
+export const createMediaUploadSession = gatewayMutation({
+  args: {
+    userId: v.string(),
+    deviceId: v.union(v.id("devices"), v.null()),
+    clientRequestId: v.string(),
+    kind: v.string(),
+    contentType: v.string(),
+    expectedSizeBytes: v.number(),
+    expectedSha256: v.string(),
+    ownerByteLimit: v.number(),
+    storagePath: v.string(),
+    originalName: v.optional(v.string()),
+    transcript: v.optional(v.string()),
+    captureSource: v.optional(v.string()),
+    environmentId: v.optional(v.union(v.id("environments"), v.null())),
+    threadId: v.optional(v.union(v.string(), v.null())),
+    companionHandoffId: v.optional(v.union(v.id("companionHandoffs"), v.null())),
+    expiresAt: v.string(),
+    createdAt: v.optional(v.string()),
+  },
+  handler: async (ctx, args) => {
+    const rows = await ctx.db
+      .query("mediaUploadSessions")
+      .withIndex("byOwnerRequest", (q: any) => q
+        .eq("userExternalId", args.userId)
+        .eq("clientRequestId", args.clientRequestId))
+      .collect();
+    const existing = rows.find((session: any) => (session.deviceId ?? null) === args.deviceId);
+    if (existing) {
+      const conflict = existing.kind !== args.kind
+        || existing.contentType !== args.contentType
+        || existing.expectedSizeBytes !== args.expectedSizeBytes
+        || existing.expectedSha256 !== args.expectedSha256;
+      return { created: false, conflict, session: publicMediaUploadSession(existing) };
+    }
+    const usage = await ensureMediaOwnerUsage(ctx, args.userId);
+    if (usage.committedBytes + usage.reservedBytes + args.expectedSizeBytes > args.ownerByteLimit) {
+      return { created: false, conflict: false, byteLimitExceeded: true, session: null };
+    }
+    const ownerSessions = await ctx.db
+      .query("mediaUploadSessions")
+      .withIndex("byUserExternalId", (q) => q.eq("userExternalId", args.userId))
+      .take(257);
+    if (args.companionHandoffId && ownerSessions.some((session) => (
+      session.companionHandoffId === args.companionHandoffId
+      && ["pending", "uploaded", "finalized"].includes(session.status)
+    ))) {
+      return { created: false, conflict: true, session: null };
+    }
+    while (ownerSessions.length >= 256) {
+      const terminalIndex = ownerSessions.findIndex((session) => (
+        ["finalized", "aborted", "expired"].includes(session.status)
+      ));
+      if (terminalIndex === -1) {
+        return { created: false, conflict: false, limitExceeded: true, session: null };
+      }
+      const [terminal] = ownerSessions.splice(terminalIndex, 1);
+      await ctx.db.delete(terminal._id);
+    }
+    const id = await ctx.db.insert("mediaUploadSessions", {
+      userExternalId: args.userId,
+      deviceId: args.deviceId,
+      clientRequestId: args.clientRequestId,
+      kind: args.kind,
+      contentType: args.contentType,
+      expectedSizeBytes: args.expectedSizeBytes,
+      expectedSha256: args.expectedSha256,
+      storagePath: args.storagePath,
+      originalName: args.originalName ?? null,
+      transcript: args.kind === "audio" ? normalizeTranscript(args.transcript) ?? null : null,
+      captureSource: args.captureSource ?? undefined,
+      environmentId: args.environmentId ?? null,
+      threadId: args.threadId ?? null,
+      companionHandoffId: args.companionHandoffId ?? null,
+      status: "pending",
+      mediaId: null,
+      createdAt: args.createdAt ?? nowIso(),
+      expiresAt: args.expiresAt,
+      uploadedAt: null,
+      finalizedAt: null,
+      abortedAt: null,
+    });
+    const session = await ctx.db.get(id);
+    await ctx.db.patch(usage._id, {
+      reservedBytes: usage.reservedBytes + args.expectedSizeBytes,
+      updatedAt: nowIso(),
+    });
+    await audit(ctx, {
+      userExternalId: args.userId,
+      actorType: args.deviceId ? "device" : "user",
+      actorId: args.deviceId ?? undefined,
+      action: "media.upload_session_created",
+      targetId: id,
+      metadata: {
+        kind: args.kind,
+        contentType: args.contentType,
+        expectedSizeBytes: args.expectedSizeBytes,
+        expiresAt: args.expiresAt,
+      },
+    });
+    return { created: true, conflict: false, session: publicMediaUploadSession(session) };
+  },
+});
+
+export const getMediaUploadSessionForActor = gatewayQuery({
+  args: {
+    userId: v.string(),
+    deviceId: v.union(v.id("devices"), v.null()),
+    sessionId: v.id("mediaUploadSessions"),
+  },
+  handler: async (ctx, args) => {
+    const session = await ctx.db.get(args.sessionId);
+    if (!session || session.userExternalId !== args.userId) return null;
+    if (args.deviceId !== null && (session.deviceId ?? null) !== args.deviceId) return null;
+    return mediaUploadSessionForGateway(session);
+  },
+});
+
+export const markMediaUploadSessionUploaded = gatewayMutation({
+  args: {
+    userId: v.string(),
+    deviceId: v.union(v.id("devices"), v.null()),
+    sessionId: v.id("mediaUploadSessions"),
+    uploadedAt: v.optional(v.string()),
+  },
+  handler: async (ctx, args) => {
+    const session = await ctx.db.get(args.sessionId);
+    if (!session || session.userExternalId !== args.userId) return null;
+    if (args.deviceId !== null && (session.deviceId ?? null) !== args.deviceId) return null;
+    if (session.status === "pending") {
+      await ctx.db.patch(session._id, { status: "uploaded", uploadedAt: args.uploadedAt ?? nowIso() });
+    }
+    return publicMediaUploadSession(await ctx.db.get(session._id));
+  },
+});
+
+export const finalizeMediaUploadSession = gatewayMutation({
+  args: {
+    userId: v.string(),
+    deviceId: v.union(v.id("devices"), v.null()),
+    sessionId: v.id("mediaUploadSessions"),
+    storagePath: v.string(),
+    mediaExpiresAt: v.union(v.string(), v.null()),
+    finalizedAt: v.optional(v.string()),
+  },
+  handler: async (ctx, args) => {
+    const session = await ctx.db.get(args.sessionId);
+    if (!session || session.userExternalId !== args.userId) return null;
+    if (args.deviceId !== null && (session.deviceId ?? null) !== args.deviceId) return null;
+    if (session.status === "finalized" && session.mediaId) {
+      return {
+        session: publicMediaUploadSession(session),
+        media: publicMediaUpload(await ctx.db.get(session.mediaId)),
+      };
+    }
+    if (session.status !== "uploaded") {
+      return { session: publicMediaUploadSession(session), media: null };
+    }
+    let media = (await ctx.db
+      .query("mediaUploads")
+      .withIndex("byUploadSessionId", (q: any) => q.eq("uploadSessionId", session._id))
+      .unique()) as any;
+    if (!media) {
+      const transcript = session.kind === "audio" ? session.transcript ?? null : null;
+      const mediaId = await ctx.db.insert("mediaUploads", {
+        userExternalId: session.userExternalId,
+        ...(session.deviceId ? { deviceId: session.deviceId } : {}),
+        kind: session.kind,
+        contentType: session.contentType,
+        sizeBytes: session.expectedSizeBytes,
+        sha256: session.expectedSha256,
+        storagePath: args.storagePath,
+        uploadSessionId: session._id,
+        ...(session.originalName ? { originalName: session.originalName } : {}),
+        transcript,
+        captureSource: session.captureSource ?? undefined,
+        environmentId: session.environmentId ?? null,
+        threadId: session.threadId ?? null,
+        companionHandoffId: session.companionHandoffId ?? null,
+        processing: normalizeMediaProcessing(null, session.kind, transcript),
+        expiresAt: args.mediaExpiresAt,
+        createdAt: nowIso(),
+      });
+      media = await ctx.db.get(mediaId);
+      const usage = await ensureMediaOwnerUsage(ctx, session.userExternalId);
+      await ctx.db.patch(usage._id, {
+        committedBytes: usage.committedBytes + session.expectedSizeBytes,
+        reservedBytes: Math.max(0, usage.reservedBytes - session.expectedSizeBytes),
+        updatedAt: nowIso(),
+      });
+      await audit(ctx, {
+        userExternalId: session.userExternalId,
+        actorType: session.deviceId ? "device" : "user",
+        actorId: session.deviceId ?? undefined,
+        action: "media.uploaded",
+        targetId: mediaId,
+        metadata: {
+          kind: session.kind,
+          contentType: session.contentType,
+          sizeBytes: session.expectedSizeBytes,
+          sha256: session.expectedSha256,
+          transcriptLength: transcript?.length ?? 0,
+          expiresAt: args.mediaExpiresAt,
+        },
+      });
+    }
+    await ctx.db.patch(session._id, {
+      status: "finalized",
+      mediaId: media._id,
+      finalizedAt: args.finalizedAt ?? nowIso(),
+    });
+    return {
+      session: publicMediaUploadSession(await ctx.db.get(session._id)),
+      media: publicMediaUpload(media),
+    };
+  },
+});
+
+export const abortMediaUploadSession = gatewayMutation({
+  args: {
+    userId: v.string(),
+    deviceId: v.union(v.id("devices"), v.null()),
+    sessionId: v.id("mediaUploadSessions"),
+    status: v.optional(v.string()),
+    at: v.optional(v.string()),
+  },
+  handler: async (ctx, args) => {
+    const session = await ctx.db.get(args.sessionId);
+    if (!session || session.userExternalId !== args.userId) return null;
+    if (args.deviceId !== null && (session.deviceId ?? null) !== args.deviceId) return null;
+    if (session.status === "finalized") return publicMediaUploadSession(session);
+    if (session.status !== "aborted" && session.status !== "expired") {
+      const usage = await ensureMediaOwnerUsage(ctx, args.userId);
+      await ctx.db.patch(usage._id, {
+        reservedBytes: Math.max(0, usage.reservedBytes - session.expectedSizeBytes),
+        updatedAt: nowIso(),
+      });
+      await ctx.db.patch(session._id, {
+        status: args.status === "expired" ? "expired" : "aborted",
+        abortedAt: args.at ?? nowIso(),
+      });
+    }
+    return publicMediaUploadSession(await ctx.db.get(session._id));
+  },
+});
+
+export const listExpiredMediaUploadSessions = gatewayQuery({
+  args: { userId: v.string(), now: v.string() },
+  handler: async (ctx, args) => {
+    const sessions = await ctx.db
+      .query("mediaUploadSessions")
+      .withIndex("byUserExternalId", (q: any) => q.eq("userExternalId", args.userId))
+      .collect();
+    return sessions
+      .filter((session: any) => ["pending", "uploaded"].includes(session.status)
+        && session.expiresAt <= args.now)
+      .map(mediaUploadSessionForGateway);
+  },
+});
+
 export const createMediaUpload = gatewayMutation({
   args: {
     userId: v.string(),
@@ -1349,11 +2698,29 @@ export const createMediaUpload = gatewayMutation({
     sizeBytes: v.number(),
     sha256: v.string(),
     storagePath: v.string(),
+    uploadSessionId: v.optional(v.union(v.id("mediaUploadSessions"), v.null())),
     originalName: v.optional(v.string()),
     transcript: v.optional(v.string()),
+    captureSource: v.optional(v.string()),
+    environmentId: v.optional(v.union(v.id("environments"), v.null())),
+    threadId: v.optional(v.union(v.string(), v.null())),
+    companionHandoffId: v.optional(v.union(v.id("companionHandoffs"), v.null())),
     expiresAt: v.optional(v.union(v.string(), v.null())),
+    ownerByteLimit: v.optional(v.number()),
   },
   handler: async (ctx, args) => {
+    if (args.uploadSessionId) {
+      const existing = await ctx.db
+        .query("mediaUploads")
+        .withIndex("byUploadSessionId", (q: any) => q.eq("uploadSessionId", args.uploadSessionId))
+        .unique();
+      if (existing) return publicMediaUpload(existing);
+    }
+    const usage = await ensureMediaOwnerUsage(ctx, args.userId);
+    if (args.ownerByteLimit !== undefined
+      && usage.committedBytes + usage.reservedBytes + args.sizeBytes > args.ownerByteLimit) {
+      return { byteLimitExceeded: true };
+    }
     const transcript = args.kind === "audio" ? normalizeTranscript(args.transcript) ?? null : null;
     const id = await ctx.db.insert("mediaUploads", {
       userExternalId: args.userId,
@@ -1363,13 +2730,22 @@ export const createMediaUpload = gatewayMutation({
       sizeBytes: args.sizeBytes,
       sha256: args.sha256,
       storagePath: args.storagePath,
+      ...(args.uploadSessionId ? { uploadSessionId: args.uploadSessionId } : {}),
       ...(args.originalName ? { originalName: args.originalName } : {}),
+      captureSource: args.captureSource ?? undefined,
+      environmentId: args.environmentId ?? null,
+      threadId: args.threadId ?? null,
+      companionHandoffId: args.companionHandoffId ?? null,
       transcript,
       processing: normalizeMediaProcessing(null, args.kind, transcript),
       expiresAt: args.expiresAt ?? null,
       createdAt: nowIso(),
     });
     const media = await ctx.db.get(id);
+    await ctx.db.patch(usage._id, {
+      committedBytes: usage.committedBytes + args.sizeBytes,
+      updatedAt: nowIso(),
+    });
     await audit(ctx, {
       userExternalId: args.userId,
       actorType: args.deviceId ? "device" : "user",
@@ -1538,7 +2914,12 @@ export const deleteMediaUpload = gatewayMutation({
   handler: async (ctx, args) => {
     const media = await ctx.db.get(args.mediaId);
     if (!media || media.userExternalId !== args.userId) return null;
+    const usage = await ensureMediaOwnerUsage(ctx, args.userId);
     await ctx.db.delete(media._id);
+    await ctx.db.patch(usage._id, {
+      committedBytes: Math.max(0, usage.committedBytes - media.sizeBytes),
+      updatedAt: nowIso(),
+    });
     // A job whose media is gone can never finish; leaving it queued would make the worker
     // rediscover it on every tick until the retry budget burned out.
     const orphaned = await ctx.db
@@ -2513,6 +3894,143 @@ export const createCommand = gatewayMutation({
   },
 });
 
+export const claimCommandRequest = gatewayMutation({
+  args: {
+    userId: v.string(),
+    actorType: v.string(),
+    actorId: v.string(),
+    operation: v.string(),
+    clientRequestId: v.string(),
+    requestHash: v.string(),
+  },
+  handler: async (ctx, args) => {
+    const nowMs = Date.now();
+    const exact = await ctx.db
+      .query("commandRequests")
+      .withIndex("byOwnerOperationRequest", (q: any) => q
+        .eq("userExternalId", args.userId)
+        .eq("actorType", args.actorType)
+        .eq("actorId", args.actorId)
+        .eq("operation", args.operation)
+        .eq("clientRequestId", args.clientRequestId))
+      .unique();
+    if (exact && Date.parse(exact.expiresAt) > nowMs) {
+      return {
+        claimed: false,
+        conflict: exact.requestHash !== args.requestHash,
+        capacity: false,
+        request: publicCommandRequest(exact),
+      };
+    }
+    if (exact) await ctx.db.delete(exact._id);
+
+    // The exact-index fast path above keeps normal retries O(1). Only a genuinely new claim pays
+    // the bounded owner scan needed for TTL cleanup and terminal oldest-first eviction.
+    const owned = await ctx.db
+      .query("commandRequests")
+      .withIndex("byOwnerCreatedAt", (q: any) => q
+        .eq("userExternalId", args.userId)
+        .eq("actorType", args.actorType)
+        .eq("actorId", args.actorId))
+      .collect();
+    const live: any[] = [];
+    for (const request of owned) {
+      if (Date.parse(request.expiresAt) <= nowMs) await ctx.db.delete(request._id);
+      else live.push(request);
+    }
+
+    live.sort((left, right) => Date.parse(left.createdAt) - Date.parse(right.createdAt));
+    while (live.length >= COMMAND_REQUEST_MAX_PER_OWNER) {
+      const index = live.findIndex((request) => request.status !== "processing");
+      if (index < 0) return { claimed: false, conflict: false, capacity: true, request: null };
+      const [evicted] = live.splice(index, 1);
+      await ctx.db.delete(evicted._id);
+    }
+
+    const now = new Date(nowMs).toISOString();
+    const id = await ctx.db.insert("commandRequests", {
+      userExternalId: args.userId,
+      actorType: args.actorType,
+      actorId: args.actorId,
+      operation: args.operation,
+      clientRequestId: args.clientRequestId,
+      requestHash: args.requestHash,
+      status: "processing",
+      commandId: null,
+      httpStatus: null,
+      createdAt: now,
+      updatedAt: now,
+      expiresAt: new Date(nowMs + COMMAND_REQUEST_TTL_MS).toISOString(),
+    });
+    return {
+      claimed: true,
+      conflict: false,
+      capacity: false,
+      request: publicCommandRequest(await ctx.db.get(id)),
+    };
+  },
+});
+
+export const settleCommandRequest = gatewayMutation({
+  args: {
+    userId: v.string(),
+    actorType: v.string(),
+    actorId: v.string(),
+    operation: v.string(),
+    clientRequestId: v.string(),
+    requestHash: v.string(),
+    status: v.string(),
+    commandId: v.union(v.id("commands"), v.null()),
+    httpStatus: v.number(),
+  },
+  handler: async (ctx, args) => {
+    const request = await ctx.db
+      .query("commandRequests")
+      .withIndex("byOwnerOperationRequest", (q: any) => q
+        .eq("userExternalId", args.userId)
+        .eq("actorType", args.actorType)
+        .eq("actorId", args.actorId)
+        .eq("operation", args.operation)
+        .eq("clientRequestId", args.clientRequestId))
+      .unique();
+    if (!request || request.requestHash !== args.requestHash) return null;
+    if (request.status !== "processing") return publicCommandRequest(request);
+    const status = [
+      "approval_required", "blocked", "dispatched", "completed", "failed", "rejected", "cancelled",
+    ].includes(args.status) ? args.status : "failed";
+    await ctx.db.patch(request._id, {
+      status,
+      commandId: args.commandId,
+      httpStatus: args.httpStatus,
+      updatedAt: nowIso(),
+    });
+    return publicCommandRequest(await ctx.db.get(request._id));
+  },
+});
+
+export const getCommandRequest = gatewayQuery({
+  args: {
+    userId: v.string(),
+    actorType: v.string(),
+    actorId: v.string(),
+    operation: v.string(),
+    clientRequestId: v.string(),
+  },
+  handler: async (ctx, args) => {
+    const request = await ctx.db
+      .query("commandRequests")
+      .withIndex("byOwnerOperationRequest", (q: any) => q
+        .eq("userExternalId", args.userId)
+        .eq("actorType", args.actorType)
+        .eq("actorId", args.actorId)
+        .eq("operation", args.operation)
+        .eq("clientRequestId", args.clientRequestId))
+      .unique();
+    if (!request || Date.parse(request.expiresAt) <= Date.now()) return null;
+    return publicCommandRequest(request);
+  },
+});
+
 export const getCommandForUser = gatewayQuery({
   args: {
     userId: v.string(),
@@ -2733,6 +4251,362 @@ export const listProviderUserInputAnswers = gatewayQuery({
   },
 });
 
+export const createNotification = gatewayMutation({
+  args: {
+    userId: v.string(),
+    dedupeKey: v.string(),
+    kind: v.string(),
+    severity: v.string(),
+    title: v.string(),
+    environmentId: v.optional(v.union(v.string(), v.null())),
+    threadId: v.optional(v.union(v.string(), v.null())),
+    commandId: v.optional(v.union(v.string(), v.null())),
+    occurredAt: v.optional(v.union(v.string(), v.null())),
+  },
+  handler: async (ctx, args) => {
+    if (!(await findUser(ctx, args.userId))) return null;
+    if (!notificationKinds.has(args.kind)) throw new Error("Unsupported notification kind.");
+    if (!notificationSeverities.has(args.severity)) throw new Error("Unsupported notification severity.");
+    const dedupeKey = normalizeNotificationText(args.dedupeKey, 128, "dedupeKey");
+    await pruneNotifications(ctx, args.userId);
+    const existing = await ctx.db
+      .query("notifications")
+      .withIndex("byUserDedupeKey", (q: any) =>
+        q.eq("userExternalId", args.userId).eq("dedupeKey", dedupeKey))
+      .unique();
+    if (existing) return { created: false, notification: publicNotification(existing) };
+
+    const latest = await ctx.db
+      .query("notifications")
+      .withIndex("byUserSequence", (q: any) => q.eq("userExternalId", args.userId))
+      .order("desc")
+      .first();
+    const timestamp = nowIso();
+    const id = await ctx.db.insert("notifications", {
+      userExternalId: args.userId,
+      sequence: (latest?.sequence ?? 0) + 1,
+      dedupeKey,
+      kind: args.kind,
+      severity: args.severity,
+      title: normalizeNotificationText(args.title, 120, "title"),
+      environmentId: normalizeNullableNotificationText(args.environmentId, 160),
+      threadId: normalizeNullableNotificationText(args.threadId, 240),
+      commandId: normalizeNullableNotificationText(args.commandId, 160),
+      createdAt: normalizeNotificationTimestamp(args.occurredAt, Date.now()),
+      updatedAt: timestamp,
+      readAt: null,
+      dismissedAt: null,
+    });
+    await pruneNotifications(ctx, args.userId);
+    return { created: true, notification: publicNotification(await ctx.db.get(id)) };
+  },
+});
+
+export const listNotifications = gatewayQuery({
+  args: {
+    userId: v.string(),
+    afterCursor: v.optional(v.union(v.string(), v.null())),
+    beforeCursor: v.optional(v.union(v.string(), v.null())),
+    limit: v.optional(v.number()),
+    includeDismissed: v.optional(v.boolean()),
+  },
+  handler: async (ctx, args) => {
+    const limit = Number.isSafeInteger(args.limit) ? Math.min(100, Math.max(1, args.limit!)) : 50;
+    const after = parseNotificationCursor(args.afterCursor);
+    const before = parseNotificationCursor(args.beforeCursor);
+    if (after !== null && before !== null) throw new Error("Notification cursors are mutually exclusive.");
+    const all = await ctx.db
+      .query("notifications")
+      .withIndex("byUserSequence", (q: any) => q.eq("userExternalId", args.userId))
+      .collect();
+    const rows = all.filter((row: any) =>
+      (args.includeDismissed || !row.dismissedAt)
+      && (after === null || row.sequence > after)
+      && (before === null || row.sequence < before));
+    rows.sort(after !== null
+      ? (left: any, right: any) => left.sequence - right.sequence
+      : (left: any, right: any) => right.sequence - left.sequence);
+    const page = rows.slice(0, limit);
+    return {
+      notifications: page.map(publicNotification),
+      nextCursor: before === null && page.length > 0
+        ? String(Math.max(...page.map((row: any) => row.sequence)))
+        : (args.afterCursor ?? null),
+      oldestCursor: page.length > 0
+        ? String(Math.min(...page.map((row: any) => row.sequence)))
+        : (args.beforeCursor ?? null),
+      hasMore: rows.length > page.length,
+      hasMoreBefore: before !== null || after === null ? rows.length > page.length : false,
+      hasMoreAfter: after !== null ? rows.length > page.length : false,
+      unreadCount: all.filter((row: any) => !row.readAt && !row.dismissedAt).length,
+    };
+  },
+});
+
+export const markNotificationRead = gatewayMutation({
+  args: { userId: v.string(), notificationId: v.id("notifications") },
+  handler: async (ctx, args) => {
+    const notification = await ctx.db.get(args.notificationId);
+    if (!notification || notification.userExternalId !== args.userId) return null;
+    const duplicate = Boolean(notification.readAt);
+    if (!duplicate) {
+      const timestamp = nowIso();
+      await ctx.db.patch(notification._id, { readAt: timestamp, updatedAt: timestamp });
+    }
+    return { notification: publicNotification(await ctx.db.get(notification._id)), duplicate };
+  },
+});
+
+export const dismissNotification = gatewayMutation({
+  args: { userId: v.string(), notificationId: v.id("notifications") },
+  handler: async (ctx, args) => {
+    const notification = await ctx.db.get(args.notificationId);
+    if (!notification || notification.userExternalId !== args.userId) return null;
+    const duplicate = Boolean(notification.dismissedAt);
+    if (!duplicate) {
+      const timestamp = nowIso();
+      await ctx.db.patch(notification._id, {
+        dismissedAt: timestamp,
+        readAt: notification.readAt ?? timestamp,
+        updatedAt: timestamp,
+      });
+    }
+    return { notification: publicNotification(await ctx.db.get(notification._id)), duplicate };
+  },
+});
+
+export const dismissNotificationByDedupe = gatewayMutation({
+  args: {
+    userId: v.string(),
+    dedupeKey: v.string(),
+    resolvedAt: v.optional(v.union(v.string(), v.null())),
+  },
+  handler: async (ctx, args) => {
+    const dedupeKey = normalizeNotificationText(args.dedupeKey, 128, "dedupeKey");
+    const notification = await ctx.db
+      .query("notifications")
+      .withIndex("byUserDedupeKey", (q: any) =>
+        q.eq("userExternalId", args.userId).eq("dedupeKey", dedupeKey))
+      .unique();
+    if (!notification) return null;
+    const duplicate = Boolean(notification.dismissedAt);
+    if (!duplicate) {
+      const timestamp = normalizeNotificationTimestamp(args.resolvedAt, Date.now());
+      await ctx.db.patch(notification._id, {
+        dismissedAt: timestamp,
+        readAt: notification.readAt ?? timestamp,
+        updatedAt: timestamp,
+      });
+    }
+    return { notification: publicNotification(await ctx.db.get(notification._id)), duplicate };
+  },
+});
+
+export const markAllNotificationsRead = gatewayMutation({
+  args: { userId: v.string() },
+  handler: async (ctx, args) => {
+    const rows = await ctx.db
+      .query("notifications")
+      .withIndex("byUserSequence", (q: any) => q.eq("userExternalId", args.userId))
+      .collect();
+    const updatedAt = nowIso();
+    let count = 0;
+    for (const row of rows) {
+      if (row.readAt || row.dismissedAt) continue;
+      await ctx.db.patch(row._id, { readAt: updatedAt, updatedAt });
+      count += 1;
+    }
+    return { updatedAt, count };
+  },
+});
+
+export const upsertPushSubscription = gatewayMutation({
+  args: {
+    userId: v.string(), endpoint: v.string(), endpointHash: v.string(), p256dh: v.string(),
+    auth: v.string(), vapidKeyId: v.string(), userAgent: v.optional(v.union(v.string(), v.null())),
+  },
+  handler: async (ctx, args) => {
+    if (!(await findUser(ctx, args.userId))) return null;
+    const previous = await ctx.db.query("pushSubscriptions")
+      .withIndex("byUserEndpointHash", (q: any) => q.eq("userExternalId", args.userId).eq("endpointHash", args.endpointHash))
+      .unique();
+    const timestamp = nowIso();
+    const values: any = {
+      userExternalId: args.userId, endpoint: args.endpoint, endpointHash: args.endpointHash,
+      p256dh: args.p256dh, auth: args.auth, vapidKeyId: args.vapidKeyId,
+      updatedAt: timestamp, revokedAt: null, lastFailureCode: null,
+    };
+    if (previous) {
+      await ctx.db.patch(previous._id, values);
+      return { subscription: publicPushSubscription(await ctx.db.get(previous._id)), created: false };
+    }
+    const id = await ctx.db.insert("pushSubscriptions", { ...values, createdAt: timestamp, lastAcceptedAt: null });
+    return { subscription: publicPushSubscription(await ctx.db.get(id)), created: true };
+  },
+});
+
+export const listPushSubscriptions = gatewayQuery({
+  args: { userId: v.string() },
+  handler: async (ctx, args) => (await ctx.db.query("pushSubscriptions")
+    .withIndex("byUser", (q: any) => q.eq("userExternalId", args.userId)).collect())
+    .filter((row: any) => !row.revokedAt).map(publicPushSubscription),
+});
+
+export const revokePushSubscription = gatewayMutation({
+  args: { userId: v.string(), subscriptionId: v.id("pushSubscriptions"), reason: v.optional(v.string()) },
+  handler: async (ctx, args) => {
+    const row = await ctx.db.get(args.subscriptionId);
+    if (!row || row.userExternalId !== args.userId) return null;
+    const duplicate = Boolean(row.revokedAt);
+    if (!duplicate) {
+      const timestamp = nowIso();
+      await ctx.db.patch(row._id, { revokedAt: timestamp, updatedAt: timestamp, lastFailureCode: args.reason ?? "user_revoked" });
+    }
+    return { subscription: publicPushSubscription(await ctx.db.get(row._id)), duplicate };
+  },
+});
+
+export const revokePushSubscriptionByEndpoint = gatewayMutation({
+  args: { userId: v.string(), endpointHash: v.string(), reason: v.optional(v.string()) },
+  handler: async (ctx, args) => {
+    const row = await ctx.db.query("pushSubscriptions")
+      .withIndex("byUserEndpointHash", (q: any) => q.eq("userExternalId", args.userId).eq("endpointHash", args.endpointHash))
+      .unique();
+    if (!row) return null;
+    const duplicate = Boolean(row.revokedAt);
+    if (!duplicate) {
+      const timestamp = nowIso();
+      await ctx.db.patch(row._id, { revokedAt: timestamp, updatedAt: timestamp, lastFailureCode: args.reason ?? "user_revoked" });
+    }
+    return { subscription: publicPushSubscription(await ctx.db.get(row._id)), duplicate };
+  },
+});
+
+export const enqueuePushDeliveries = gatewayMutation({
+  args: { userId: v.string(), notificationId: v.id("notifications") },
+  handler: async (ctx, args) => {
+    const notification = await ctx.db.get(args.notificationId);
+    if (!notification || notification.userExternalId !== args.userId) return [];
+    const subscriptions = (await ctx.db.query("pushSubscriptions")
+      .withIndex("byUser", (q: any) => q.eq("userExternalId", args.userId)).collect())
+      .filter((row: any) => !row.revokedAt);
+    const created: string[] = [];
+    const timestamp = nowIso();
+    for (const subscription of subscriptions) {
+      const dedupeKey = `${subscription._id}:${notification._id}`;
+      const existing = await ctx.db.query("pushDeliveries")
+        .withIndex("byDedupeKey", (q: any) => q.eq("dedupeKey", dedupeKey)).unique();
+      if (existing) continue;
+      created.push(await ctx.db.insert("pushDeliveries", {
+        userExternalId: args.userId, subscriptionId: subscription._id, notificationId: notification._id,
+        dedupeKey, status: "queued", attempts: 0, nextAttemptAt: timestamp, leaseUntil: null,
+        lastFailureCode: null, acceptedAt: null, createdAt: timestamp, updatedAt: timestamp,
+      }));
+    }
+    return created;
+  },
+});
+
+export const claimPushDeliveries = gatewayMutation({
+  args: { limit: v.optional(v.number()), leaseMs: v.optional(v.number()), now: v.optional(v.number()) },
+  handler: async (ctx, args) => {
+    const now = args.now ?? Date.now();
+    const limit = Math.max(1, Math.min(args.limit ?? 10, 50));
+    const all = await ctx.db.query("pushDeliveries").collect();
+    const candidates = all.filter((row: any) => (row.status === "queued" || row.status === "retry")
+      && Date.parse(row.nextAttemptAt) <= now && (!row.leaseUntil || Date.parse(row.leaseUntil) <= now))
+      .sort((a: any, b: any) => a.nextAttemptAt.localeCompare(b.nextAttemptAt)).slice(0, limit);
+    const claims: any[] = [];
+    for (const delivery of candidates) {
+      const subscription = await ctx.db.get(delivery.subscriptionId);
+      const notification = await ctx.db.get(delivery.notificationId);
+      if (!subscription || subscription.revokedAt || !notification || notification.dismissedAt) {
+        await ctx.db.patch(delivery._id, { status: "cancelled", leaseUntil: null, updatedAt: nowIso() });
+        continue;
+      }
+      const patch = { status: "sending", attempts: delivery.attempts + 1, leaseUntil: new Date(now + (args.leaseMs ?? 30_000)).toISOString(), updatedAt: nowIso() };
+      await ctx.db.patch(delivery._id, patch);
+      claims.push({
+        delivery: { id: delivery._id, ...delivery, ...patch },
+        subscription: { id: subscription._id, endpoint: subscription.endpoint, keys: { p256dh: subscription.p256dh, auth: subscription.auth }, vapidKeyId: subscription.vapidKeyId },
+        notification: publicNotification(notification),
+      });
+    }
+    return claims;
+  },
+});
+
+export const settlePushDelivery = gatewayMutation({
+  args: { deliveryId: v.id("pushDeliveries"), outcome: v.string(), failureCode: v.optional(v.union(v.string(), v.null())), retryAt: v.optional(v.union(v.number(), v.null())) },
+  handler: async (ctx, args) => {
+    const row = await ctx.db.get(args.deliveryId);
+    if (!row || row.status !== "sending") return null;
+    const timestamp = nowIso();
+    let status = args.outcome === "accepted" ? "accepted" : args.outcome === "gone" ? "gone" : "failed";
+    const patch: any = { status, leaseUntil: null, lastFailureCode: args.failureCode ?? null, updatedAt: timestamp };
+    if (args.outcome === "accepted") patch.acceptedAt = timestamp;
+    if (args.outcome === "retry" && row.attempts < 5) {
+      status = "retry";
+      patch.status = status;
+      patch.nextAttemptAt = new Date(args.retryAt ?? Date.now() + Math.min(60_000, 1_000 * (2 ** row.attempts))).toISOString();
+    }
+    await ctx.db.patch(row._id, patch);
+    const subscription = await ctx.db.get(row.subscriptionId);
+    if (subscription) {
+      await ctx.db.patch(subscription._id, {
+        updatedAt: timestamp,
+        lastFailureCode: args.outcome === "accepted" ? null : (args.failureCode ?? null),
+        ...(args.outcome === "accepted" ? { lastAcceptedAt: timestamp } : {}),
+        ...(args.outcome === "gone" ? { revokedAt: timestamp } : {}),
+      });
+    }
+    return { id: row._id, ...row, ...patch };
+  },
+});
+
+export const recordBackgroundLiveness = gatewayMutation({
+  args: {
+    scope: v.optional(v.string()),
+    attemptedAt: v.optional(v.union(v.string(), v.null())),
+    succeeded: v.optional(v.boolean()),
+    failureCode: v.optional(v.union(v.string(), v.null())),
+  },
+  handler: async (ctx, args) => {
+    const scope = normalizeNotificationText(args.scope ?? "scheduled-worker", 80, "scope");
+    const timestamp = normalizeNotificationTimestamp(args.attemptedAt, Date.now());
+    const previous = await ctx.db
+      .query("backgroundLiveness")
+      .withIndex("byScope", (q: any) => q.eq("scope", scope))
+      .unique();
+    const patch: any = {
+      scope,
+      lastAttemptAt: timestamp,
+      ...(args.succeeded ? { lastSuccessAt: timestamp, failureCode: null } : {}),
+      ...(args.failureCode
+        ? {
+            lastFailureAt: timestamp,
+            failureCode: normalizeBackgroundFailureCode(args.failureCode),
+          }
+        : {}),
+      updatedAt: nowIso(),
+    };
+    if (previous) {
+      await ctx.db.patch(previous._id, patch);
+      return publicBackgroundLiveness(await ctx.db.get(previous._id));
+    }
+    const id = await ctx.db.insert("backgroundLiveness", patch);
+    return publicBackgroundLiveness(await ctx.db.get(id));
+  },
+});
+
+export const getBackgroundLiveness = gatewayQuery({
+  args: { scope: v.optional(v.string()) },
+  handler: async (ctx, args) => publicBackgroundLiveness(await ctx.db
+    .query("backgroundLiveness")
+    .withIndex("byScope", (q: any) => q.eq("scope", args.scope ?? "scheduled-worker"))
+    .unique()),
+});
+
 export const updateCommand = gatewayMutation({
   args: {
     userId: v.string(),
@@ -2872,7 +4746,9 @@ export const getDisplaySummary = gatewayQuery({
     // listEnvironments() collapses duplicate baseUrls, so a raw row count would report a number
     // the environments list never shows.
     const environmentUrls = new Set<string>();
-    for (const environment of environments) environmentUrls.add(environment.baseUrl);
+    for (const environment of environments) {
+      if (!environment.archivedAt) environmentUrls.add(environment.baseUrl);
+    }
 
     return {
       counts: {
@@ -3215,6 +5091,7 @@ function normalizeEnvironmentHealth(input: any = {}, existing: any = null) {
       : {}),
     ...(Object.hasOwn(input, "snapshot") ? { snapshot: input.snapshot ?? null } : {}),
     ...(Object.hasOwn(input, "compatibility") ? { compatibility: input.compatibility ?? null } : {}),
+    ...(Object.hasOwn(input, "capabilities") ? { capabilities: input.capabilities ?? null } : {}),
   };
 }
 
@@ -3437,6 +5314,8 @@ function publicDevice(device: any) {
     // Stamped at pre-provision. Absent on devices created before the board catalogue existed, so
     // it is null rather than a guessed default — the console must not invent a board.
     hardwareModel: device.hardwareModel ?? null,
+    credentialVersion: device.credentialVersion ?? 1,
+    credentialRotation: publicDeviceCredentialRotation(device),
     claimedAt: device.claimedAt ?? null,
     claimCodeExpiresAt: device.claimCodeExpiresAt ?? null,
     revokedAt: device.revokedAt ?? null,
@@ -3450,6 +5329,39 @@ function publicDevice(device: any) {
     voiceAutoSend: normalizeVoiceAutoSend(device.voiceAutoSend, deviceReportsMicrophone(device)),
     createdAt: device.createdAt,
     claimed: Boolean(device.claimedAt),
+  };
+}
+
+function publicDeviceCredentialRotation(device: any, now = Date.now()) {
+  if (!device?.rotationId) {
+    return {
+      id: null,
+      state: "idle",
+      purpose: null,
+      pendingCredentialVersion: null,
+      startedAt: null,
+      expiresAt: null,
+      completedAt: null,
+    };
+  }
+  const completed = Boolean(device.rotationCompletedAt);
+  const expired = !completed && Date.parse(device.rotationExpiresAt ?? "") <= now;
+  return {
+    id: device.rotationId,
+    state: completed ? "completed" : expired ? "expired" : "pending",
+    purpose: device.rotationPurpose ?? "rotate",
+    pendingCredentialVersion: device.pendingCredentialVersion ?? null,
+    startedAt: device.rotationStartedAt ?? null,
+    expiresAt: device.rotationExpiresAt ?? null,
+    completedAt: device.rotationCompletedAt ?? null,
+  };
+}
+
+function deviceForGateway(device: any, authenticatedCredentialVersion: number, credentialState: string) {
+  return {
+    ...publicDevice(device),
+    authenticatedCredentialVersion,
+    credentialState,
   };
 }
 
@@ -3570,6 +5482,7 @@ function publicConnectSession(session: any) {
     userId: session.userExternalId,
     label: session.label,
     accessMode: session.accessMode,
+    purpose: session.purpose ?? "t3_enrollment",
     environmentId: session.environmentId ?? null,
     status: session.status,
     expiresAt: session.expiresAt,
@@ -3578,6 +5491,52 @@ function publicConnectSession(session: any) {
     completedAt: session.completedAt ?? null,
     createdAt: session.createdAt,
     updatedAt: session.updatedAt,
+  };
+}
+
+function publicConnector(connector: any) {
+  if (!connector) return null;
+  const gatewayConnector = connectorForGateway(connector);
+  if (!gatewayConnector) return null;
+  const { secretHash: _secretHash, ...output } = gatewayConnector;
+  return output;
+}
+
+function connectorForGateway(connector: any) {
+  if (!connector) return null;
+  return {
+    id: connector._id,
+    userId: connector.userExternalId,
+    environmentId: connector.environmentId,
+    label: connector.label,
+    secretHash: connector.secretHash ?? null,
+    secretPrefix: connector.secretPrefix,
+    credentialVersion: connector.credentialVersion ?? 1,
+    rotationId: connector.rotationId ?? null,
+    rotationStartedAt: connector.rotationStartedAt ?? null,
+    rotationExpiresAt: connector.rotationExpiresAt ?? null,
+    rotationCompletedAt: connector.rotationCompletedAt ?? null,
+    rotationPending: Boolean(connector.pendingSecretHash && Date.parse(connector.rotationExpiresAt ?? "") > Date.now()),
+    scopes: connector.scopes,
+    status: connector.status,
+    protocolVersion: connector.protocolVersion,
+    connectorVersion: connector.connectorVersion ?? null,
+    t3Version: connector.t3Version ?? null,
+    platform: connector.platform ?? null,
+    capabilities: connector.capabilities,
+    createdAt: connector.createdAt,
+    updatedAt: connector.updatedAt,
+    lastSeenAt: connector.lastSeenAt ?? null,
+    lastConnectedAt: connector.lastConnectedAt ?? null,
+    revokedAt: connector.revokedAt ?? null,
+    lastDisconnectReason: connector.lastDisconnectReason ?? null,
+    lastT3Health: connector.lastT3Health ?? null,
+    lastT3HealthAt: connector.lastT3HealthAt ?? null,
+    activeRequests: connector.activeRequests ?? 0,
+    queueDepth: connector.queueDepth ?? 0,
+    lastPresenceEventAt: connector.lastPresenceEventAt ?? null,
+    lastPresenceEventKey: connector.lastPresenceEventKey ?? null,
+    lastConnectionId: connector.lastConnectionId ?? null,
   };
 }
 
@@ -3595,13 +5554,21 @@ function environmentForGateway(environment: any) {
     id: environment._id,
     userId: environment.userExternalId,
     label: environment.label,
-    baseUrl: environment.baseUrl,
+    baseUrl: environment.baseUrl ?? null,
+    transportMode: environment.transportMode ?? "direct",
+    connectorId: environment.connectorId ?? null,
     accessToken: environment.accessToken,
     accessTokenExpiresAt: environment.accessTokenExpiresAt ?? null,
     scopes: environment.scopes,
     status: environment.status,
+    archivedAt: environment.archivedAt ?? null,
+    deletedAt: environment.deletedAt ?? null,
+    purgeAfter: environment.purgeAfter ?? null,
     health: normalizeEnvironmentHealth(environment.health),
     providerCatalogue: environment.providerCatalogue ?? null,
+    lastProjectionAt: environment.lastProjectionAt ?? null,
+    lastConnectorSeenAt: environment.lastConnectorSeenAt ?? null,
+    freshness: environment.freshness ?? "unknown",
     createdAt: environment.createdAt,
     updatedAt: environment.updatedAt,
   };
@@ -3620,6 +5587,59 @@ function publicFirmwareRelease(release: any) {
     mandatory: release.mandatory,
     releaseNotes: release.releaseNotes,
     createdAt: release.createdAt,
+  };
+}
+
+function publicReleaseRolloutRecord(rollout: any) {
+  if (!rollout) return null;
+  return {
+    id: rollout._id,
+    userId: rollout.userExternalId,
+    name: rollout.name,
+    targetKind: rollout.targetKind,
+    targetVersion: rollout.targetVersion,
+    rollbackVersion: rollout.rollbackVersion ?? null,
+    releaseId: rollout.releaseId ?? null,
+    channel: rollout.channel,
+    cohort: rollout.cohort?.type === "allowlist"
+      ? { type: "allowlist", targetIds: [...(rollout.cohort.targetIds ?? [])] }
+      : { type: "percentage", percentage: rollout.cohort?.percentage ?? 0 },
+    minimumProtocolVersion: rollout.minimumProtocolVersion,
+    requiredCapabilities: [...rollout.requiredCapabilities],
+    state: rollout.state,
+    evidenceRef: rollout.evidenceRef ?? null,
+    createdAt: rollout.createdAt,
+    updatedAt: rollout.updatedAt,
+    startedAt: rollout.startedAt ?? null,
+    completedAt: rollout.completedAt ?? null,
+  };
+}
+
+async function publicReleaseRolloutWithProgress(ctx: any, rollout: any) {
+  if (!rollout) return null;
+  const assignments = await ctx.db.query("rolloutAssignments")
+    .withIndex("byRolloutId", (q: any) => q.eq("rolloutId", rollout._id)).collect();
+  const counts: Record<string, number> = {};
+  for (const assignment of assignments) counts[assignment.status] = (counts[assignment.status] ?? 0) + 1;
+  return { ...publicReleaseRolloutRecord(rollout), progress: { total: assignments.length, counts } };
+}
+
+function publicRolloutAssignment(row: any) {
+  return {
+    id: row._id,
+    userId: row.userExternalId,
+    rolloutId: row.rolloutId,
+    targetId: row.targetId,
+    targetKind: row.targetKind,
+    status: row.status,
+    reasonCode: row.reasonCode ?? null,
+    observedVersion: row.observedVersion ?? null,
+    progress: row.progress ?? null,
+    attempts: row.attempts,
+    previousDesiredVersion: row.previousDesiredVersion ?? null,
+    createdAt: row.createdAt,
+    updatedAt: row.updatedAt,
+    completedAt: row.completedAt ?? null,
   };
 }
 
@@ -3647,8 +5667,60 @@ function publicMediaUpload(media: any) {
   if (!media) return null;
   const gatewayMedia = mediaForGateway(media);
   if (!gatewayMedia) return null;
-  const { storagePath, ...output } = gatewayMedia;
+  const { storagePath, uploadSessionId, ...output } = gatewayMedia;
   return output;
+}
+
+function publicMediaUploadSession(session: any) {
+  if (!session) return null;
+  return {
+    id: session._id,
+    kind: session.kind,
+    contentType: session.contentType,
+    sizeBytes: session.expectedSizeBytes,
+    sha256: session.expectedSha256,
+    status: session.status,
+    mediaId: session.mediaId ?? null,
+    createdAt: session.createdAt,
+    expiresAt: session.expiresAt,
+    uploadedAt: session.uploadedAt ?? null,
+    finalizedAt: session.finalizedAt ?? null,
+    abortedAt: session.abortedAt ?? null,
+  };
+}
+
+function publicCompanionHandoff(handoff: any) {
+  if (!handoff) return null;
+  const { codeHash, userExternalId, _id, _creationTime, ...rest } = handoff;
+  return { id: _id, ...rest };
+}
+
+function mediaUploadSessionForGateway(session: any) {
+  if (!session) return null;
+  return {
+    id: session._id,
+    userId: session.userExternalId,
+    deviceId: session.deviceId ?? null,
+    clientRequestId: session.clientRequestId,
+    kind: session.kind,
+    contentType: session.contentType,
+    expectedSizeBytes: session.expectedSizeBytes,
+    expectedSha256: session.expectedSha256,
+    storagePath: session.storagePath,
+    originalName: session.originalName ?? null,
+    transcript: session.transcript ?? null,
+    captureSource: session.captureSource ?? null,
+    environmentId: session.environmentId ?? null,
+    threadId: session.threadId ?? null,
+    companionHandoffId: session.companionHandoffId ?? null,
+    status: session.status,
+    mediaId: session.mediaId ?? null,
+    createdAt: session.createdAt,
+    expiresAt: session.expiresAt,
+    uploadedAt: session.uploadedAt ?? null,
+    finalizedAt: session.finalizedAt ?? null,
+    abortedAt: session.abortedAt ?? null,
+  };
 }
 
 function publicMacro(macro: any) {
@@ -3748,7 +5820,12 @@ function mediaForGateway(media: any) {
     sizeBytes: media.sizeBytes,
     sha256: media.sha256,
     storagePath: media.storagePath,
+    uploadSessionId: media.uploadSessionId ?? null,
     originalName: media.originalName ?? null,
+    captureSource: media.captureSource ?? null,
+    environmentId: media.environmentId ?? null,
+    threadId: media.threadId ?? null,
+    companionHandoffId: media.companionHandoffId ?? null,
     transcript: media.transcript ?? null,
     description: media.description ?? null,
     processing: normalizeMediaProcessing(
@@ -3835,6 +5912,20 @@ function publicCommand(command: any) {
   };
 }
 
+function publicCommandRequest(request: any) {
+  if (!request) return null;
+  return {
+    clientRequestId: request.clientRequestId,
+    operation: request.operation,
+    status: request.status,
+    commandId: request.commandId ?? null,
+    httpStatus: request.httpStatus ?? null,
+    createdAt: request.createdAt,
+    updatedAt: request.updatedAt,
+    expiresAt: request.expiresAt,
+  };
+}
+
 function publicCommandEvent(event: any) {
   if (!event) return null;
   return {
@@ -3851,6 +5942,120 @@ function publicCommandEvent(event: any) {
     metrics: normalizeCommandMetrics(event.metrics),
     createdAt: event.createdAt,
   };
+}
+
+function publicNotification(notification: any) {
+  if (!notification) return null;
+  return {
+    id: notification._id,
+    userId: notification.userExternalId,
+    sequence: notification.sequence,
+    kind: notification.kind,
+    severity: notification.severity,
+    title: notification.title,
+    environmentId: notification.environmentId ?? null,
+    threadId: notification.threadId ?? null,
+    commandId: notification.commandId ?? null,
+    createdAt: notification.createdAt,
+    updatedAt: notification.updatedAt,
+    readAt: notification.readAt ?? null,
+    dismissedAt: notification.dismissedAt ?? null,
+  };
+}
+
+function publicPushSubscription(subscription: any) {
+  if (!subscription) return null;
+  return {
+    id: subscription._id,
+    vapidKeyId: subscription.vapidKeyId,
+    createdAt: subscription.createdAt,
+    updatedAt: subscription.updatedAt,
+    revokedAt: subscription.revokedAt ?? null,
+    lastAcceptedAt: subscription.lastAcceptedAt ?? null,
+    lastFailureCode: subscription.lastFailureCode ?? null,
+  };
+}
+
+async function ensureMediaOwnerUsage(ctx: any, userId: string) {
+  const existing = await ctx.db.query("mediaOwnerUsage")
+    .withIndex("byUserExternalId", (q: any) => q.eq("userExternalId", userId))
+    .first();
+  if (existing) return existing;
+  // One-time migration for owners created before the accounting row existed. Subsequent quota
+  // checks and updates are O(1) and execute atomically in the same Convex mutation.
+  const [media, sessions] = await Promise.all([
+    ctx.db.query("mediaUploads").withIndex("byUserExternalId", (q: any) => q.eq("userExternalId", userId)).collect(),
+    ctx.db.query("mediaUploadSessions").withIndex("byUserExternalId", (q: any) => q.eq("userExternalId", userId)).collect(),
+  ]);
+  const id = await ctx.db.insert("mediaOwnerUsage", {
+    userExternalId: userId,
+    committedBytes: media.reduce((total: number, item: any) => total + item.sizeBytes, 0),
+    reservedBytes: sessions.filter((session: any) => ["pending", "uploaded"].includes(session.status))
+      .reduce((total: number, session: any) => total + session.expectedSizeBytes, 0),
+    updatedAt: nowIso(),
+  });
+  return await ctx.db.get(id);
+}
+
+function publicBackgroundLiveness(record: any) {
+  if (!record) return null;
+  return {
+    scope: record.scope,
+    lastAttemptAt: record.lastAttemptAt,
+    lastSuccessAt: record.lastSuccessAt ?? null,
+    lastFailureAt: record.lastFailureAt ?? null,
+    failureCode: record.failureCode ?? null,
+    updatedAt: record.updatedAt,
+  };
+}
+
+async function pruneNotifications(ctx: any, userId: string) {
+  const rows = await ctx.db
+    .query("notifications")
+    .withIndex("byUserSequence", (q: any) => q.eq("userExternalId", userId))
+    .collect();
+  const cutoff = Date.now() - NOTIFICATION_RETENTION_MS;
+  const retained: any[] = [];
+  for (const row of rows) {
+    if (Date.parse(row.createdAt) <= cutoff) await ctx.db.delete(row._id);
+    else retained.push(row);
+  }
+  if (retained.length <= NOTIFICATION_MAX_PER_OWNER) return;
+  retained.sort((left: any, right: any) => {
+    const leftPriority = left.dismissedAt ? 0 : left.readAt ? 1 : 2;
+    const rightPriority = right.dismissedAt ? 0 : right.readAt ? 1 : 2;
+    return leftPriority - rightPriority || left.sequence - right.sequence;
+  });
+  for (const row of retained.slice(0, retained.length - NOTIFICATION_MAX_PER_OWNER)) {
+    await ctx.db.delete(row._id);
+  }
+}
+
+function parseNotificationCursor(value: any) {
+  if (value === null || value === undefined || value === "") return null;
+  const parsed = Number(value);
+  return Number.isSafeInteger(parsed) && parsed >= 0 ? parsed : null;
+}
+
+function normalizeNotificationTimestamp(value: any, fallbackMs: number) {
+  const parsed = Date.parse(typeof value === "string" ? value : "");
+  return new Date(Number.isFinite(parsed) ? parsed : fallbackMs).toISOString();
+}
+
+function normalizeNotificationText(value: any, maxLength: number, field: string) {
+  if (typeof value !== "string" || !value.trim()) throw new Error(`${field} is required.`);
+  return value.trim().slice(0, maxLength);
+}
+
+function normalizeNullableNotificationText(value: any, maxLength: number) {
+  if (typeof value !== "string" || !value.trim()) return null;
+  return value.trim().slice(0, maxLength);
+}
+
+function normalizeBackgroundFailureCode(value: any) {
+  return typeof value === "string" && /^[a-z][a-z0-9_.:-]{0,63}$/u.test(value)
+    ? value
+    : "background_task_failed";
 }
 
 function publicAuditLog(event: any) {

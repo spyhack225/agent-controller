@@ -55,8 +55,25 @@ import {
   foldUserInputActivity,
   type UserInputRequest,
 } from "./userInput";
+import {
+  collectWorkProjection,
+  createWorkProjection,
+  foldWorkActivity,
+  workBackgroundLiveness,
+  workHasActiveNodes,
+  workOwnerIdForActivity,
+  type WorkProjection,
+} from "./workGraph";
 
 export const LIVE_THREAD_SEEN_LIMIT = 512;
+/**
+ * Maximum transcript projection held and rendered by one console tab.
+ *
+ * T3 snapshots are already windowed, but a tab can stay open while events append for days. Keeping
+ * every row makes both the reducer and React's DOM work grow without a ceiling. We retain the most
+ * recent rows and set `historyTruncated` so the UI never presents that bounded view as complete.
+ */
+export const LIVE_THREAD_ENTRY_LIMIT = 512;
 
 /** The five states `t3.thread.status` reports, plus the one before anything has been said. */
 export type LiveThreadStatus =
@@ -98,6 +115,8 @@ export interface LiveThreadActivityEntry extends LiveThreadEntryBase {
   activityKind: string;
   summary: string;
   turnId: string | null;
+  /** Exact T3 taskId/agentId attribution; null means it remains parent-thread activity. */
+  workNodeId: string | null;
 }
 
 export interface LiveThreadTurnEntry extends LiveThreadEntryBase {
@@ -156,6 +175,10 @@ export interface LiveThreadState {
    * left to answer with.
    */
   userInputRequests: UserInputRequest[];
+  /** T3-native task/agent lifecycle, folded independently from parent-thread narration. */
+  work: WorkProjection;
+  /** T3's explicit snapshot value, or the same task lifecycle derived from live activities. */
+  backgroundLiveness: "working" | "monitoring" | null;
   /** Highest sequence seen. Display and diagnostics only — dedup is `seen`. */
   sequence: number | null;
   /** The sequence the current snapshot represents; anything at or below it is already applied. */
@@ -191,6 +214,8 @@ export function createLiveThreadState({ environmentId, threadId }: LiveThreadTar
     entries: [],
     approvals: [],
     userInputRequests: [],
+    work: createWorkProjection(),
+    backgroundLiveness: null,
     sequence: null,
     baseSequence: null,
     sessionStatus: null,
@@ -223,6 +248,7 @@ export function liveThreadIsCurrent(state: LiveThreadState | null): boolean {
 export function liveThreadTurnInFlight(state: LiveThreadState | null): boolean {
   if (!state) return false;
   if (state.activeTurnId) return true;
+  if (state.backgroundLiveness || workHasActiveNodes(state.work)) return true;
   return state.entries.some((entry) => entry.kind === "message" && entry.streaming);
 }
 
@@ -253,12 +279,14 @@ export function applyThreadSnapshot(state: LiveThreadState, payload: unknown): L
   // dedup memory that only makes sense relative to it — is discarded rather than appended to.
   const built = buildSnapshotEntries(thread);
   const session = asRecord(thread?.session);
+  const work = collectWorkProjection(thread?.activities);
+  const explicitBackgroundLiveness = stringOrNull(thread?.backgroundLiveness);
 
   return {
     ...state,
     hasSnapshot: true,
     historyGap: record.gap === true,
-    historyTruncated: page?.hasMore === true,
+    historyTruncated: page?.hasMore === true || built.truncated,
     entries: built.entries,
     order: built.order,
     // REPLACE, like the transcript: the snapshot is the thread's approval state in full, and an
@@ -267,6 +295,11 @@ export function applyThreadSnapshot(state: LiveThreadState, payload: unknown): L
     // REPLACE for the same reason: a question carried over from a stale transcript is a form
     // offering to answer something nothing is waiting on.
     userInputRequests: collectUserInputRequests(thread, state.threadId),
+    work,
+    backgroundLiveness: explicitBackgroundLiveness === "working"
+      || explicitBackgroundLiveness === "monitoring"
+      ? explicitBackgroundLiveness
+      : workBackgroundLiveness(work),
     sequence: snapshotSequence,
     baseSequence: snapshotSequence,
     seen: [],
@@ -280,6 +313,7 @@ export function applyThreadSnapshot(state: LiveThreadState, payload: unknown): L
 function buildSnapshotEntries(thread: Record<string, unknown> | null): {
   entries: LiveThreadEntry[];
   order: number;
+  truncated: boolean;
 } {
   const staged: { entry: LiveThreadEntry; time: number }[] = [];
 
@@ -306,8 +340,9 @@ function buildSnapshotEntries(thread: Record<string, unknown> | null): {
 
   // Array.prototype.sort is stable, so entries T3 gave no timestamp for keep the order above.
   staged.sort((left, right) => left.time - right.time);
-  const entries = staged.map(({ entry }, index) => ({ ...entry, order: index }));
-  return { entries, order: entries.length };
+  const allEntries = staged.map(({ entry }, index) => ({ ...entry, order: index }));
+  const entries = allEntries.slice(-LIVE_THREAD_ENTRY_LIMIT);
+  return { entries, order: allEntries.length, truncated: allEntries.length > entries.length };
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -352,10 +387,21 @@ export function applyThreadEvent(state: LiveThreadState, payload: unknown): Live
   if (type === "thread.message-sent") return applyMessageSent(next, eventPayload, occurredAt);
   if (type === "thread.activity-appended") {
     const activity = eventPayload?.activity;
-    const approvals = foldApprovalActivity(next.approvals, activity, next.threadId);
-    const withApprovals = approvals === next.approvals
+    const work = foldWorkActivity(next.work, activity);
+    const withWork = work === next.work
       ? next
-      : { ...next, approvals: [...approvals] };
+      : {
+          ...next,
+          work,
+          // Once a projection has omitted nodes, "no retained active node" is not proof that an
+          // omitted task stopped. Preserve T3's last liveness evidence until a replacing snapshot.
+          backgroundLiveness: workBackgroundLiveness(work)
+            ?? (work.truncated ? next.backgroundLiveness : null),
+        };
+    const approvals = foldApprovalActivity(withWork.approvals, activity, withWork.threadId);
+    const withApprovals = approvals === withWork.approvals
+      ? withWork
+      : { ...withWork, approvals: [...approvals] };
     // The two folds are independent: an activity is either an approval row or a user-input row,
     // never both, and each returns its input unchanged when the activity is not its business.
     const questions = foldUserInputActivity(
@@ -425,7 +471,7 @@ function applyMessageSent(
       at: stringOrNull(payload?.createdAt) ?? occurredAt,
       order: state.order,
     };
-    return { ...state, entries: [...state.entries, entry], order: state.order + 1 };
+    return appendEntry(state, entry);
   }
 
   const nextText = streaming
@@ -462,15 +508,22 @@ function upsert(state: LiveThreadState, entry: LiveThreadEntry | null): LiveThre
   if (!entry) return state;
   const index = state.entries.findIndex((candidate) => candidate.key === entry.key);
   if (index === -1) {
-    return {
-      ...state,
-      entries: [...state.entries, { ...entry, order: state.order }],
-      order: state.order + 1,
-    };
+    return appendEntry(state, { ...entry, order: state.order });
   }
   const entries = [...state.entries];
   entries[index] = { ...entry, order: entries[index].order };
   return { ...state, entries };
+}
+
+function appendEntry(state: LiveThreadState, entry: LiveThreadEntry): LiveThreadState {
+  const entries = [...state.entries, entry].slice(-LIVE_THREAD_ENTRY_LIMIT);
+  return {
+    ...state,
+    entries,
+    order: state.order + 1,
+    historyTruncated: state.historyTruncated || entries.length === LIVE_THREAD_ENTRY_LIMIT
+      && state.entries.length === LIVE_THREAD_ENTRY_LIMIT,
+  };
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -567,6 +620,7 @@ function activityEntryFrom(raw: unknown, occurredAt: string | null = null): Live
     activityKind: stringOrNull(record.kind) ?? "activity",
     summary,
     turnId: stringOrNull(record.turnId),
+    workNodeId: workOwnerIdForActivity(raw),
     at: stringOrNull(record.createdAt) ?? occurredAt,
     order: 0,
   };

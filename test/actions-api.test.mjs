@@ -51,6 +51,9 @@ test("saved actions and ordered device controls execute through the normal polic
       scopes: ["orchestration:read", "orchestration:operate", "terminal:operate"],
     },
   });
+  await requestJson(originalFetch, baseUrl, `/v1/t3/environments/${environment.environment.id}/capabilities`, {
+    method: "GET", headers: auth,
+  });
   await requestJson(originalFetch, baseUrl, `/v1/devices/${created.device.id}/config`, {
     method: "PUT",
     headers: auth,
@@ -168,14 +171,34 @@ test("saved actions and ordered device controls execute through the normal polic
   assert.equal(status.screen.state, "running");
   assert.equal(status.screen.thread.id, "thread_actions");
 
-  const ran = await requestJson(originalFetch, baseUrl, `/v1/device/actions/${prompt.id}/run`, {
-    method: "POST", headers: deviceAuth, body: {},
+  const deviceActionPath = `/v1/device/actions/${prompt.id}/run`;
+  const deviceActionBody = { clientRequestId: "dev:action-request-0001" };
+  const dispatchCountBeforeDeviceAction = dispatches.length;
+  const capabilityHealthUpdates = [];
+  const updateEnvironmentHealth = store.updateEnvironmentHealth;
+  store.updateEnvironmentHealth = async (input) => {
+    capabilityHealthUpdates.push(input);
+    return await updateEnvironmentHealth(input);
+  };
+  const ran = await requestJson(originalFetch, baseUrl, deviceActionPath, {
+    method: "POST", headers: deviceAuth, body: deviceActionBody,
   });
+  store.updateEnvironmentHealth = updateEnvironmentHealth;
   assert.equal(ran.command.status, "dispatched");
+  const persistedCapabilities = capabilityHealthUpdates.find((input) => input.health?.capabilities);
+  assert.ok(persistedCapabilities);
+  assert.equal(Object.hasOwn(persistedCapabilities, "capabilities"), false);
+  assert.equal(persistedCapabilities.health.capabilities.schema, "agent-controller.t3-capabilities.v1");
   assert.equal(ran.responseAfter, ran.command.createdAt);
   assert.match(dispatches.at(-1).message.text, /^Continue and run tests\.\n\n<!--AC_DEVICE_FOLLOWUP_REQUEST/u);
   assert.match(dispatches.at(-1).message.text, new RegExp(photo.id, "u"));
   assert.doesNotMatch(dispatches.at(-1).message.text, new RegExp(`\"${prompt.id}\"`, "u"));
+  const replayedDeviceAction = await requestJson(originalFetch, baseUrl, deviceActionPath, {
+    method: "POST", headers: deviceAuth, body: deviceActionBody,
+  });
+  assert.equal(replayedDeviceAction.duplicate, true);
+  assert.equal(replayedDeviceAction.command.id, ran.command.id);
+  assert.equal(dispatches.length, dispatchCountBeforeDeviceAction + 1);
 
   const macroRun = await requestJson(originalFetch, baseUrl, `/v1/actions/${macro.id}/run`, {
     method: "POST",
@@ -228,6 +251,7 @@ test("saved actions and ordered device controls execute through the normal polic
     body: "{}",
   });
   assert.equal(denied.status, 403);
+  await denied.arrayBuffer();
 
   const mediaMacro = await originalFetch(new URL("/v1/actions", baseUrl), {
     method: "POST",
@@ -235,12 +259,14 @@ test("saved actions and ordered device controls execute through the normal polic
     body: JSON.stringify({ type: "macro", label: "Invalid media macro", steps: [{ actionId: photo.id }] }),
   });
   assert.equal(mediaMacro.status, 409);
+  await mediaMacro.arrayBuffer();
   const nestedMacro = await originalFetch(new URL("/v1/actions", baseUrl), {
     method: "POST",
     headers: { "content-type": "application/json", ...auth },
     body: JSON.stringify({ type: "macro", label: "Invalid nested macro", steps: [{ actionId: macro.id }] }),
   });
   assert.equal(nestedMacro.status, 409);
+  await nestedMacro.arrayBuffer();
 
   const deleteReferenced = await originalFetch(new URL(`/v1/actions/${prompt.id}`, baseUrl), {
     method: "DELETE", headers: auth,
@@ -254,11 +280,12 @@ test("saved actions and ordered device controls execute through the normal polic
     body: JSON.stringify({ type: "media", payload: { mediaKind: "image", prompt: "Inspect" } }),
   });
   assert.equal(convertReferenced.status, 409);
+  await convertReferenced.arrayBuffer();
 
   const userMedia = await requestJson(originalFetch, baseUrl, "/v1/media", {
     method: "POST",
     headers: auth,
-    body: { kind: "image", contentType: "image/jpeg", dataBase64: Buffer.from("not-a-real-jpeg").toString("base64") },
+    body: { kind: "image", contentType: "image/jpeg", dataBase64: validJpeg().toString("base64") },
   });
   const crossDeviceMedia = await originalFetch(new URL(`/v1/device/actions/${photo.id}/run`, baseUrl), {
     method: "POST",
@@ -266,10 +293,11 @@ test("saved actions and ordered device controls execute through the normal polic
     body: JSON.stringify({ mediaUploadId: userMedia.media.id }),
   });
   assert.equal(crossDeviceMedia.status, 403);
+  await crossDeviceMedia.arrayBuffer();
   const deviceAudio = await requestJson(originalFetch, baseUrl, "/v1/device/media", {
     method: "POST",
     headers: deviceAuth,
-    body: { kind: "audio", contentType: "audio/wav", dataBase64: Buffer.from("fake-wav").toString("base64") },
+    body: { kind: "audio", contentType: "audio/wav", dataBase64: validWav().toString("base64") },
   });
   const wrongKind = await originalFetch(new URL(`/v1/device/actions/${photo.id}/run`, baseUrl), {
     method: "POST",
@@ -277,6 +305,7 @@ test("saved actions and ordered device controls execute through the normal polic
     body: JSON.stringify({ mediaUploadId: deviceAudio.media.id }),
   });
   assert.equal(wrongKind.status, 409);
+  await wrongKind.arrayBuffer();
 
   const removed = await requestJson(originalFetch, baseUrl, `/v1/actions/${photo.id}`, {
     method: "DELETE", headers: auth,
@@ -294,12 +323,14 @@ test("saved actions and ordered device controls execute through the normal polic
     body: JSON.stringify({ revision: 2, appliedCount: 4 }),
   });
   assert.equal(staleAck.status, 409);
+  await staleAck.arrayBuffer();
   const mismatchedAck = await originalFetch(new URL("/v1/device/controls/ack", baseUrl), {
     method: "POST",
     headers: { "content-type": "application/json", ...deviceAuth },
     body: JSON.stringify({ revision: 3, appliedCount: 99 }),
   });
   assert.equal(mismatchedAck.status, 409);
+  await mismatchedAck.arrayBuffer();
   const afterBadAcks = await requestJson(originalFetch, baseUrl, `/v1/devices/${created.device.id}/controls`, {
     method: "GET", headers: auth,
   });
@@ -313,6 +344,7 @@ test("saved actions and ordered device controls execute through the normal polic
     method: "POST", headers: { "content-type": "application/json", ...deviceAuth }, body: "{}",
   });
   assert.equal(blockedRun.status, 403);
+  await blockedRun.arrayBuffer();
   const audit = await requestJson(originalFetch, baseUrl, "/v1/audit", { method: "GET", headers: auth });
   const blockedAudit = audit.events.findLast((event) => event.action === "action.run_blocked" && event.targetId === prompt.id);
   assert.equal(blockedAudit.metadata.intentType, "agent_prompt");
@@ -402,8 +434,10 @@ test("firmware policy, telemetry, and derived T3 capabilities are owner scoped",
     { method: "GET", headers: auth },
   );
   assert.equal(capabilities.capabilities.orchestrationOperate, true);
-  assert.equal(capabilities.capabilities.terminalDirect, true);
+  assert.equal(capabilities.capabilities.terminalDirect, false);
   assert.equal(capabilities.capabilities.savedActions, "gateway");
+  assert.equal(capabilities.manifest.schema, "agent-controller.t3-capabilities.v1");
+  assert.equal(capabilities.manifest.recovery.action, "UPDATE T3 CODE");
 
   const updated = await requestJson(originalFetch, baseUrl, `/v1/devices/${created.device.id}/firmware-policy`, {
     method: "PUT",
@@ -481,6 +515,9 @@ test("a fixed action survives its environment being removed as a disabled contro
     headers: auth,
     body: { label: "Mock T3", baseUrl: "https://mock-t3.example", accessToken: "mock-token" },
   });
+  await requestJson(originalFetch, baseUrl, `/v1/t3/environments/${environment.environment.id}/capabilities`, {
+    method: "GET", headers: auth,
+  });
   await requestJson(originalFetch, baseUrl, `/v1/devices/${created.device.id}/config`, {
     method: "PUT",
     headers: auth,
@@ -503,7 +540,7 @@ test("a fixed action survives its environment being removed as a disabled contro
   assert.equal(before.controls[0].enabled, true);
 
   await requestJson(originalFetch, baseUrl, `/v1/t3/environments/${environment.environment.id}`, {
-    method: "DELETE", headers: auth,
+    method: "DELETE", headers: auth, body: { confirmationLabel: environment.environment.label },
   });
 
   const after = await requestJson(originalFetch, baseUrl, "/v1/device/controls", {
@@ -552,4 +589,26 @@ async function createAuthHeaders(fetchImpl, baseUrl) {
 
 function jsonResponse(body, status) {
   return new Response(JSON.stringify(body), { status, headers: { "content-type": "application/json" } });
+}
+
+function validJpeg() {
+  return Buffer.from("ffd8ffc00008080001000100", "hex");
+}
+
+function validWav() {
+  const buffer = Buffer.alloc(44);
+  buffer.write("RIFF", 0, "ascii");
+  buffer.writeUInt32LE(36, 4);
+  buffer.write("WAVE", 8, "ascii");
+  buffer.write("fmt ", 12, "ascii");
+  buffer.writeUInt32LE(16, 16);
+  buffer.writeUInt16LE(1, 20);
+  buffer.writeUInt16LE(1, 22);
+  buffer.writeUInt32LE(16_000, 24);
+  buffer.writeUInt32LE(32_000, 28);
+  buffer.writeUInt16LE(2, 32);
+  buffer.writeUInt16LE(16, 34);
+  buffer.write("data", 36, "ascii");
+  buffer.writeUInt32LE(0, 40);
+  return buffer;
 }

@@ -473,12 +473,62 @@ Device responses include computed presence metadata. A device is `online` when i
 }
 ```
 
-## Device Media Upload
+## Phone companion handoff
 
-Devices can upload short audio clips or still images before sending a prompt.
+A signed-in owner or claimed controller can create a five-minute phone capture handoff. The handoff
+is pinned to one owned environment, one thread, and one action (`record_audio` or `capture_image`).
+It contains no prompt, transcript, device secret, or T3 credential.
 
 ```http
-POST /v1/device/media
+POST /v1/companion-handoffs
+authorization: Bearer PLATFORM_TOKEN
+content-type: application/json
+
+{ "environmentId": "env_...", "threadId": "thread_...", "action": "record_audio" }
+```
+
+Claimed hardware uses `POST /v1/device/companion-handoffs` with its device credential. Omitted
+`environmentId` or `threadId` falls back to the controller's current configuration. Both creation
+routes return the redacted handoff, a `launchUrl`, and the same `qrPayload`. The owner route also
+returns a locally encoded `qrSvg` for its web dialog; the constrained device response omits that
+larger rendering and lets board firmware render `qrPayload` for its own display. The bearer appears
+only after `#` in `/#/media?handoff=...`; browsers do not send fragments in HTTP requests or
+referrers, and the PWA removes it from the visible URL immediately after reading it. No external QR
+service receives the payload.
+
+After platform sign-in, the phone atomically consumes the code:
+
+```http
+POST /v1/companion-handoffs/claim
+authorization: Bearer PLATFORM_TOKEN
+content-type: application/json
+
+{ "code": "one-time-fragment-bearer" }
+```
+
+The code is single-use and only the owner who created it can claim it. The public lifecycle is
+`waiting`, `claimed`, `completed`, `expired`, or `cancelled`. Owners can read or cancel
+`/v1/companion-handoffs/:id`; a controller can read or cancel only its own created handoff under
+`/v1/device/companion-handoffs/:id`. Retry creates a fresh code. A claimed phone passes the returned
+handoff id into the normal private raw upload session. The gateway then enforces the requested media
+kind, pins environment/thread metadata, derives `companion_recording` or `companion_camera`, and
+marks the handoff completed after integrity-checked finalization.
+
+Bluetooth earbuds remain a phone/browser input. The PWA lists browser-exposed audio inputs after
+permission and can request a selected input; it does not claim that an ESP32-S3 supports Bluetooth
+HFP or LE Audio.
+
+## Media upload sessions
+
+Browsers and devices upload short audio clips or still images through a bounded three-step session.
+The byte transfer is a private authenticated HTTP request; media bytes are never sent over the
+gateway WebSocket/SSE channels and do not become attachable until finalization succeeds.
+
+Create an owner session with `POST /v1/media/uploads` and a device session with
+`POST /v1/device/media/uploads`. Use the matching platform or device authentication realm:
+
+```http
+POST /v1/device/media/uploads
 x-device-id: dev_...
 x-device-secret: ...
 content-type: application/json
@@ -488,11 +538,54 @@ content-type: application/json
 {
   "kind": "audio",
   "contentType": "audio/webm",
-  "dataBase64": "BASE64_BYTES",
+  "sizeBytes": 1048576,
+  "sha256": "64-character-lowercase-hex-digest",
+  "clientRequestId": "device-media:stable-request-id",
   "originalName": "prompt.webm",
   "transcript": "Optional transcript from phone, browser, device, or a transcription worker."
 }
 ```
+
+The response contains a redacted session projection and relative private routes:
+
+```json
+{
+  "session": {
+    "id": "mup_...",
+    "status": "pending",
+    "sizeBytes": 1048576,
+    "sha256": "...",
+    "expiresAt": "2026-08-27T20:15:00.000Z",
+    "upload": {
+      "method": "PUT",
+      "url": "/v1/device/media/uploads/mup_.../content",
+      "contentType": "audio/webm",
+      "sizeBytes": 1048576
+    },
+    "finalizeUrl": "/v1/device/media/uploads/mup_.../finalize",
+    "statusUrl": "/v1/device/media/uploads/mup_..."
+  }
+}
+```
+
+Upload the exact raw bytes to `session.upload.url` with the same authentication and declared
+`content-type`, then `POST {session.finalizeUrl}`. The gateway verifies the exact length and SHA-256
+both before staging and again before committing the media row. Create and finalize are idempotent;
+reusing a `clientRequestId` with a different descriptor is `409`. `GET {session.statusUrl}` supports
+recovery and `DELETE {session.statusUrl}` aborts and removes staged bytes. Pending/uploaded sessions
+expire after `MEDIA_UPLOAD_SESSION_TTL_MS` (15 minutes by default), and the media-retention runner
+cleans abandoned private objects. Durable dedup state is capped at 256 sessions per owner; terminal
+rows are evicted first and the gateway fails closed rather than discarding unfinished work. Session
+responses never expose object keys, original filenames,
+transcripts, actor IDs, or client request IDs.
+
+The owner paths have the same suffixes under `/v1/media/uploads`. A browser uses raw XHR so it can
+show byte progress and cancel safely. The shared controller core hashes and streams its existing
+capture buffer directly, eliminating base64's wire expansion and a second full-size allocation.
+
+The legacy JSON `POST /v1/media` and `POST /v1/device/media` routes remain compatibility paths for
+older clients, but new clients should use sessions. Device finalization also enqueues the existing
+transcription job and returns `{ session, media, job }`.
 
 Supported content types:
 
@@ -507,7 +600,7 @@ image/png
 image/webp
 ```
 
-The response returns a `media.id`. Audio uploads may include `transcript`; image uploads ignore it. Media metadata includes `processing.transcriptionStatus`:
+Finalization returns a `media.id`. Audio uploads may include `transcript`; image uploads ignore it. Media metadata includes `processing.transcriptionStatus`:
 
 ```text
 pending
@@ -530,7 +623,7 @@ derived `displayName` and a structured `origin` alongside the `originalName` the
   "originalName": "controller.wav",
   "displayName": "Hosyond Touch screen · Verify Workspace · 24 Aug 19:32",
   "origin": {
-    "source": "device",
+    "source": "controller_capture",
     "deviceId": "dev_...",
     "deviceLabel": "Hosyond Touch screen",
     "environmentId": "env_...",
@@ -541,12 +634,21 @@ derived `displayName` and a structured `origin` alongside the `originalName` the
 }
 ```
 
-Both fields are computed on read and never stored, so a renamed device or a retitled thread is
-reflected immediately and clips uploaded before this existed are named too. `originalName` is never
+The label and thread title are computed on read, so a renamed device or a retitled thread is
+reflected immediately and clips uploaded before this existed are named too. The non-sensitive
+capture-source enum is stored as `controller_capture`, `browser_recording`, `browser_camera`,
+`companion_recording`, `companion_camera`, or `upload`; older records retain their legacy
+`device`/`console` projection. `originalName` is never
 overwritten, and it remains the filename the agent sees on an attachment. Segments are dropped when
 unknown: a console upload has no device (`Console · diagram.png · 24 Aug 19:32`), a device with
 no bound thread has no destination, and a thread whose title T3 cannot supply is named by a short
 form of its id (`Thread 4f2a1c`). See `src/mediaNaming.mjs`.
+
+The Media library fetches image/audio preview bytes only after the owner asks. It uses the normal
+authenticated owner route, keeps object URLs in memory only for the mounted row, revokes them on
+teardown, uses lazy image decoding and `audio preload="metadata"`, and refuses local previews above
+8 MiB for images or 24 MiB for audio. Processing, failure, and retry state remains metadata; user
+filenames, descriptions, transcripts, and media bytes are excluded from support projections.
 
 The signed-in owner can update an audio transcript later:
 
@@ -1060,12 +1162,35 @@ Content-Type: application/json
 
 `modelSelection` is optional when the T3 project has a default. Provider instance IDs are not restricted to built-ins, so user-defined T3 provider instances are supported. The gateway dispatches `thread.create` followed by `thread.turn.start` because T3's HTTP orchestration endpoint requires the thread to exist before accepting the first turn.
 
+### Manage a T3 thread
+
+Platform users can manage threads in an environment they own. These routes forward T3's native
+orchestration commands; the gateway does not keep a second copy of thread metadata.
+
+```http
+PATCH  /v1/t3/environments/:environmentId/threads/:threadId
+POST   /v1/t3/environments/:environmentId/threads/:threadId/archive
+DELETE /v1/t3/environments/:environmentId/threads/:threadId
+Authorization: Bearer <platform-token>
+Content-Type: application/json
+```
+
+Rename body:
+
+```json
+{ "title": "Release checklist" }
+```
+
+Rename collapses whitespace and caps the title to T3's supported length. Archive is recoverable
+from T3 Code; delete permanently removes the thread and its conversation. Successful mutations
+return `202` with `environmentId`, `threadId`, `action`, and T3's dispatch `result`; rename also
+returns the normalized `title` applied to T3.
+
 ### Console-first pairing (connect sessions)
 
-`POST /v1/t3/environments` requires the browser to hold a credential the T3 host produced, which
-means the user must copy a token between two machines. Connect sessions invert that: the console
-mints a short-lived, single-use enrollment code while the user is signed in, shows one command to run
-on the host, and polls until the pairing lands.
+Connect sessions let the console mint a short-lived, single-use enrollment code while the user is
+signed in, show one command to run on the host, and poll until the connector lands. The cloud never
+receives the local T3 URL, pairing token, or access token.
 
 ```http
 POST /v1/t3/connect-sessions
@@ -1081,9 +1206,9 @@ content-type: application/json
 }
 ```
 
-`accessMode` is `local`, `tailscale`, or `online` (anything else falls back to `local`) and only
-decides which `--tunnel` the returned command carries. `environmentId` is optional and marks the
-session as a **re-pair**: redeeming updates that environment in place rather than creating a row. A
+`accessMode` is retained as connection-session metadata for compatibility; it does not alter the
+connector command or disclose a T3 credential. `environmentId` is optional and marks the session as
+a **re-pair**: connector enrollment updates that environment in place rather than creating a row. A
 first pairing is checked against the plan's environment allowance; a re-pair is not.
 
 The response carries the code once — the gateway stores only its SHA-256 hash and cannot show it
@@ -1094,7 +1219,7 @@ again:
   "session": { "id": "cxn_...", "status": "pending", "expiresAt": "..." },
   "code": "ABCDE-FGHIJ",
   "gatewayUrl": "https://gateway.example",
-  "command": "npm run setup:t3 -- --gateway-url 'https://gateway.example' --connect-code 'ABCDE-FGHIJ' --tunnel 'tailscale'"
+  "command": "npx @agent-controller/connector connect --server 'https://gateway.example' --code 'ABCDE-FGHIJ'"
 }
 ```
 
@@ -1106,11 +1231,96 @@ authorization: Bearer PLATFORM_TOKEN
 ```
 
 Returns `{ "session": ..., "environment": ... }`. `session.status` is `pending`, `redeeming`,
-`completed`, `failed`, or `expired`; `environment` is populated only once the status is `completed`,
-and never includes the stored access token. A session belonging to another user answers 404.
+`completed`, `failed`, or `expired`; `environment` is populated only once the status is `completed`.
+A session belonging to another user answers 404.
 
-The T3 host redeems the code. This route takes **no** platform credential — the code is the
-credential — and is rate limited per client address (`CONNECT_REDEEM_RATE_LIMIT`, default 20/window):
+The connector redeems the code without a platform credential:
+
+```http
+POST /v1/connectors/enroll
+content-type: application/json
+```
+
+```json
+{
+  "code": "ABCDE-FGHIJ",
+  "protocolVersion": 1,
+  "connectorVersion": "0.1.0",
+  "platform": "darwin-arm64",
+  "capabilities": ["snapshot", "dispatch"]
+}
+```
+
+The response returns a connector-mode environment, connector metadata, and the standing connector
+secret once. The environment has no `baseUrl` or T3 access token. Supplying `accessToken` or
+`pairingToken` returns 400 before consuming the code.
+
+### Atomic connector credential rotation
+
+An authenticated owner first creates a rotation session. This is a separate user-realm endpoint so
+platform and connector credentials are never interchangeable:
+
+```http
+POST /v1/connectors/ctr_.../rotation-sessions
+authorization: Bearer PLATFORM_TOKEN
+```
+
+It returns a 15-minute single-use code and canonical `npx ... rotate --server ... --code ... --yes`
+command. The connector then authenticates with its current standing credential and stages a new one
+without changing connector or environment identity:
+
+The code is purpose-bound to `connector_rotation`. A T3 enrollment/re-pair code cannot authorize
+this endpoint, and a rotation code cannot be redeemed by connector-enrollment or legacy T3 setup.
+
+```http
+POST /v1/connectors/ctr_.../rotate
+authorization: Connector ctr_....CURRENT_SECRET
+content-type: application/json
+```
+
+```json
+{ "code": "ABCDE-FGHIJ" }
+```
+
+The `201` response returns `{ connector, rotation: { id, expiresAt }, secret }`; the staged secret is
+shown once and its hash is retained for no more than ten minutes. During that bounded overlap the
+current credential and live socket remain valid. The staged credential may mint a short-lived socket
+ticket. Atomically consuming the first such ticket is the acknowledgement and commit point: its hash
+becomes current, unconsumed tickets from the old generation are retired, and the old standing secret
+can no longer mint tickets. The environment Durable Object accepts only one authoritative socket, so
+the newly authenticated bridge supersedes the prior socket before the managed service takes over.
+
+The CLI persists a private local journal before activation (native credential storage when available,
+otherwise a mode-`0600` file). Runtime health and cursor writes use a separate private sidecar, so a
+stale managed process cannot erase that journal during handoff. `rotate --yes` resumes an interrupted
+attempt without a new code; supplying a new code replaces an uncommitted attempt. Owner revocation
+still clears both active and staged hashes and closes the live socket immediately. Neither secret is
+included in audit metadata, connector events, or public connector projections.
+
+### Connector self-revocation
+
+The CLI can revoke its own standing authority without a platform bearer:
+
+```http
+POST /v1/connectors/self/revoke
+authorization: Connector ctr_....CURRENT_SECRET
+content-type: application/json
+```
+
+The gateway rate-limits this as `connector:write`, consumes every outstanding ticket, persists the
+connector as revoked, and asks the environment router to close matching sockets, subscriptions,
+leases, and pending requests. A `200` response returns `{ "connector": ... }` with status `revoked`.
+If edge closure fails, the route returns an error after durable revocation; the exact same current
+credential may retry only this self-revocation operation. Ordinary authentication and ticket minting
+reject it. The server retains only its one-way hash for that retry and never returns or audits the
+secret. The CLI does not remove local credentials until this route succeeds unless the operator
+explicitly uses `--force-local`.
+
+### Legacy direct redeem (self-hosted only)
+
+The repository-local `setup:t3` compatibility path can redeem an enrollment-purpose code against a
+**self-hosted** gateway. This route takes no platform credential—the code is the credential—and is
+rate limited per client address (`CONNECT_REDEEM_RATE_LIMIT`, default 20/window):
 
 ```http
 POST /v1/t3/connect-sessions/redeem
@@ -1138,11 +1348,15 @@ validation happens **before** the code is consumed, so a malformed body leaves t
 the exchange itself fails, the session is marked `failed` with the reason, which is what the polling
 console renders.
 
+With `DEPLOYMENT_MODE=cloud`, this legacy route returns 404 after its client-address rate limit but
+before parsing the body, consuming the code, exchanging a pairing token, or making an outbound
+request. The code therefore remains usable at `/v1/connectors/enroll`.
+
 `scripts/setup-t3.mjs` drives this with `--connect-code`; `--gateway-token` / `--gateway-dev-user`
 remain for the manual path. Launching a first thread (`--initial-prompt`) still needs a platform
 token, because a connect code deliberately does not grant the platform realm.
 
-### Manual pairing
+### Manual pairing (self-hosted only)
 
 ```http
 POST /v1/t3/environments
@@ -1169,9 +1383,28 @@ Development can provide an existing T3 access token:
 }
 ```
 
-The gateway encrypts stored T3 access tokens when `T3_TOKEN_ENCRYPTION_KEY` is configured. Convex-backed deployments fall back to `GATEWAY_CONVEX_SECRET` if no dedicated token encryption key is set, but production deployments should use a separate key.
+This compatibility route is disabled when `DEPLOYMENT_MODE=cloud`: an authenticated request returns
+409 before its body can trigger token exchange or environment storage. Self-hosted gateways encrypt
+stored T3 access tokens when `T3_TOKEN_ENCRYPTION_KEY` is configured. Convex-backed self-hosted
+deployments fall back to `GATEWAY_CONVEX_SECRET` if no dedicated token encryption key is set.
 
 When T3 token exchange returns `expires_in`, the gateway stores an `accessTokenExpiresAt` timestamp automatically. Manual access-token registration can include `accessTokenExpiresAt`; omitted means the gateway has no known expiry for that token. Expired T3 credentials set environment health to `token_expired` and return HTTP 409 for snapshot, dispatch, and approval dispatch until the environment is re-paired or updated.
+
+Read the owner-scoped, versioned capability manifest:
+
+```http
+GET /v1/t3/environments/env_.../capabilities
+authorization: Bearer PLATFORM_TOKEN
+```
+
+Add `?refresh=1` for a fresh bounded probe. The response carries
+`manifest.schema: "agent-controller.t3-capabilities.v1"`, the adapter contract, installed version,
+probe/freshness/source metadata, separately gated feature and attachment states, runtime/interaction
+modes, approval decisions, and a bounded recovery action. The legacy `capabilities` booleans remain
+as a compatibility projection of that manifest; they are no longer inferred from scopes alone.
+Fresh results are cached for five minutes. The owner projection contains no paths, provider config,
+project/thread identifiers, prompts, transcripts, or credentials. See
+[t3-capability-manifest.md](t3-capability-manifest.md).
 
 Update a paired environment:
 
@@ -1190,9 +1423,16 @@ content-type: application/json
 }
 ```
 
-You can also send a new `pairingToken` instead of `accessToken`. Omitted fields keep their current values, including `accessTokenExpiresAt`.
+On a self-hosted gateway, you can also send a new `pairingToken` instead of `accessToken`. Omitted
+fields keep their current values, including `accessTokenExpiresAt`.
 
-Preview what still points at an environment before removing it:
+In cloud mode, `PUT` only accepts `{ "label": "..." }` for a connector-backed environment. Fields
+that could change routing, credentials, capability, or transport—including `baseUrl`, `accessToken`,
+`accessTokenExpiresAt`, `pairingToken`, `scopes`, and `transportMode`—return 409. A persisted legacy
+direct environment cannot be edited or contacted: the transport boundary rejects it before network
+I/O (individual operation routes retain their established error envelope).
+
+Preview what still points at an environment before archiving or deleting it:
 
 ```http
 GET /v1/t3/environments/env_.../dependencies
@@ -1212,11 +1452,29 @@ authorization: Bearer PLATFORM_TOKEN
 }
 ```
 
-Remove an environment:
+Archive and fully disconnect an environment while retaining its dashboard record:
+
+```http
+POST /v1/t3/environments/env_.../archive
+authorization: Bearer PLATFORM_TOKEN
+content-type: application/json
+```
+
+The response includes the archived environment, the same `removed` dependency summary shown below,
+and `alreadyArchived`. Archiving deletes the stored T3 credential, stops polling, clears device and
+onboarding selections, disables fixed actions and macros, and excludes the record from every device
+environment list. `GET /v1/t3/environments` still includes the row with `status: "archived"` and an
+`archivedAt` timestamp so the dashboard can render its Archive section. Repeating the request is
+idempotent.
+
+Remove a connected environment into retention:
 
 ```http
 DELETE /v1/t3/environments/env_...
 authorization: Bearer PLATFORM_TOKEN
+content-type: application/json
+
+{ "confirmationLabel": "MacBook Pro T3 Code" }
 ```
 
 ```json
@@ -1232,9 +1490,29 @@ authorization: Bearer PLATFORM_TOKEN
 }
 ```
 
-Removal deletes the stored T3 credential and repairs everything that referenced the environment: device runtime configs lose it as their default, the onboarding selection (and its first thread) is cleared, and saved actions and macros that targeted it are **disabled** with `disabledReason: "environment_removed"` rather than left dangling — a fixed-target action without an `environmentId` is a record the API would refuse to create. Saving such an action or macro again re-enables it.
+Removal immediately revokes the connector and stored T3 credential and repairs everything that
+referenced the environment: device runtime configs lose it as their default, the onboarding
+selection (and its first thread) is cleared, and saved actions and macros that targeted it are
+**disabled** with `disabledReason: "environment_removed"` rather than left dangling. When the
+dependency preview is non-empty, `confirmationLabel` must exactly match the environment's current
+label or the gateway returns `409 environment_label_confirmation_required`.
 
-The call is idempotent: repeating it answers `200` with `environment: null`, an empty `removed`, and `alreadyRemoved: true`.
+The returned credential-free tombstone includes `deletedAt` and `purgeAfter`; its default recovery
+window is configured with `ENVIRONMENT_RETENTION_DAYS` (30 days). Repeating removal is idempotent
+and returns the same tombstone with an empty `removed` summary. Restore during the window with:
+
+```http
+POST /v1/t3/environments/env_.../restore
+authorization: Bearer PLATFORM_TOKEN
+```
+
+Restore is idempotent and returns the record in `needs_repair`: revoked credentials, connector
+sessions, device defaults, actions, macros, and onboarding selections are never silently recreated.
+The owner must re-pair and intentionally repair targets. `410 environment_retention_expired` means
+the recovery deadline passed. The user-scoped `environment.retention` background task performs
+explicit purge after that deadline. Purge removes only the tombstone; command/audit history remains
+under its own retention, and media remains governed by the user's media-retention policy. Audit
+records include ids, labels, retention deadlines, and repair counts, never credentials or T3 URLs.
 
 Check whether a paired environment is currently reachable:
 
@@ -1331,6 +1609,67 @@ DELETE /v1/factory/firmware/releases/fw_...
 authorization: Bearer FACTORY_TOKEN
 ```
 
+Owners can read the public release catalogue needed to build a rollout without receiving artifact
+storage keys or signing material:
+
+```http
+GET /v1/firmware/releases?channel=stable
+authorization: Bearer PLATFORM_TOKEN
+```
+
+## Release Rollout Controls
+
+Create an owner-scoped draft. `cohort` is either a stable percentage or an explicit allowlist of
+owned, active target ids. Firmware drafts require an existing signed `releaseId`; connector drafts
+use the package version and remain locally installed.
+
+```http
+POST /v1/release-rollouts
+authorization: Bearer PLATFORM_TOKEN
+content-type: application/json
+```
+
+```json
+{
+  "name": "Internal controller canary",
+  "targetKind": "firmware",
+  "targetVersion": "0.2.0",
+  "rollbackVersion": "0.1.9",
+  "releaseId": "fw_...",
+  "channel": "stable",
+  "cohort": { "type": "percentage", "percentage": 10 },
+  "minimumProtocolVersion": 2,
+  "requiredCapabilities": ["ota_confirm"]
+}
+```
+
+List summaries or inspect bounded per-target progress:
+
+```http
+GET /v1/release-rollouts
+GET /v1/release-rollouts/rol_...
+authorization: Bearer PLATFORM_TOKEN
+```
+
+Change state only with an operator evidence identifier:
+
+```http
+POST /v1/release-rollouts/rol_.../actions
+authorization: Bearer PLATFORM_TOKEN
+content-type: application/json
+```
+
+```json
+{ "action": "start", "evidenceRef": "test-run:staging-2026-08-27" }
+```
+
+Actions are `start`, `pause`, `resume`, `expand`, `cancel`, `rollback`, and `complete`. `expand`
+also supplies a larger integer `percentage`. The service never advances percentage or terminal
+state based on time alone. `complete` returns `409` until every assignment reports the expected
+terminal version. Connector assignments report `connector_update_requires_local_cli` until the
+connector independently reports the target version. See [release-rollouts.md](release-rollouts.md)
+for the state machine and incident procedure.
+
 ## Device Intent
 
 ```http
@@ -1344,6 +1683,7 @@ Prompt:
 
 ```json
 {
+  "clientRequestId": "dev:84d1f1d2-88984f43-a15b19c0-9238f411",
   "environmentId": "env_...",
   "threadId": "thread_...",
   "intent": {
@@ -1357,6 +1697,7 @@ Status:
 
 ```json
 {
+  "clientRequestId": "dev:991fd3c2-9248c000-97ce21ae-fbad0091",
   "environmentId": "env_...",
   "intent": {
     "type": "status"
@@ -1783,6 +2124,7 @@ content-type: application/json
 
 ```json
 {
+  "clientRequestId": "web:18de0d08-e7aa-41cb-a9ef-fc9a374bc356",
   "environmentId": "env_...",
   "threadId": "thread_...",
   "intent": {
@@ -1791,6 +2133,29 @@ content-type: application/json
   }
 }
 ```
+
+`clientRequestId` is the durable idempotency identity for a mutating agent request. It is 8–128
+URL-safe characters and is scoped to the authenticated user or device, operation, and actor. Reuse
+with the same canonical request returns the original command and `duplicate: true`; reuse for
+different content returns `409` with `code: "idempotency_conflict"`. A retry racing the first call
+returns `202` with `recovery: "processing"` and does not dispatch again.
+
+The gateway stores only a SHA-256 request fingerprint and a command reference for 24 hours, bounded
+to 1,000 receipts per owner. Prompt text, transcripts, paths, attachment content, result bodies, and
+connector idempotency keys are not present in the receipt. Older clients that omit the field receive
+a server-generated compatibility id, but cannot recover that id after their own restart.
+
+Recover a web request without resending it:
+
+```http
+GET /v1/requests/web%3A18de0d08-e7aa-41cb-a9ef-fc9a374bc356
+authorization: Bearer PLATFORM_TOKEN
+```
+
+For first-thread launch, append `?operation=thread.launch`. Devices use
+`GET /v1/device/requests/:clientRequestId`; device-created threads append
+`?operation=thread.create`. Responses contain `{request,command?}`. The receipt records the command's
+initial accepted state; the returned command is authoritative for later arbiter reconciliation.
 
 ## Saved Macros
 
@@ -1826,6 +2191,10 @@ POST /v1/macros/macro_.../run
 authorization: Bearer PLATFORM_TOKEN
 content-type: application/json
 ```
+
+Saved-action and macro run bodies accept the same `clientRequestId`. A multi-step saved-action macro
+derives a stable child id for each step, so replay neither duplicates a completed step nor conflicts
+one step with the next.
 
 ```json
 {
@@ -1868,10 +2237,12 @@ http://127.0.0.1:3996/
 The React application can register or claim devices, rotate device secrets, revoke devices, pair or
 dependency-preview/remove T3 environments, upload media, send prompts with ordered stored-media
 attachments, approve or reject high-risk Agent Controller commands, request status, stop sessions,
-and review audit activity. Dispatch is not yet a complete live T3 conversation: provider approvals,
-structured questions, streamed tool activity, subagents, and parallel tasks are not exposed through
-the current API/UI. That work is tracked in
-[roadmap/IMPLEMENTATION-STATUS.md](../roadmap/IMPLEMENTATION-STATUS.md).
+review audit activity, answer provider approvals and structured questions, read streamed messages
+and tools, and inspect T3-native task/subagent/background work. T3 supplies the task identity,
+status, and optional parent links; Agent Controller does not create a second orchestrator or infer a
+graph from model prose. Durable privacy-minimal in-app notifications, optional queued Web Push, and
+scheduled-worker liveness are implemented; deployed Web Push/live-T3/browser/hardware qualification
+remains tracked in [roadmap/IMPLEMENTATION-STATUS.md](../roadmap/IMPLEMENTATION-STATUS.md).
 
 ## Display State And Events
 
@@ -2247,6 +2618,9 @@ The event stream emits:
 connected
 heartbeat
 state.changed
+device.refresh
+firmware.changed
+threads.changed
 t3.snapshot
 media.job
 command.reconciled
@@ -2255,7 +2629,115 @@ t3.user-input.answered
 t3.thread.snapshot
 t3.thread.event
 t3.thread.status
+notification.created
+notification.updated
+background.liveness.changed
 ```
+
+### Notifications
+
+The signed-in owner's inbox is durable and privacy-minimal. Rows contain static copy and opaque
+environment/thread/command navigation ids only; prompts, transcripts, file paths, provider details,
+question/answer text, and raw provider request ids are not stored or emitted.
+
+```text
+GET /v1/notifications?limit=50
+GET /v1/notifications?after=42&limit=50
+GET /v1/notifications?before=17&limit=50
+POST /v1/notifications/notification_.../read
+POST /v1/notifications/read-all
+DELETE /v1/notifications/notification_...
+```
+
+An initial read is newest-first. `nextCursor` is the highest delivered sequence and is used with
+`after` for chronological reconnect replay. `oldestCursor` is the lowest delivered sequence and is
+used with `before` for older inbox pages. `after` and `before` cannot be combined. Read and dismiss
+are idempotent; dismiss is a soft tombstone. Rows are retained for at most 30 days and 1,000 rows per
+owner. Provider and agent-question source ids are represented only by an opaque deduplication hash,
+which is not returned.
+
+There is deliberately no device notification inbox. Controllers retain their existing bounded,
+capability-gated approval, user-input, and result projections; an owner's general inbox can reveal
+thread or command existence outside a controller's scope.
+
+### Optional Web Push
+
+```text
+GET /v1/push/config
+GET /v1/push/subscriptions
+POST /v1/push/subscriptions
+POST /v1/push/subscriptions/revoke
+DELETE /v1/push/subscriptions/push_subscription_...
+```
+
+`GET /v1/push/config` returns only whether delivery is supported plus the active public VAPID key
+and key id. Private keys never cross this boundary. Registration accepts the browser's standard
+`{ endpoint, keys: { p256dh, auth } }` shape and rejects non-HTTPS or non-allowlisted endpoint hosts.
+Public subscription records contain an opaque id, VAPID key id, timestamps, and bounded failure
+code; endpoint capability URLs and encryption keys are never returned.
+
+Revocation is owner-scoped either by opaque subscription id or by the current browser endpoint.
+Notification creation queues idempotent durable delivery work. Internal background task
+`push.deliver` processes it in bounded batches. A stored `acceptedAt` means only that the push
+service accepted the request, never that the browser displayed it. See `docs/notifications.md` for
+payload privacy, retry, terminal cleanup, VAPID rotation, and provider-host configuration.
+
+### Scheduled worker liveness
+
+```text
+GET /v1/background/liveness
+```
+
+The response reports only the scheduled control-plane worker:
+
+```json
+{
+  "scheduledWorker": {
+    "status": "healthy",
+    "lastAttemptAt": "2026-08-27T20:00:00.000Z",
+    "lastSuccessAt": "2026-08-27T20:00:00.000Z",
+    "lastFailureAt": null,
+    "nextExpectedBy": "2026-08-27T20:10:00.000Z",
+    "failureCode": null,
+    "expectedIntervalMs": 300000
+  },
+  "observedAt": "2026-08-27T20:00:01.000Z"
+}
+```
+
+Statuses are `healthy`, `degraded`, `stale`, `not_configured`, and `unknown`. Connector, T3, and
+provider health remain on their existing environment health surfaces; they are intentionally not
+folded into this result. In cloud mode, a dedicated Cron -> Queue -> private Container heartbeat is
+the durable evidence behind this status.
+
+`device.refresh` targets one device and carries the bounded resources it should mark due. Current
+values are `environments`, `projects`, `config`, `threads`, `controls`, `approvals`, `display`, and
+`gateway`; firmware can ignore resources it does not implement, coalesces a burst, and continues
+fetching one resource at a time.
+
+`firmware.changed` is broadcast for release publication/withdrawal and targeted policy changes.
+Compatible devices poll the manifest immediately instead of waiting for their six-hour fallback.
+Mandatory releases resolve to automatic installation for every compatible claimed device.
+
+`threads.changed` is emitted after an owner create, rename, archive, or delete command is accepted
+by T3. It is broadcast to every connected dashboard and device owned by that user:
+
+```json
+{
+  "environmentId": "env_...",
+  "threadId": "thread_...",
+  "action": "renamed",
+  "title": "Release checklist",
+  "clearedDeviceCount": 0,
+  "bindingRepairFailureCount": 0,
+  "changedAt": "2026-08-25T15:00:00.000Z"
+}
+```
+
+Create, archive, and delete omit `title`. Any device bound to a removed thread is cleared before the
+event is published, and `clearedDeviceCount` reports how many bindings were repaired. Dashboard
+clients apply rename/removal deltas immediately and invalidate only the affected workspace cache;
+the delayed authoritative snapshot cannot resurrect the stale row.
 
 ## Live Thread Streams
 
@@ -2336,6 +2818,33 @@ to the message with the same `messageId`; a frame with `streaming: false` carrie
 text, or empty text meaning "keep what you have". This is T3's own projector rule
 (`src/orchestration/projector.ts:497-515`) and a client that treats a delta as the whole message
 will show the last few tokens of every reply.
+
+For T3-native agents and background work, `thread.activity-appended.payload.activity.kind` is one
+of `task.started`, `task.progress`, `task.updated`, or `task.completed`. The activity payload fields
+used by Agent Controller are the exact T3 0.0.32 contract fields:
+
+| Field | Meaning |
+|---|---|
+| `taskId` | Stable task identity and fold key |
+| activity `turnId` | Exact T3 turn attribution for the task row |
+| `agentKind` | T3-stamped `agent` or `background`; absent legacy rows remain generic tasks |
+| `parentAgentId` | Explicit parent-agent edge |
+| `agentId` | Explicit owning-agent edge for nested task/tool activity |
+| `taskType`, `title`, `role`, `model`, `effort`, `agentPath` | Optional T3 task identity |
+| `workflowName`, `phaseIndex`, `phaseTitle`, `phases`, `attempt` | Optional workflow evidence |
+| `status` | `pending`, `running`, `waiting`, `idle`, `completed`, `failed`, `cancelled`, or `interrupted` |
+| `summary`, `detail`, `error`, `lastToolName` | Bounded latest task detail |
+| `typedUsage` | Typed token/tool/duration rollup |
+| `usageSnapshot` | The stable progress row carries usage only and must not change task status |
+
+`tool.progress.payload.taskId` and `tool.started|updated|completed.payload.agentId` provide exact
+tool attribution. Without one of those fields, a tool stays in the parent thread; its wording is
+never treated as an agent link. Snapshot replacement, event replay/dedup, the 64-node/16-activity
+client bounds, missing-parent behavior, and the lack of certified per-task commands are specified in
+[T3-native agents and work](t3-work-graph.md).
+
+`idle` is displayed as a waiting/resumable task but does not count as active background liveness,
+matching T3's own `ThreadBackgroundLiveness` service. `waiting` remains active.
 
 `t3.thread.status` — connection state, so a client can say "live" rather than guess.
 

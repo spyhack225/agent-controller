@@ -21,6 +21,7 @@ import {
   buildNvsSeedCsv,
   claimLabelFilename,
 } from "../src/manufacturing.mjs";
+import { loadConfig } from "../src/config.mjs";
 
 const GATEWAY = "https://gateway.example.com";
 const DEVICE_ID = "dev_0123456789ab";
@@ -423,10 +424,47 @@ test("flash config still builds alongside the QR artefacts", () => {
   const config = buildFlashConfig({ gatewayBaseUrl: GATEWAY, deviceId: DEVICE_ID, deviceSecret: "s3cr3t" });
   assert.ok(config.includes(`#define DEVICE_ID "${DEVICE_ID}"`));
   assert.ok(config.includes(`#define GATEWAY_BASE_URL "${GATEWAY}"`));
+  assert.ok(config.includes("#define INSECURE_SKIP_TLS_VERIFY 0"));
+  assert.ok(config.includes('#define GATEWAY_TLS_ROOT_CA_PEM ""'));
   // Break 1: a factory-baked SSID cannot match the customer's network, so no shipped unit could
   // ever connect. Wi-Fi is the owner's to supply through the on-device portal.
   assert.doesNotMatch(config, /#define\s+WIFI_SSID/u);
   assert.doesNotMatch(config, /#define\s+WIFI_PASSWORD/u);
+});
+
+test("flash config carries rotatable TLS roots and requires an explicit insecure bench override", () => {
+  const root = "-----BEGIN CERTIFICATE-----\ncurrent\n-----END CERTIFICATE-----";
+  const next = "-----BEGIN CERTIFICATE-----\nnext\n-----END CERTIFICATE-----";
+  const secure = buildFlashConfig({
+    gatewayBaseUrl: GATEWAY,
+    deviceId: DEVICE_ID,
+    deviceSecret: "s3cr3t",
+    gatewayTlsRootCaPem: root,
+    gatewayTlsNextRootCaPem: next,
+  });
+  assert.ok(secure.includes('#define GATEWAY_TLS_ROOT_CA_PEM "-----BEGIN CERTIFICATE-----\\ncurrent\\n-----END CERTIFICATE-----"'));
+  assert.ok(secure.includes('#define GATEWAY_TLS_NEXT_ROOT_CA_PEM "-----BEGIN CERTIFICATE-----\\nnext\\n-----END CERTIFICATE-----"'));
+  assert.ok(secure.includes("#define INSECURE_SKIP_TLS_VERIFY 0"));
+
+  const bench = buildFlashConfig({
+    gatewayBaseUrl: GATEWAY,
+    deviceId: DEVICE_ID,
+    deviceSecret: "s3cr3t",
+    allowInsecureTls: true,
+  });
+  assert.ok(bench.includes("#define INSECURE_SKIP_TLS_VERIFY 1"));
+});
+
+test("one-line env PEM values become valid multiline manufacturing roots", () => {
+  const config = loadConfig({ GATEWAY_TLS_ROOT_CA_PEM: "BEGIN\\nroot\\nEND\\n" });
+  assert.equal(config.gatewayTlsRootCaPem, "BEGIN\nroot\nEND\n");
+  const header = buildFlashConfig({
+    gatewayBaseUrl: GATEWAY,
+    deviceId: DEVICE_ID,
+    deviceSecret: "s3cr3t",
+    gatewayTlsRootCaPem: config.gatewayTlsRootCaPem,
+  });
+  assert.ok(header.includes('#define GATEWAY_TLS_ROOT_CA_PEM "BEGIN\\nroot\\nEND\\n"'));
 });
 
 test("the NVS seed carries identity and the claim code, in nvs_partition_gen's format", () => {

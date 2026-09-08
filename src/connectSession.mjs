@@ -5,10 +5,10 @@
 // console, and the console is the only place that knows which account the host should land in.
 //
 // A connect session inverts it. The console mints a short-lived, single-use enrollment code while
-// the user is authenticated, hands them one command to run on the host, and then polls. The setup
-// script redeems the code at `POST /v1/t3/connect-sessions/redeem`, which is deliberately *not* in
-// the platform-user realm: the script has no Clerk session and `POST /v1/users/dev` is hard-disabled
-// in Clerk mode, so a copyable one-liner could never have carried a platform token.
+// the user is authenticated, hands them one command to run on the host, and then polls. The
+// connector CLI redeems the code at `POST /v1/connectors/enroll`, which is deliberately *not* in the
+// platform-user realm: the CLI has no Clerk session and the copyable one-liner never carries a
+// platform token or local T3 credential.
 //
 // The code is the credential, so it follows the device claim-code rules exactly: hashed at rest,
 // compared with timingSafeEqual, single use, and refused (not ignored) once expired.
@@ -41,7 +41,33 @@ export function tunnelForAccessMode(mode) {
  * exactly one implementation of it, and so the gateway URL comes from the gateway itself rather than
  * from whatever origin the browser happens to be on.
  */
-export function buildConnectCommand({ gatewayUrl, code, accessMode = "local" }) {
+export function buildConnectCommand({ gatewayUrl, code }) {
+  return [
+    "npx @agent-controller/connector connect",
+    "--server",
+    shellQuote(String(gatewayUrl).replace(/\/+$/u, "")),
+    "--code",
+    shellQuote(code),
+  ].join(" ");
+}
+
+export function buildConnectorRotateCommand({ gatewayUrl, code }) {
+  return [
+    "npx @agent-controller/connector rotate",
+    "--server",
+    shellQuote(String(gatewayUrl).replace(/\/+$/u, "")),
+    "--code",
+    shellQuote(code),
+    "--yes",
+  ].join(" ");
+}
+
+/**
+ * Repository-local migration path for the old direct T3 pairing flow. New console onboarding must
+ * use buildConnectCommand; this is explicitly named so a caller cannot select direct mode by
+ * accidentally forwarding the UI's accessMode field.
+ */
+export function buildLegacyDirectConnectCommand({ gatewayUrl, code, accessMode = "local" }) {
   const parts = [
     "npm run setup:t3 --",
     "--gateway-url",

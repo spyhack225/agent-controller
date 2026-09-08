@@ -1,6 +1,8 @@
 import { expect, test } from "vitest";
+import workFixture from "../../test/fixtures/t3-work-activities-contract.json";
 
 import {
+  LIVE_THREAD_ENTRY_LIMIT,
   applyThreadEvent,
   applyThreadSnapshot,
   applyThreadStatus,
@@ -160,6 +162,41 @@ test("a gap snapshot replaces the transcript rather than appending to it", () =>
   expect(state.baseSequence).toBe(5000);
 });
 
+test("a snapshot replaces the T3 work projection and its parent links with the authoritative window", () => {
+  let state = applyThreadSnapshot(start(), snapshot({
+    thread: {
+      id: "thread_1",
+      messages: [],
+      activities: workFixture.activities,
+      session: null,
+      backgroundLiveness: "monitoring",
+    },
+  }));
+  expect(state.work.nodes.map((node) => node.id).sort()).toEqual([
+    "agent_child",
+    "agent_parent",
+    "monitor_1",
+  ]);
+  expect(state.work.relationshipMode).toBe("tree");
+  expect(state.backgroundLiveness).toBe("monitoring");
+
+  state = applyThreadSnapshot(state, snapshot({
+    gap: true,
+    snapshotSequence: 5000,
+    thread: {
+      id: "thread_1",
+      messages: [],
+      activities: [workFixture.activities[1]],
+      session: null,
+    },
+  }));
+  expect(state.work.nodes.map((node) => node.id)).toEqual(["agent_child"]);
+  expect(state.work.nodes[0].parentId).toBe("agent_parent");
+  expect(state.work.relationshipMode).toBe("tree");
+  expect(state.backgroundLiveness).toBe("working");
+  expect(state.historyGap).toBe(true);
+});
+
 test("a clean snapshot clears a gap that a previous one reported", () => {
   let state = applyThreadSnapshot(start(), snapshot({ gap: true }));
   expect(state.historyGap).toBe(true);
@@ -171,6 +208,36 @@ test("a windowed snapshot says that older history was never loaded", () => {
   const state = applyThreadSnapshot(start(), snapshot({
     page: { beforeCursor: "cur_1", hasMore: true, snapshotSequence: 100 },
   }));
+  expect(state.historyTruncated).toBe(true);
+});
+
+test("bounds a large snapshot and truthfully reports the omitted history", () => {
+  const allMessages = Array.from({ length: LIVE_THREAD_ENTRY_LIMIT + 17 }, (_, index) => ({
+    id: `msg_${index}`,
+    role: "assistant",
+    text: `Reply ${index}`,
+    streaming: false,
+    createdAt: new Date(Date.UTC(2026, 7, 24, 12, 0, index)).toISOString(),
+  }));
+  const state = applyThreadSnapshot(start(), snapshot({
+    thread: { id: "thread_1", messages: allMessages, activities: [], session: null },
+  }));
+
+  expect(state.entries).toHaveLength(LIVE_THREAD_ENTRY_LIMIT);
+  expect(state.entries[0].key).toBe("message:msg_17");
+  expect(state.entries.at(-1)?.key).toBe(`message:msg_${allMessages.length - 1}`);
+  expect(state.historyTruncated).toBe(true);
+});
+
+test("keeps a long-running live projection bounded while retaining the newest rows", () => {
+  let state = applyThreadSnapshot(start(), snapshot());
+  for (let index = 0; index < LIVE_THREAD_ENTRY_LIMIT + 25; index += 1) {
+    state = applyThreadEvent(state, delta(101 + index, `msg_${index}`, `Reply ${index}`, false));
+  }
+
+  expect(state.entries).toHaveLength(LIVE_THREAD_ENTRY_LIMIT);
+  expect(state.entries[0].key).toBe("message:msg_25");
+  expect(state.entries.at(-1)?.key).toBe(`message:msg_${LIVE_THREAD_ENTRY_LIMIT + 24}`);
   expect(state.historyTruncated).toBe(true);
 });
 
@@ -217,6 +284,42 @@ test("ignores a repeated activity delivered by the replay/live overlap", () => {
   state = applyThreadEvent(state, activity);
   state = applyThreadEvent(state, activity);
   expect(state.entries).toHaveLength(1);
+});
+
+test("deduplicates live task events and keeps background work active after the parent turn settles", () => {
+  const started = event(101, "thread.activity-appended", {
+    threadId: "thread_1",
+    activity: workFixture.activities[0],
+  });
+  let state = applyThreadSnapshot(start(), snapshot({
+    thread: {
+      id: "thread_1",
+      messages: [],
+      activities: [],
+      session: { status: "stopped", activeTurnId: null, lastError: null },
+    },
+  }));
+  state = applyThreadEvent(state, started);
+  state = applyThreadEvent(state, started);
+  expect(state.work.nodes).toHaveLength(1);
+  expect(state.work.nodes[0].activities).toHaveLength(1);
+  expect(state.backgroundLiveness).toBe("working");
+  expect(liveThreadTurnInFlight(state)).toBe(true);
+
+  state = applyThreadEvent(state, event(102, "thread.activity-appended", {
+    threadId: "thread_1",
+    activity: {
+      ...workFixture.activities[5],
+      payload: {
+        ...workFixture.activities[5].payload,
+        taskId: "agent_parent",
+        parentAgentId: undefined,
+      },
+    },
+  }));
+  expect(state.work.nodes[0].status).toBe("completed");
+  expect(state.backgroundLiveness).toBeNull();
+  expect(liveThreadTurnInFlight(state)).toBe(false);
 });
 
 test("deduplicates on eventId when no usable sequence is present", () => {

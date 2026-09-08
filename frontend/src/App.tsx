@@ -1,5 +1,6 @@
 import {
   Activity,
+  Archive,
   Blocks,
   Boxes,
   Cable,
@@ -7,11 +8,11 @@ import {
   ChevronLeft,
   ChevronRight,
   ChevronsUpDown,
-  CircleDot,
   Folder,
   GalleryVerticalEnd,
   Menu,
   Moon,
+  Pencil,
   Plus,
   RefreshCw,
   Search,
@@ -20,40 +21,37 @@ import {
   Sparkles,
   Sun,
   TerminalSquare,
+  Trash2,
   X,
   Zap,
   type LucideIcon,
 } from "lucide-react";
-import { useEffect, useMemo, useRef, useState } from "react";
+import {
+  Suspense,
+  lazy,
+  useEffect,
+  useMemo,
+  useRef,
+  useState,
+  type ComponentType,
+  type LazyExoticComponent,
+} from "react";
 
 import { connectionActivity, refreshActivity } from "./activity";
 import { type ClaimLink, readClaimLink } from "./claimLink";
+import { readCompanionCode } from "./companionLink";
+import { connectorForEnvironment } from "./connectorHealth";
 import { useController } from "./controller";
-import { ActivityPage } from "./features/ActivityPage";
-import { ActionsPage } from "./features/ActionsPage";
-import { ClaimPage } from "./features/ClaimPage";
-import { DeveloperLandingPage } from "./features/DeveloperLandingPage";
 import {
   DeviceActionCluster,
-  DevicesPage,
   type DeviceOnboardingFlow,
-} from "./features/DevicesPage";
-import {
   EnvironmentActionCluster,
-  EnvironmentsPage,
-} from "./features/EnvironmentsPage";
-import { HardwareLandingPage } from "./features/HardwareLandingPage";
-import { LandingPage } from "./features/LandingPage";
-import { MediaPage } from "./features/MediaPage";
-import { OnboardingPage } from "./features/OnboardingPage";
-import { OperatePage } from "./features/OperatePage";
-import { QuickPage } from "./features/QuickPage";
-import { SettingsPage } from "./features/SettingsPage";
-import { WorkspaceRecoveryDialog } from "./features/WorkspaceRecoveryDialog";
+} from "./features/FeatureActionClusters";
 import { type MarketingRoute, readMarketingRoute } from "./marketingRoute";
 import { ActivityOrb, NavLiquidIndicator } from "./motion";
 import { useReorderable } from "./reorderable";
 import { environmentScope, projectScope, threadScope } from "./resourceOrder";
+import { ThreadSidebarItem } from "./ThreadSidebarItem";
 import type { AuthConfig, ClerkBridge, Environment, PageId } from "./types";
 import { useWorkspaceRecoveryMonitor } from "./useWorkspaceRecoveryMonitor";
 import {
@@ -63,7 +61,46 @@ import {
   StatusBadge,
   Toast,
   cn,
+  useConfirm,
 } from "./ui";
+
+// Feature workspaces are deliberately route chunks. The controller and shell stay mounted while
+// only the surface a user opens is downloaded and parsed; a 100 KiB device editor should not tax a
+// first visit to Operations or the signed-out landing page.
+const ActivityPage = lazyNamed(() => import("./features/ActivityPage"), "ActivityPage");
+const ActionsPage = lazyNamed(() => import("./features/ActionsPage"), "ActionsPage");
+const ClaimPage = lazyNamed(() => import("./features/ClaimPage"), "ClaimPage");
+const DeveloperLandingPage = lazyNamed(() => import("./features/DeveloperLandingPage"), "DeveloperLandingPage");
+const DevicesPage = lazyNamed(() => import("./features/DevicesPage"), "DevicesPage");
+const EnvironmentsPage = lazyNamed(() => import("./features/EnvironmentsPage"), "EnvironmentsPage");
+const HardwareLandingPage = lazyNamed(() => import("./features/HardwareLandingPage"), "HardwareLandingPage");
+const LandingPage = lazyNamed(() => import("./features/LandingPage"), "LandingPage");
+const MediaPage = lazyNamed(() => import("./features/MediaPage"), "MediaPage");
+const OnboardingPage = lazyNamed(() => import("./features/OnboardingPage"), "OnboardingPage");
+const OperatePage = lazyNamed(() => import("./features/OperatePage"), "OperatePage");
+const QuickPage = lazyNamed(() => import("./features/QuickPage"), "QuickPage");
+const SettingsPage = lazyNamed(() => import("./features/SettingsPage"), "SettingsPage");
+const WorkspaceRecoveryDialog = lazyNamed(
+  () => import("./features/WorkspaceRecoveryDialog"),
+  "WorkspaceRecoveryDialog",
+);
+
+type ComponentKey<Module> = {
+  [Key in keyof Module]: Module[Key] extends ComponentType<any> ? Key : never;
+}[keyof Module];
+
+function lazyNamed<Module, Name extends ComponentKey<Module>>(
+  loader: () => Promise<Module>,
+  name: Name,
+): LazyExoticComponent<Extract<Module[Name], ComponentType<any>>> {
+  return lazy(async () => ({
+    default: (await loader())[name] as Extract<Module[Name], ComponentType<any>>,
+  }));
+}
+
+function RouteFallback() {
+  return <div className="page-route-loading" role="status">Loading workspace…</div>;
+}
 
 interface AppProps {
   authConfig: AuthConfig;
@@ -125,7 +162,7 @@ const navItems: NavItem[] = [
     id: "activity",
     label: "Activity",
     shortLabel: "Activity",
-    description: "Approvals, commands, and audit",
+    description: "Notifications, approvals, commands, and audit",
     icon: Activity,
   },
   {
@@ -164,7 +201,7 @@ const mobileNavItems: NavItem[] = [
 ];
 
 function readPage(): PageId {
-  const value = window.location.hash.replace(/^#\/?/, "") as PageId;
+  const value = window.location.hash.replace(/^#\/?/, "").split("?", 1)[0] as PageId;
   return value === "onboarding" || navItems.some((item) => item.id === value) ? value : "operate";
 }
 
@@ -191,18 +228,21 @@ function connectionTone(connection: string) {
 }
 
 function AppContent({ authConfig, clerk = null }: AppProps) {
+  const confirm = useConfirm();
   const controller = useController({ authConfig, clerk });
   const c = controller;
   const [page, setPageState] = useState<PageId>(readPage);
   const [marketingRoute, setMarketingRoute] = useState<MarketingRoute>(readMarketingRoute);
   // Read once, before anything else can rewrite the URL. A scanned QR is a one-shot arrival.
   const [claimLink, setClaimLink] = useState<ClaimLink | null>(() => readClaimLink());
+  const [companionCode] = useState<string | null>(() => readCompanionCode());
   const [sidebarCollapsed, setSidebarCollapsed] = useState(false);
   const [mobileMenuOpen, setMobileMenuOpen] = useState(false);
   const [mobileViewport, setMobileViewport] = useState(readMobileViewport);
   const [theme, setTheme] = useState<"light" | "dark">(readTheme);
   const [deviceOnboardingFlow, setDeviceOnboardingFlow] = useState<DeviceOnboardingFlow | null>(null);
   const [environmentConnectOpen, setEnvironmentConnectOpen] = useState(false);
+  const [environmentEditId, setEnvironmentEditId] = useState<string | null>(null);
   const [sidebarQuery, setSidebarQuery] = useState("");
   const sidebarSearchRef = useRef<HTMLInputElement>(null);
   const mobileNavRef = useRef<HTMLElement>(null);
@@ -218,6 +258,56 @@ function AppContent({ authConfig, clerk = null }: AppProps) {
     setPageState(next);
     window.location.hash = next;
     setMobileMenuOpen(false);
+  };
+
+  const editEnvironmentFromSidebar = (environment: Environment) => {
+    c.setSelectedEnvironmentId(environment.id);
+    setEnvironmentEditId(environment.id);
+    setPage("environments");
+  };
+
+  const archiveEnvironmentFromSidebar = async (environment: Environment) => {
+    const accepted = await confirm({
+      title: `Archive ${environment.label}?`,
+      description: "This deletes its stored credential, disconnects attached devices, clears onboarding selections, disables fixed actions and macros, and moves the record to Archive.",
+      confirmLabel: "Archive environment",
+    });
+    if (!accepted) return;
+    await c.run(`archive-environment-${environment.id}`, "Environment archived and disconnected.", async () => {
+      const result = await c.api(`/v1/t3/environments/${encodeURIComponent(environment.id)}/archive`, {
+        method: "POST",
+        body: {},
+      });
+      await c.refreshAll();
+      return result;
+    });
+  };
+
+  const deleteEnvironmentFromSidebar = async (environment: Environment) => {
+    let dependencyCount = 0;
+    try {
+      const preview = await c.api<{ counts: { devices: number; actions: number; macros: number; onboarding: number } }>(
+        `/v1/t3/environments/${encodeURIComponent(environment.id)}/dependencies`,
+      );
+      dependencyCount = preview.counts.devices + preview.counts.actions + preview.counts.macros + preview.counts.onboarding;
+    } catch {
+      dependencyCount = 0;
+    }
+    const accepted = await confirm({
+      title: `Remove ${environment.label}?`,
+      description: "This revokes its connector and credential, disconnects attached devices, and disables fixed actions and macros. The record remains recoverable during retention.",
+      confirmLabel: "Remove environment",
+      ...(dependencyCount > 0 ? { requiredText: environment.label } : {}),
+    });
+    if (!accepted) return;
+    await c.run(`delete-environment-${environment.id}`, "Environment removed. You can restore it during retention.", async () => {
+      const result = await c.api(`/v1/t3/environments/${encodeURIComponent(environment.id)}`, {
+        method: "DELETE",
+        body: { confirmationLabel: environment.label },
+      });
+      await c.refreshAll();
+      return result;
+    });
   };
 
   useEffect(() => {
@@ -334,6 +424,9 @@ function AppContent({ authConfig, clerk = null }: AppProps) {
   const visibleEnvironments = c.environments.filter((environment) =>
     !normalizedSidebarQuery || environment.label.toLowerCase().includes(normalizedSidebarQuery)
   );
+  const visibleArchivedEnvironments = c.archivedEnvironments.filter((environment) =>
+    !normalizedSidebarQuery || environment.label.toLowerCase().includes(normalizedSidebarQuery)
+  );
   const visibleProjects = c.projects.filter((project) => {
     const label = project.title ?? project.name ?? project.workspaceRoot ?? project.id;
     return !normalizedSidebarQuery
@@ -360,7 +453,9 @@ function AppContent({ authConfig, clerk = null }: AppProps) {
     devices: c.devices.length,
     environments: c.environments.length,
     media: c.media.length,
-    activity: c.pendingApprovals.length,
+    // Approval holds also produce durable notifications. Use the larger attention set instead of
+    // double-counting the same blocked command in both projections.
+    activity: Math.max(c.notificationUnreadCount, c.pendingApprovals.length),
     settings: 0,
     onboarding: 0,
   };
@@ -384,10 +479,12 @@ function AppContent({ authConfig, clerk = null }: AppProps) {
             controller={controller}
             connectOpen={environmentConnectOpen}
             onConnectOpenChange={setEnvironmentConnectOpen}
+            editEnvironmentId={environmentEditId}
+            onEditEnvironmentHandled={() => setEnvironmentEditId(null)}
           />
         );
       case "media":
-        return <MediaPage controller={controller} />;
+        return <MediaPage controller={controller} companionCode={companionCode} />;
       case "activity":
         return <ActivityPage controller={controller} />;
       case "settings":
@@ -397,14 +494,15 @@ function AppContent({ authConfig, clerk = null }: AppProps) {
       default:
         return <OperatePage controller={controller} />;
     }
-  }, [controller, deviceOnboardingFlow, environmentConnectOpen, page]);
+  }, [companionCode, controller, deviceOnboardingFlow, environmentConnectOpen, environmentEditId, page]);
 
   if (claimLink) {
     return (
-      <ClaimPage
-        controller={controller}
-        link={claimLink}
-        onDone={async ({ device }) => {
+      <Suspense fallback={<RouteFallback />}>
+        <ClaimPage
+          controller={controller}
+          link={claimLink}
+          onDone={async ({ device }) => {
           setClaimLink(null);
           if (!device) {
             setPage("devices");
@@ -425,8 +523,9 @@ function AppContent({ authConfig, clerk = null }: AppProps) {
           } else {
             setPage("devices");
           }
-        }}
-      />
+          }}
+        />
+      </Suspense>
     );
   }
 
@@ -440,12 +539,12 @@ function AppContent({ authConfig, clerk = null }: AppProps) {
       return <div className="landing landing--resolving" role="status" aria-label="Restoring your session" />;
     }
     if (marketingRoute === "developers") {
-      return <DeveloperLandingPage authConfig={authConfig} clerk={clerk} />;
+      return <Suspense fallback={<RouteFallback />}><DeveloperLandingPage authConfig={authConfig} clerk={clerk} /></Suspense>;
     }
     if (marketingRoute === "early-access") {
-      return <HardwareLandingPage authConfig={authConfig} clerk={clerk} />;
+      return <Suspense fallback={<RouteFallback />}><HardwareLandingPage authConfig={authConfig} clerk={clerk} /></Suspense>;
     }
-    return <LandingPage authConfig={authConfig} clerk={clerk} />;
+    return <Suspense fallback={<RouteFallback />}><LandingPage authConfig={authConfig} clerk={clerk} /></Suspense>;
   }
 
   return (
@@ -584,35 +683,62 @@ function AppContent({ authConfig, clerk = null }: AppProps) {
                     enabled: canReorder,
                   })}
                 >
-                  <button
-                    type="button"
-                    className="resource-row resource-row--environment"
-                    data-active={selected || undefined}
-                    onClick={() => {
-                      c.setSelectedEnvironmentId(environment.id);
-                      setPage("operate");
-                      void c.run(
-                        `sidebar-snapshot-${environment.id}`,
-                        "T3 workspace loaded.",
-                        () => c.loadSnapshot(environment.id),
-                      );
-                    }}
-                  >
-                    <ChevronDown className={cn("resource-row__chevron", !selected && "-rotate-90")} />
-                    <Server className="resource-row__icon" />
-                    <span className="resource-row__label">{environment.label}</span>
-                    <span
-                      className={cn(
-                        "resource-row__status",
-                        environment.status === "reachable" && "resource-row__status--live",
-                        (environment.status === "unreachable" || environment.status === "token_expired")
-                          && "resource-row__status--danger",
-                      )}
-                      title={environment.status ?? "unknown"}
-                      role="img"
-                      aria-label={`Environment status: ${environment.status ?? "unknown"}`}
-                    />
-                  </button>
+                  <div className="resource-row-shell">
+                    <button
+                      type="button"
+                      className="resource-row resource-row--environment"
+                      data-active={selected || undefined}
+                      onClick={() => {
+                        c.setSelectedEnvironmentId(environment.id);
+                        setPage("operate");
+                      }}
+                    >
+                      <ChevronDown className={cn("resource-row__chevron", !selected && "-rotate-90")} />
+                      <Server className="resource-row__icon" />
+                      <span className="resource-row__label">{environment.label}</span>
+                      <span
+                        className={cn(
+                          "resource-row__status",
+                          environment.status === "reachable" && "resource-row__status--live",
+                          (environment.status === "unreachable" || environment.status === "token_expired")
+                            && "resource-row__status--danger",
+                        )}
+                        title={environment.status ?? "unknown"}
+                        role="img"
+                        aria-label={`Environment status: ${environment.status ?? "unknown"}`}
+                      />
+                    </button>
+                    <span className="resource-row-inline-actions" role="group" aria-label={`${environment.label} actions`}>
+                      <button
+                        type="button"
+                        aria-label={`Edit ${environment.label}`}
+                        title="Edit environment"
+                        onClick={(event) => {
+                          event.stopPropagation();
+                          editEnvironmentFromSidebar(environment);
+                        }}
+                      ><Pencil className="size-3" /></button>
+                      <button
+                        type="button"
+                        aria-label={`Archive ${environment.label}`}
+                        title="Archive environment"
+                        onClick={(event) => {
+                          event.stopPropagation();
+                          void archiveEnvironmentFromSidebar(environment);
+                        }}
+                      ><Archive className="size-3" /></button>
+                      <button
+                        type="button"
+                        className="resource-row-inline-actions__danger"
+                        aria-label={`Delete ${environment.label}`}
+                        title="Delete environment"
+                        onClick={(event) => {
+                          event.stopPropagation();
+                          void deleteEnvironmentFromSidebar(environment);
+                        }}
+                      ><Trash2 className="size-3" /></button>
+                    </span>
+                  </div>
 
                   {selected ? (
                     <div className="resource-children">
@@ -653,52 +779,75 @@ function AppContent({ authConfig, clerk = null }: AppProps) {
                               <span className="resource-row__label">{projectLabel}</span>
                             </button>
                             {projectThreads.map((thread) => (
-                              <button
+                              <ThreadSidebarItem
                                 key={thread.id}
-                                type="button"
-                                className="resource-thread"
-                                {...reorderable.rowProps({
+                                thread={thread}
+                                active={thread.id === c.selectedThreadId}
+                                status={thread.status}
+                                rowProps={reorderable.rowProps({
                                   scope: threadScope(project.id),
                                   id: thread.id,
                                   ids: projectThreadIds,
                                   label: thread.label,
                                   enabled: canReorder,
                                 })}
-                                data-active={thread.id === c.selectedThreadId || undefined}
-                                onClick={() => {
+                                onSelect={() => {
                                   c.setSelectedProjectId(project.id);
                                   c.setSelectedThreadId(thread.id);
                                   setPage("operate");
                                 }}
-                              >
-                                <CircleDot className="size-3" />
-                                <span>{thread.label}</span>
-                                <span className="resource-thread__status">{thread.status ?? ""}</span>
-                              </button>
+                                onRename={async (title) => Boolean(await c.run(
+                                  `rename-thread-${thread.id}`,
+                                  "Thread renamed.",
+                                  () => c.renameThread(thread.id, title),
+                                ))}
+                                onArchive={async () => Boolean(await c.run(
+                                  `archive-thread-${thread.id}`,
+                                  "Thread archived.",
+                                  () => c.archiveThread(thread.id),
+                                ))}
+                                onDelete={async () => Boolean(await c.run(
+                                  `delete-thread-${thread.id}`,
+                                  "Thread deleted.",
+                                  () => c.deleteThread(thread.id),
+                                ))}
+                              />
                             ))}
                           </div>
                         );
                       }) : ungroupedThreads.length ? ungroupedThreads.map((thread) => (
-                        <button
+                        <ThreadSidebarItem
                           key={thread.id}
-                          type="button"
-                          className="resource-thread"
-                          {...reorderable.rowProps({
+                          thread={thread}
+                          active={thread.id === c.selectedThreadId}
+                          status={thread.status}
+                          rowProps={reorderable.rowProps({
                             scope: threadScope(null),
                             id: thread.id,
                             ids: ungroupedThreadIds,
                             label: thread.label,
                             enabled: canReorder,
                           })}
-                          data-active={thread.id === c.selectedThreadId || undefined}
-                          onClick={() => {
+                          onSelect={() => {
                             c.setSelectedThreadId(thread.id);
                             setPage("operate");
                           }}
-                        >
-                          <CircleDot className="size-3" />
-                          <span>{thread.label}</span>
-                        </button>
+                          onRename={async (title) => Boolean(await c.run(
+                            `rename-thread-${thread.id}`,
+                            "Thread renamed.",
+                            () => c.renameThread(thread.id, title),
+                          ))}
+                          onArchive={async () => Boolean(await c.run(
+                            `archive-thread-${thread.id}`,
+                            "Thread archived.",
+                            () => c.archiveThread(thread.id),
+                          ))}
+                          onDelete={async () => Boolean(await c.run(
+                            `delete-thread-${thread.id}`,
+                            "Thread deleted.",
+                            () => c.deleteThread(thread.id),
+                          ))}
+                        />
                       )) : (
                         <button
                           type="button"
@@ -726,6 +875,30 @@ function AppContent({ authConfig, clerk = null }: AppProps) {
               </button>
             )}
           </div>
+
+          {visibleArchivedEnvironments.length ? (
+            <>
+              <div className="sidebar__section-heading sidebar__section-heading--archive">
+                <span>Archive</span>
+                <span className="nav-count">{visibleArchivedEnvironments.length}</span>
+              </div>
+              <div className="resource-tree resource-tree--archive">
+                {visibleArchivedEnvironments.map((environment) => (
+                  <button
+                    key={environment.id}
+                    type="button"
+                    className="resource-row resource-row--archived"
+                    title={`${environment.label} · fully disconnected`}
+                    onClick={() => setPage("environments")}
+                  >
+                    <Archive className="resource-row__icon" />
+                    <span className="resource-row__label">{environment.label}</span>
+                    <span className="resource-row__status" role="img" aria-label="Environment archived" />
+                  </button>
+                ))}
+              </div>
+            </>
+          ) : null}
 
           <div className="sidebar__section-heading sidebar__section-heading--control">
             <span>Control plane</span>
@@ -865,7 +1038,7 @@ function AppContent({ authConfig, clerk = null }: AppProps) {
         </header>
 
         <main className="workspace__content" id="main-content" data-page={page}>
-          {pageContent}
+          <Suspense fallback={<RouteFallback />}>{pageContent}</Suspense>
         </main>
       </div>
 
@@ -903,9 +1076,14 @@ function AppContent({ authConfig, clerk = null }: AppProps) {
         </Toast>
       ) : null}
 
-      <WorkspaceRecoveryDialog
-        open={workspaceRecoveryOpen}
+      {workspaceRecoveryOpen ? <Suspense fallback={null}><WorkspaceRecoveryDialog
+        open
         failure={c.workspaceRecovery?.failure ?? null}
+        environment={c.environments.find((environment) => environment.id === c.workspaceRecovery?.environmentId) ?? null}
+        connector={connectorForEnvironment(
+          c.connectors,
+          c.environments.find((environment) => environment.id === c.workspaceRecovery?.environmentId),
+        )}
         retrying={c.busyAction === "retry-workspace-snapshot"}
         checking={workspaceRecoveryChecking}
         onClose={c.dismissWorkspaceRecovery}
@@ -923,7 +1101,7 @@ function AppContent({ authConfig, clerk = null }: AppProps) {
             () => c.loadSnapshot(environmentId),
           );
         }}
-      />
+      /></Suspense> : null}
     </div>
   );
 }

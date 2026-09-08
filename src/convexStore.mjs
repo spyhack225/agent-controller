@@ -1,6 +1,7 @@
 import { createHash, randomBytes } from "node:crypto";
 
 import { CONNECT_SESSION_TTL_MS, normalizeConnectAccessMode } from "./connectSession.mjs";
+import { CONNECTOR_TICKET_AUDIENCE, CONNECTOR_TICKET_TTL_MS } from "./connectorProtocol.mjs";
 import { createSecretBox } from "./secretBox.mjs";
 
 const DEFAULT_FUNCTIONS = {
@@ -19,6 +20,8 @@ const DEFAULT_FUNCTIONS = {
   revokeDevice: { type: "mutation", name: "gatewayStore:revokeDevice" },
   deleteDevice: { type: "mutation", name: "gatewayStore:deleteDevice" },
   rotateDeviceSecret: { type: "mutation", name: "gatewayStore:rotateDeviceSecret" },
+  stageDeviceSecret: { type: "mutation", name: "gatewayStore:stageDeviceSecret" },
+  acknowledgeDeviceSecret: { type: "mutation", name: "gatewayStore:acknowledgeDeviceSecret" },
   updateDeviceProfile: { type: "mutation", name: "gatewayStore:updateDeviceProfile" },
   resetDeviceForTransfer: { type: "mutation", name: "gatewayStore:resetDeviceForTransfer" },
   ensureUnclaimedDeviceClaimCode: { type: "mutation", name: "gatewayStore:ensureUnclaimedDeviceClaimCode" },
@@ -38,20 +41,57 @@ const DEFAULT_FUNCTIONS = {
   reportDeviceGatewaySwitch: { type: "mutation", name: "gatewayStore:reportDeviceGatewaySwitch" },
   rollbackDeviceGatewaySwitch: { type: "mutation", name: "gatewayStore:rollbackDeviceGatewaySwitch" },
   upsertEnvironment: { type: "mutation", name: "gatewayStore:upsertEnvironment" },
+  archiveEnvironment: { type: "mutation", name: "gatewayStore:archiveEnvironment" },
+  restoreEnvironment: { type: "mutation", name: "gatewayStore:restoreEnvironment" },
+  listExpiredEnvironments: { type: "query", name: "gatewayStore:listExpiredEnvironments" },
+  purgeEnvironment: { type: "mutation", name: "gatewayStore:purgeEnvironment" },
   deleteEnvironment: { type: "mutation", name: "gatewayStore:deleteEnvironment" },
   updateEnvironmentHealth: { type: "mutation", name: "gatewayStore:updateEnvironmentHealth" },
   updateEnvironmentCatalogue: { type: "mutation", name: "gatewayStore:updateEnvironmentCatalogue" },
   getEnvironmentForUser: { type: "query", name: "gatewayStore:getEnvironmentForUser" },
   listEnvironments: { type: "query", name: "gatewayStore:listEnvironments" },
+  listArchivedEnvironments: { type: "query", name: "gatewayStore:listArchivedEnvironments" },
   createConnectSession: { type: "mutation", name: "gatewayStore:createConnectSession" },
   getConnectSession: { type: "query", name: "gatewayStore:getConnectSession" },
   claimConnectSession: { type: "mutation", name: "gatewayStore:claimConnectSession" },
   completeConnectSession: { type: "mutation", name: "gatewayStore:completeConnectSession" },
+  createConnector: { type: "mutation", name: "gatewayStore:createConnector" },
+  // Authentication evaluates rotation expiry, so it must not be query-cached.
+  authenticateConnector: { type: "mutation", name: "gatewayStore:authenticateConnector" },
+  authenticateConnectorForRevocation: { type: "mutation", name: "gatewayStore:authenticateConnectorForRevocation" },
+  beginConnectorCredentialRotation: { type: "mutation", name: "gatewayStore:beginConnectorCredentialRotation" },
+  listConnectors: { type: "query", name: "gatewayStore:listConnectors" },
+  listBackgroundWorkUsers: { type: "query", name: "gatewayStore:listBackgroundWorkUsers" },
+  getConnectorForUser: { type: "query", name: "gatewayStore:getConnectorForUser" },
+  revokeConnector: { type: "mutation", name: "gatewayStore:revokeConnector" },
+  revokeConnectorByCredential: { type: "mutation", name: "gatewayStore:revokeConnectorByCredential" },
+  createConnectorTicket: { type: "mutation", name: "gatewayStore:createConnectorTicket" },
+  consumeConnectorTicket: { type: "mutation", name: "gatewayStore:consumeConnectorTicket" },
+  recordConnectorPresence: { type: "mutation", name: "gatewayStore:recordConnectorPresence" },
   createFirmwareRelease: { type: "mutation", name: "gatewayStore:createFirmwareRelease" },
   deleteFirmwareRelease: { type: "mutation", name: "gatewayStore:deleteFirmwareRelease" },
   listFirmwareReleases: { type: "query", name: "gatewayStore:listFirmwareReleases" },
   getLatestFirmwareRelease: { type: "query", name: "gatewayStore:getLatestFirmwareRelease" },
   getFirmwareArtifact: { type: "query", name: "gatewayStore:getFirmwareArtifact" },
+  createReleaseRollout: { type: "mutation", name: "gatewayStore:createReleaseRollout" },
+  listReleaseRollouts: { type: "query", name: "gatewayStore:listReleaseRollouts" },
+  listRunnableReleaseRollouts: { type: "query", name: "gatewayStore:listRunnableReleaseRollouts" },
+  getReleaseRolloutForUser: { type: "query", name: "gatewayStore:getReleaseRolloutForUser" },
+  transitionReleaseRollout: { type: "mutation", name: "gatewayStore:transitionReleaseRollout" },
+  upsertRolloutAssignment: { type: "mutation", name: "gatewayStore:upsertRolloutAssignment" },
+  listRolloutAssignments: { type: "query", name: "gatewayStore:listRolloutAssignments" },
+  createCompanionHandoff: { type: "mutation", name: "gatewayStore:createCompanionHandoff" },
+  getCompanionHandoffForUser: { type: "query", name: "gatewayStore:getCompanionHandoffForUser" },
+  getCompanionHandoffForDevice: { type: "query", name: "gatewayStore:getCompanionHandoffForDevice" },
+  claimCompanionHandoff: { type: "mutation", name: "gatewayStore:claimCompanionHandoff" },
+  cancelCompanionHandoff: { type: "mutation", name: "gatewayStore:cancelCompanionHandoff" },
+  completeCompanionHandoff: { type: "mutation", name: "gatewayStore:completeCompanionHandoff" },
+  createMediaUploadSession: { type: "mutation", name: "gatewayStore:createMediaUploadSession" },
+  getMediaUploadSessionForActor: { type: "query", name: "gatewayStore:getMediaUploadSessionForActor" },
+  markMediaUploadSessionUploaded: { type: "mutation", name: "gatewayStore:markMediaUploadSessionUploaded" },
+  finalizeMediaUploadSession: { type: "mutation", name: "gatewayStore:finalizeMediaUploadSession" },
+  abortMediaUploadSession: { type: "mutation", name: "gatewayStore:abortMediaUploadSession" },
+  listExpiredMediaUploadSessions: { type: "query", name: "gatewayStore:listExpiredMediaUploadSessions" },
   createMediaUpload: { type: "mutation", name: "gatewayStore:createMediaUpload" },
   getMediaForUser: { type: "query", name: "gatewayStore:getMediaForUser" },
   updateMediaTranscript: { type: "mutation", name: "gatewayStore:updateMediaTranscript" },
@@ -91,6 +131,9 @@ const DEFAULT_FUNCTIONS = {
   listMacros: { type: "query", name: "gatewayStore:listMacros" },
   deleteMacro: { type: "mutation", name: "gatewayStore:deleteMacro" },
   createCommand: { type: "mutation", name: "gatewayStore:createCommand" },
+  claimCommandRequest: { type: "mutation", name: "gatewayStore:claimCommandRequest" },
+  settleCommandRequest: { type: "mutation", name: "gatewayStore:settleCommandRequest" },
+  getCommandRequest: { type: "query", name: "gatewayStore:getCommandRequest" },
   getCommandForUser: { type: "query", name: "gatewayStore:getCommandForUser" },
   claimCommandApproval: { type: "mutation", name: "gatewayStore:claimCommandApproval" },
   claimProviderApprovalDecision: { type: "mutation", name: "gatewayStore:claimProviderApprovalDecision" },
@@ -99,12 +142,40 @@ const DEFAULT_FUNCTIONS = {
   claimProviderUserInputAnswer: { type: "mutation", name: "gatewayStore:claimProviderUserInputAnswer" },
   updateProviderUserInputAnswer: { type: "mutation", name: "gatewayStore:updateProviderUserInputAnswer" },
   listProviderUserInputAnswers: { type: "query", name: "gatewayStore:listProviderUserInputAnswers" },
+  createNotification: { type: "mutation", name: "gatewayStore:createNotification" },
+  listNotifications: { type: "query", name: "gatewayStore:listNotifications" },
+  markNotificationRead: { type: "mutation", name: "gatewayStore:markNotificationRead" },
+  dismissNotification: { type: "mutation", name: "gatewayStore:dismissNotification" },
+  dismissNotificationByDedupe: { type: "mutation", name: "gatewayStore:dismissNotificationByDedupe" },
+  markAllNotificationsRead: { type: "mutation", name: "gatewayStore:markAllNotificationsRead" },
+  recordBackgroundLiveness: { type: "mutation", name: "gatewayStore:recordBackgroundLiveness" },
+  getBackgroundLiveness: { type: "query", name: "gatewayStore:getBackgroundLiveness" },
+  upsertPushSubscription: { type: "mutation", name: "gatewayStore:upsertPushSubscription" },
+  listPushSubscriptions: { type: "query", name: "gatewayStore:listPushSubscriptions" },
+  revokePushSubscription: { type: "mutation", name: "gatewayStore:revokePushSubscription" },
+  revokePushSubscriptionByEndpoint: { type: "mutation", name: "gatewayStore:revokePushSubscriptionByEndpoint" },
+  enqueuePushDeliveries: { type: "mutation", name: "gatewayStore:enqueuePushDeliveries" },
+  claimPushDeliveries: { type: "mutation", name: "gatewayStore:claimPushDeliveries" },
+  settlePushDelivery: { type: "mutation", name: "gatewayStore:settlePushDelivery" },
   updateCommand: { type: "mutation", name: "gatewayStore:updateCommand" },
   listCommands: { type: "query", name: "gatewayStore:listCommands" },
   listCommandEvents: { type: "query", name: "gatewayStore:listCommandEvents" },
   listAuditLogs: { type: "query", name: "gatewayStore:listAuditLogs" },
   getDisplaySummary: { type: "query", name: "gatewayStore:getDisplaySummary" },
 };
+
+const SAFE_REMOTE_ERROR_CODES = new Set([
+  "EAI_AGAIN",
+  "ECONNABORTED",
+  "ECONNREFUSED",
+  "ECONNRESET",
+  "EHOSTUNREACH",
+  "ENETUNREACH",
+  "ENOTFOUND",
+  "ETIMEDOUT",
+  "INVALID_ARGUMENT",
+  "UND_ERR_CONNECT_TIMEOUT",
+]);
 
 export async function createConvexStore(config = {}, options = {}) {
   if (!config.convexUrl) {
@@ -121,6 +192,7 @@ export async function createConvexStore(config = {}, options = {}) {
     functions: options.functions ?? DEFAULT_FUNCTIONS,
     gatewaySecret,
     t3TokenEncryptionKey: options.t3TokenEncryptionKey ?? config.t3TokenEncryptionKey ?? gatewaySecret,
+    pushEncryptionKey: options.pushEncryptionKey ?? config.webPushEncryptionKey ?? gatewaySecret,
   });
 }
 
@@ -129,6 +201,7 @@ export function createConvexStoreAdapter({
   functions = DEFAULT_FUNCTIONS,
   gatewaySecret = null,
   t3TokenEncryptionKey = null,
+  pushEncryptionKey = null,
 }) {
   if (!client || typeof client.query !== "function" || typeof client.mutation !== "function") {
     throw new Error("Convex store adapter requires a client with query() and mutation() methods.");
@@ -137,6 +210,7 @@ export function createConvexStoreAdapter({
     throw new Error("Convex store adapter requires a gatewaySecret.");
   }
   const t3TokenBox = createSecretBox(t3TokenEncryptionKey);
+  const pushSecretBox = createSecretBox(pushEncryptionKey ?? t3TokenEncryptionKey);
   const listeners = new Set();
 
   function notify(change) {
@@ -155,9 +229,20 @@ export function createConvexStoreAdapter({
     if (!fn) {
       throw new Error(`Convex Store API function mapping is missing for ${method}.`);
     }
-    if (fn.type === "query") return client.query(fn.name, input);
+    if (fn.type === "query") {
+      try {
+        return await client.query(fn.name, input);
+      } catch (error) {
+        throw remoteCallError(method, error);
+      }
+    }
     if (fn.type === "mutation") {
-      const result = await client.mutation(fn.name, input);
+      let result;
+      try {
+        result = await client.mutation(fn.name, input);
+      } catch (error) {
+        throw remoteCallError(method, error);
+      }
       // Convex holds the state, so there is no local store to diff. Emitting the affected user
       // on every mutation is what keeps live dashboard updates working under STORAGE_PROVIDER=convex.
       const userId = affectedUserId(args, result);
@@ -218,25 +303,13 @@ export function createConvexStoreAdapter({
     revokeDevice: (args) => call("revokeDevice", args),
     deleteDevice: (args) => call("deleteDevice", args),
     updateDeviceProfile: (args) => call("updateDeviceProfile", args),
-    rotateDeviceSecret: async (args) => {
-      const secret = createSecret();
-      const device = await call("rotateDeviceSecret", {
-        ...args,
-        secretHash: hashSecret(secret),
-      });
-      return device ? { device, secret } : null;
-    },
-    resetDeviceForTransfer: async (args) => {
-      const secret = createSecret();
-      const claimCode = createHumanCode();
-      const device = await call("resetDeviceForTransfer", {
-        ...args,
-        secretHash: hashSecret(secret),
-        claimCodeHash: hashSecret(normalizeClaimCode(claimCode)),
-        claimCodeExpiresAt: claimCodeExpiryFrom(Date.now()),
-      });
-      return device ? { device, secret, claimCode } : null;
-    },
+    rotateDeviceSecret: (args) => call("rotateDeviceSecret", args),
+    resetDeviceForTransfer: (args) => call("resetDeviceForTransfer", args),
+    stageDeviceSecret: ({ secret, ...args }) => call("stageDeviceSecret", {
+      ...args,
+      secretHash: hashSecret(secret),
+    }),
+    acknowledgeDeviceSecret: (args) => call("acknowledgeDeviceSecret", args),
     // The candidate code is minted here and only its hash crosses to Convex, matching
     // `preprovisionDevice`. Convex decides whether the existing code is still live; when it is, it
     // ignores the candidate and reports `rotated: false`, so the plaintext is discarded unused.
@@ -276,8 +349,14 @@ export function createConvexStoreAdapter({
     rollbackDeviceGatewaySwitch: (args) => call("rollbackDeviceGatewaySwitch", args),
     upsertEnvironment: (args) => call("upsertEnvironment", {
       ...args,
-      accessToken: t3TokenBox.seal(args.accessToken),
+      ...(args.transportMode === "connector" || !args.accessToken
+        ? { accessToken: undefined }
+        : { accessToken: t3TokenBox.seal(args.accessToken) }),
     }),
+    archiveEnvironment: (args) => call("archiveEnvironment", args),
+    restoreEnvironment: (args) => call("restoreEnvironment", args),
+    listExpiredEnvironments: (args) => call("listExpiredEnvironments", args),
+    purgeEnvironment: (args) => call("purgeEnvironment", args),
     deleteEnvironment: (args) => call("deleteEnvironment", args),
     updateEnvironmentHealth: (args) => call("updateEnvironmentHealth", args),
     updateEnvironmentCatalogue: (args) => call("updateEnvironmentCatalogue", args),
@@ -286,10 +365,11 @@ export function createConvexStoreAdapter({
       if (!environment) return null;
       return {
         ...environment,
-        accessToken: t3TokenBox.open(environment.accessToken),
+        accessToken: environment.accessToken ? t3TokenBox.open(environment.accessToken) : undefined,
       };
     },
     listEnvironments: (userId) => call("listEnvironments", { userId }),
+    listArchivedEnvironments: (userId) => call("listArchivedEnvironments", { userId }),
     // The code is generated in Node and only its hash crosses the wire, so Convex never holds
     // enough to reconstruct a usable enrollment credential.
     createConnectSession: async (args) => {
@@ -299,6 +379,7 @@ export function createConvexStoreAdapter({
         label: args.label ?? "T3 Code",
         accessMode: normalizeConnectAccessMode(args.accessMode),
         environmentId: args.environmentId ?? null,
+        purpose: args.purpose ?? "t3_enrollment",
         codeHash: hashSecret(normalizeClaimCode(code)),
         expiresAt: new Date(Date.now() + CONNECT_SESSION_TTL_MS).toISOString(),
       });
@@ -314,11 +395,117 @@ export function createConvexStoreAdapter({
       baseUrl: args.baseUrl ?? null,
       error: args.error ?? null,
     }),
+    createConnector: async (args) => {
+      const secret = createSecret();
+      const connector = await call("createConnector", {
+        ...args,
+        secretHash: hashSecret(secret),
+        secretPrefix: secret.slice(0, 8),
+        connectorVersion: args.connectorVersion ?? null,
+        platform: args.platform ?? null,
+      });
+      return connector ? { connector, secret } : null;
+    },
+    authenticateConnector: (connectorId, secret) => call("authenticateConnector", {
+      connectorId,
+      secretHash: hashSecret(secret),
+    }),
+    authenticateConnectorForRevocation: (connectorId, secret) => call("authenticateConnectorForRevocation", {
+      connectorId,
+      secretHash: hashSecret(secret),
+    }),
+    beginConnectorCredentialRotation: async ({ userId, connectorId, expiresAt = null }) => {
+      const secret = createSecret();
+      const rotationId = `crt_${randomBytes(16).toString("hex")}`;
+      const boundedExpiresAt = new Date(Math.min(
+        Number.isFinite(Date.parse(expiresAt ?? "")) ? Date.parse(expiresAt) : Date.now() + 10 * 60_000,
+        Date.now() + 10 * 60_000,
+      )).toISOString();
+      const result = await call("beginConnectorCredentialRotation", {
+        userId,
+        connectorId,
+        pendingSecretHash: hashSecret(secret),
+        pendingSecretPrefix: secret.slice(0, 8),
+        rotationId,
+        expiresAt: boundedExpiresAt,
+      });
+      return result ? { connector: result.connector, rotation: result.rotation, secret } : null;
+    },
+    listConnectors: (userId) => call("listConnectors", { userId }),
+    listBackgroundWorkUsers: (args = {}) => call("listBackgroundWorkUsers", args),
+    getConnectorForUser: (userId, connectorId) => call("getConnectorForUser", { userId, connectorId }),
+    revokeConnector: (args) => call("revokeConnector", args),
+    revokeConnectorByCredential: ({ connectorId, secret, reason }) => call("revokeConnectorByCredential", {
+      connectorId,
+      secretHash: hashSecret(secret),
+      ...(reason ? { reason } : {}),
+    }),
+    createConnectorTicket: async ({ connectorId, audience = CONNECTOR_TICKET_AUDIENCE, credentialVersion = null, rotationId = null }) => {
+      const ticket = createSecret();
+      const expiresAt = new Date(Date.now() + CONNECTOR_TICKET_TTL_MS).toISOString();
+      const result = await call("createConnectorTicket", {
+        connectorId,
+        tokenHash: hashSecret(ticket),
+        audience,
+        expiresAt,
+        credentialVersion,
+        rotationId,
+      });
+      return result ? { ticket, expiresAt: result.expiresAt } : null;
+    },
+    consumeConnectorTicket: ({ ticket, audience = null, now = Date.now() }) => call("consumeConnectorTicket", {
+      tokenHash: hashSecret(ticket),
+      audience,
+      now,
+    }),
+    recordConnectorPresence: (args) => call("recordConnectorPresence", args),
     createFirmwareRelease: (args) => call("createFirmwareRelease", args),
     deleteFirmwareRelease: (releaseId) => call("deleteFirmwareRelease", { releaseId }),
     listFirmwareReleases: (args) => call("listFirmwareReleases", args ?? {}),
     getLatestFirmwareRelease: (args) => call("getLatestFirmwareRelease", args),
     getFirmwareArtifact: (args) => call("getFirmwareArtifact", args),
+    createReleaseRollout: (args) => call("createReleaseRollout", args),
+    listReleaseRollouts: (userId, args = {}) => call("listReleaseRollouts", { userId, states: args.states }),
+    listRunnableReleaseRollouts: (args = {}) => call("listRunnableReleaseRollouts", args),
+    getReleaseRolloutForUser: (userId, rolloutId) => call("getReleaseRolloutForUser", { userId, rolloutId }),
+    transitionReleaseRollout: (args) => call("transitionReleaseRollout", args),
+    upsertRolloutAssignment: (args) => call("upsertRolloutAssignment", args),
+    listRolloutAssignments: (args) => call("listRolloutAssignments", args),
+    createCompanionHandoff: ({ code, ...args }) => call("createCompanionHandoff", {
+      ...args,
+      deviceId: args.deviceId ?? null,
+      codeHash: hashSecret(code),
+    }),
+    getCompanionHandoffForUser: (userId, handoffId) => call("getCompanionHandoffForUser", { userId, handoffId }),
+    getCompanionHandoffForDevice: (args) => call("getCompanionHandoffForDevice", args),
+    claimCompanionHandoff: ({ code, ...args }) => call("claimCompanionHandoff", {
+      ...args,
+      codeHash: hashSecret(code),
+    }),
+    cancelCompanionHandoff: (args) => call("cancelCompanionHandoff", {
+      ...args,
+      deviceId: args.deviceId ?? null,
+    }),
+    completeCompanionHandoff: (args) => call("completeCompanionHandoff", args),
+    createMediaUploadSession: (args) => call("createMediaUploadSession", args),
+    getMediaUploadSessionForActor: (args) => call("getMediaUploadSessionForActor", {
+      ...args,
+      deviceId: args.deviceId ?? null,
+    }),
+    markMediaUploadSessionUploaded: (args) => call("markMediaUploadSessionUploaded", {
+      ...args,
+      deviceId: args.deviceId ?? null,
+    }),
+    finalizeMediaUploadSession: (args) => call("finalizeMediaUploadSession", {
+      ...args,
+      deviceId: args.deviceId ?? null,
+      mediaExpiresAt: args.mediaExpiresAt ?? null,
+    }),
+    abortMediaUploadSession: (args) => call("abortMediaUploadSession", {
+      ...args,
+      deviceId: args.deviceId ?? null,
+    }),
+    listExpiredMediaUploadSessions: (args) => call("listExpiredMediaUploadSessions", args),
     createMediaUpload: (args) => call("createMediaUpload", args),
     getMediaForUser: (userId, mediaId) => call("getMediaForUser", { userId, mediaId }),
     updateMediaTranscript: (args) => call("updateMediaTranscript", args),
@@ -365,6 +552,9 @@ export function createConvexStoreAdapter({
     listMacros: (userId) => call("listMacros", { userId }),
     deleteMacro: (args) => call("deleteMacro", args),
     createCommand: (args) => call("createCommand", args),
+    claimCommandRequest: (args) => call("claimCommandRequest", args),
+    settleCommandRequest: (args) => call("settleCommandRequest", args),
+    getCommandRequest: (args) => call("getCommandRequest", args),
     getCommandForUser: (userId, commandId) => call("getCommandForUser", { userId, commandId }),
     claimCommandApproval: (args) => call("claimCommandApproval", args),
     claimProviderApprovalDecision: (args) => call("claimProviderApprovalDecision", args),
@@ -373,6 +563,42 @@ export function createConvexStoreAdapter({
     claimProviderUserInputAnswer: (args) => call("claimProviderUserInputAnswer", args),
     updateProviderUserInputAnswer: (args) => call("updateProviderUserInputAnswer", args),
     listProviderUserInputAnswers: (args) => call("listProviderUserInputAnswers", args),
+    createNotification: (args) => call("createNotification", args),
+    listNotifications: (args) => call("listNotifications", args),
+    markNotificationRead: (args) => call("markNotificationRead", args),
+    dismissNotification: (args) => call("dismissNotification", args),
+    dismissNotificationByDedupe: (args) => call("dismissNotificationByDedupe", args),
+    markAllNotificationsRead: (args) => call("markAllNotificationsRead", args),
+    recordBackgroundLiveness: (args) => call("recordBackgroundLiveness", args),
+    getBackgroundLiveness: (scope = "scheduled-worker") => call("getBackgroundLiveness", { scope }),
+    upsertPushSubscription: (args) => call("upsertPushSubscription", {
+      userId: args.userId,
+      endpointHash: createHash("sha256").update(args.endpoint, "utf8").digest("hex"),
+      endpoint: pushSecretBox.seal(args.endpoint),
+      p256dh: pushSecretBox.seal(args.keys.p256dh),
+      auth: pushSecretBox.seal(args.keys.auth),
+      vapidKeyId: args.vapidKeyId,
+    }),
+    listPushSubscriptions: (args) => call("listPushSubscriptions", args),
+    revokePushSubscription: (args) => call("revokePushSubscription", args),
+    revokePushSubscriptionByEndpoint: (args) => call("revokePushSubscriptionByEndpoint", {
+      userId: args.userId,
+      endpointHash: createHash("sha256").update(args.endpoint, "utf8").digest("hex"),
+      reason: args.reason,
+    }),
+    enqueuePushDeliveries: (args) => call("enqueuePushDeliveries", args),
+    claimPushDeliveries: async (args) => (await call("claimPushDeliveries", args)).map((claim) => ({
+      ...claim,
+      subscription: {
+        ...claim.subscription,
+        endpoint: pushSecretBox.open(claim.subscription.endpoint),
+        keys: {
+          p256dh: pushSecretBox.open(claim.subscription.keys.p256dh),
+          auth: pushSecretBox.open(claim.subscription.keys.auth),
+        },
+      },
+    })),
+    settlePushDelivery: (args) => call("settlePushDelivery", args),
     updateCommand: (args) => call("updateCommand", args),
     listCommands: (userId) => call("listCommands", { userId }),
     listCommandEvents: (args) => call("listCommandEvents", args),
@@ -382,6 +608,25 @@ export function createConvexStoreAdapter({
     // hits every five seconds.
     getDisplaySummary: (userId) => call("getDisplaySummary", { userId }),
   };
+}
+
+// Convex validation errors can include the complete function argument object in their message and
+// stack. Every Store call carries the shared gateway credential, and some carry private user data,
+// so neither the remote Error nor its cause may cross the adapter boundary. Retain only the local
+// method plus primitive fields used by retry/status classification.
+function remoteCallError(method, error) {
+  const wrapped = new Error(`Convex Store call failed (${method}).`);
+  wrapped.name = "ConvexStoreRemoteError";
+  wrapped.code = safeRemoteCode(error?.code) ?? "convex_store_call_failed";
+  if (Number.isInteger(error?.status) && error.status >= 400 && error.status <= 599) {
+    wrapped.status = error.status;
+  }
+  if (typeof error?.retryable === "boolean") wrapped.retryable = error.retryable;
+  return wrapped;
+}
+
+function safeRemoteCode(value) {
+  return SAFE_REMOTE_ERROR_CODES.has(value) ? value : null;
 }
 
 async function createConvexHttpClient(convexUrl, options = {}) {
@@ -410,6 +655,8 @@ function emptyState() {
     devices: [],
     environments: [],
     firmwareReleases: [],
+    releaseRollouts: [],
+    rolloutAssignments: [],
     gatewayProfiles: [],
     mediaUploads: [],
     macros: [],

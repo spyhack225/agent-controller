@@ -59,6 +59,57 @@ test("waiting output never reuses an assistant response older than the dispatche
   assert.match(output.response.lines[0], /Waiting/u);
 });
 
+test("waiting output carries a bounded content-free summary of T3 native task work", () => {
+  const output = buildDeviceThreadOutput({
+    thread: {
+      id: "thread_1",
+      session: { status: "stopped" },
+      activities: [
+        {
+          kind: "task.started",
+          summary: "Private repository audit",
+          payload: {
+            taskId: "agent_private",
+            agentKind: "agent",
+            title: "Private repository audit",
+          },
+        },
+        {
+          kind: "task.completed",
+          summary: "Task failed",
+          payload: {
+            taskId: "agent_failed",
+            agentKind: "agent",
+            status: "failed",
+            summary: "Secret provider output",
+          },
+        },
+      ],
+    },
+    controls,
+    after: "2026-08-08T20:00:00.000Z",
+  });
+
+  assert.deepEqual(output.work, {
+    version: 1,
+    source: "t3-task-activities",
+    total: 2,
+    active: 1,
+    queued: 0,
+    working: 1,
+    waiting: 0,
+    completed: 0,
+    failed: 1,
+    stopped: 0,
+    backgroundLiveness: "working",
+    truncated: false,
+    omitted: 0,
+  });
+  assert.deepEqual(output.response.lines, ["1 active task", "0 done · 1 failed", "EXIT returns to actions"]);
+  assert.ok(output.response.lines.every((line) => line.length <= 31));
+  assert.doesNotMatch(JSON.stringify(output.work), /Private repository|Secret provider|agent_private/u);
+});
+
 test("malformed and untrusted follow-up markers fail closed", () => {
   assert.deepEqual(extractFollowUpIds('Done <!--AC_FOLLOWUPS:not-json-->'), []);
   assert.deepEqual(extractFollowUpIds('Done <!--AC_FOLLOWUPS:["a"]-->'), ["a"]);

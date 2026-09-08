@@ -1,13 +1,15 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 
-import { ApiError, downloadJson, requestJson, type ApiOptions } from "./api";
-import { useApprovalNotifications } from "./notifications";
+import { ApiError, downloadJson, requestJson, uploadBinary, type ApiOptions } from "./api";
+import { connectorFailureFromMetadata, connectorForEnvironment } from "./connectorHealth";
+import { useLocalNotifications } from "./notifications";
 import type {
   ProviderApprovalDecision,
   ProviderApprovalLocalDecision,
 } from "./providerApprovals";
 import type { UserInputAnswers, UserInputLocalAnswer } from "./userInput";
 import { useThreadWatch } from "./useThreadWatch";
+import { clearDurableMutationRequest, durableMutationRequest } from "./requestId";
 import {
   projectScope,
   threadScope,
@@ -16,11 +18,13 @@ import {
 } from "./resourceOrder";
 import type {
   AuditEvent,
+  BackgroundLiveness,
   AuthConfig,
   ClerkBridge,
   Command,
   CommandEvent,
   ConnectionState,
+  Connector,
   ConnectSession,
   ConnectSessionMint,
   Device,
@@ -43,16 +47,44 @@ import type {
   OnboardingState,
   RemoteAccessStatus,
   T3HarnessCatalogue,
+  T3CapabilityManifest,
   T3Project,
   T3Thread,
   T3ThreadMessage,
   SavedAction,
+  UserNotification,
   GatewayProfile,
 } from "./types";
+import { createFrameBatcher } from "./frameBatcher";
 
 interface Notice {
   tone: "success" | "danger" | "info";
   message: string;
+}
+
+interface ControllerApiOptions extends ApiOptions {
+  /** Background warming should not replace the operator's current notice or connection state. */
+  silent?: boolean;
+}
+
+export interface MediaUploadProgress {
+  stage: "creating" | "uploading" | "finalizing";
+  loaded: number;
+  total: number;
+}
+
+export interface MediaUploadOptions {
+  signal?: AbortSignal;
+  onProgress?: (progress: MediaUploadProgress) => void;
+}
+
+interface MediaUploadSessionResponse {
+  session: {
+    id: string;
+    status: string;
+    upload: { url: string; contentType: string; sizeBytes: number };
+    finalizeUrl: string;
+  };
 }
 
 export interface WorkspaceRecovery {
@@ -64,6 +96,9 @@ export interface WorkspaceRecovery {
 export const T3_SNAPSHOT_UNAVAILABLE_MESSAGE = "T3 snapshot is unavailable.";
 
 const ENVIRONMENT_FAILURE_REASONS: readonly EnvironmentFailureReason[] = [
+  "connector_offline",
+  "connector_revoked",
+  "connector_incompatible",
   "process_not_running",
   "network_unreachable",
   "timeout",
@@ -133,10 +168,8 @@ export function normalizeThread(thread: JsonRecord, projects: T3Project[]): T3Th
       ? (thread.project as JsonRecord).id
       : null);
   const projectId = typeof projectValue === "string" ? projectValue : null;
-  const project = projects.find((candidate) => candidate.id === projectId);
   const titleValue = thread.title ?? thread.name ?? thread.label;
   const title = typeof titleValue === "string" && titleValue ? titleValue : idValue;
-  const suffix = project?.title ?? project?.name ?? projectId ?? "";
   const statusValue = thread.status ?? thread.state;
   const rawModelSelection = thread.modelSelection;
   const modelSelection = rawModelSelection && typeof rawModelSelection === "object"
@@ -172,12 +205,123 @@ export function normalizeThread(thread: JsonRecord, projects: T3Project[]): T3Th
   }) : [];
   return {
     id: idValue,
-    label: suffix ? `${title} — ${suffix}` : title,
+    title,
+    label: threadLabel(title, projectId, projects),
     projectId,
     modelSelection,
     status: typeof statusValue === "string" ? statusValue : null,
     messages,
   };
+}
+
+function threadLabel(title: string, projectId: string | null | undefined, projects: T3Project[]): string {
+  const project = projects.find((candidate) => candidate.id === projectId);
+  const suffix = project?.title ?? project?.name ?? projectId ?? "";
+  return suffix ? `${title} — ${suffix}` : title;
+}
+
+export type PendingThreadMutation =
+  | { kind: "remove" }
+  | { kind: "rename"; title: string };
+
+/**
+ * Keeps an accepted T3 mutation visible while its read projection catches up.
+ *
+ * T3 acknowledges orchestration dispatch before `/snapshot` necessarily reflects the event. An
+ * immediate refresh can therefore contain the just-deleted thread or its previous title. Pending
+ * mutations mask that stale read; once a snapshot agrees, the matching entry can be forgotten.
+ */
+export function applyPendingThreadMutations(
+  threads: T3Thread[],
+  projects: T3Project[],
+  pending: ReadonlyMap<string, PendingThreadMutation>,
+): { threads: T3Thread[]; settledIds: string[] } {
+  const visible = [...threads];
+  const settledIds: string[] = [];
+  for (const [threadId, mutation] of pending) {
+    const index = visible.findIndex((thread) => thread.id === threadId);
+    if (index < 0) {
+      settledIds.push(threadId);
+      continue;
+    }
+    if (mutation.kind === "remove") {
+      visible.splice(index, 1);
+      continue;
+    }
+    const thread = visible[index];
+    if (thread.title === mutation.title) {
+      settledIds.push(threadId);
+      continue;
+    }
+    visible[index] = {
+      ...thread,
+      title: mutation.title,
+      label: threadLabel(mutation.title, thread.projectId, projects),
+    };
+  }
+  return { threads: visible, settledIds };
+}
+
+const WORKSPACE_CACHE_TTL_MS = 30_000;
+const WORKSPACE_PREFETCH_CONCURRENCY = 2;
+const WORKSPACE_PREFETCH_LIMIT = 3;
+const WORKSPACE_CACHE_MAX_ENTRIES = 8;
+
+interface WorkspaceSnapshotResponse {
+  environment: Environment;
+  snapshot?: { projects?: JsonRecord[]; threads?: JsonRecord[] };
+  screen?: unknown;
+}
+
+interface CachedWorkspace {
+  result: WorkspaceSnapshotResponse;
+  projects: T3Project[];
+  threads: T3Thread[];
+  loadedAt: number;
+}
+
+/** LRU insertion for browser-only projections; old workspaces must not accumulate forever. */
+export function setBoundedCacheEntry<K, V>(
+  cache: Map<K, V>,
+  key: K,
+  value: V,
+  maxEntries: number,
+): void {
+  const limit = Number.isFinite(maxEntries) ? Math.max(1, Math.floor(maxEntries)) : 1;
+  cache.delete(key);
+  cache.set(key, value);
+  while (cache.size > limit) {
+    const oldest = cache.keys().next();
+    if (oldest.done) break;
+    cache.delete(oldest.value);
+  }
+}
+
+/** Speculative workspace reads are a small optimization, never an account-sized fan-out. */
+export function selectWorkspacePrefetchIds(
+  environmentIds: readonly string[],
+  limit = WORKSPACE_PREFETCH_LIMIT,
+): string[] {
+  const boundedLimit = Number.isFinite(limit) ? Math.max(0, Math.floor(limit)) : 0;
+  return [...new Set(environmentIds)].slice(0, boundedLimit);
+}
+
+/** Runs background work with a hard concurrency ceiling so large environment lists stay responsive. */
+export async function runWithConcurrency<T>(
+  items: readonly T[],
+  concurrency: number,
+  task: (item: T) => Promise<void>,
+): Promise<void> {
+  const limit = Math.max(1, Math.min(Math.floor(concurrency), items.length));
+  let cursor = 0;
+  const worker = async () => {
+    while (cursor < items.length) {
+      const item = items[cursor];
+      cursor += 1;
+      await task(item);
+    }
+  };
+  await Promise.all(Array.from({ length: limit }, () => worker()));
 }
 
 /** SSE payloads are JSON text. A frame the gateway could not have sent is simply ignored. */
@@ -193,7 +337,9 @@ function parseEventData(data: unknown): unknown {
 export function dedupeEnvironments(environments: Environment[]): Environment[] {
   const unique = new Map<string, Environment>();
   for (const environment of environments) {
-    const key = environment.baseUrl.trim().replace(/\/+$/u, "").toLowerCase();
+    const key = environment.baseUrl
+      ? environment.baseUrl.trim().replace(/\/+$/u, "").toLowerCase()
+      : `connector:${environment.connectorId ?? environment.id}`;
     const current = unique.get(key);
     if (!current) {
       unique.set(key, environment);
@@ -233,6 +379,8 @@ export function useController({ authConfig, clerk }: UseControllerOptions) {
   const [hardwareBoards, setHardwareBoards] = useState<HardwareBoard[]>([]);
   const [defaultHardwareBoard, setDefaultHardwareBoard] = useState<string | null>(null);
   const [environments, setEnvironments] = useState<Environment[]>([]);
+  const [archivedEnvironments, setArchivedEnvironments] = useState<Environment[]>([]);
+  const [connectors, setConnectors] = useState<Connector[]>([]);
   const [projects, setProjects] = useState<T3Project[]>([]);
   const [threads, setThreads] = useState<T3Thread[]>([]);
   const [harnessCatalogue, setHarnessCatalogue] = useState<T3HarnessCatalogue | null>(null);
@@ -245,6 +393,14 @@ export function useController({ authConfig, clerk }: UseControllerOptions) {
   const [media, setMedia] = useState<MediaItem[]>([]);
   const [mediaJobs, setMediaJobs] = useState<MediaJob[]>([]);
   const [audit, setAudit] = useState<AuditEvent[]>([]);
+  const [notifications, setNotifications] = useState<UserNotification[]>([]);
+  const [notificationUnreadCount, setNotificationUnreadCount] = useState(0);
+  const [notificationOldestCursor, setNotificationOldestCursor] = useState<string | null>(null);
+  const [notificationsHaveMore, setNotificationsHaveMore] = useState(false);
+  const [notificationsLoaded, setNotificationsLoaded] = useState(false);
+  const [notificationsError, setNotificationsError] = useState<string | null>(null);
+  const [backgroundLiveness, setBackgroundLiveness] = useState<BackgroundLiveness | null>(null);
+  const [backgroundLivenessError, setBackgroundLivenessError] = useState<string | null>(null);
   const [display, setDisplay] = useState<DisplayState | null>(null);
   const [privacyDays, setPrivacyDays] = useState<number | null>(30);
   const [remoteAccess, setRemoteAccess] = useState<RemoteAccessStatus | null>(null);
@@ -258,6 +414,18 @@ export function useController({ authConfig, clerk }: UseControllerOptions) {
   const [selectedProjectId, setSelectedProjectIdState] = useState("");
   const [selectedThreadId, setSelectedThreadIdState] = useState("");
   const [selectedDeviceId, setSelectedDeviceId] = useState("");
+  // Keyed per environment so a late response from one workspace can never mask a thread in the
+  // workspace the operator switched to while the request was in flight.
+  const pendingThreadMutationsRef = useRef(
+    new Map<string, Map<string, PendingThreadMutation>>(),
+  );
+  // Workspace snapshots are cheap to switch between once normalized, so keep a short-lived cache
+  // per environment. Network work is also shared per environment to prevent page-level loaders,
+  // the sidebar, and background prefetch from issuing the same request at once.
+  const workspaceCacheRef = useRef(new Map<string, CachedWorkspace>());
+  const workspaceFetchesRef = useRef(new Map<string, Promise<CachedWorkspace>>());
+  const workspaceLoadsRef = useRef(new Map<string, Promise<WorkspaceSnapshotResponse>>());
+  const workspaceCacheEpochRef = useRef(0);
   const [deviceConfig, setDeviceConfig] = useState<DeviceConfig>({
     environmentId: null,
     threadId: null,
@@ -269,6 +437,11 @@ export function useController({ authConfig, clerk }: UseControllerOptions) {
   });
 
   const refreshTimerRef = useRef<number | null>(null);
+  const notificationRefreshTimerRef = useRef<number | null>(null);
+  const notificationRefreshModeRef = useRef<"replay" | "full">("replay");
+  const notificationReplayCursorRef = useRef<string | null>(null);
+  const workspaceEventTimersRef = useRef(new Map<string, number>());
+  const loadSnapshotRef = useRef<((environmentId: string) => Promise<unknown>) | null>(null);
   // Refresh coalescing and rate-limit backoff. Without these, one 429 feeds the next refresh and
   // the dashboard hammers the gateway until the window resets.
   const refreshInFlightRef = useRef(false);
@@ -281,7 +454,10 @@ export function useController({ authConfig, clerk }: UseControllerOptions) {
   const snapshotRequestRef = useRef(0);
   const harnessRequestRef = useRef(0);
 
-  const api = useCallback(async <T,>(path: string, options: ApiOptions = {}): Promise<T> => {
+  const api = useCallback(async <T,>(
+    path: string,
+    options: ControllerApiOptions = {},
+  ): Promise<T> => {
     try {
       let requestToken = options.token;
       if (options.auth !== false && !requestToken) {
@@ -290,18 +466,208 @@ export function useController({ authConfig, clerk }: UseControllerOptions) {
           throw new ApiError(401, "Sign in to continue.");
         }
       }
+      const { silent: _silent, ...requestOptions } = options;
       return await requestJson<T>(path, {
-        ...options,
+        ...requestOptions,
         token: requestToken,
       });
     } catch (error) {
       const message = error instanceof Error ? error.message : "Unexpected request failure.";
-      setConnection("error");
-      setConnectionDetail(message);
-      setNotice({ tone: "danger", message });
+      if (!options.silent) {
+        setConnection("error");
+        setConnectionDetail(message);
+        setNotice({ tone: "danger", message });
+      }
       throw error;
     }
   }, [clerk]);
+
+  const refreshNotifications = useCallback(async () => {
+    if (!authenticated) return;
+    try {
+      const result = await api<{
+        notifications: UserNotification[];
+        nextCursor: string | null;
+        oldestCursor: string | null;
+        hasMoreBefore: boolean;
+        unreadCount: number;
+      }>("/v1/notifications?limit=100", { silent: true });
+      setNotifications((result.notifications ?? [])
+        .filter((record) => !record.dismissedAt)
+        .sort((left, right) => Date.parse(right.createdAt) - Date.parse(left.createdAt)));
+      notificationReplayCursorRef.current = result.nextCursor ?? null;
+      setNotificationOldestCursor(result.oldestCursor ?? null);
+      setNotificationsHaveMore(Boolean(result.hasMoreBefore));
+      setNotificationUnreadCount(result.unreadCount ?? 0);
+      setNotificationsError(null);
+    } catch (error) {
+      setNotificationsError(error instanceof Error ? error.message : "Notifications are unavailable.");
+    } finally {
+      setNotificationsLoaded(true);
+    }
+  }, [api, authenticated]);
+
+  const replayNotifications = useCallback(async () => {
+    if (!authenticated) return;
+    const cursor = notificationReplayCursorRef.current;
+    if (!cursor) return await refreshNotifications();
+    try {
+      let after: string | null = cursor;
+      let pageCount = 0;
+      let unreadCount = 0;
+      const incoming: UserNotification[] = [];
+      while (after && pageCount < 10) {
+        const result: {
+          notifications: UserNotification[];
+          nextCursor: string | null;
+          hasMoreAfter: boolean;
+          unreadCount: number;
+        } = await api(`/v1/notifications?limit=100&after=${encodeURIComponent(after)}`, { silent: true });
+        incoming.push(...(result.notifications ?? []));
+        unreadCount = result.unreadCount ?? 0;
+        const next: string = result.nextCursor ?? after;
+        pageCount += 1;
+        if (!result.hasMoreAfter || next === after) {
+          after = next;
+          break;
+        }
+        after = next;
+      }
+      notificationReplayCursorRef.current = after;
+      if (incoming.length > 0) {
+        setNotifications((current) => {
+          const byId = new Map(current.map((record) => [record.id, record]));
+          for (const record of incoming) {
+            if (record.dismissedAt) byId.delete(record.id);
+            else byId.set(record.id, record);
+          }
+          return [...byId.values()].sort(
+            (left, right) => Date.parse(right.createdAt) - Date.parse(left.createdAt),
+          );
+        });
+      }
+      setNotificationUnreadCount(unreadCount);
+      setNotificationsError(null);
+      setNotificationsLoaded(true);
+    } catch (error) {
+      setNotificationsError(error instanceof Error ? error.message : "Notification replay failed.");
+      setNotificationsLoaded(true);
+    }
+  }, [api, authenticated, refreshNotifications]);
+
+  const refreshBackgroundLiveness = useCallback(async () => {
+    if (!authenticated) return;
+    try {
+      const result = await api<BackgroundLiveness>("/v1/background/liveness", { silent: true });
+      setBackgroundLiveness(result);
+      setBackgroundLivenessError(null);
+    } catch (error) {
+      setBackgroundLivenessError(error instanceof Error ? error.message : "Scheduler status is unavailable.");
+    }
+  }, [api, authenticated]);
+
+  const loadOlderNotifications = useCallback(async () => {
+    if (!authenticated || !notificationsHaveMore || !notificationOldestCursor) return;
+    try {
+      const result = await api<{
+        notifications: UserNotification[];
+        nextCursor: string | null;
+        oldestCursor: string | null;
+        hasMoreBefore: boolean;
+        unreadCount: number;
+      }>(`/v1/notifications?limit=100&before=${encodeURIComponent(notificationOldestCursor)}`, { silent: true });
+      setNotifications((current) => {
+        const byId = new Map(current.map((record) => [record.id, record]));
+        for (const record of result.notifications ?? []) {
+          if (!record.dismissedAt) byId.set(record.id, record);
+        }
+        return [...byId.values()].sort(
+          (left, right) => Date.parse(right.createdAt) - Date.parse(left.createdAt),
+        );
+      });
+      setNotificationOldestCursor(result.oldestCursor ?? null);
+      setNotificationsHaveMore(Boolean(result.hasMoreBefore));
+      setNotificationUnreadCount(result.unreadCount ?? 0);
+      setNotificationsError(null);
+    } catch (error) {
+      setNotificationsError(error instanceof Error ? error.message : "Older notifications are unavailable.");
+    }
+  }, [api, authenticated, notificationOldestCursor, notificationsHaveMore]);
+
+  const markNotificationRead = useCallback(async (id: string) => {
+    const result = await api<{ notification: UserNotification; duplicate: boolean }>(
+      `/v1/notifications/${encodeURIComponent(id)}/read`,
+      { method: "POST", body: {} },
+    );
+    await refreshNotifications();
+    return result;
+  }, [api, refreshNotifications]);
+
+  const dismissNotification = useCallback(async (id: string) => {
+    const result = await api<{ notification: UserNotification; duplicate: boolean }>(
+      `/v1/notifications/${encodeURIComponent(id)}`,
+      { method: "DELETE" },
+    );
+    await refreshNotifications();
+    return result;
+  }, [api, refreshNotifications]);
+
+  const markAllNotificationsRead = useCallback(async () => {
+    const result = await api<{ updatedAt: string; count: number }>("/v1/notifications/read-all", {
+      method: "POST",
+      body: {},
+    });
+    await refreshNotifications();
+    return result;
+  }, [api, refreshNotifications]);
+
+  const fetchWorkspaceSnapshot = useCallback(async (
+    environmentId: string,
+    force = false,
+    silent = false,
+  ): Promise<CachedWorkspace> => {
+    const cached = workspaceCacheRef.current.get(environmentId);
+    if (!force && cached && Date.now() - cached.loadedAt < WORKSPACE_CACHE_TTL_MS) {
+      setBoundedCacheEntry(
+        workspaceCacheRef.current,
+        environmentId,
+        cached,
+        WORKSPACE_CACHE_MAX_ENTRIES,
+      );
+      return cached;
+    }
+    const inFlight = workspaceFetchesRef.current.get(environmentId);
+    if (inFlight) return inFlight;
+
+    const cacheEpoch = workspaceCacheEpochRef.current;
+    const request = api<WorkspaceSnapshotResponse>(
+      `/v1/t3/environments/${encodeURIComponent(environmentId)}/snapshot`,
+      { silent },
+    ).then((result) => {
+      const projects = (result.snapshot?.projects ?? [])
+        .filter((project): project is JsonRecord => typeof project?.id === "string")
+        .map((project) => project as unknown as T3Project);
+      const threads = (result.snapshot?.threads ?? [])
+        .map((thread) => normalizeThread(thread, projects))
+        .filter((thread): thread is T3Thread => Boolean(thread));
+      const workspace = { result, projects, threads, loadedAt: Date.now() };
+      if (cacheEpoch === workspaceCacheEpochRef.current) {
+        setBoundedCacheEntry(
+          workspaceCacheRef.current,
+          environmentId,
+          workspace,
+          WORKSPACE_CACHE_MAX_ENTRIES,
+        );
+      }
+      return workspace;
+    }).finally(() => {
+      if (workspaceFetchesRef.current.get(environmentId) === request) {
+        workspaceFetchesRef.current.delete(environmentId);
+      }
+    });
+    workspaceFetchesRef.current.set(environmentId, request);
+    return request;
+  }, [api]);
 
   const run = useCallback(async <T,>(
     key: string,
@@ -354,7 +720,7 @@ export function useController({ authConfig, clerk }: UseControllerOptions) {
     liveThread,
     watchThread,
     applyThreadSnapshotEvent,
-    applyThreadEventEvent,
+    applyThreadEventEvents,
     applyThreadStatusEvent,
   } = threadWatch;
 
@@ -365,8 +731,9 @@ export function useController({ authConfig, clerk }: UseControllerOptions) {
     // what turns one 429 into a storm, because every failed refresh triggers another one.
     if (Date.now() < rateLimitedUntilRef.current) return;
 
-    // A refresh is twelve requests. Overlapping refreshes multiply that against the rate limit for
-    // no benefit, so coalesce instead: remember that another was asked for and run it once.
+    // A refresh is a bounded group of control-plane reads. Overlapping refreshes multiply that
+    // against the rate limit for no benefit, so coalesce instead: remember that another was asked
+    // for and run it once.
     if (refreshInFlightRef.current) {
       refreshQueuedRef.current = true;
       return;
@@ -375,33 +742,40 @@ export function useController({ authConfig, clerk }: UseControllerOptions) {
 
     try {
       // allSettled, not all: one throttled endpoint must not discard the other good responses.
-      const results = await Promise.allSettled([
-        api<{ environments: Environment[] }>("/v1/t3/environments"),
-        api<{ devices: Device[] }>("/v1/devices"),
-        api<{ commands: Command[] }>("/v1/commands"),
-        api<{ macros: Macro[] }>("/v1/macros"),
-        api<{ privacy: { mediaRetentionDays: number | null } }>("/v1/settings/privacy"),
-        api<{ media: MediaItem[] }>("/v1/media"),
-        api<{ jobs: MediaJob[] }>("/v1/media/jobs"),
-        api<{ events: AuditEvent[] }>("/v1/audit"),
-        api<{ display: DisplayState }>("/v1/display"),
-        api<OnboardingResponse>("/v1/onboarding"),
-        api<{ actions: SavedAction[] }>("/v1/actions"),
-        api<{ remoteAccess: RemoteAccessStatus }>("/v1/settings/remote-access"),
-        api<{ profiles: GatewayProfile[] }>("/v1/gateway-profiles"),
+      const [results] = await Promise.all([
+        Promise.allSettled([
+          api<{ environments: Environment[] }>("/v1/t3/environments"),
+          api<{ devices: Device[] }>("/v1/devices"),
+          api<{ commands: Command[] }>("/v1/commands"),
+          api<{ macros: Macro[] }>("/v1/macros"),
+          api<{ privacy: { mediaRetentionDays: number | null } }>("/v1/settings/privacy"),
+          api<{ media: MediaItem[] }>("/v1/media"),
+          api<{ jobs: MediaJob[] }>("/v1/media/jobs"),
+          api<{ events: AuditEvent[] }>("/v1/audit"),
+          api<{ display: DisplayState }>("/v1/display"),
+          api<OnboardingResponse>("/v1/onboarding"),
+          api<{ actions: SavedAction[] }>("/v1/actions"),
+          api<{ remoteAccess: RemoteAccessStatus }>("/v1/settings/remote-access"),
+          api<{ profiles: GatewayProfile[] }>("/v1/gateway-profiles"),
+          api<{ connectors: Connector[] }>("/v1/connectors"),
+        ]),
+        refreshNotifications(),
+        refreshBackgroundLiveness(),
       ]);
 
       const [
         environmentResult, deviceResult, commandResult, macroResult, privacyResult,
         mediaResult, mediaJobsResult, auditResult, displayResult, onboardingResult, actionsResult,
-        remoteAccessResult, gatewayProfilesResult,
+        remoteAccessResult, gatewayProfilesResult, connectorsResult,
       ] = results;
 
       const valueOf = <T,>(result: PromiseSettledResult<T>): T | null =>
         result.status === "fulfilled" ? result.value : null;
 
       if (environmentResult.status === "fulfilled") {
-        setEnvironments(dedupeEnvironments(environmentResult.value.environments ?? []));
+        const listed = dedupeEnvironments(environmentResult.value.environments ?? []);
+        setEnvironments(listed.filter((environment) => !environment.archivedAt));
+        setArchivedEnvironments(listed.filter((environment) => Boolean(environment.archivedAt)));
       }
       if (deviceResult.status === "fulfilled") setDevices(deviceResult.value.devices ?? []);
       if (commandResult.status === "fulfilled") setCommands(commandResult.value.commands ?? []);
@@ -421,6 +795,9 @@ export function useController({ authConfig, clerk }: UseControllerOptions) {
       }
       if (gatewayProfilesResult.status === "fulfilled") {
         setGatewayProfiles(gatewayProfilesResult.value.profiles ?? []);
+      }
+      if (connectorsResult.status === "fulfilled") {
+        setConnectors(connectorsResult.value.connectors ?? []);
       }
       const onboardingValue = valueOf(onboardingResult);
       if (onboardingValue) {
@@ -461,7 +838,7 @@ export function useController({ authConfig, clerk }: UseControllerOptions) {
         window.setTimeout(() => void refreshAllRef.current?.(), 0);
       }
     }
-  }, [api, authenticated]);
+  }, [api, authenticated, refreshBackgroundLiveness, refreshNotifications]);
 
   const loadRemoteAccess = useCallback(async (force = false) => {
     const result = await api<{ remoteAccess: RemoteAccessStatus }>(
@@ -507,16 +884,97 @@ export function useController({ authConfig, clerk }: UseControllerOptions) {
 
   // Every capture surface funnels through here so the library, the Operate composer and the Quick
   // composer all agree on the endpoint and on refreshing the library afterwards.
-  const uploadMedia = useCallback(async (payload: Record<string, unknown>) => {
-    const result = await api<{ media: MediaItem }>("/v1/media", { method: "POST", body: payload });
-    await refreshAll();
-    return result.media;
-  }, [api, refreshAll]);
+  const uploadMedia = useCallback(async (
+    payload: Record<string, unknown>,
+    options: MediaUploadOptions = {},
+  ) => {
+    const blob = mediaBlobFromPayload(payload);
+    const contentType = typeof payload.contentType === "string" ? payload.contentType : blob.type;
+    const kind = payload.kind;
+    const sha256 = await blobSha256(blob);
+    const request = await durableMutationRequest({
+      operation: "media.upload",
+      kind,
+      contentType,
+      sizeBytes: blob.size,
+      sha256,
+    });
+    let session: MediaUploadSessionResponse["session"] | null = null;
+    try {
+      options.onProgress?.({ stage: "creating", loaded: 0, total: blob.size });
+      const created = await api<MediaUploadSessionResponse>("/v1/media/uploads", {
+        method: "POST",
+        body: {
+          kind,
+          contentType,
+          sizeBytes: blob.size,
+          sha256,
+          clientRequestId: request.clientRequestId,
+          ...(typeof payload.originalName === "string" ? { originalName: payload.originalName } : {}),
+          ...(typeof payload.transcript === "string" ? { transcript: payload.transcript } : {}),
+          ...(typeof payload.captureSource === "string" ? { captureSource: payload.captureSource } : {}),
+          ...(typeof payload.companionHandoffId === "string"
+            ? { companionHandoffId: payload.companionHandoffId }
+            : {}),
+        },
+      });
+      session = created.session;
+      const token = await clerk?.getToken();
+      if (!token) throw new ApiError(401, "Sign in to continue.");
+      options.onProgress?.({ stage: "uploading", loaded: 0, total: blob.size });
+      await uploadBinary(session.upload.url, blob, {
+        token,
+        contentType: session.upload.contentType,
+        signal: options.signal,
+        onProgress: (loaded, total) => options.onProgress?.({ stage: "uploading", loaded, total }),
+      });
+      options.onProgress?.({ stage: "finalizing", loaded: blob.size, total: blob.size });
+      const finalized = await api<{ media: MediaItem }>(session.finalizeUrl, { method: "POST", body: {} });
+      clearDurableMutationRequest(request.storageKey);
+      await refreshAll();
+      return finalized.media;
+    } catch (error) {
+      if (options.signal?.aborted && session) {
+        await api(session.upload.url.replace(/\/content$/u, ""), {
+          method: "DELETE",
+          body: {},
+          silent: true,
+        }).catch(() => undefined);
+        clearDurableMutationRequest(request.storageKey);
+      }
+      throw error;
+    }
+  }, [api, clerk, refreshAll]);
+
+  const loadMediaPreview = useCallback(async (item: MediaItem): Promise<Blob> => {
+    const maxPreviewBytes = item.kind === "image" ? 8 * 1024 * 1024 : 24 * 1024 * 1024;
+    if ((item.sizeBytes ?? 0) > maxPreviewBytes) {
+      throw new Error(`Preview is limited to ${Math.round(maxPreviewBytes / 1024 / 1024)} MB.`);
+    }
+    const token = await clerk?.getToken();
+    if (!token) throw new ApiError(401, "Sign in to preview media.");
+    const response = await fetch(`/v1/media/${encodeURIComponent(item.id)}`, {
+      headers: { authorization: `Bearer ${token}` },
+    });
+    if (!response.ok) throw new ApiError(response.status, `Media preview failed with HTTP ${response.status}.`);
+    const blob = await response.blob();
+    if (blob.size > maxPreviewBytes) throw new Error("Media preview exceeded the local preview limit.");
+    return blob;
+  }, [clerk]);
 
   const clearSessionState = useCallback(() => {
+    workspaceCacheEpochRef.current += 1;
+    workspaceCacheRef.current.clear();
+    workspaceFetchesRef.current.clear();
+    workspaceLoadsRef.current.clear();
+    pendingThreadMutationsRef.current.clear();
+    snapshotRequestRef.current += 1;
+    harnessRequestRef.current += 1;
     setConnection("signed-out");
     setConnectionDetail("Authentication required");
     setEnvironments([]);
+    setArchivedEnvironments([]);
+    setConnectors([]);
     setProjects([]);
     setThreads([]);
     setDevices([]);
@@ -526,6 +984,15 @@ export function useController({ authConfig, clerk }: UseControllerOptions) {
     setMedia([]);
     setMediaJobs([]);
     setAudit([]);
+    setNotifications([]);
+    setNotificationUnreadCount(0);
+    setNotificationOldestCursor(null);
+    notificationReplayCursorRef.current = null;
+    setNotificationsHaveMore(false);
+    setNotificationsLoaded(false);
+    setNotificationsError(null);
+    setBackgroundLiveness(null);
+    setBackgroundLivenessError(null);
     setDisplay(null);
     setRemoteAccess(null);
     setGatewayProfiles([]);
@@ -603,10 +1070,14 @@ export function useController({ authConfig, clerk }: UseControllerOptions) {
 
   useEffect(() => {
     if (!authenticated) return;
+    const threadEventBatcher = createFrameBatcher<unknown>((batch) => {
+      applyThreadEventEvents(batch);
+    });
     const stream = new EventSource("/v1/events", { withCredentials: true });
     stream.addEventListener("connected", () => {
       setConnection("live");
       setConnectionDetail("Live event stream connected");
+      void replayNotifications();
     });
     stream.addEventListener("heartbeat", () => {
       setConnection("live");
@@ -627,14 +1098,98 @@ export function useController({ authConfig, clerk }: UseControllerOptions) {
         void refreshAll();
       }, 750);
     });
+    const scheduleNotificationRefresh = (mode: "replay" | "full") => {
+      if (mode === "full") notificationRefreshModeRef.current = "full";
+      if (notificationRefreshTimerRef.current !== null) {
+        window.clearTimeout(notificationRefreshTimerRef.current);
+      }
+      // The stream carries an invalidation, while GET owns replay and unread totals. Coalescing a
+      // burst preserves that authority without turning each durable record into another request.
+      notificationRefreshTimerRef.current = window.setTimeout(() => {
+        notificationRefreshTimerRef.current = null;
+        const refreshMode = notificationRefreshModeRef.current;
+        notificationRefreshModeRef.current = "replay";
+        if (refreshMode === "full") void refreshNotifications();
+        else void replayNotifications();
+      }, 150);
+    };
+    stream.addEventListener("notification.created", () => scheduleNotificationRefresh("replay"));
+    // Updates retain their original creation cursor, so an `after` replay cannot see them. Re-read
+    // the bounded inbox to apply cross-tab read/dismiss resolution and its exact unread total.
+    stream.addEventListener("notification.updated", () => scheduleNotificationRefresh("full"));
+    stream.addEventListener("background.liveness.changed", () => {
+      void refreshBackgroundLiveness();
+    });
+    stream.addEventListener("threads.changed", (event) => {
+      const payload = parseEventData(event.data) as {
+        environmentId?: string;
+        threadId?: string;
+        action?: "created" | "renamed" | "archived" | "deleted";
+        title?: string;
+      } | null;
+      if (!payload?.environmentId || !payload.threadId || !payload.action) return;
+      const { environmentId, threadId, action } = payload;
+
+      // T3 acknowledges a mutation before its snapshot projection necessarily catches up. Apply
+      // the small delta immediately and retain it as an overlay while the forced snapshot settles.
+      if (action === "renamed" && payload.title) {
+        const pending = pendingThreadMutationsRef.current.get(environmentId) ?? new Map();
+        pending.set(threadId, { kind: "rename", title: payload.title });
+        pendingThreadMutationsRef.current.set(environmentId, pending);
+        if (selectedEnvironmentIdRef.current === environmentId) {
+          const title = payload.title;
+          setThreads((current) => current.map((thread) => {
+            if (thread.id !== threadId) return thread;
+            const oldTitle = thread.title ?? thread.id;
+            const oldLabel = thread.label ?? oldTitle;
+            return { ...thread, title,
+              label: oldLabel.startsWith(oldTitle)
+                ? title + oldLabel.slice(oldTitle.length)
+                : title };
+          }));
+        }
+      } else if (action === "archived" || action === "deleted") {
+        const pending = pendingThreadMutationsRef.current.get(environmentId) ?? new Map();
+        pending.set(threadId, { kind: "remove" });
+        pendingThreadMutationsRef.current.set(environmentId, pending);
+        if (selectedEnvironmentIdRef.current === environmentId) {
+          setThreads((current) => current.filter((thread) => thread.id !== threadId));
+          if (selectedThreadIdRef.current === threadId) {
+            selectedThreadIdRef.current = "";
+            setSelectedThreadIdState("");
+          }
+        }
+      }
+
+      // Invalidate only this workspace. Advancing the epoch also prevents an older in-flight
+      // response from putting pre-mutation data back into the cache.
+      workspaceCacheEpochRef.current += 1;
+      workspaceCacheRef.current.delete(environmentId);
+      workspaceFetchesRef.current.delete(environmentId);
+      workspaceLoadsRef.current.delete(environmentId);
+      const existingTimer = workspaceEventTimersRef.current.get(environmentId);
+      if (existingTimer !== undefined) window.clearTimeout(existingTimer);
+      const timer = window.setTimeout(() => {
+        workspaceEventTimersRef.current.delete(environmentId);
+        if (selectedEnvironmentIdRef.current === environmentId) {
+          void loadSnapshotRef.current?.(environmentId);
+        }
+      }, action === "created" ? 1500 : 350);
+      workspaceEventTimersRef.current.set(environmentId, timer);
+      setConnection("live");
+      setConnectionDetail(`Thread ${action}`);
+    });
     // The live thread stream. Three separate events on the same broker as everything above, and
     // deliberately NOT a refetch trigger: they carry the content itself, so a `t3.thread.event`
     // must not cost thirteen HTTP requests the way `state.changed` does.
     stream.addEventListener("t3.thread.snapshot", (event) => {
+      // Everything queued before a snapshot happened before that reset. Apply it first so the
+      // snapshot remains authoritative even for an unsequenced compatibility event.
+      threadEventBatcher.flush();
       applyThreadSnapshotEvent(parseEventData(event.data));
     });
     stream.addEventListener("t3.thread.event", (event) => {
-      applyThreadEventEvent(parseEventData(event.data));
+      threadEventBatcher.push(parseEventData(event.data));
     });
     stream.addEventListener("t3.thread.status", (event) => {
       applyThreadStatusEvent(parseEventData(event.data));
@@ -695,18 +1250,28 @@ export function useController({ authConfig, clerk }: UseControllerOptions) {
       setConnectionDetail("Live stream reconnecting");
     };
     return () => {
+      threadEventBatcher.cancel();
       stream.close();
       if (refreshTimerRef.current !== null) {
         window.clearTimeout(refreshTimerRef.current);
         refreshTimerRef.current = null;
       }
+      if (notificationRefreshTimerRef.current !== null) {
+        window.clearTimeout(notificationRefreshTimerRef.current);
+        notificationRefreshTimerRef.current = null;
+      }
+      for (const timer of workspaceEventTimersRef.current.values()) window.clearTimeout(timer);
+      workspaceEventTimersRef.current.clear();
     };
   }, [
-    applyThreadEventEvent,
+    applyThreadEventEvents,
     applyThreadSnapshotEvent,
     applyThreadStatusEvent,
     authenticated,
+    refreshBackgroundLiveness,
     refreshAll,
+    refreshNotifications,
+    replayNotifications,
   ]);
 
   useEffect(() => {
@@ -719,7 +1284,14 @@ export function useController({ authConfig, clerk }: UseControllerOptions) {
     }
     if (!environments.some((environment) => environment.id === selectedEnvironmentId)) {
       selectedEnvironmentIdRef.current = environments[0].id;
+      selectedProjectIdRef.current = "";
+      selectedThreadIdRef.current = "";
       setSelectedEnvironmentIdState(environments[0].id);
+      setProjects([]);
+      setThreads([]);
+      setHarnessCatalogue(null);
+      setSelectedProjectIdState("");
+      setSelectedThreadIdState("");
     }
   }, [environments, selectedEnvironmentId]);
 
@@ -758,6 +1330,49 @@ export function useController({ authConfig, clerk }: UseControllerOptions) {
     };
   }, [api, authenticated, selectedDeviceId]);
 
+  const applyWorkspaceToSelection = useCallback((
+    environmentId: string,
+    workspace: CachedWorkspace,
+  ) => {
+    if (selectedEnvironmentIdRef.current !== environmentId) return;
+    const pendingMutations = pendingThreadMutationsRef.current.get(environmentId) ?? new Map();
+    const reconciled = applyPendingThreadMutations(
+      workspace.threads,
+      workspace.projects,
+      pendingMutations,
+    );
+    for (const threadId of reconciled.settledIds) pendingMutations.delete(threadId);
+    if (pendingMutations.size === 0) pendingThreadMutationsRef.current.delete(environmentId);
+
+    const nextProjects = workspace.projects;
+    const nextThreads = reconciled.threads;
+    const preservedThread = nextThreads.find(
+      (thread) => thread.id === selectedThreadIdRef.current,
+    ) ?? null;
+    const preservedProject = nextProjects.find(
+      (project) => project.id === selectedProjectIdRef.current,
+    ) ?? null;
+    const nextProjectId = preservedThread?.projectId
+      ?? preservedProject?.id
+      ?? nextProjects[0]?.id
+      ?? nextThreads[0]?.projectId
+      ?? "";
+    const nextThreadId = preservedThread?.id
+      ?? nextThreads.find((thread) => thread.projectId === nextProjectId)?.id
+      ?? nextThreads[0]?.id
+      ?? "";
+    const synchronizedProjectId = nextThreads.find(
+      (thread) => thread.id === nextThreadId,
+    )?.projectId ?? nextProjectId;
+
+    setProjects(nextProjects);
+    setThreads(nextThreads);
+    selectedProjectIdRef.current = synchronizedProjectId;
+    selectedThreadIdRef.current = nextThreadId;
+    setSelectedProjectIdState(synchronizedProjectId);
+    setSelectedThreadIdState(nextThreadId);
+  }, []);
+
   const setSelectedEnvironmentId = useCallback((environmentId: string) => {
     selectedEnvironmentIdRef.current = environmentId;
     selectedProjectIdRef.current = "";
@@ -765,12 +1380,19 @@ export function useController({ authConfig, clerk }: UseControllerOptions) {
     snapshotRequestRef.current += 1;
     harnessRequestRef.current += 1;
     setSelectedEnvironmentIdState(environmentId);
-    setProjects([]);
-    setThreads([]);
+    const cached = workspaceCacheRef.current.get(environmentId);
+    if (cached) {
+      applyWorkspaceToSelection(environmentId, cached);
+    } else {
+      setProjects([]);
+      setThreads([]);
+    }
     setHarnessCatalogue(null);
-    setSelectedProjectIdState("");
-    setSelectedThreadIdState("");
-  }, []);
+    if (!cached) {
+      setSelectedProjectIdState("");
+      setSelectedThreadIdState("");
+    }
+  }, [applyWorkspaceToSelection]);
 
   const setSelectedProjectId = useCallback((projectId: string) => {
     selectedProjectIdRef.current = projectId;
@@ -817,58 +1439,222 @@ export function useController({ authConfig, clerk }: UseControllerOptions) {
 
   const loadSnapshot = useCallback(async (environmentId = selectedEnvironmentId) => {
     if (!environmentId) throw new Error("Select a T3 environment first.");
+    const existing = workspaceLoadsRef.current.get(environmentId);
+    if (existing) return existing;
+
     const requestId = ++snapshotRequestRef.current;
-    const harnessRequest = loadHarnesses(environmentId);
-    let result: {
-      environment: Environment;
-      snapshot?: { projects?: JsonRecord[]; threads?: JsonRecord[] };
-      screen?: unknown;
-    };
-    try {
-      result = await api<typeof result>(
-        `/v1/t3/environments/${encodeURIComponent(environmentId)}/snapshot`,
-      );
-      setWorkspaceRecovery(null);
-    } catch (error) {
-      if (isT3SnapshotUnavailableError(error)) {
-        const failure = (error instanceof ApiError ? parseEnvironmentFailure(error.details) : null)
-          ?? genericEnvironmentFailure();
-        setWorkspaceRecovery({ environmentId, failure });
+    const request = (async () => {
+      const harnessRequest = loadHarnesses(environmentId);
+      let workspace: CachedWorkspace;
+      try {
+        workspace = await fetchWorkspaceSnapshot(environmentId, true);
+        setWorkspaceRecovery(null);
+      } catch (error) {
+        if (isT3SnapshotUnavailableError(error)) {
+          const environment = environments.find((candidate) => candidate.id === environmentId);
+          const connectorFailure = connectorFailureFromMetadata(
+            environment,
+            connectorForEnvironment(connectors, environment),
+          );
+          const failure = connectorFailure
+            ?? (error instanceof ApiError ? parseEnvironmentFailure(error.details) : null)
+            ?? genericEnvironmentFailure();
+          setWorkspaceRecovery({ environmentId, failure });
+        }
+        throw error;
       }
-      throw error;
+      await harnessRequest;
+      if (requestId === snapshotRequestRef.current
+        && selectedEnvironmentIdRef.current === environmentId) {
+        applyWorkspaceToSelection(environmentId, workspace);
+      }
+      return workspace.result;
+    })();
+    workspaceLoadsRef.current.set(environmentId, request);
+    try {
+      return await request;
+    } finally {
+      if (workspaceLoadsRef.current.get(environmentId) === request) {
+        workspaceLoadsRef.current.delete(environmentId);
+      }
     }
-    await harnessRequest;
-    if (requestId !== snapshotRequestRef.current
-      || selectedEnvironmentIdRef.current !== environmentId) {
-      return result;
+  }, [
+    applyWorkspaceToSelection,
+    connectors,
+    environments,
+    fetchWorkspaceSnapshot,
+    loadHarnesses,
+    selectedEnvironmentId,
+  ]);
+
+  const loadCapabilities = useCallback(async (environmentId: string) => {
+    const result = await api<{ capabilities: T3CapabilityManifest }>(
+      `/v1/t3/environments/${encodeURIComponent(environmentId)}/capabilities`,
+    );
+    setEnvironments((current) => current.map((environment) => environment.id === environmentId
+      ? { ...environment, health: { ...(environment.health ?? {}), capabilities: result.capabilities } }
+      : environment));
+    return result.capabilities;
+  }, [api]);
+  loadSnapshotRef.current = loadSnapshot;
+
+  const prefetchWorkspaces = useCallback(async (environmentIds: readonly string[]) => {
+    const uniqueIds = selectWorkspacePrefetchIds(environmentIds);
+    await runWithConcurrency(uniqueIds, WORKSPACE_PREFETCH_CONCURRENCY, async (environmentId) => {
+      try {
+        await fetchWorkspaceSnapshot(environmentId, false, true);
+      } catch {
+        // Prefetch is opportunistic. A selected environment still gets the normal recovery UI.
+      }
+    });
+  }, [fetchWorkspaceSnapshot]);
+
+  const environmentBatchKey = environments
+    .map((environment) => `${environment.id}:${environment.status ?? "unknown"}`)
+    .join("|");
+
+  useEffect(() => {
+    if (!authenticated || !selectedEnvironmentId) return;
+    let cancelled = false;
+    let prefetchTimer: number | null = null;
+    const selectedCached = workspaceCacheRef.current.get(selectedEnvironmentId);
+    const selectedIsFresh = selectedCached
+      && Date.now() - selectedCached.loadedAt < WORKSPACE_CACHE_TTL_MS;
+    if (selectedCached) applyWorkspaceToSelection(selectedEnvironmentId, selectedCached);
+
+    const activeLoad = Promise.all([
+      selectedIsFresh
+        ? loadHarnesses(selectedEnvironmentId).then(() => undefined)
+        : loadSnapshot(selectedEnvironmentId).then(() => undefined),
+      loadCapabilities(selectedEnvironmentId).then(() => undefined),
+    ]);
+
+    void activeLoad.catch(() => {
+      // The request surface and workspace recovery dialog already expose selected-workspace errors.
+    }).finally(() => {
+      if (cancelled) return;
+      const backgroundIds = environments
+        .filter((environment) => environment.id !== selectedEnvironmentId)
+        .filter((environment) => environment.status !== "unreachable"
+          && environment.status !== "token_expired")
+        .map((environment) => environment.id);
+      if (backgroundIds.length === 0) return;
+      // Let the selected workspace paint first, then warm the remaining trees in two-wide batches.
+      prefetchTimer = window.setTimeout(() => {
+        if (!cancelled) void prefetchWorkspaces(backgroundIds);
+      }, 120);
+    });
+
+    return () => {
+      cancelled = true;
+      if (prefetchTimer !== null) window.clearTimeout(prefetchTimer);
+    };
+  }, [
+    authenticated,
+    applyWorkspaceToSelection,
+    environmentBatchKey,
+    loadHarnesses,
+    loadCapabilities,
+    loadSnapshot,
+    prefetchWorkspaces,
+    selectedEnvironmentId,
+  ]);
+
+  const renameThread = useCallback(async (threadId: string, title: string) => {
+    const environmentId = selectedEnvironmentId;
+    if (!environmentId) throw new Error("Select a T3 environment first.");
+    const result = await api<{ threadId: string; action: "renamed"; title: string; result: unknown }>(
+      `/v1/t3/environments/${encodeURIComponent(environmentId)}`
+        + `/threads/${encodeURIComponent(threadId)}`,
+      { method: "PATCH", body: { title } },
+    );
+    const pending = pendingThreadMutationsRef.current.get(environmentId) ?? new Map();
+    pending.set(threadId, { kind: "rename", title: result.title });
+    pendingThreadMutationsRef.current.set(environmentId, pending);
+    if (selectedEnvironmentIdRef.current !== environmentId) return result;
+    const project = projects.find((candidate) =>
+      candidate.id === threads.find((thread) => thread.id === threadId)?.projectId
+    );
+    const suffix = project?.title ?? project?.name ?? project?.id ?? "";
+    const canonicalTitle = result.title;
+    setThreads((current) => current.map((thread) => thread.id === threadId
+      ? {
+          ...thread,
+          title: canonicalTitle,
+          label: suffix ? `${canonicalTitle} — ${suffix}` : canonicalTitle,
+        }
+      : thread));
+    // T3 projects the command asynchronously. The local update makes the action immediate while
+    // this best-effort read picks up T3's normalized, authoritative title when it is ready.
+    try {
+      await loadSnapshot(environmentId);
+    } catch {
+      // The mutation already succeeded. Workspace recovery owns any subsequent snapshot failure.
     }
-    const nextProjects = (result.snapshot?.projects ?? [])
-      .filter((project): project is JsonRecord => typeof project?.id === "string")
-      .map((project) => project as unknown as T3Project);
-    const nextThreads = (result.snapshot?.threads ?? [])
-      .map((thread) => normalizeThread(thread, nextProjects))
-      .filter((thread): thread is T3Thread => Boolean(thread));
-    const preservedThread = nextThreads.find((thread) => thread.id === selectedThreadIdRef.current) ?? null;
-    const preservedProject = nextProjects.find((project) => project.id === selectedProjectIdRef.current) ?? null;
-    const nextProjectId = preservedThread?.projectId
-      ?? preservedProject?.id
-      ?? nextProjects[0]?.id
-      ?? nextThreads[0]?.projectId
-      ?? "";
-    const nextThreadId = preservedThread?.id
-      ?? nextThreads.find((thread) => thread.projectId === nextProjectId)?.id
-      ?? nextThreads[0]?.id
-      ?? "";
-    const synchronizedProjectId = nextThreads.find((thread) => thread.id === nextThreadId)?.projectId
-      ?? nextProjectId;
-    setProjects(nextProjects);
-    setThreads(nextThreads);
-    selectedProjectIdRef.current = synchronizedProjectId;
-    selectedThreadIdRef.current = nextThreadId;
-    setSelectedProjectIdState(synchronizedProjectId);
-    setSelectedThreadIdState(nextThreadId);
     return result;
-  }, [api, loadHarnesses, selectedEnvironmentId]);
+  }, [api, loadSnapshot, projects, selectedEnvironmentId, threads]);
+
+  const removeThreadFromWorkspace = useCallback((threadId: string) => {
+    const removed = threads.find((thread) => thread.id === threadId) ?? null;
+    const remaining = threads.filter((thread) => thread.id !== threadId);
+    setThreads((current) => current.filter((thread) => thread.id !== threadId));
+    if (selectedThreadIdRef.current !== threadId) return;
+    const next = remaining.find((thread) => thread.projectId === removed?.projectId)
+      ?? remaining[0]
+      ?? null;
+    const nextThreadId = next?.id ?? "";
+    const nextProjectId = next?.projectId
+      ?? (removed?.projectId && projects.some((project) => project.id === removed.projectId)
+        ? removed.projectId
+        : projects[0]?.id)
+      ?? "";
+    selectedThreadIdRef.current = nextThreadId;
+    selectedProjectIdRef.current = nextProjectId;
+    setSelectedThreadIdState(nextThreadId);
+    setSelectedProjectIdState(nextProjectId);
+  }, [projects, threads]);
+
+  const archiveThread = useCallback(async (threadId: string) => {
+    const environmentId = selectedEnvironmentId;
+    if (!environmentId) throw new Error("Select a T3 environment first.");
+    const result = await api<{ threadId: string; action: "archived"; result: unknown }>(
+      `/v1/t3/environments/${encodeURIComponent(environmentId)}`
+        + `/threads/${encodeURIComponent(threadId)}/archive`,
+      { method: "POST" },
+    );
+    const pending = pendingThreadMutationsRef.current.get(environmentId) ?? new Map();
+    pending.set(threadId, { kind: "remove" });
+    pendingThreadMutationsRef.current.set(environmentId, pending);
+    if (selectedEnvironmentIdRef.current !== environmentId) return result;
+    removeThreadFromWorkspace(threadId);
+    try {
+      await loadSnapshot(environmentId);
+    } catch {
+      // The archive succeeded; keep the locally repaired selection until T3 is reachable again.
+    }
+    return result;
+  }, [api, loadSnapshot, removeThreadFromWorkspace, selectedEnvironmentId]);
+
+  const deleteThread = useCallback(async (threadId: string) => {
+    const environmentId = selectedEnvironmentId;
+    if (!environmentId) throw new Error("Select a T3 environment first.");
+    const result = await api<{ threadId: string; action: "deleted"; result: unknown }>(
+      `/v1/t3/environments/${encodeURIComponent(environmentId)}`
+        + `/threads/${encodeURIComponent(threadId)}`,
+      { method: "DELETE" },
+    );
+    const pending = pendingThreadMutationsRef.current.get(environmentId) ?? new Map();
+    pending.set(threadId, { kind: "remove" });
+    pendingThreadMutationsRef.current.set(environmentId, pending);
+    if (selectedEnvironmentIdRef.current !== environmentId) return result;
+    removeThreadFromWorkspace(threadId);
+    try {
+      await loadSnapshot(environmentId);
+    } catch {
+      // The delete succeeded; keep the locally repaired selection until T3 is reachable again.
+    }
+    return result;
+  }, [api, loadSnapshot, removeThreadFromWorkspace, selectedEnvironmentId]);
 
   const dismissWorkspaceRecovery = useCallback(() => {
     setWorkspaceRecovery(null);
@@ -888,6 +1674,11 @@ export function useController({ authConfig, clerk }: UseControllerOptions) {
     mediaUploadIds?: string[];
   }) => {
     if (!selectedEnvironmentId) throw new Error("Select a T3 environment first.");
+    const pending = await durableMutationRequest({
+      operation: "thread.launch",
+      environmentId: selectedEnvironmentId,
+      ...input,
+    });
     const result = await api<{
       threadId: string;
       command: Command;
@@ -897,9 +1688,10 @@ export function useController({ authConfig, clerk }: UseControllerOptions) {
       `/v1/t3/environments/${encodeURIComponent(selectedEnvironmentId)}/threads`,
       {
         method: "POST",
-        body: input,
+        body: { ...input, clientRequestId: pending.clientRequestId },
       },
     );
+    clearDurableMutationRequest(pending.storageKey);
     selectedThreadIdRef.current = result.threadId;
     setSelectedThreadIdState(result.threadId);
     await loadSnapshot(selectedEnvironmentId);
@@ -1075,10 +1867,10 @@ export function useController({ authConfig, clerk }: UseControllerOptions) {
     );
   }, [api, run]);
 
-  const approvalNotifications = useApprovalNotifications(pendingApprovals);
+  const localNotificationControls = useLocalNotifications(notifications, notificationsLoaded);
 
   return {
-    ...approvalNotifications,
+    ...localNotificationControls,
     authConfig,
     clerk,
     authenticated,
@@ -1097,6 +1889,8 @@ export function useController({ authConfig, clerk }: UseControllerOptions) {
     hardwareBoards,
     defaultHardwareBoard,
     environments: orderedEnvironments,
+    archivedEnvironments,
+    connectors,
     projects: orderedProjects,
     threads: orderedThreads,
     reorderResources: ordering.reorder,
@@ -1121,6 +1915,13 @@ export function useController({ authConfig, clerk }: UseControllerOptions) {
     media,
     mediaJobs,
     audit,
+    notifications,
+    notificationUnreadCount,
+    notificationsHaveMore,
+    notificationsLoaded,
+    notificationsError,
+    backgroundLiveness,
+    backgroundLivenessError,
     display,
     privacyDays,
     setPrivacyDays,
@@ -1154,10 +1955,20 @@ export function useController({ authConfig, clerk }: UseControllerOptions) {
     refreshAll,
     refreshCommands,
     refreshMedia,
+    refreshNotifications,
+    refreshBackgroundLiveness,
+    loadOlderNotifications,
+    markNotificationRead,
+    dismissNotification,
+    markAllNotificationsRead,
     createConnectSession,
     fetchConnectSession,
     uploadMedia,
+    loadMediaPreview,
     loadSnapshot,
+    renameThread,
+    archiveThread,
+    deleteThread,
     launchProject,
     loadCommandTimeline,
     saveOnboarding,
@@ -1168,3 +1979,22 @@ export function useController({ authConfig, clerk }: UseControllerOptions) {
 }
 
 export type Controller = ReturnType<typeof useController>;
+
+function mediaBlobFromPayload(payload: Record<string, unknown>): Blob {
+  if (payload.blob instanceof Blob) return payload.blob;
+  if (typeof payload.dataBase64 === "string") {
+    const binary = atob(payload.dataBase64);
+    const bytes = new Uint8Array(binary.length);
+    for (let index = 0; index < binary.length; index += 1) bytes[index] = binary.charCodeAt(index);
+    return new Blob([bytes], {
+      type: typeof payload.contentType === "string" ? payload.contentType : "application/octet-stream",
+    });
+  }
+  throw new ApiError(400, "Media bytes are required.");
+}
+
+async function blobSha256(blob: Blob): Promise<string> {
+  if (!crypto.subtle) throw new ApiError(501, "This browser cannot verify media integrity.");
+  const digest = await crypto.subtle.digest("SHA-256", await blob.arrayBuffer());
+  return [...new Uint8Array(digest)].map((byte) => byte.toString(16).padStart(2, "0")).join("");
+}

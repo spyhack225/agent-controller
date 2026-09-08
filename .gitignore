@@ -5,7 +5,14 @@ node_modules/
 .venv-parakeet/
 .manufacturing/
 firmware/esp32-controller/.pio/
-firmware/esp32-controller/include/controller_config.h
+firmware/*/.pio/
+# A board's checked-in example is the only controller_config variant allowed in source control.
+# Ignore local, backup, editor, and future live-config suffixes by default.
+firmware/*/include/controller_config*
+!firmware/*/include/controller_config.example.h
+.wrangler/
+cloudflare/.wrangler/
+cloudflare-control-plane/.wrangler/
 .env
 .DS_Store
 coverage/

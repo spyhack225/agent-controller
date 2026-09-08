@@ -45,6 +45,24 @@ test("poller only touches users that are currently active", async () => {
   assert.equal(snapshotCalls, 1);
 });
 
+test("cloud reconciliation can supply durable user targets without process-local activity", async () => {
+  const store = createMemoryStore();
+  await seedEnvironment(store);
+  let snapshotCalls = 0;
+  const poller = createSnapshotPoller({
+    store,
+    fetchSnapshot: async () => {
+      snapshotCalls += 1;
+      return { projects: [], threads: [] };
+    },
+  });
+
+  const result = await poller.runOnce({ userIds: ["user_1", "user_1"] });
+  assert.equal(result.skipped, false);
+  assert.equal(snapshotCalls, 1);
+  assert.deepEqual(poller.activeUserIds(), [], "cloud targets do not become an isolate-local lease");
+});
+
 test("active users expire after the activity TTL", async () => {
   const store = createMemoryStore();
   await seedEnvironment(store);

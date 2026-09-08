@@ -11,6 +11,7 @@ import {
 } from "../liveThread";
 import { ConfirmProvider } from "../ui";
 import { OperatePage } from "./OperatePage";
+import workFixture from "../../../test/fixtures/t3-work-activities-contract.json";
 
 const TARGET = { environmentId: "env_1", threadId: "thread_1" };
 
@@ -215,6 +216,41 @@ test("shows tool activity and a finished turn alongside the reply", () => {
   expect(feed).toHaveTextContent("Read src/snapshotPoller.mjs");
   expect(feed).toHaveTextContent("Turn finished");
   expect(feed).toHaveTextContent("2 files changed · +42 −4");
+});
+
+test("re-homes T3-attributed agent work without mixing it into parent narration", () => {
+  const liveThread = liveState((state) => {
+    let next = applyThreadSnapshot(state, snapshotPayload({
+      messages: [{
+        id: "msg_parent",
+        role: "user",
+        text: "Audit the repository",
+        streaming: false,
+        createdAt: "2026-08-27T12:00:00.000Z",
+      }],
+      activities: [
+        ...workFixture.activities,
+        {
+          id: "parent_tool",
+          tone: "tool",
+          kind: "tool.started",
+          summary: "Parent tool started",
+          payload: { itemType: "command_execution" },
+          turnId: "turn_1",
+          createdAt: "2026-08-27T12:00:07.000Z",
+        },
+      ],
+    }));
+    return applyThreadStatus(next, { ...TARGET, state: "live" });
+  });
+
+  renderOperate({ liveThread });
+
+  expect(screen.getByText(/3 shown · 1 active · 1 complete · 1 failed/u)).toBeInTheDocument();
+  const feed = screen.getByLabelText("Thread messages");
+  expect(feed).toHaveTextContent("Audit the repository");
+  expect(feed).toHaveTextContent("Parent tool started");
+  expect(feed).not.toHaveTextContent("Read frontend/src/liveThread.ts started");
 });
 
 test("replaces the transcript after a gap and says the intermediate steps were lost", () => {

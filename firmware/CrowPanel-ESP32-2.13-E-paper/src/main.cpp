@@ -5,12 +5,18 @@
 #include <Update.h>
 #include <WiFi.h>
 #include <WiFiClientSecure.h>
+
 #include <esp_ota_ops.h>
+#include <freertos/FreeRTOS.h>
+#include <freertos/semphr.h>
+#include <freertos/task.h>
 #include <mbedtls/md.h>
 #include <mbedtls/sha256.h>
 #include <cstring>
 
-#if __has_include("controller_config.h")
+#if defined(CONTROLLER_CONFIG_PLACEHOLDER_BUILD)
+#include "controller_config.example.h"
+#elif __has_include("controller_config.h")
 #include "controller_config.h"
 
 // The production environment is authoritative even when a developer's older, ignored
@@ -27,6 +33,9 @@
 #else
 #include "controller_config.example.h"
 #endif
+
+#include <GatewayTls.h>
+#include <MediaUpload.h>
 
 // Writable device state and the provisioning state machine. Device id, secret, gateway URL, and
 // Wi-Fi credentials now live in NVS: the values in controller_config.h are a bench seed used only
@@ -104,6 +113,7 @@ constexpr size_t kOtaBufferSize = 4096;
 // of the current screen so a moved, resold, or revoked unit never requires a USB reflash.
 constexpr uint32_t kResetHoldMs = 10000;
 constexpr uint32_t kStopHoldMs = 1500;
+constexpr uint32_t kRealtimeCoalesceMs = 250;
 uint32_t lastHeartbeatAt = 0;
 uint32_t lastDisplayPollAt = 0;
 uint32_t lastConfigPollAt = 0;
@@ -113,6 +123,23 @@ uint32_t lastFirmwarePollAt = 0;
 uint32_t lastSetupCodeAt = 0;
 uint32_t nextGatewayRequestAt = 0;
 int selectedMenuIndex = 0;
+
+constexpr uint32_t kRefreshConfigBit = 1u << 0;
+constexpr uint32_t kRefreshThreadsBit = 1u << 1;
+constexpr uint32_t kRefreshControlsBit = 1u << 2;
+constexpr uint32_t kRefreshDisplayBit = 1u << 3;
+constexpr uint32_t kRefreshGatewayBit = 1u << 4;
+constexpr uint32_t kRefreshFirmwareBit = 1u << 5;
+volatile uint32_t pendingRealtimeRefreshMask = 0;
+volatile uint32_t realtimeRefreshDueAt = 0;
+portMUX_TYPE realtimeRefreshMux = portMUX_INITIALIZER_UNLOCKED;
+
+SemaphoreHandle_t realtimeEndpointMutex = nullptr;
+String realtimeGatewayBase;
+String realtimeDeviceId;
+String realtimeDeviceSecret;
+volatile uint32_t realtimeEndpointGeneration = 0;
+TaskHandle_t realtimeTaskHandle = nullptr;
 
 // Universal physical-navigation contract:
 //   DIAL UP/DOWN  move the visible selection and wrap within the current list
@@ -305,6 +332,7 @@ bool postRemoteAction(
   bool showThreadOutput = true
 );
 void openThreadActions();
+String beginDurableRequest(const String& signature);
 bool fetchThreadOutput(int page, const String& after = String());
 void openThreadOutput(const String& after = String());
 void reportFirmwareStatus(
@@ -313,6 +341,7 @@ void reportFirmwareStatus(
   const char* detail = "",
   int progress = -1
 );
+void syncRealtimeEndpoint();
 
 #if ENABLE_EINK
 // The driver's framebuffer, defined in lib/ElecrowEPD/EPD.cpp. Drawing helpers
@@ -359,28 +388,11 @@ String urlOrigin(String url) {
 }
 
 bool isValidGatewayUrl(const String& url) {
-  if (!(url.startsWith("http://") || url.startsWith("https://"))) return false;
-  if (url.indexOf(' ') >= 0 || url.indexOf('\n') >= 0 || url.indexOf('\r') >= 0) return false;
-  const int authorityStart = url.indexOf("://") + 3;
-  const int pathStart = url.indexOf('/', authorityStart);
-  const String authority = pathStart < 0 ? url.substring(authorityStart) : url.substring(authorityStart, pathStart);
-  // Credentials in a profile URL are both unnecessary (device auth uses headers) and easy to leak
-  // through logs or the e-ink display.
-  return authority.length() > 0 && authority.indexOf('@') < 0;
-}
-
-bool isHttps(const String& url) {
-  return url.startsWith("https://");
+  return gateway_tls::gatewayUrlAllowed(url);
 }
 
 bool beginHttp(HTTPClient& http, WiFiClient& plainClient, WiFiClientSecure& secureClient, const String& url) {
-  if (isHttps(url)) {
-#if INSECURE_SKIP_TLS_VERIFY
-    secureClient.setInsecure();
-#endif
-    return http.begin(secureClient, url);
-  }
-  return http.begin(plainClient, url);
+  return gateway_tls::beginHttp(http, plainClient, secureClient, url, "crowpanel");
 }
 
 int requestJsonAtBase(
@@ -1380,6 +1392,7 @@ bool applyGatewayProfile(const GatewayProfile& profile, uint32_t revision) {
     return false;
   }
 
+  syncRealtimeEndpoint();
   nextGatewayRequestAt = 0;
   displayModel.state = "stable";
   displayModel.line1 = profile.label;
@@ -2042,15 +2055,16 @@ bool applyFirmwareUpdate(JsonObject manifest) {
 }
 
 #if ENABLE_AUDIO_CAPTURE || ENABLE_CAMERA_CAPTURE
-// Uploads one capture to POST /v1/device/media and returns the created media id,
+// Uploads one capture through AgentControllerCore's private raw session protocol and returns the
+// finalized media id,
 // or an empty String on failure. `httpCodeOut` always receives the transport
 // result so the caller can put something specific on the display.
 //
 // The payload is presented as two contiguous segments (a container header plus
 // the captured bytes) so a WAV header can be prepended without reallocating or
-// memmoving the recording. Nothing is copied: the JSON envelope and the base64
-// expansion are generated on the fly while HTTPClient drains the stream, so the
-// capture buffer stays the only full copy in RAM.
+// memmoving the recording. Nothing is copied: the shared segmented stream reads both ranges
+// directly while HTTPClient drains the raw PUT, so the capture buffer stays the only full copy in
+// RAM and the board does not own a second protocol implementation.
 String uploadMedia(
   const char* kind,
   const char* contentType,
@@ -2061,85 +2075,21 @@ String uploadMedia(
   size_t bodyLength,
   int& httpCodeOut
 ) {
-  httpCodeOut = -1;
-
-  const size_t rawBytes = headerLength + bodyLength;
-  if (rawBytes == 0) return String();
-  // The gateway measures the *decoded* size against MAX_MEDIA_BYTES, so this is
-  // the same number it will check. Refusing here turns a wasted upload of up to
-  // 1.33x the clip into an instant local error.
-  if (rawBytes > static_cast<size_t>(MEDIA_UPLOAD_MAX_BYTES)) {
-    httpCodeOut = 413;
-    return String();
-  }
-
-  if (nextGatewayRequestAt > 0 && millis() < nextGatewayRequestAt) {
-    httpCodeOut = 429;
-    return String();
-  }
-
-  String prefix = "{\"kind\":\"";
-  prefix += kind;
-  prefix += "\",\"contentType\":\"";
-  prefix += contentType;
-  prefix += "\",\"originalName\":\"";
-  prefix += jsonEscape(originalName);
-  prefix += "\",\"dataBase64\":\"";
-  const String suffix = "\"}";
-
-  capture::Base64JsonBodyStream bodyStream(
-    prefix,
-    suffix,
+  const media::UploadSessionResult result = media::uploadSession(
+    deviceStore,
+    "crowpanel",
+    kind,
+    contentType,
+    originalName,
     headerBytes,
     headerLength,
     bodyBytes,
-    bodyLength
+    bodyLength,
+    MEDIA_UPLOAD_MAX_BYTES,
+    &nextGatewayRequestAt
   );
-  const size_t contentLength = bodyStream.contentLength();
-
-  // Clients first, HTTPClient last; see the note in requestJsonAtBase().
-  WiFiClient plainClient;
-  WiFiClientSecure secureClient;
-  HTTPClient http;
-  const String url = urlFor("/v1/device/media");
-  if (!beginHttp(http, plainClient, secureClient, url)) {
-    Serial.println("[media] http begin failed");
-    return String();
-  }
-
-  http.addHeader("content-type", "application/json");
-  http.addHeader("x-device-id", deviceStore.deviceId());
-  http.addHeader("x-device-secret", deviceStore.deviceSecret());
-  const char* responseHeaders[] = {"retry-after"};
-  http.collectHeaders(responseHeaders, 1);
-  // A base64 upload over a slow uplink outlasts the 5 s default.
-  http.setTimeout(30000);
-
-  const int code = http.sendRequest("POST", &bodyStream, contentLength);
-  httpCodeOut = code;
-  const String response = http.getString();
-  if (code == 429) {
-    const int retryAfterSeconds = http.header("retry-after").toInt();
-    const uint32_t delayMs = static_cast<uint32_t>(max(1, retryAfterSeconds)) * 1000UL;
-    nextGatewayRequestAt = millis() + delayMs;
-  }
-  http.end();
-
-  Serial.printf(
-    "[media] upload kind=%s raw=%u encoded=%u code=%d response=%s\n",
-    kind,
-    static_cast<unsigned>(rawBytes),
-    static_cast<unsigned>(contentLength),
-    code,
-    response.c_str()
-  );
-
-  if (code < 200 || code >= 300) return String();
-
-  JsonDocument doc;
-  if (deserializeJson(doc, response)) return String();
-  const char* mediaId = doc["media"]["id"] | "";
-  return String(mediaId);
+  httpCodeOut = result.httpStatus;
+  return result.mediaId;
 }
 #endif  // ENABLE_AUDIO_CAPTURE || ENABLE_CAMERA_CAPTURE
 
@@ -2299,10 +2249,16 @@ bool runFirstMacro() {
     return false;
   }
 
-  String body = "{}";
+  JsonDocument requestDoc;
+  requestDoc["clientRequestId"] = beginDurableRequest(
+    String("macro\n") + macroId + "\n" + runtimeConfig.environmentId + "\n" + runtimeConfig.threadId
+  );
+  String body;
+  serializeJson(requestDoc, body);
   response = "";
   String path = String("/v1/device/macros/") + macroId + "/run";
   code = requestJson("POST", path.c_str(), body, response);
+  if (code > 0) deviceStore.clearPendingRequest();
   Serial.printf("macro run id=%s code=%d response=%s\n", macroId, code, response.c_str());
 
   JsonDocument runDoc;
@@ -2385,13 +2341,47 @@ bool handleFirstApproval(const char* action) {
 // Wraps an intent object in the device envelope, posts it, and reflects the
 // resulting command status on the display. Shared by the menu actions and the
 // media capture flows so they all report status the same way.
+String beginDurableRequest(const String& signature) {
+  uint64_t fingerprint = 1469598103934665603ULL;
+  for (size_t index = 0; index < signature.length(); index += 1) {
+    fingerprint ^= static_cast<uint8_t>(signature[index]);
+    fingerprint *= 1099511628211ULL;
+  }
+  char hashText[17];
+  snprintf(hashText, sizeof(hashText), "%08lx%08lx",
+    static_cast<unsigned long>(fingerprint >> 32),
+    static_cast<unsigned long>(fingerprint & 0xffffffffULL));
+  String clientRequestId;
+  if (deviceStore.pendingRequestHash() == hashText) clientRequestId = deviceStore.pendingRequestId();
+  if (clientRequestId.length() == 0) {
+    char requestText[41];
+    snprintf(requestText, sizeof(requestText), "dev:%08lx-%08lx-%08lx-%08lx",
+      static_cast<unsigned long>(esp_random()), static_cast<unsigned long>(esp_random()),
+      static_cast<unsigned long>(esp_random()), static_cast<unsigned long>(esp_random()));
+    clientRequestId = requestText;
+  }
+  deviceStore.setPendingRequest(clientRequestId, hashText);
+  return clientRequestId;
+}
+
 bool postIntent(const String& intentJson, const String& label) {
-  String body = String("{\"environmentId\":\"") + jsonEscape(runtimeConfig.environmentId.c_str()) + "\","
-    "\"threadId\":\"" + jsonEscape(runtimeConfig.threadId.c_str()) + "\","
-    "\"intent\":" + intentJson + "}";
+  const String clientRequestId = beginDurableRequest(
+    runtimeConfig.environmentId + "\n" + runtimeConfig.threadId + "\n" + intentJson
+  );
+
+  JsonDocument bodyDoc;
+  bodyDoc["environmentId"] = runtimeConfig.environmentId;
+  bodyDoc["threadId"] = runtimeConfig.threadId;
+  bodyDoc["clientRequestId"] = clientRequestId;
+  JsonDocument intentDoc;
+  if (deserializeJson(intentDoc, intentJson)) return false;
+  bodyDoc["intent"] = intentDoc.as<JsonObject>();
+  String body;
+  serializeJson(bodyDoc, body);
 
   String response;
   const int code = requestJson("POST", "/v1/device/intents", body, response);
+  if (code > 0) deviceStore.clearPendingRequest();
   Serial.printf("intent menu=%s code=%d response=%s\n", label.c_str(), code, response.c_str());
 
   JsonDocument doc;
@@ -2451,11 +2441,16 @@ bool postRemoteAction(
 
   JsonDocument request;
   if (mediaUploadId.length() > 0) request["mediaUploadId"] = mediaUploadId;
+  request["clientRequestId"] = beginDurableRequest(
+    String("action\n") + actionId + "\n" + runtimeConfig.environmentId + "\n"
+      + runtimeConfig.threadId + "\n" + mediaUploadId
+  );
   String body;
   serializeJson(request, body);
   const String path = String("/v1/device/actions/") + encodePathSegment(actionId) + "/run";
   String response;
   const int code = requestJson("POST", path.c_str(), body, response);
+  if (code > 0) deviceStore.clearPendingRequest();
   Serial.printf(
     "action run id=%s label=%s media=%s code=%d response=%s\n",
     actionId.c_str(), label.c_str(), mediaUploadId.c_str(), code, response.c_str()
@@ -3482,6 +3477,162 @@ void attachKeys() {
   attachInterruptArg(digitalPinToInterrupt(KEY_MENU_PIN), onKeyIsr, (void*)kKeyMenuBit, FALLING);
   attachInterruptArg(digitalPinToInterrupt(KEY_EXIT_PIN), onKeyIsr, (void*)kKeyExitBit, FALLING);
 }
+
+void queueRealtimeRefresh(const String& event, const String& payload, const String& deviceId) {
+  uint32_t mask = 0;
+  if (event == "threads.changed") {
+    // A rename, archive, or delete can also change the selected thread and action availability.
+    mask = kRefreshThreadsBit | kRefreshConfigBit | kRefreshControlsBit | kRefreshDisplayBit;
+  } else if (event == "device.refresh") {
+    JsonDocument doc;
+    if (deserializeJson(doc, payload)) return;
+    const String targetDevice = String(doc["deviceId"] | "");
+    if (targetDevice.length() > 0 && targetDevice != deviceId) return;
+    for (JsonVariant value : doc["resources"].as<JsonArray>()) {
+      const String resource = String(value | "");
+      if (resource == "config") mask |= kRefreshConfigBit;
+      else if (resource == "threads") mask |= kRefreshThreadsBit;
+      else if (resource == "controls") mask |= kRefreshControlsBit;
+      else if (resource == "display" || resource == "approvals") mask |= kRefreshDisplayBit;
+      else if (resource == "gateway") mask |= kRefreshGatewayBit;
+    }
+  } else if (event == "firmware.changed") {
+    JsonDocument doc;
+    if (deserializeJson(doc, payload)) return;
+    const String targetDevice = String(doc["deviceId"] | "");
+    const String model = String(doc["hardwareModel"] | "");
+    if (targetDevice.length() > 0 && targetDevice != deviceId) return;
+    if (model.length() == 0 || model == HARDWARE_MODEL) mask = kRefreshFirmwareBit;
+  } else if (event == "t3.approval.decided" || event == "t3.user-input.answered") {
+    mask = kRefreshControlsBit | kRefreshDisplayBit;
+  } else if (event == "command.reconciled" || event == "t3.snapshot"
+             || event == "t3.thread.snapshot" || event == "t3.thread.event"
+             || event == "t3.thread.status" || event == "media.job"
+             || event == "state.changed") {
+    mask = kRefreshDisplayBit;
+  }
+  if (mask == 0) return;
+
+  portENTER_CRITICAL(&realtimeRefreshMux);
+  const bool wasEmpty = pendingRealtimeRefreshMask == 0;
+  pendingRealtimeRefreshMask |= mask;
+  // Do not extend the deadline for every event: a busy task must still make progress.
+  if (wasEmpty) realtimeRefreshDueAt = millis() + kRealtimeCoalesceMs;
+  portEXIT_CRITICAL(&realtimeRefreshMux);
+}
+
+void realtimeEventTask(void*) {
+  for (;;) {
+    if (WiFi.status() != WL_CONNECTED || realtimeEndpointMutex == nullptr) {
+      vTaskDelay(pdMS_TO_TICKS(500));
+      continue;
+    }
+
+    String gatewayBase;
+    String deviceId;
+    String deviceSecret;
+    uint32_t endpointGeneration = 0;
+    if (xSemaphoreTake(realtimeEndpointMutex, pdMS_TO_TICKS(1000)) == pdTRUE) {
+      gatewayBase = realtimeGatewayBase;
+      deviceId = realtimeDeviceId;
+      deviceSecret = realtimeDeviceSecret;
+      endpointGeneration = realtimeEndpointGeneration;
+      xSemaphoreGive(realtimeEndpointMutex);
+    }
+    if (gatewayBase.length() == 0 || deviceId.length() == 0 || deviceSecret.length() == 0) {
+      vTaskDelay(pdMS_TO_TICKS(2000));
+      continue;
+    }
+
+    // Clients are declared before HTTPClient so HTTPClient is destroyed first.
+    WiFiClient plainClient;
+    WiFiClientSecure secureClient;
+    HTTPClient http;
+    http.useHTTP10(true);
+    http.setConnectTimeout(5000);
+    http.setTimeout(5000);
+    const String url = normalizeGatewayBase(gatewayBase) + "/v1/device/events";
+    if (!beginHttp(http, plainClient, secureClient, url)) {
+      vTaskDelay(pdMS_TO_TICKS(2000));
+      continue;
+    }
+    http.addHeader("x-device-id", deviceId);
+    http.addHeader("x-device-secret", deviceSecret);
+
+    const int code = http.GET();
+    if (code != 200) {
+      Serial.printf("[events] stream failed code=%d\n", code);
+      http.end();
+      vTaskDelay(pdMS_TO_TICKS(code == 429 ? 5000 : 2000));
+      continue;
+    }
+
+    Serial.println("[events] realtime stream connected");
+    WiFiClient* stream = http.getStreamPtr();
+    String line;
+    String event;
+    String data;
+    line.reserve(160);
+    data.reserve(384);
+    while (WiFi.status() == WL_CONNECTED
+           && endpointGeneration == realtimeEndpointGeneration
+           && (stream->connected() || stream->available())) {
+      if (!stream->available()) {
+        vTaskDelay(pdMS_TO_TICKS(20));
+        continue;
+      }
+      const char c = static_cast<char>(stream->read());
+      if (c != '\n') {
+        if (c != '\r' && line.length() < 768) line += c;
+        continue;
+      }
+      if (line.startsWith("event:")) {
+        event = line.substring(6);
+        event.trim();
+      } else if (line.startsWith("data:")) {
+        if (data.length() > 0) data += '\n';
+        String part = line.substring(5);
+        part.trim();
+        data += part;
+      } else if (line.length() == 0) {
+        if (event.length() > 0) queueRealtimeRefresh(event, data, deviceId);
+        event = "";
+        data = "";
+      }
+      line = "";
+    }
+    http.end();
+    vTaskDelay(pdMS_TO_TICKS(1000));
+  }
+}
+
+void syncRealtimeEndpoint() {
+  if (realtimeEndpointMutex == nullptr) return;
+  if (xSemaphoreTake(realtimeEndpointMutex, pdMS_TO_TICKS(1000)) != pdTRUE) return;
+  realtimeGatewayBase = activeGatewayBase();
+  realtimeDeviceId = deviceStore.deviceId();
+  realtimeDeviceSecret = deviceStore.deviceSecret();
+  realtimeEndpointGeneration += 1;
+  xSemaphoreGive(realtimeEndpointMutex);
+}
+
+void startRealtimeTask() {
+  if (realtimeTaskHandle != nullptr) return;
+  realtimeEndpointMutex = xSemaphoreCreateMutex();
+  if (realtimeEndpointMutex == nullptr) {
+    Serial.println("[events] could not create endpoint mutex; periodic polling remains active");
+    return;
+  }
+  syncRealtimeEndpoint();
+  if (xTaskCreatePinnedToCore(
+        realtimeEventTask, "events", 8192, nullptr, 1, &realtimeTaskHandle, 0
+      ) != pdPASS) {
+    realtimeTaskHandle = nullptr;
+    Serial.println("[events] could not start stream task; periodic polling remains active");
+    return;
+  }
+  Serial.println("[events] realtime refresh task started");
+}
 }
 
 void setup() {
@@ -3568,7 +3719,59 @@ void setup() {
   }
 
   provisioning.begin(deviceStore, deviceStore.deviceId());
+  startRealtimeTask();
   renderProvisioningState();
+}
+
+bool consumeRealtimeRefresh() {
+  const uint32_t now = millis();
+  uint32_t nextBit = 0;
+  portENTER_CRITICAL(&realtimeRefreshMux);
+  if (pendingRealtimeRefreshMask != 0
+      && static_cast<int32_t>(now - realtimeRefreshDueAt) >= 0) {
+    // Priority prevents a release or selected-thread repair from sitting behind cosmetic updates.
+    const uint32_t priorities[] = {
+      kRefreshFirmwareBit,
+      kRefreshGatewayBit,
+      kRefreshConfigBit,
+      kRefreshThreadsBit,
+      kRefreshControlsBit,
+      kRefreshDisplayBit,
+    };
+    for (uint32_t bit : priorities) {
+      if ((pendingRealtimeRefreshMask & bit) != 0) {
+        nextBit = bit;
+        pendingRealtimeRefreshMask &= ~bit;
+        break;
+      }
+    }
+    realtimeRefreshDueAt = pendingRealtimeRefreshMask == 0 ? 0 : now + kRealtimeCoalesceMs;
+  }
+  portEXIT_CRITICAL(&realtimeRefreshMux);
+  if (nextBit == 0) return false;
+
+  if (nextBit == kRefreshFirmwareBit) {
+    lastFirmwarePollAt = now;
+    pollFirmwareManifest();
+  } else if (nextBit == kRefreshGatewayBit) {
+    lastGatewayPollAt = now;
+    fetchGatewayState(/*applyPending=*/true);
+    syncRealtimeEndpoint();
+  } else if (nextBit == kRefreshConfigBit) {
+    lastConfigPollAt = now;
+    fetchDeviceConfig();
+  } else if (nextBit == kRefreshThreadsBit) {
+    // The list is fetched only while visible. Opening it already performs a fresh fetch, so a
+    // background event never spends bandwidth on data the person is not looking at.
+    if (uiScreen == UiScreen::Threads) openThreadMenu();
+  } else if (nextBit == kRefreshControlsBit) {
+    lastControlsPollAt = now;
+    fetchDeviceControls();
+  } else if (nextBit == kRefreshDisplayBit) {
+    lastDisplayPollAt = now;
+    pollDisplay();
+  }
+  return true;
 }
 
 // Everything that talks to the gateway, run once the link is up. Kept together so the loop has a
@@ -3590,6 +3793,7 @@ void runGatewayCycle(bool justConnected) {
     pollDisplay();
     return;
   }
+  if (consumeRealtimeRefresh()) return;
   if (now - lastHeartbeatAt > kHeartbeatIntervalMs) {
     lastHeartbeatAt = now;
     sendHeartbeat();

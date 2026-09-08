@@ -1,8 +1,11 @@
+import { browserSecurityHeaders } from "./securityHeaders.mjs";
+
 export function createEventBroker() {
   const clientsByUser = new Map();
 
   function connect({ userId, res }) {
     res.writeHead(200, {
+      ...browserSecurityHeaders(),
       "content-type": "text/event-stream; charset=utf-8",
       "cache-control": "no-store, no-transform",
       connection: "keep-alive",
@@ -36,6 +39,10 @@ export function createEventBroker() {
     for (const client of clients) send(client, type, payload);
   }
 
+  function broadcastToAll(type, payload) {
+    for (const userId of clientsByUser.keys()) broadcastToUser(userId, type, payload);
+  }
+
   function broadcastStateChange(state) {
     const users = state.users ?? [];
     for (const user of users) {
@@ -66,7 +73,7 @@ export function createEventBroker() {
     });
   }
 
-  return { connect, broadcastToUser, broadcastStateChange, broadcastUserChange };
+  return { connect, broadcastToUser, broadcastToAll, broadcastStateChange, broadcastUserChange };
 }
 
 function send(client, type, payload) {

@@ -6,6 +6,8 @@
 #include <WiFi.h>
 #include <WiFiClientSecure.h>
 
+#include <GatewayTls.h>
+
 #if __has_include("controller_config.h")
 #include "controller_config.h"
 #else
@@ -51,9 +53,7 @@ GatewayStatus probeOnce(const String& base) {
 
   bool began = false;
   if (url.startsWith("https://")) {
-#if INSECURE_SKIP_TLS_VERIFY
-    secure.setInsecure();
-#endif
+    if (!gateway_tls::configure(secure, "probe")) return GatewayStatus::Unreachable;
     began = http.begin(secure, url);
   } else {
     began = http.begin(plain, url);

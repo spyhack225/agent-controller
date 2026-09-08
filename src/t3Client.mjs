@@ -125,8 +125,9 @@ export async function fetchT3ThreadDetail(environment, threadId, options = {}) {
   return payload?.thread ?? null;
 }
 
-export async function dispatchT3Command(environment, command) {
-  const response = await fetch(new URL("/api/orchestration/dispatch", environment.baseUrl), {
+export async function dispatchT3Command(environment, command, options = {}) {
+  const fetchImpl = options.fetchImpl ?? globalThis.fetch;
+  const response = await fetchImpl(new URL("/api/orchestration/dispatch", environment.baseUrl), {
     method: "POST",
     headers: {
       ...authorizationHeaders(environment.accessToken),

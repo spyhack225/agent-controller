@@ -125,7 +125,7 @@ export function buildMediaName({
   threadTitle = null,
   now = new Date(),
 } = {}) {
-  const source = media?.deviceId ? "device" : "console";
+  const source = media?.captureSource ?? (media?.deviceId ? "device" : "console");
   const deviceLabel = trimmed(device?.label);
   const title = trimmed(threadTitle);
   const boundThreadId = trimmed(threadId);
@@ -151,7 +151,14 @@ export function buildMediaName({
 
 /** Who produced the bytes. A device that was never labelled still beats a bare uuid. */
 function originSegment(media, deviceLabel) {
-  if (!media?.deviceId) return "Console";
+  if (!media?.deviceId) {
+    if (!media?.captureSource) return "Console";
+    if (media?.captureSource === "browser_recording") return "Browser microphone";
+    if (media?.captureSource === "browser_camera") return "Browser camera";
+    if (media?.captureSource === "companion_recording") return "Phone microphone";
+    if (media?.captureSource === "companion_camera") return "Phone camera";
+    return "Upload";
+  }
   return deviceLabel ?? `Controller ${shortId(media.deviceId)}`;
 }
 
@@ -166,7 +173,7 @@ function destinationSegment({ media, source, threadId, threadTitle }) {
   if (threadId) {
     return threadTitle ? truncate(threadTitle, MAX_THREAD_TITLE) : `Thread ${shortId(threadId)}`;
   }
-  if (source === "console") {
+  if (["console", "upload", "browser_recording", "browser_camera"].includes(source)) {
     const uploaded = meaningfulUploadName(media?.originalName);
     if (uploaded) return truncate(uploaded, MAX_UPLOAD_NAME);
   }

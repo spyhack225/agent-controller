@@ -32,8 +32,30 @@ class DeviceStore {
   // --- Identity. Written once by the factory flashing station, never by the owner. ---
   const String& deviceId() const { return deviceId_; }
   const String& deviceSecret() const { return deviceSecret_; }
+  uint32_t credentialVersion() const { return credentialVersion_; }
   bool hasIdentity() const { return deviceId_.length() > 0 && deviceSecret_.length() > 0; }
   bool setIdentity(const String& id, const String& secret);
+
+  // A replacement credential is written to separate NVS keys before it is sent to the gateway.
+  // The rotation id is the commit marker and is written last, so a power loss cannot make a
+  // partially written candidate look usable. The active secret remains untouched until the
+  // gateway has authenticated the candidate and acknowledged promotion.
+  bool hasPendingDeviceSecret() const {
+    return pendingDeviceSecret_.length() > 0 && pendingCredentialRotationId_.length() > 0
+      && pendingCredentialVersion_ > credentialVersion_;
+  }
+  const String& pendingDeviceSecret() const { return pendingDeviceSecret_; }
+  const String& pendingCredentialRotationId() const { return pendingCredentialRotationId_; }
+  const String& pendingCredentialPurpose() const { return pendingCredentialPurpose_; }
+  uint32_t pendingCredentialVersion() const { return pendingCredentialVersion_; }
+  bool stagePendingDeviceSecret(
+    const String& secret,
+    const String& rotationId,
+    uint32_t credentialVersion,
+    const String& purpose
+  );
+  bool promotePendingDeviceSecret(const String& rotationId, uint32_t credentialVersion);
+  bool rollbackPendingDeviceSecret();
 
   // Seeds identity and gateway URL from compile-time values only when NVS holds none. This is the
   // bench path — it lets a developer flash controller_config.h values without an NVS partition —
@@ -91,6 +113,13 @@ class DeviceStore {
   const String& configCache() const { return configCache_; }
   bool setConfigCache(const String& json);
 
+  // One uncertain agent write survives reboot. The body is represented only by a local
+  // fingerprint; prompt/audio text is never copied into NVS. A positive HTTP response clears it.
+  const String& pendingRequestId() const { return pendingRequestId_; }
+  const String& pendingRequestHash() const { return pendingRequestHash_; }
+  bool setPendingRequest(const String& requestId, const String& requestHash);
+  bool clearPendingRequest();
+
   // --- OTA attempt marker. ---
   // Written only after a new image has been completely verified and committed to the inactive
   // partition. It survives the restart, which lets the previous image report a real bootloader
@@ -126,6 +155,11 @@ class DeviceStore {
   bool opened_ = false;
   String deviceId_;
   String deviceSecret_;
+  uint32_t credentialVersion_ = 1;
+  String pendingDeviceSecret_;
+  String pendingCredentialRotationId_;
+  String pendingCredentialPurpose_;
+  uint32_t pendingCredentialVersion_ = 0;
   String gatewayUrl_;
   GatewayProfile gatewayProfiles_[kMaxGatewayProfiles];
   size_t gatewayProfileCount_ = 0;
@@ -141,6 +175,8 @@ class DeviceStore {
   String claimCode_;
   String claimCodeExpiresAt_;
   String configCache_;
+  String pendingRequestId_;
+  String pendingRequestHash_;
   String otaSourceVersion_;
   String otaTargetVersion_;
 };

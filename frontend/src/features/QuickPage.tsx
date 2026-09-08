@@ -11,11 +11,13 @@ import { ArrowRight, Check, CheckCircle2, CircleAlert, Mic, Play, RefreshCw, Sen
 import { useState } from "react";
 
 import type { Controller } from "../controller";
+import { clearDurableMutationRequest, durableMutationRequest } from "../requestId";
 import { commandSummary, commandType, formatRelativeTime } from "../format";
 import { LiveFrame } from "../motion";
 import type { Command, PageId, SavedAction } from "../types";
 import { Button, StatusBadge, useConfirm } from "../ui";
 import { useWorkspaceLoader } from "../useWorkspaceLoader";
+import { composerAvailability } from "../t3CapabilityAvailability";
 import {
   AttachmentChips,
   AttachmentSourceMenu,
@@ -50,10 +52,13 @@ function QuickComposer({
 
   const ready = Boolean(c.selectedEnvironmentId && c.selectedThreadId);
   const hasRequest = Boolean(draft.prompt.trim()) || draft.attachmentIds.length > 0;
-  const canSend = ready && hasRequest;
-  const blockedReason = c.selectedEnvironmentId
-    ? "Choose a thread above to send from here."
-    : "Pair a T3 environment first.";
+  const capability = composerAvailability(c.selectedEnvironment, draft.attachments);
+  const canSend = ready && hasRequest && capability.enabled;
+  const blockedReason = !c.selectedEnvironmentId
+    ? "Pair a T3 environment first."
+    : !c.selectedThreadId
+      ? "Choose a thread above to send from here."
+      : capability.reason ?? "Write a message or attach context.";
 
   const submit = async () => {
     if (!canSend) return;
@@ -79,7 +84,7 @@ function QuickComposer({
           : "Choose a thread above to send from here"}
         canSend={canSend}
         onSubmit={() => void submit()}
-        onFiles={ready ? (files) => void attachFiles(files) : undefined}
+        onFiles={ready && capability.enabled ? (files) => void attachFiles(files) : undefined}
         attachments={
           <AttachmentChips
             attachments={draft.attachments}
@@ -92,13 +97,13 @@ function QuickComposer({
             <AttachmentSourceMenu
               controller={c}
               draft={draft}
-              disabled={!ready}
+              disabled={!ready || !capability.enabled}
               disabledReason={blockedReason}
             />
             <button
               type="button"
               className="composer-inline-action"
-              disabled={!ready || draft.atLimit}
+              disabled={!ready || !capability.enabled || draft.atLimit}
               aria-label="Record voice"
               title={ready ? "Record a voice message" : blockedReason}
               onClick={() => setRecording(true)}
@@ -121,7 +126,7 @@ function QuickComposer({
         }
       />
 
-      {ready ? null : (
+      {ready && capability.enabled ? null : (
         <p className="dashboard-composer__blocked">
           <span>{blockedReason}</span>
           {c.selectedEnvironmentId ? (
@@ -182,13 +187,21 @@ export function QuickPage({ controller: c, onNavigate }: QuickPageProps) {
 
   const runAction = async (action: SavedAction) => {
     await c.run(`action-${action.id}`, "Action dispatched.", async () => {
+      const pending = await durableMutationRequest({
+        operation: "action.run",
+        actionId: action.id,
+        environmentId: c.selectedEnvironmentId || null,
+        threadId: c.selectedThreadId || null,
+      });
       const result = await c.api(`/v1/actions/${encodeURIComponent(action.id)}/run`, {
         method: "POST",
         body: {
           environmentId: c.selectedEnvironmentId || undefined,
           threadId: c.selectedThreadId || undefined,
+          clientRequestId: pending.clientRequestId,
         },
       });
+      clearDurableMutationRequest(pending.storageKey);
       await c.refreshAll();
       return result;
     });

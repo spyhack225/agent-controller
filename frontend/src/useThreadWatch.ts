@@ -60,6 +60,8 @@ export interface ThreadWatch {
   watchThread: (target: LiveThreadTarget | null) => void;
   applyThreadSnapshotEvent: (payload: unknown) => void;
   applyThreadEventEvent: (payload: unknown) => void;
+  /** Apply one display-frame batch with a single React state transition. */
+  applyThreadEventEvents: (payloads: readonly unknown[]) => void;
   applyThreadStatusEvent: (payload: unknown) => void;
 }
 
@@ -164,6 +166,13 @@ export function useThreadWatch({
     (payload: unknown) => applyIfCurrent(payload, applyThreadEvent),
     [applyIfCurrent],
   );
+  const applyThreadEventEvents = useCallback((payloads: readonly unknown[]) => {
+    if (payloads.length === 0) return;
+    setLiveThread((current) => payloads.reduce<LiveThreadState | null>((state, payload) => {
+      if (!payloadMatchesThread(state, payload)) return state;
+      return applyThreadEvent(state as LiveThreadState, payload);
+    }, current));
+  }, []);
   const applyThreadStatusEvent = useCallback(
     (payload: unknown) => applyIfCurrent(payload, applyThreadStatus),
     [applyIfCurrent],
@@ -174,6 +183,7 @@ export function useThreadWatch({
     watchThread,
     applyThreadSnapshotEvent,
     applyThreadEventEvent,
+    applyThreadEventEvents,
     applyThreadStatusEvent,
   };
 }

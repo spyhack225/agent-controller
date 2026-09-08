@@ -1,5 +1,10 @@
 import { fetchT3EnvironmentInfo, fetchT3Snapshot } from "./t3Client.mjs";
 import { callT3Rpc, T3_WS_METHODS } from "./t3Ws.mjs";
+import {
+  buildT3CapabilityManifest,
+  ownerSafeT3CapabilityProjection,
+  T3_ADAPTER_CONTRACT_VERSION,
+} from "./t3CapabilityManifest.mjs";
 
 // Agent Controller's orchestration and websocket contracts were verified live against this
 // release. Raise the ceiling only after the contract suite passes against a newer T3 host.
@@ -82,14 +87,35 @@ export async function runT3CompatibilityCheck({
   latestVersion = null,
   previous = null,
   fetchImpl = globalThis.fetch,
-  rpcImpl = callT3Rpc,
+  rpcImpl = null,
   WebSocketImpl = globalThis.WebSocket,
+  transport = null,
   now = () => new Date(),
 }) {
+  if (transport?.capabilities && !rpcImpl) {
+    const manifestResult = await Promise.allSettled([
+      transport.capabilities(environment, { fetchImpl, WebSocketImpl, timeoutMs: 5000, force: true }),
+    ]);
+    if (manifestResult[0].status === "fulfilled") {
+      return evaluateT3Compatibility({
+        environment,
+        latestVersion,
+        previous,
+        checkedAt: now().toISOString(),
+        capabilityManifest: manifestResult[0].value,
+      });
+    }
+  }
   const [metadataResult, snapshotResult, rpcResult] = await Promise.allSettled([
-    fetchT3EnvironmentInfo(environment, { fetchImpl, timeoutMs: 5000 }),
-    fetchT3Snapshot(environment, { fetchImpl, timeoutMs: 5000 }),
-    rpcImpl(environment, T3_WS_METHODS.serverGetConfig, {}, {
+    transport
+      ? transport.environmentInfo(environment, { fetchImpl, timeoutMs: 5000 })
+      : fetchT3EnvironmentInfo(environment, { fetchImpl, timeoutMs: 5000 }),
+    transport
+      ? transport.snapshot(environment, { fetchImpl, timeoutMs: 5000 })
+      : fetchT3Snapshot(environment, { fetchImpl, timeoutMs: 5000 }),
+    transport
+      ? transport.callRpc(environment, T3_WS_METHODS.serverGetConfig, {}, { fetchImpl, WebSocketImpl, timeoutMs: 5000 })
+      : (rpcImpl ?? callT3Rpc)(environment, T3_WS_METHODS.serverGetConfig, {}, {
       fetchImpl,
       WebSocketImpl,
       timeoutMs: 5000,
@@ -121,7 +147,17 @@ export function evaluateT3Compatibility({
   snapshotError = null,
   serverConfig = null,
   serverConfigError = null,
+  capabilityManifest = null,
 }) {
+  if (capabilityManifest) {
+    return evaluateT3CompatibilityManifest({
+      environment,
+      latestVersion,
+      previous,
+      checkedAt,
+      capabilityManifest,
+    });
+  }
   const release = buildT3ReleaseStatus(latestVersion);
   const installedVersion = normalizeVersion(metadata?.serverVersion);
   const previousVersion = normalizeVersion(previous?.installedVersion);
@@ -243,6 +279,38 @@ export function evaluateT3Compatibility({
     checks,
     findings,
   };
+}
+
+function evaluateT3CompatibilityManifest({ environment, latestVersion, previous, checkedAt, capabilityManifest }) {
+  const probes = capabilityManifest.probes ?? {};
+  const metadata = capabilityManifest.installedVersion
+    ? { serverVersion: capabilityManifest.installedVersion }
+    : {};
+  const base = evaluateT3Compatibility({
+    environment,
+    latestVersion,
+    previous,
+    checkedAt,
+    metadata,
+    metadataError: probes.metadata === "passed" ? null : "Environment metadata probe failed.",
+    snapshot: probes.snapshot === "passed" ? { projects: [], threads: [] } : null,
+    snapshotError: probes.snapshot === "passed" ? null : "Snapshot probe failed.",
+    serverConfig: probes.serverConfig === "passed" ? { providers: [] } : null,
+    serverConfigError: probes.serverConfig === "passed" ? null : "WebSocket configuration probe failed.",
+  });
+  const adapterCurrent = capabilityManifest.contractVersion === T3_ADAPTER_CONTRACT_VERSION;
+  if (!adapterCurrent) {
+    base.status = "incompatible";
+    base.compatible = false;
+    base.breakingRisk = true;
+    base.findings.unshift({
+      level: "danger",
+      code: "adapter_contract_unknown",
+      message: "The T3 capability manifest uses an adapter contract this gateway does not understand.",
+    });
+  }
+  base.capabilities = ownerSafeT3CapabilityProjection(capabilityManifest);
+  return base;
 }
 
 export function compareT3Versions(left, right) {

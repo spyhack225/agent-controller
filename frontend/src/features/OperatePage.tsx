@@ -26,6 +26,7 @@ import {
   workspaceSyncActivity,
 } from "../activity";
 import type { Controller } from "../controller";
+import { clearDurableMutationRequest, durableMutationRequest } from "../requestId";
 import { commandSummary, commandType, formatRelativeTime, renderEventResult } from "../format";
 import {
   liveThreadTurnInFlight,
@@ -56,6 +57,7 @@ import {
 } from "../userInput";
 import type { Command, JsonRecord, SavedAction, T3SessionFailure } from "../types";
 import { useWorkspaceLoader } from "../useWorkspaceLoader";
+import { composerAvailability } from "../t3CapabilityAvailability";
 import {
   Button,
   EmptyState,
@@ -77,6 +79,7 @@ import {
   useFileAttachment,
   type ComposerMode,
 } from "./Composer";
+import { WorkGraphPanel } from "./WorkGraphPanel";
 
 function statusTone(status?: string) {
   if (status === "approval_required") return "warning" as const;
@@ -148,7 +151,13 @@ export function OperatePage({ controller }: { controller: Controller }) {
     : streamDegraded && live.status === "live" ? "reconnecting" : live.status;
   // An empty snapshot is a real answer ("this thread has nothing in it"), but it is not something
   // to render over the polled view, so the fallback below still applies.
-  const liveEntries = live?.hasSnapshot && live.entries.length > 0 ? live.entries : null;
+  // T3-attributed task/tool rows are re-homed into Agents & work. They remain in the reducer's
+  // bounded transcript projection for replay/snapshot correctness, but do not splice child work
+  // into the parent conversation.
+  const parentLiveEntries = live?.hasSnapshot
+    ? live.entries.filter((entry) => entry.kind !== "activity" || !entry.workNodeId)
+    : [];
+  const liveEntries = parentLiveEntries.length > 0 ? parentLiveEntries : null;
 
   const threadPendingApprovals = useMemo(
     () => c.pendingApprovals.filter((command) =>
@@ -315,14 +324,17 @@ export function OperatePage({ controller }: { controller: Controller }) {
 
   const hasRequest = Boolean(prompt.trim())
     || (composerMode === "prompt" && attachmentIds.length > 0);
-  const canSendFollowUp = Boolean(c.selectedEnvironmentId && c.selectedThreadId) && hasRequest;
+  const composerCapability = composerAvailability(c.selectedEnvironment, draft.attachments, !c.selectedThreadId);
+  const canSendFollowUp = Boolean(c.selectedEnvironmentId && c.selectedThreadId)
+    && hasRequest && composerCapability.enabled;
   const canStartThread = Boolean(
     c.selectedEnvironmentId
     && c.selectedProjectId
     && composerMode === "prompt"
     && hasRequest
     && model
-    && activeHarness?.available !== false,
+    && activeHarness?.available !== false
+    && composerCapability.enabled
   );
   const canSend = c.selectedThreadId ? canSendFollowUp : canStartThread;
 
@@ -367,13 +379,21 @@ export function OperatePage({ controller }: { controller: Controller }) {
     }
     const actionId = action.id;
     await c.run(`action-${actionId}`, "Action dispatched.", async () => {
+      const pending = await durableMutationRequest({
+        operation: "action.run",
+        actionId,
+        environmentId: c.selectedEnvironmentId || null,
+        threadId: c.selectedThreadId || null,
+      });
       const result = await c.api(`/v1/actions/${encodeURIComponent(actionId)}/run`, {
         method: "POST",
         body: {
           environmentId: c.selectedEnvironmentId || undefined,
           threadId: c.selectedThreadId || undefined,
+          clientRequestId: pending.clientRequestId,
         },
       });
+      clearDurableMutationRequest(pending.storageKey);
       await c.refreshAll();
       return result;
     });
@@ -729,6 +749,8 @@ export function OperatePage({ controller }: { controller: Controller }) {
 
           <LiveThreadBanner state={live} status={liveStatus} />
 
+          <WorkGraphPanel state={live} status={liveStatus} />
+
           {live?.historyGap ? (
             <div className="thread-gap-notice" role="note">
               <History className="size-4" aria-hidden="true" />
@@ -906,7 +928,9 @@ export function OperatePage({ controller }: { controller: Controller }) {
                 : "Describe the first task for this new thread…"}
             canSend={canSend}
             onSubmit={() => void submitComposer()}
-            onFiles={composerMode === "shell" ? undefined : (files) => void attachFiles(files)}
+            onFiles={composerMode === "shell" || !composerCapability.enabled
+              ? undefined
+              : (files) => void attachFiles(files)}
             attachments={
               <AttachmentChips
                 attachments={draft.attachments}
@@ -919,8 +943,10 @@ export function OperatePage({ controller }: { controller: Controller }) {
               <AttachmentSourceMenu
                 controller={c}
                 draft={draft}
-                disabled={composerMode === "shell"}
-                disabledReason="Shell commands cannot carry attachments."
+                disabled={composerMode === "shell" || !composerCapability.enabled}
+                disabledReason={composerMode === "shell"
+                  ? "Shell commands cannot carry attachments."
+                  : composerCapability.reason ?? undefined}
               />
               <ShellModeToggle mode={composerMode} onChange={selectComposerMode} />
             </>

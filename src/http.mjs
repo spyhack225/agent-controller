@@ -1,3 +1,5 @@
+import { browserSecurityHeaders } from "./securityHeaders.mjs";
+
 export class HttpError extends Error {
   constructor(status, message, details = undefined) {
     super(message);
@@ -45,6 +47,7 @@ export function parseJsonBody(raw) {
 export function sendJson(res, status, body) {
   const payload = JSON.stringify(body, null, 2);
   res.writeHead(status, {
+    ...browserSecurityHeaders(),
     "content-type": "application/json; charset=utf-8",
     "cache-control": "no-store",
   });
@@ -53,6 +56,7 @@ export function sendJson(res, status, body) {
 
 export function sendBuffer(res, status, buffer, headers = {}) {
   res.writeHead(status, {
+    ...browserSecurityHeaders(),
     "cache-control": "private, no-store",
     "content-length": buffer.length,
     ...headers,

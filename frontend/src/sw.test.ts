@@ -14,6 +14,7 @@ type Route = "bypass" | "navigate" | "asset" | "passive";
 interface ServiceWorkerInternals {
   routeFor: (request: { method: string; url: string; mode?: string }) => Route;
   isApiPath: (pathname: string) => boolean;
+  isPublicStaticPath: (pathname: string) => boolean;
   PRECACHE_URLS: string[];
 }
 
@@ -67,6 +68,14 @@ describe("service worker caching policy", () => {
     expect(internals.routeFor(get("https://console.example.test/legacy/app.js"))).toBe("bypass");
   });
 
+  test("does not persist unknown same-origin reads that may become private routes", () => {
+    expect(internals.routeFor(get("https://console.example.test/account/export"))).toBe("bypass");
+    expect(internals.routeFor(get("https://console.example.test/downloads/private.txt"))).toBe("bypass");
+    expect(internals.isPublicStaticPath("/manifest.webmanifest")).toBe(true);
+    expect(internals.isPublicStaticPath("/icons/icon-192.png")).toBe(true);
+    expect(internals.isPublicStaticPath("/account/export")).toBe(false);
+  });
+
   test("serves the app shell and hashed assets from cache", () => {
     expect(
       internals.routeFor(get("https://console.example.test/", { mode: "navigate" })),
@@ -80,7 +89,7 @@ describe("service worker caching policy", () => {
 
   test("registers the lifecycle and notification handlers the console relies on", () => {
     expect(events).toEqual(
-      expect.arrayContaining(["install", "activate", "fetch", "notificationclick"]),
+      expect.arrayContaining(["install", "activate", "fetch", "push", "notificationclick"]),
     );
   });
 });

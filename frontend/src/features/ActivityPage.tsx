@@ -1,13 +1,18 @@
 import {
+  Bell,
+  BellRing,
   Check,
   ChevronLeft,
   ChevronRight,
   Clock3,
   History,
   ListChecks,
+  LoaderCircle,
   RefreshCw,
   ScrollText,
   ShieldAlert,
+  Trash2,
+  WifiOff,
   X,
 } from "lucide-react";
 import { useMemo, useState } from "react";
@@ -24,7 +29,17 @@ import {
   useConfirm,
 } from "../ui";
 
-type ActivityView = "approvals" | "commands" | "audit";
+type ActivityView = "notifications" | "approvals" | "commands" | "audit";
+
+function initialActivityView(c: Controller): ActivityView {
+  const query = window.location.hash.split("?", 2)[1] ?? "";
+  const requested = new URLSearchParams(query).get("view");
+  if (requested === "notifications" || requested === "approvals" || requested === "commands" || requested === "audit") {
+    return requested;
+  }
+  if (c.notificationUnreadCount > 0) return "notifications";
+  return c.pendingApprovals.length ? "approvals" : "commands";
+}
 
 function tone(status: string) {
   if (status === "approval_required") return "warning" as const;
@@ -36,7 +51,7 @@ function tone(status: string) {
 
 export function ActivityPage({ controller: c }: { controller: Controller }) {
   const confirm = useConfirm();
-  const [view, setView] = useState<ActivityView>(c.pendingApprovals.length ? "approvals" : "commands");
+  const [view, setView] = useState<ActivityView>(() => initialActivityView(c));
   const [query, setQuery] = useState("");
   const [traceOpen, setTraceOpen] = useState(false);
 
@@ -74,6 +89,47 @@ export function ActivityPage({ controller: c }: { controller: Controller }) {
     void c.run(`timeline-${command.id}`, "Timeline loaded.", () => c.loadCommandTimeline(command));
   };
 
+  const markRead = async (id: string) => {
+    await c.run(`read-notification-${id}`, "Notification marked read.", () => c.markNotificationRead(id));
+  };
+
+  const dismiss = async (id: string) => {
+    await c.run(`dismiss-notification-${id}`, "Notification dismissed.", () => c.dismissNotification(id));
+  };
+
+  const openNotification = async (notification: (typeof c.notifications)[number]) => {
+    if (!notification.readAt) {
+      const result = await c.run(
+        `open-notification-${notification.id}`,
+        "Notification opened.",
+        () => c.markNotificationRead(notification.id),
+      );
+      if (!result) return;
+    }
+    const command = notification.commandId
+      ? c.commands.find((candidate) => candidate.id === notification.commandId)
+      : null;
+    if (command) {
+      setView("commands");
+      openTimeline(command);
+      return;
+    }
+    if (notification.environmentId) {
+      c.setSelectedEnvironmentId(notification.environmentId);
+      if (notification.threadId) c.setSelectedThreadId(notification.threadId);
+      window.location.hash = "operate";
+    }
+  };
+
+  const scheduler = c.backgroundLiveness?.scheduledWorker ?? null;
+  const schedulerTone = scheduler?.status === "healthy"
+    ? "success" as const
+    : scheduler?.status === "degraded" || scheduler?.status === "stale"
+      ? "warning" as const
+      : scheduler?.status === "unknown" || scheduler?.status === "not_configured"
+        ? "neutral" as const
+        : "danger" as const;
+
   return (
     <div
       className="activity-workspace"
@@ -84,7 +140,7 @@ export function ActivityPage({ controller: c }: { controller: Controller }) {
         <SectionHeader
           eyebrow="Audit trail"
           title="Activity and decisions"
-          description="Review work that needs attention, inspect command history, and trace account changes."
+          description="Review durable notifications, work that needs attention, command history, and account changes."
           action={
             <Button size="sm" onClick={() => void c.refreshAll()}>
               <RefreshCw className="size-4" /> Refresh
@@ -93,6 +149,15 @@ export function ActivityPage({ controller: c }: { controller: Controller }) {
         />
         <div className="flex flex-col gap-3 border-y border-control bg-surface-inset/45 p-3 sm:flex-row sm:items-center sm:justify-between">
           <div className="intent-switcher" aria-label="Activity view">
+            <button
+              type="button"
+              className="intent-switcher__item"
+              data-active={view === "notifications" || undefined}
+              onClick={() => setView("notifications")}
+            >
+              <Bell className="size-3.5" /> Notifications
+              {c.notificationUnreadCount ? <span className="nav-count nav-count--warning">{c.notificationUnreadCount}</span> : null}
+            </button>
             <button
               type="button"
               className="intent-switcher__item"
@@ -119,7 +184,7 @@ export function ActivityPage({ controller: c }: { controller: Controller }) {
               <ScrollText className="size-3.5" /> Audit
             </button>
           </div>
-          {view !== "audit" ? (
+          {view === "approvals" || view === "commands" ? (
             <label className="relative block">
               <span className="sr-only">Filter activity</span>
               <input
@@ -132,8 +197,122 @@ export function ActivityPage({ controller: c }: { controller: Controller }) {
           ) : null}
         </div>
 
+        <div className="flex flex-wrap items-center justify-between gap-3 border-b border-control bg-surface-inset/25 px-5 py-3" aria-label="Scheduled worker health">
+          <div className="min-w-0">
+            <div className="flex flex-wrap items-center gap-2">
+              <span className="text-xs font-semibold text-ink">Scheduled background work</span>
+              {scheduler ? <StatusBadge tone={schedulerTone} label={scheduler.status.replaceAll("_", " ")} /> : null}
+            </div>
+            <p className="mt-1 text-[11px] text-ink-muted">
+              {c.backgroundLivenessError
+                ? c.backgroundLivenessError
+                : scheduler
+                  ? `Last successful run ${formatRelativeTime(scheduler.lastSuccessAt)}. This is scheduler evidence, separate from connector, T3, and provider health.`
+                  : "Scheduler evidence is loading. Connector, T3, and provider health are reported separately."}
+            </p>
+          </div>
+          <Button size="sm" variant="ghost" onClick={() => void c.refreshBackgroundLiveness()}>
+            <RefreshCw className="size-3.5" /> Check scheduler
+          </Button>
+        </div>
+
         <div className="activity-list__body">
-          {view === "audit" ? (
+          {view === "notifications" ? (
+            !c.notificationsLoaded ? (
+              <div className="grid min-h-full place-items-center p-8" role="status">
+                <span className="inline-flex items-center gap-2 text-sm text-ink-muted">
+                  <LoaderCircle className="size-4 animate-spin motion-reduce:animate-none" /> Loading notifications…
+                </span>
+              </div>
+            ) : c.notificationsError && c.notifications.length === 0 ? (
+              <EmptyState
+                icon={WifiOff}
+                title="Notifications are unavailable"
+                description={`${c.notificationsError} Durable records will replay when the gateway is reachable again.`}
+                action={<Button onClick={() => void c.refreshNotifications()}><RefreshCw className="size-4" /> Retry</Button>}
+              />
+            ) : c.notifications.length ? (
+              <div>
+                <div className="flex flex-wrap items-center justify-between gap-3 border-b border-control px-5 py-3">
+                  <p className="text-xs text-ink-muted">
+                    {c.connection === "reconnecting"
+                      ? "Live updates are reconnecting; durable replay remains authoritative."
+                      : `${c.notificationUnreadCount} unread · retained for 30 days, up to 1,000 records.`}
+                  </p>
+                  {c.notificationUnreadCount ? (
+                    <Button
+                      size="sm"
+                      variant="ghost"
+                      busy={c.busyAction === "read-all-notifications"}
+                      onClick={() => void c.run("read-all-notifications", "All notifications marked read.", c.markAllNotificationsRead)}
+                    >
+                      <Check className="size-3.5" /> Mark all read
+                    </Button>
+                  ) : null}
+                </div>
+                <div className="divide-y divide-control">
+                  {c.notifications.map((notification) => {
+                    const unread = !notification.readAt;
+                    const notificationTone = notification.severity === "error"
+                      ? "danger" as const
+                      : notification.severity === "attention" ? "warning" as const : "info" as const;
+                    const environment = notification.environmentId
+                      ? c.environments.find((candidate) => candidate.id === notification.environmentId)
+                      : null;
+                    return (
+                      <article
+                        key={notification.id}
+                        className="grid gap-4 px-5 py-4 sm:grid-cols-[minmax(0,1fr)_auto] sm:items-center"
+                        data-unread={unread || undefined}
+                      >
+                        <button
+                          type="button"
+                          className="min-w-0 rounded-md text-left outline-none focus-visible:ring-2 focus-visible:ring-focus"
+                          onClick={() => void openNotification(notification)}
+                        >
+                          <div className="flex flex-wrap items-center gap-2">
+                            {unread ? <span className="size-2 rounded-full bg-primary" aria-label="Unread" /> : null}
+                            <span className="font-display text-sm font-semibold">{notification.title}</span>
+                            <StatusBadge tone={notificationTone} label={notification.kind.replaceAll("_", " ").replaceAll(".", " · ")} />
+                          </div>
+                          <p className="mt-2 truncate text-xs text-ink-muted">
+                            {environment?.label ?? notification.environmentId ?? "Account"}
+                            {notification.threadId ? ` · thread ${notification.threadId}` : ""}
+                          </p>
+                          <p className="mt-2 font-mono text-[11px] text-ink-faint">
+                            {formatRelativeTime(notification.createdAt)} · {unread ? "unread" : `read ${formatRelativeTime(notification.readAt)}`}
+                          </p>
+                        </button>
+                        <div className="flex flex-wrap items-center gap-2">
+                          {unread ? (
+                            <Button size="sm" variant="ghost" onClick={() => void markRead(notification.id)}>
+                              <Check className="size-3.5" /> Mark read
+                            </Button>
+                          ) : null}
+                          <Button size="sm" variant="ghost" onClick={() => void dismiss(notification.id)}>
+                            <Trash2 className="size-3.5" /> Dismiss
+                          </Button>
+                        </div>
+                      </article>
+                    );
+                  })}
+                </div>
+                {c.notificationsHaveMore ? (
+                  <div className="border-t border-control p-4 text-center">
+                    <Button onClick={() => void c.loadOlderNotifications()}>
+                      <History className="size-4" /> Load older
+                    </Button>
+                  </div>
+                ) : null}
+              </div>
+            ) : (
+              <EmptyState
+                icon={BellRing}
+                title="No notifications"
+                description="Completed or failed turns, decisions that need you, and connection changes will appear here and replay after reconnect."
+              />
+            )
+          ) : view === "audit" ? (
             c.audit.length ? (
               <div className="divide-y divide-control">
                 {c.audit.map((event, index) => (

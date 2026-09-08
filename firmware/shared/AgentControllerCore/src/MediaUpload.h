@@ -1,18 +1,16 @@
 #pragma once
 
-// Getting captured bytes to POST /v1/device/media without ever holding a second copy of them.
-//
-// The gateway takes media as base64 inside a JSON body. A 30 s clip at 16 kHz mono is ~960 KB of
-// PCM, whose base64 form is ~1.28 MB — on a board whose entire internal heap is ~300 KB, building
-// that String is not a tight fit, it is impossible. So the body is generated on demand, four
-// characters at a time, straight into HTTPClient's TCP buffer, with the capture buffer in PSRAM
-// remaining the only full copy of the payload.
+// Streams captured bytes to the gateway without holding a second copy. The upload-session API sends
+// the raw header/body segments over an authenticated HTTP PUT, avoiding base64's 33% wire overhead
+// and keeping large media off the device WebSocket path.
 //
 // Lifted from the CrowPanel firmware's media_capture.h, which is the only implementation proven
 // against a live gateway. Nothing here is board-specific: it is a Stream over two byte ranges.
 
 #include <Arduino.h>
 #include <Stream.h>
+
+class DeviceStore;
 
 namespace media {
 
@@ -22,6 +20,72 @@ constexpr size_t kWavHeaderBytes = 44;
 
 void buildWavHeader(uint8_t header[kWavHeaderBytes], uint32_t dataBytes, uint32_t sampleRateHz,
                     uint16_t channels = 1, uint16_t bitsPerSample = 16);
+
+String sha256Hex(const uint8_t* headerBytes, size_t headerLength,
+                 const uint8_t* bodyBytes, size_t bodyLength);
+
+struct UploadSessionResult {
+  String mediaId;
+  String jobId;
+  int httpStatus = -1;
+};
+
+// Shared device upload transport used by every board and voice surface. The caller owns capture,
+// review UI, pins and buffers; this owns authenticated create/raw-PUT/finalize, integrity metadata,
+// retry-after backoff, and the private gateway contract.
+UploadSessionResult uploadSession(
+  DeviceStore& store,
+  const char* requestNamespace,
+  const char* kind,
+  const char* contentType,
+  const char* originalName,
+  const uint8_t* headerBytes,
+  size_t headerLength,
+  const uint8_t* bodyBytes,
+  size_t bodyLength,
+  uint32_t maxRawBytes,
+  uint32_t* backoffUntil = nullptr
+);
+
+class SegmentedBodyStream : public Stream {
+ public:
+  SegmentedBodyStream(const uint8_t* headerBytes, size_t headerLength,
+                      const uint8_t* bodyBytes, size_t bodyLength)
+    : header_(headerBytes),
+      headerLength_(headerBytes ? headerLength : 0),
+      body_(bodyBytes),
+      bodyLength_(bodyBytes ? bodyLength : 0) {}
+
+  size_t contentLength() const { return headerLength_ + bodyLength_; }
+  int available() override {
+    const size_t remaining = contentLength() - position_;
+    return static_cast<int>(remaining);
+  }
+  int read() override {
+    if (position_ >= contentLength()) return -1;
+    return byteAt(position_++);
+  }
+  int peek() override { return position_ < contentLength() ? byteAt(position_) : -1; }
+  size_t readBytes(char* buffer, size_t length) override {
+    const size_t count = min(length, contentLength() - position_);
+    for (size_t index = 0; index < count; index += 1) buffer[index] = byteAt(position_ + index);
+    position_ += count;
+    return count;
+  }
+  size_t write(uint8_t) override { return 0; }
+  void flush() override {}
+
+ private:
+  uint8_t byteAt(size_t index) const {
+    if (index < headerLength_) return header_[index];
+    return body_[index - headerLength_];
+  }
+  const uint8_t* header_ = nullptr;
+  size_t headerLength_ = 0;
+  const uint8_t* body_ = nullptr;
+  size_t bodyLength_ = 0;
+  size_t position_ = 0;
+};
 
 // Length of the base64 encoding of rawLength bytes, including '=' padding.
 inline size_t base64EncodedLength(size_t rawLength) {

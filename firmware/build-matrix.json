@@ -1,0 +1,96 @@
+{
+  "schemaVersion": 1,
+  "platform": "https://github.com/pioarduino/platform-espressif32/releases/download/55.03.311/platform-espressif32.zip",
+  "environments": [
+    {
+      "hardwareModel": "e213-esp32-s3r8",
+      "directory": "CrowPanel-ESP32-2.13-E-paper",
+      "environment": "crowpanel-esp32-213-epaper-secure",
+      "role": "release"
+    },
+    {
+      "hardwareModel": "e213-esp32-s3r8",
+      "directory": "CrowPanel-ESP32-2.13-E-paper",
+      "environment": "crowpanel-esp32-213-epaper",
+      "role": "bench"
+    },
+    {
+      "hardwareModel": "e213-esp32-s3r8",
+      "directory": "CrowPanel-ESP32-2.13-E-paper",
+      "environment": "crowpanel-esp32-213-epaper-capture",
+      "role": "carrier-probe"
+    },
+    {
+      "hardwareModel": "e213-esp32-s3r8",
+      "directory": "CrowPanel-ESP32-2.13-E-paper",
+      "environment": "crowpanel-esp32-213-epaper-capture-placeholder",
+      "role": "hermetic-probe"
+    },
+    {
+      "hardwareModel": "e213-esp32-s3r8",
+      "directory": "CrowPanel-ESP32-2.13-E-paper",
+      "environment": "epd-probe",
+      "role": "probe"
+    },
+    {
+      "hardwareModel": "ips28-esp32-s3r8",
+      "directory": "Hosyond-ESP32-S3-2.8-Touchscreen",
+      "environment": "hosyond-es3c28p-controller",
+      "role": "release"
+    },
+    {
+      "hardwareModel": "ips28-esp32-s3r8",
+      "directory": "Hosyond-ESP32-S3-2.8-Touchscreen",
+      "environment": "hosyond-es3c28p",
+      "role": "bench"
+    },
+    {
+      "hardwareModel": "ips28-esp32-s3r8",
+      "directory": "Hosyond-ESP32-S3-2.8-Touchscreen",
+      "environment": "hosyond-es3c28p-capture",
+      "role": "probe"
+    },
+    {
+      "hardwareModel": "ips28-esp32-s3r8",
+      "directory": "Hosyond-ESP32-S3-2.8-Touchscreen",
+      "environment": "hosyond-es3c28p-recovery",
+      "role": "recovery"
+    },
+    {
+      "hardwareModel": "ips28-esp32-s3r8",
+      "directory": "Hosyond-ESP32-S3-2.8-Touchscreen",
+      "environment": "hosyond-es3c28p-display",
+      "role": "probe"
+    },
+    {
+      "hardwareModel": "ips28-esp32-s3r8",
+      "directory": "Hosyond-ESP32-S3-2.8-Touchscreen",
+      "environment": "hosyond-es3c28p-orbbench",
+      "role": "benchmark"
+    },
+    {
+      "hardwareModel": "ips28-esp32-s3r8",
+      "directory": "Hosyond-ESP32-S3-2.8-Touchscreen",
+      "environment": "hosyond-es3c28p-bench",
+      "role": "benchmark"
+    },
+    {
+      "hardwareModel": "amoled175-esp32-s3r8",
+      "directory": "Waveshare-ESP32-S3-Touch-AMOLED-1.75C",
+      "environment": "waveshare-amoled-175c",
+      "role": "scaffold"
+    },
+    {
+      "hardwareModel": "amoled175-esp32-s3r8",
+      "directory": "Waveshare-ESP32-S3-Touch-AMOLED-1.75C",
+      "environment": "waveshare-amoled-175c-capture",
+      "role": "scaffold-probe"
+    },
+    {
+      "hardwareModel": "vision-master-t190",
+      "directory": "vision-master-t190",
+      "environment": "vision-master-t190",
+      "role": "scaffold"
+    }
+  ]
+}

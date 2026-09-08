@@ -1,7 +1,7 @@
 import { createCommandArbiter } from "./commandArbiter.mjs";
 import { isEnvironmentTokenExpired } from "./t3Client.mjs";
 import { parseProviderError } from "./t3Harness.mjs";
-import { openT3ThreadStream } from "./t3Ws.mjs";
+import { createT3TransportResolver } from "./t3Transport.mjs";
 
 // The live thread stream: T3's `orchestration.subscribeThread` in, the existing SSE broker out.
 //
@@ -84,17 +84,22 @@ const KEY_SEPARATOR = " ";
 export function createThreadStreamHub({
   store,
   events = null,
+  notifications = null,
   intervalMs = DEFAULT_INTERVAL_MS,
   watchTtlMs = DEFAULT_WATCH_TTL_MS,
   baseBackoffMs = DEFAULT_BASE_BACKOFF_MS,
   maxBackoffMs = DEFAULT_MAX_BACKOFF_MS,
-  openStream = openT3ThreadStream,
+  openStream = null,
+  transportResolver = createT3TransportResolver(),
   streamOptions = {},
   // Shared with the snapshot poller by createApp(): see src/commandArbiter.mjs.
   arbiter = createCommandArbiter(),
   now = () => Date.now(),
   logger = console,
 } = {}) {
+  const openEnvironmentStream = openStream ?? ((environment, input, options) => (
+    transportResolver.forEnvironment(environment).openThreadStream(environment, input, options)
+  ));
   /** @type {Map<string, object>} one entry per watched thread; the subscription lives on it. */
   const entries = new Map();
   let timer = null;
@@ -262,7 +267,7 @@ export function createThreadStreamHub({
     publishStatus(entry, entry.resumeRequested ? "resuming" : "connecting", {});
 
     try {
-      entry.handle = openStream(
+      entry.handle = openEnvironmentStream(
         environment,
         {
           threadId: entry.threadId,
@@ -335,6 +340,9 @@ export function createThreadStreamHub({
 
     const thread = snapshot?.thread ?? null;
     seedOutcomeFromThread(entry, thread);
+    for (const activity of (Array.isArray(thread?.activities) ? thread.activities : []).slice(-200)) {
+      await projectInteractionNotification(entry, activity);
+    }
 
     publish(entry, "t3.thread.snapshot", {
       reset: true,
@@ -371,6 +379,9 @@ export function createThreadStreamHub({
       commandId: event?.commandId ?? null,
       event,
     });
+    if (event?.type === "thread.activity-appended") {
+      await projectInteractionNotification(entry, event?.payload?.activity);
+    }
 
     // Reconciliation costs a listCommands, so it is only attempted on the events that can
     // actually end a turn: a session error, or a finished (non-streaming) assistant message.
@@ -487,7 +498,7 @@ export function createThreadStreamHub({
           outcome: entry.outcome,
           source: "stream",
           apply: async (decision) => {
-            await store.updateCommand({
+            const updated = await store.updateCommand({
               userId: entry.userId,
               commandId: command.id,
               status: decision.status,
@@ -508,6 +519,13 @@ export function createThreadStreamHub({
               observedAt: new Date(now()).toISOString(),
               source: "stream",
             });
+            if (notifications?.forCommand) {
+              try {
+                await notifications.forCommand(updated);
+              } catch (error) {
+                logger?.warn?.(`thread stream: command notification failed for ${command.id}: ${message(error)}`);
+              }
+            }
           },
         });
         if (update) applied.push({ commandId: command.id, status: update.status });
@@ -525,6 +543,19 @@ export function createThreadStreamHub({
       ...payload,
       observedAt: new Date(now()).toISOString(),
     });
+  }
+
+  async function projectInteractionNotification(entry, activity) {
+    try {
+      await notifications?.forThreadActivity?.({
+        userId: entry.userId,
+        environmentId: entry.environmentId,
+        threadId: entry.threadId,
+        activity,
+      });
+    } catch (error) {
+      logger?.warn?.(`thread stream: notification projection failed for ${entry.threadId}: ${message(error)}`);
+    }
   }
 
   function publishStatus(entry, state, extra) {

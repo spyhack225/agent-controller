@@ -60,7 +60,11 @@ test("runs, edits, and duplicates an existing action", async () => {
   fireEvent.click(screen.getByRole("button", { name: "Run" }));
   await waitFor(() => expect(c.api).toHaveBeenCalledWith("/v1/actions/action_review/run", {
     method: "POST",
-    body: { environmentId: "env_1", threadId: "thread_1" },
+    body: {
+      environmentId: "env_1",
+      threadId: "thread_1",
+      clientRequestId: expect.stringMatching(/^web:/u),
+    },
   }));
 
   fireEvent.click(screen.getByRole("button", { name: "Duplicate Review branch" }));
@@ -137,7 +141,12 @@ test("requires and dispatches a compatible media upload when testing a media act
 
   await waitFor(() => expect(c.api).toHaveBeenCalledWith("/v1/actions/action_photo/run", {
     method: "POST",
-    body: { environmentId: "env_1", threadId: "thread_1", mediaUploadId: "media_image" },
+    body: {
+      environmentId: "env_1",
+      threadId: "thread_1",
+      mediaUploadId: "media_image",
+      clientRequestId: expect.stringMatching(/^web:/u),
+    },
   }));
 });
 

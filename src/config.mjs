@@ -1,5 +1,6 @@
 import { loadAlertThresholds } from "./alerts.mjs";
 import { loadRateLimitConfig } from "./rateLimit.mjs";
+import { loadWebPushConfig } from "./webPush.mjs";
 import {
   PARAKEET_ACCEPTED_CONTENT_TYPES,
   PARAKEET_DEFAULT_CONCURRENCY,
@@ -17,10 +18,19 @@ export function loadConfig(env = process.env) {
     host: env.HOST ?? "127.0.0.1",
     port: Number.parseInt(env.PORT ?? "3996", 10),
     publicBaseUrl: env.PUBLIC_BASE_URL ?? null,
+    deploymentMode: env.DEPLOYMENT_MODE === "cloud" ? "cloud" : "self-hosted",
     dataFile: env.DATA_FILE ?? null,
     mediaDir: env.MEDIA_DIR ?? ".data/media",
     maxMediaBytes: Number.parseInt(env.MAX_MEDIA_BYTES ?? String(2 * 1024 * 1024), 10),
+    maxOwnerMediaBytes: normalizePositiveInt(env.MAX_OWNER_MEDIA_BYTES, 64 * 1024 * 1024),
+    maxImageDimension: normalizePositiveInt(env.MAX_IMAGE_DIMENSION, 8192),
+    maxImagePixels: normalizePositiveInt(env.MAX_IMAGE_PIXELS, 40_000_000),
+    maxAudioDurationSeconds: normalizePositiveInt(env.MAX_AUDIO_DURATION_SECONDS, 300),
+    maxAudioSampleRate: normalizePositiveInt(env.MAX_AUDIO_SAMPLE_RATE, 96_000),
+    maxAudioChannels: normalizePositiveInt(env.MAX_AUDIO_CHANNELS, 2),
+    mediaUploadSessionTtlMs: normalizePositiveInt(env.MEDIA_UPLOAD_SESSION_TTL_MS, 15 * 60 * 1000),
     defaultMediaRetentionDays: normalizeRetentionDays(env.DEFAULT_MEDIA_RETENTION_DAYS, 30),
+    environmentRetentionDays: normalizeRetentionDays(env.ENVIRONMENT_RETENTION_DAYS, 30) ?? 30,
     mediaSigningKey: env.MEDIA_SIGNING_KEY
       ?? env.T3_TOKEN_ENCRYPTION_KEY
       ?? env.GATEWAY_TOKEN_ENCRYPTION_KEY
@@ -63,6 +73,23 @@ export function loadConfig(env = process.env) {
     // When set, a finished transcript parks at `review_required` until a person accepts or edits
     // it, instead of being written straight onto the media record.
     transcriptionReviewRequired: normalizeBoolean(env.TRANSCRIPTION_REVIEW_REQUIRED, false),
+    // Cloud consumers replace process timers one-for-one. Keeping these separate makes a partial
+    // rollout fail closed instead of disabling every local runner because one Queue exists.
+    cloudMediaConsumerEnabled: normalizeBoolean(env.CLOUD_MEDIA_CONSUMER_ENABLED, false),
+    cloudSnapshotConsumerEnabled: normalizeBoolean(env.CLOUD_SNAPSHOT_CONSUMER_ENABLED, false),
+    cloudThreadStreamConsumerEnabled: normalizeBoolean(env.CLOUD_THREAD_STREAM_CONSUMER_ENABLED, false),
+    cloudConnectorEventConsumerEnabled: normalizeBoolean(env.CLOUD_CONNECTOR_EVENT_CONSUMER_ENABLED, false),
+    cloudRetentionConsumerEnabled: normalizeBoolean(env.CLOUD_RETENTION_CONSUMER_ENABLED, false),
+    webPush: loadWebPushConfig(env),
+    webPushEncryptionKey: env.WEB_PUSH_STORAGE_ENCRYPTION_KEY
+      ?? env.T3_TOKEN_ENCRYPTION_KEY
+      ?? env.GATEWAY_TOKEN_ENCRYPTION_KEY
+      ?? env.GATEWAY_CONVEX_SECRET
+      ?? null,
+    webPushStorageEncryptionKeyConfigured: typeof env.WEB_PUSH_STORAGE_ENCRYPTION_KEY === "string"
+      && env.WEB_PUSH_STORAGE_ENCRYPTION_KEY.length > 0,
+    webPushWorkerEnabled: normalizeBoolean(env.WEB_PUSH_WORKER_ENABLED, true),
+    webPushWorkerIntervalMs: normalizePositiveInt(env.WEB_PUSH_WORKER_INTERVAL_MS, 2_000),
     // Parakeet is a local ASR sidecar, not a hosted API, so it gets its own settings rather than
     // borrowing the TRANSCRIPTION_* ones: the defaults differ in kind. A CPU box is slow, so the
     // timeout is minutes rather than seconds, the model is a checkpoint name rather than a whisper
@@ -95,6 +122,8 @@ export function loadConfig(env = process.env) {
     // Phase 4 "TLS only": refuse to issue or accept device credentials in cleartext.
     // Loopback is always exempt so local development and the simulator still work.
     requireTls: normalizeBoolean(env.REQUIRE_TLS, false),
+    gatewayTlsRootCaPem: normalizePem(env.GATEWAY_TLS_ROOT_CA_PEM),
+    gatewayTlsNextRootCaPem: normalizePem(env.GATEWAY_TLS_NEXT_ROOT_CA_PEM),
     billingWebhookSecret: env.BILLING_WEBHOOK_SECRET ?? null,
     // Plan limits and tier-based policy are inert until an operator turns billing on. Otherwise
     // every existing deployment would silently drop to the free tier's 0-device, no-shell limits.
@@ -117,6 +146,7 @@ export function loadConfig(env = process.env) {
     convexUrl: env.CONVEX_URL ?? null,
     convexDeployment: env.CONVEX_DEPLOYMENT ?? null,
     convexGatewaySecret: env.GATEWAY_CONVEX_SECRET ?? null,
+    connectorTicketAudience: env.CONNECTOR_TICKET_AUDIENCE ?? "agent-controller-connectors",
     t3TokenEncryptionKey: env.T3_TOKEN_ENCRYPTION_KEY ?? env.GATEWAY_TOKEN_ENCRYPTION_KEY ?? null,
     clerkJwtIssuerDomain: env.CLERK_JWT_ISSUER_DOMAIN ?? null,
     // Only classify request origin when the operator has actually declared trusted ranges.
@@ -173,6 +203,13 @@ function normalizeBoolean(value, fallback) {
   if (["1", "true", "yes", "on"].includes(normalized)) return true;
   if (["0", "false", "no", "off"].includes(normalized)) return false;
   return fallback;
+}
+
+function normalizePem(value) {
+  if (!value) return "";
+  // `.env` files commonly carry a PEM on one line with escaped newlines. Convert those before
+  // manufacturing's C-string encoder escapes the real line breaks for controller_config.h.
+  return String(value).replaceAll("\\n", "\n");
 }
 
 function normalizeRetentionDays(value, fallback) {

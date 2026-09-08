@@ -21,6 +21,7 @@ import { createMemoryStore } from "../src/store.mjs";
 // coding agent as instructions, because auto-send now defaults on for a microphone device.
 
 const USER_ID = "user_dev";
+const WEBM_BASE64 = Buffer.from([0x1a, 0x45, 0xdf, 0xa3]).toString("base64");
 
 function wavClip(seconds, { sampleRate = 16000, channels = 1, bitsPerSample = 16 } = {}) {
   const byteRate = sampleRate * channels * (bitsPerSample / 8);
@@ -374,7 +375,7 @@ async function setupGateway(t, { features = ["display", "buttons", "microphone"]
       body: {
         kind: "audio",
         contentType: "audio/webm",
-        dataBase64: Buffer.from("pretend this is a webm").toString("base64"),
+        dataBase64: WEBM_BASE64,
         originalName: "note.webm",
         ...body,
       },

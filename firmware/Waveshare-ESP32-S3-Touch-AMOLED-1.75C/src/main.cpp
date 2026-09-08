@@ -1,19 +1,19 @@
-// Waveshare ESP32-S3-Touch-AMOLED-1.75C — bring-up scaffold.
+// Waveshare ESP32-S3-Touch-AMOLED-1.75C — safe network bring-up target.
 //
-// This is deliberately NOT a port of the CrowPanel firmware. It boots, opens NVS, runs the shared
-// provisioning state machine, and reports what it finds over USB serial. That is enough to confirm
-// the board, the partition table, the PSRAM configuration, and the SoftAP portal on real hardware
-// before anyone writes a display or audio driver against unverified pins.
+// The board and every peripheral pin remain unverified. This target therefore touches no AMOLED,
+// touch, PMIC, or audio pin. It does exercise the board-independent product path that is safe to
+// prove without them: NVS identity, owner Wi-Fi provisioning, authenticated cloud heartbeat,
+// stable claim code, credential rotation, OTA rollback observation, and explicit recovery.
 //
-// The gateway client (heartbeat, display state, intent submission, OTA, media upload) is not here
-// because it does not exist as a reusable component yet — it lives inside the CrowPanel's
-// 3.6k-line main.cpp. Extracting it into firmware/shared is the first task of the real port; see
-// README.md.
+// USB serial reports link transitions for bring-up evidence, but exposes no remote-operation
+// command surface. The heartbeat explicitly advertises no display, thread picker, microphone, or
+// camera until the corresponding hardware path has been verified on a 1.75C.
 
 #include <Arduino.h>
 #include <WiFi.h>
 
 #include <DeviceStore.h>
+#include <GatewayClient.h>
 #include <Provisioning.h>
 
 #if __has_include("controller_config.h")
@@ -34,13 +34,18 @@ namespace {
 
 DeviceStore store;
 Provisioning provisioning;
+GatewayClient gateway;
 
 ProvisioningState lastState = ProvisioningState::Unprovisioned;
 uint32_t bootHeldSince = 0;
+bool bootWasDown = false;
+bool bootResetFired = false;
+GatewayLink observedGatewayLink = GatewayLink::Idle;
+uint32_t observedGatewayRevision = 0;
 
-// PSRAM is not optional on this board: the AMOLED framebuffer alone is ~434 KB at 16 bpp, and a
-// 30 s audio clip is another ~960 KB. A build with the wrong memory_type silently falls back to
-// no PSRAM and then fails much later, in a confusing place, so check it loudly at boot.
+// PSRAM is not optional once the display or microphone is enabled: one 16-bpp framebuffer is
+// ~434 KB and a 30 s mono clip is ~960 KB. Report it now without treating its absence as proof of
+// any peripheral failure.
 void reportMemory() {
   Serial.printf("Flash size:  %u bytes\n", (unsigned)ESP.getFlashChipSize());
   Serial.printf("Heap free:   %u bytes\n", (unsigned)ESP.getFreeHeap());
@@ -48,8 +53,7 @@ void reportMemory() {
   const size_t psram = ESP.getPsramSize();
   if (psram == 0) {
     Serial.println("PSRAM:       NOT DETECTED");
-    Serial.println("  The framebuffer and audio buffers both need it. Check that platformio.ini");
-    Serial.println("  sets board_build.arduino.memory_type = qio_opi for this ESP32-S3R8.");
+    Serial.println("  Display/audio remain disabled. Check qio_opi before peripheral bring-up.");
     return;
   }
   Serial.printf("PSRAM:       %u bytes free of %u\n",
@@ -60,12 +64,10 @@ void reportIdentity() {
   if (store.hasIdentity()) {
     Serial.printf("Device id:   %s\n", store.deviceId().c_str());
     Serial.printf("Gateway:     %s\n", store.gatewayUrl().c_str());
-  } else {
-    Serial.println("Device id:   none in NVS");
-    Serial.println("  Seed one by copying controller_config.example.h to controller_config.h and");
-    Serial.println("  filling in DEVICE_ID / DEVICE_SECRET from POST /v1/devices, or flash a");
-    Serial.println("  factory nvsSeed CSV from POST /v1/factory/batches.");
+    return;
   }
+  Serial.println("Device id:   none in NVS");
+  Serial.println("  Factory identity is required; an owner cannot repair this over the portal.");
 }
 
 void reportState(ProvisioningState state) {
@@ -75,7 +77,7 @@ void reportState(ProvisioningState state) {
   Serial.println();
 
   if (state == ProvisioningState::Provisioning) {
-    Serial.printf("  Join \"%s\" and open %s to set Wi-Fi.\n",
+    Serial.printf("  Join \"%s\" and open %s to set Wi-Fi/gateway.\n",
                   status.apName.c_str(), status.portalUrl.c_str());
   }
   if (state == ProvisioningState::Online) {
@@ -83,54 +85,87 @@ void reportState(ProvisioningState state) {
   }
 }
 
-// Recovery path, matching the CrowPanel's EXIT long-press: hold BOOT to wipe Wi-Fi credentials and
-// re-raise the portal. This is what a user does after a house move, a resale, or a revoked device.
-void pollResetButton() {
-  const bool held = digitalRead(BOOT_BUTTON_PIN) == LOW;
-  if (!held) {
-    bootHeldSince = 0;
+void reportGatewayChanges() {
+  if (!gateway.tryLockState(0)) return;
+  const GatewayLink link = gateway.link();
+  const uint32_t revision = gateway.revision();
+  if (link == observedGatewayLink && revision == observedGatewayRevision) {
+    gateway.unlockState();
     return;
   }
-  if (bootHeldSince == 0) {
-    bootHeldSince = millis();
-    return;
-  }
-  if (millis() - bootHeldSince < PROVISIONING_RESET_HOLD_MS) return;
+  observedGatewayLink = link;
+  observedGatewayRevision = revision;
 
-  bootHeldSince = 0;
-  Serial.println("[provisioning] BOOT held — clearing Wi-Fi and re-entering provisioning.");
-  provisioning.resetToProvisioning();
+  Serial.printf("[gateway] %s", gatewayLinkName(link));
+  if (gateway.detail().length()) Serial.printf(" — %s", gateway.detail().c_str());
+  Serial.println();
+  if (link == GatewayLink::Unclaimed) {
+    if (gateway.claimCode().length()) {
+      Serial.printf("  claim code: %s", gateway.claimCode().c_str());
+      if (store.claimCodeExpiresAt().length()) {
+        Serial.printf(" (expires %s)", store.claimCodeExpiresAt().c_str());
+      }
+      Serial.println();
+    } else {
+      Serial.println("  claim code pending; keep the gateway reachable");
+    }
+  } else if (link == GatewayLink::Revoked) {
+    Serial.println("  ACCESS REMOVED — hold BOOT 10 s to clear owner setup and re-provision");
+  } else if (link == GatewayLink::NoIdentity) {
+    Serial.println("  factory identity missing; owner provisioning cannot repair it");
+  } else if (link == GatewayLink::Claimed) {
+    Serial.println("  claimed and healthy; hardware operation remains disabled in this scaffold");
+  }
+  gateway.unlockState();
+}
+
+// BOOT uses the same recoverable contract as the proven touchscreen controller: a tap reopens the
+// configuration portal without destroying working Wi-Fi, while a 10 s hold clears Wi-Fi/config
+// cache/claim-code but preserves the factory identity. A stolen unit cannot unbind itself.
+void pollBootButton() {
+  const bool down = digitalRead(BOOT_BUTTON_PIN) == LOW;
+
+  if (down && !bootWasDown) {
+    bootHeldSince = millis();
+    bootWasDown = true;
+    bootResetFired = false;
+    return;
+  }
+
+  if (down) {
+    if (!bootResetFired && millis() - bootHeldSince >= PROVISIONING_RESET_HOLD_MS) {
+      bootResetFired = true;
+      Serial.println("[provisioning] BOOT held — clearing owner setup and reopening provisioning.");
+      provisioning.resetToProvisioning();
+    }
+    return;
+  }
+
+  if (!bootWasDown) return;
+  bootWasDown = false;
+  if (bootResetFired) return;
+
+  Serial.println("[provisioning] BOOT tapped — opening the configuration portal.");
+  provisioning.openConfigPortal();
 }
 
 }  // namespace
 
 void setup() {
   Serial.begin(115200);
-
-  // Never block on a serial write.
-  //
-  // Serial here is the ESP32-S3's native USB CDC, and by default a write waits for the host to
-  // drain the TX buffer. With a monitor attached that is invisible; with nothing reading, the
-  // buffer fills and every Serial.printf stalls the loop for the timeout — so the bug is masked by
-  // the very tool used to look for it. 0 means "write what fits, drop the rest", which is the right
-  // trade: diagnostics are worth nothing if printing them is what stops the device working.
-  Serial.setTxTimeoutMs(0);
-
-  // Native USB CDC needs a moment before the host enumerates it, and anything printed before that
-  // is lost. This board programs over native USB, unlike the CrowPanel.
-  delay(2000);
+  Serial.setTxTimeoutMs(0);  // diagnostics must never stop the controller when no host is reading
+  delay(2000);               // native USB CDC enumeration; bounded and boot-only
 
   Serial.println();
-  Serial.println("=== Agent Controller — Waveshare ESP32-S3-Touch-AMOLED-1.75C ===");
+  Serial.println("=== Agent Controller — Waveshare AMOLED 1.75C safe bring-up ===");
   Serial.printf("Model:       %s\n", HARDWARE_MODEL);
   Serial.printf("Firmware:    %s\n", FIRMWARE_VERSION);
+  Serial.println("Capabilities: none (AMOLED/touch/audio remain unverified and disabled)");
   reportMemory();
 
   pinMode(BOOT_BUTTON_PIN, INPUT_PULLUP);
 
   if (!store.begin()) {
-    // On this hardware an NVS failure means the partition table is wrong. There is nothing useful
-    // to do afterwards, and pretending otherwise hides the real fault.
     Serial.println("FATAL: NVS unavailable. Check board_build.partitions in platformio.ini.");
     return;
   }
@@ -138,21 +173,23 @@ void setup() {
   store.seedIdentityIfEmpty(DEVICE_ID, DEVICE_SECRET, GATEWAY_BASE_URL);
   reportIdentity();
 
+  // The four-argument form is intentional. This build has authenticated cloud transport and a
+  // USB serial diagnostics, but neither is evidence that the customer can see or operate the
+  // round screen. The gateway must not assign any hardware control on that basis.
+  gateway.setCapabilities(false, false, false, false);
+  GatewayLimits limits;
+  limits.menuItems = 0;
+  limits.threadItems = 0;
+  limits.labelCharacters = 0;
+  limits.mediaUploadBytes = 0;
+  gateway.setLimits(limits);
+  gateway.begin(store, HARDWARE_MODEL, FIRMWARE_VERSION);
+  gateway.handleOtaBootAttempt();
+  gateway.startNetworkTask();
+
   provisioning.begin(store, store.deviceId());
   lastState = provisioning.status().state;
   reportState(lastState);
-
-  // ---------------------------------------------------------------------------------------
-  // Not yet implemented. Each of these needs its pins confirmed against the 1.75C schematic
-  // before it is written, and each is tracked in README.md:
-  //
-  //   AXP2101 PMIC init over I2C — must come first; it gates the display and audio rails.
-  //   CO5300 AMOLED over QSPI    — 466x466, framebuffer from PSRAM.
-  //   CST9217 touch over I2C     — two-point, interrupt on TOUCH_INT_PIN.
-  //   ES7210 mic array init      — the one genuinely new driver; standard I2S read after init.
-  //   ES8311 codec + PA          — speaker playback, optional for v1.
-  //   Gateway client             — extract from the CrowPanel main.cpp into firmware/shared.
-  // ---------------------------------------------------------------------------------------
 }
 
 void loop() {
@@ -160,12 +197,20 @@ void loop() {
   if (state != lastState) {
     lastState = state;
     reportState(state);
+    if (state != ProvisioningState::Online && !provisioning.configPortalActive()) {
+      if (gateway.tryLockState(0)) {
+        gateway.goOffline();
+        gateway.unlockState();
+      }
+    }
   }
 
   if (provisioning.consumeJustConnected()) {
-    Serial.println("[provisioning] joined — the gateway handshake would run here.");
+    Serial.println("[provisioning] joined — starting authenticated gateway handshake.");
+    gateway.notifyJustConnected();
   }
 
-  pollResetButton();
-  delay(20);
+  pollBootButton();
+  reportGatewayChanges();
+  delay(10);
 }

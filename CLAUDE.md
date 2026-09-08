@@ -7,7 +7,8 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 Cloud control plane ("gateway") that lets remote controller hardware (ESP32 devices) and a web console drive
 [T3 Code](https://github.com/pingdotgg/t3code) agent environments running on a user's own machine. The gateway never
 runs agents itself — it authenticates actors, applies policy, and dispatches orchestration commands to a paired T3 Code
-instance over HTTP.
+instance. In managed-cloud mode that traffic crosses an authenticated outbound connector WebSocket while T3 remains
+loopback-local; direct HTTP transport is retained only for self-hosted deployments.
 
 Node >= 22 is required. The server uses ESM (`.mjs`) with **zero runtime web framework** — a hand-rolled `node:http`
 server. The frontend is React 19 + Vite 8 + Tailwind 4.
@@ -30,6 +31,18 @@ node --test --test-name-pattern="claim"    # one server test by name
 npm run test:app                           # vitest run (frontend, jsdom)
 npx vitest run --config frontend/vitest.config.ts src/format.test.ts   # one frontend test file
 npm run typecheck:app                      # tsc --noEmit on frontend/
+npm run typecheck:convex                   # durable Store functions and schema
+npm run test:connector                     # connector CLI/service lifecycle
+npm run test:cloud                         # edge Worker/DO contract, runtime, resilience
+npm run test:cloud-control-plane           # private Worker/Container boundary
+npm run test:container                     # build and smoke the release Container image
+npm run test:capacity                      # deterministic local qualification budget
+npm run test:workflow                      # CI/release/qualification/performance workflow contracts
+npm run test:staging-qualification         # hermetic tests for the staged-proof harness
+npm run test:staging-release               # static/pure safety tests for manual deploy/rollback automation
+npm run security:repo                      # fail-closed tracked-file/secret gate
+npm run check:docs                         # deterministic maintained-doc relative-link gate
+npm run pack:connector                     # pack and clean-install the npx package
 ```
 
 Supporting scripts:
@@ -43,7 +56,10 @@ npm run setup:t3                # guided T3 install/auth/tunnel/pairing wizard
 npm run convex:dev              # convex dev (deploy convex/ functions)
 ```
 
-There is no linter configured. `npm test` is the gate.
+There is no linter configured. `npm test` is the core repository gate. The credential-free GitHub
+workflow also runs the repository-secret scan, maintained-documentation link gate, connector pack smoke, and release Container smoke in
+separate jobs; capacity and staged/live qualification remain explicit evidence gates rather than
+being folded into a single misleading green check.
 
 ## Architecture
 
@@ -55,7 +71,7 @@ function in `src/app.mjs` (~1800 lines): a long `if` chain matching `req.method`
 and health routes are checked first. Handlers throw `HttpError` from `src/http.mjs`; the outer `try/catch` converts it to
 a JSON error response.
 
-### Three authentication realms
+### Four authentication realms
 
 Every route belongs to exactly one, and they never mix:
 
@@ -64,6 +80,46 @@ Every route belongs to exactly one, and they never mix:
 | Platform user | Clerk session/JWT, or a legacy `Bearer` platform token | `authenticateUser()` | `enforceUserRead/Write` |
 | Device | `x-device-id` + `x-device-secret` headers | `authenticateDevice()` | `enforceDevice{Heartbeat,Read,Write}` |
 | Factory | `FACTORY_TOKEN` env secret | `authenticateFactory()` | `enforceFactoryWrite` |
+| Connector | `Authorization: Connector <id>.<secret>` | `authenticateConnector()` | `enforceConnectorWrite` |
+
+Connector rotation keeps the connector id stable. The user-realm
+`POST /v1/connectors/:id/rotation-sessions` mints the canonical local command; connector-realm
+`POST /v1/connectors/:id/rotate` combines the current credential with that single-use,
+environment-scoped, `connector_rotation`-purpose code and stages a second hash. Enrollment and
+rotation codes are not interchangeable. The long-running connector writes health/cursor state to
+`connector-runtime.json`, never the credential document, so stale service persistence cannot erase
+the rotation journal. The server stages the second hash
+for at most ten minutes. Both hashes authenticate during that overlap, but the staged credential is
+tagged with an unguessable rotation id. Consumption of its first socket ticket atomically promotes
+it and invalidates every unconsumed old-generation ticket. Never split that commit into separate
+mutations or let a credential-version integer substitute for the rotation id; doing so reintroduces
+a replaced-staging race. Revocation clears both hashes.
+
+The packaged connector stores its standing secret in an OS facility when one is available:
+`com.agent-controller.connector` generic-password items on macOS, Secret Service items with the same
+service attribute on Linux, and generic Windows Credential Manager entries through the built-in
+PowerShell/P/Invoke adapter. Secret values travel through subprocess stdin, never argv. State JSON
+contains only the backend and an A/B slot pointer; rotation keeps the pending value in a separate
+native item. Migration writes and verifies native storage before atomically removing plaintext.
+Headless systems without a native facility retain the existing private-file representation, but an
+enrollment already bound to a native backend fails closed if that backend becomes unavailable.
+
+Connector-owned T3 process control is exact and platform-specific. POSIX uses a detached process
+group. Windows never executes `npx.cmd` through a shell: it resolves the verified npm
+`npx-cli.js`, launches it with the current `node.exe` and an argument array, fingerprints the
+observed executable/command line/creation identity through a bounded encoded PowerShell/CIM query,
+and stops only the reverified PID tree with `taskkill /PID ... /T`. A private starting journal is
+promoted atomically to ownership metadata; an interruption before fingerprinting fails closed and
+must never trigger a guessed kill or duplicate launch. Reused user-managed T3 processes are not
+owned or stopped.
+
+Connector Tailscale integration is diagnostic-only. `status` and `doctor` may execute only the
+bounded, read-only `tailscale status --json` command (with the standard macOS app CLI fallback) and
+must project a redacted state that excludes peers, users, Tailnet names, hostnames, and addresses.
+Tailscale remains optional and operator-managed: the connector never installs it, runs `tailscale
+up`, authenticates a node, or inspects or changes Serve or Funnel. Missing or disconnected
+Tailscale adds static operator guidance but cannot make overall connector health fail by itself;
+direct T3 reachability remains authoritative.
 
 Auth mode comes from `AUTH_PROVIDER` (defaults to `clerk` if `CLERK_SECRET_KEY` is set, else `dev`). In Clerk mode
 `POST /v1/users/dev` is hard-disabled; dev tokens only exist for tests and `DEMO_MODE=1`. `src/clerkAuth.mjs` adapts the
@@ -166,6 +222,36 @@ the dispatch" guard, but a command already decided or being written is never dec
 The poller was deliberately left polling: it also serves environment health, the compressed device
 screen and thread titles, none of which a thread subscription covers. It is now the backstop for
 threads nobody is watching rather than a second opinion on the ones that are.
+
+### Durable agent request envelope
+
+Mutating agent requests are claimed before policy evaluation or T3 dispatch. Product clients send a
+URL-safe `clientRequestId` on `/v1/intents`, `/v1/device/intents`, saved-action/macro runs, first
+project launch, and device thread creation. The gateway scopes that id to the user, actor realm/id,
+and operation, and stores only a canonical SHA-256 request fingerprint—never prompt, transcript,
+path, attachment content, or provider output. Same id plus same fingerprint replays the original
+command reference; the same id with different content is `409 idempotency_conflict`; a concurrent
+retry sees `processing` and is not dispatched.
+
+`commandRequests` is durable in memory/file/Convex parity. Receipts retain the initial command
+status, command id, and HTTP status for 24 hours, with at most 1,000 per owner. Oldest terminal rows
+evict first; 1,000 simultaneously processing rows fail closed with `503` instead of sacrificing an
+in-flight guard. `GET /v1/requests/:clientRequestId` and its device-realm counterpart expose the
+privacy-minimal receipt plus the current command. The command remains authoritative as the arbiter
+moves it from `dispatched` to a terminal result.
+
+The file adapter's claim and settlement methods are write barriers: the awaited claim returns only
+after its atomic state-file rename, and settlement waits for the command reference and receipt to be
+persisted before the HTTP response may clear a client journal. Convex provides the equivalent
+claim/settle atomicity in mutations; an indexed exact-retry lookup avoids the bounded owner scan on
+the hot replay path.
+
+Browser clients journal only a digest-to-id mapping in local storage until an HTTP response arrives.
+Firmware journals one uncertain id plus a non-content fingerprint in NVS. Connector request and
+idempotency ids are stable digests derived from the client id and dispatch stage, so Container/router
+retries preserve the edge Durable Object's existing replay contract without exposing a caller id.
+Missing ids are still accepted with a server-generated compatibility id, but only updated product
+clients provide retry protection across a client restart.
 
 ### Two kinds of approval
 
@@ -566,12 +652,32 @@ inlined when under `MEDIA_INLINE_MAX_BYTES`. `storableT3Command()` strips both t
 the live URL before the command is persisted, so neither media content nor a usable token is
 retained in audit or support exports.
 
+New browser and shared-controller uploads use the separate raw session state machine:
+`POST /v1/{device/}media/uploads` creates an owner-scoped, request-idempotent intent;
+`PUT .../:id/content` accepts only the declared content type, exact length, and SHA-256; and
+`POST .../:id/finalize` re-reads and verifies the private staged bytes before creating the attachable
+media row. Session state is `pending|uploaded|finalized|aborted|expired`, survives File/Convex
+adapters, and is deliberately separate from transcription/vision processing state. The retention
+runner removes expired staging objects. Browser XHR and the shared firmware stream raw bytes over
+HTTP—not SSE/WebSocket—and session projections redact storage keys, filenames, transcripts, actor
+identity, and client request IDs. Legacy base64 JSON routes remain for older clients. Hosted R2 and
+physical controller proof are still separate release qualifications.
+
+Firmware has one raw transport implementation: `media::uploadSession()` in shared
+`AgentControllerCore/MediaUpload.{h,cpp}`. `GatewayClient`, `GatewayVoice`, and CrowPanel's optional
+audio/camera carrier wrapper delegate to it. CrowPanel retains its verified board pins, compile-time
+capability gates, capture buffers, and e-ink review flow; its former board-local base64 stream was
+removed. The `crowpanel-esp32-213-epaper-capture-placeholder` environment forces the checked-in
+example configuration and makes a compile-only proof without inspecting ignored live credentials.
+
 Every step writes a command record plus a `commandEvent` timeline entry, so `/v1/commands/:id/events` reconstructs the
 full history. T3 commands are always dispatched with `runtimeMode: "approval-required"`.
 
-T3 environments are paired either by exchanging a pairing token at `{baseUrl}/oauth/token` (RFC 8693 token exchange) or
-by supplying an access token directly (local dev only). Expired tokens surface as `token_expired` health and block
-snapshot/dispatch until re-paired.
+Self-hosted T3 environments can be paired by exchanging a pairing token at `{baseUrl}/oauth/token` (RFC 8693 token
+exchange) or by supplying an access token directly (local dev only). In `DEPLOYMENT_MODE=cloud`, connector enrollment
+is the only pairing path: the legacy redeem/create routes fail before consuming a code, accepting a URL/token, or making
+network requests, and the transport resolver refuses persisted direct environments. Expired self-hosted tokens surface
+as `token_expired` health and block snapshot/dispatch until re-paired.
 
 ### Real-time
 
@@ -589,6 +695,27 @@ actually present — an open SSE stream or a recent device heartbeat — since p
 environment does not scale and Convex exposes no global enumeration. It pushes `t3.snapshot` only
 when the compressed screen actually changes, and skips overlapping ticks. Started from
 `server.mjs`, never from `createApp()`, so tests stay hermetic and drive `runOnce()` directly.
+
+### Durable notifications and scheduler liveness
+
+`src/notifications.mjs` projects only meaningful transitions into a durable owner inbox: terminal
+turns, the three distinct blocking states, and connector/T3 offline or recovered edges. Titles are
+static and rows contain only navigation ids; prompts, transcripts, paths, answers, provider detail,
+and raw upstream request ids never enter the row or SSE payload. An owner-scoped SHA-256 dedupe key
+is private store state. Memory, file, and Convex retain at most 1,000 rows per owner for 30 days.
+
+`GET /v1/notifications` uses `after` for ascending reconnect replay and `before` for descending older
+inbox pages. The cursors are mutually exclusive. SSE `notification.created|updated` is live delivery
+and invalidation, not the replay authority. Read, read-all, dismiss, and approval/input resolution
+are idempotent. There is no device inbox: controllers continue to receive their bounded,
+capability-scoped approval/input/result projections.
+
+`GET /v1/background/liveness` reports only durable Queue/Cron scheduled-worker evidence. Never infer
+it from an SSE heartbeat, connector presence, T3 reachability, or provider state. The browser can
+raise content-free local OS notifications while open. Optional Web Push is a separate owner-scoped,
+explicit opt-in backed by VAPID rotation, durable idempotent delivery jobs, bounded retries, dead
+subscription cleanup, and a strict push-host allowlist. A push-service acceptance is not proof that
+the device displayed anything. See `docs/notifications.md` for the secret and rotation runbook.
 
 ### Onboarding
 
@@ -629,6 +756,42 @@ The lease, not that handler, is the guarantee — a leaked watch costs one TTL. 
 path is untouched: live entries render only once a snapshot has arrived, and `selectedThread.messages`
 still renders for anyone not watching.
 
+#### T3-native agents and background work
+
+T3 0.0.32's shipped source map now proves a task lifecycle that earlier roadmap drafts treated as
+hypothetical. `providerRuntime.ts:177-180,471-646` defines `task.started|progress|updated|completed`;
+`ProviderRuntimeIngestion.ts:315-357,539-739` preserves `taskId`, `agentKind`, `agentId`,
+`parentAgentId`, task identity, status, typed usage, workflow/phase fields, and stable progress IDs
+in thread activities. The deterministic fixture at
+`test/fixtures/t3-work-activities-contract.json` is transcribed from those contracts and contains no
+live user data.
+
+`frontend/src/workGraph.ts` is an evidence-limited latest-state fold over those rows. It trusts
+T3-stamped `agentKind`, uses only explicit `parentAgentId`/`agentId` edges, labels legacy unlinked
+rows as tasks, and re-homes only tools carrying T3's own `taskId`/`agentId` attribution. It never
+infers agents or hierarchy from prose, tool labels, timing, or model output. A snapshot replaces the
+work projection; live activity inherits the transcript's sequence/event-ID dedup and replay-gap
+rules. The UI calls an unlinked window a roster rather than drawing a fake tree.
+
+The projection is capped at 64 nodes and 16 activity rows per node, retaining active work ahead of
+old terminal nodes and reporting omissions. `Agents & work` distinguishes loading, empty, live,
+reconnecting/stale, stopped, failed, missing-parent, and truncated evidence. Active task lifecycle
+also keeps the thread visibly in flight after the foreground session settles. T3 exposes no stable
+per-task input/stop/resume command, so there are no fake per-agent controls; the composer and Stop
+remain parent-thread operations.
+
+`src/t3CapabilityManifest.mjs` is the versioned adapter boundary for direct and connector T3 calls.
+Its `agent-controller.t3-capabilities.v1` projection comes from read-only response shapes,
+`server.getConfig` flags, scopes, and actual adapter method availability—not the reported T3 version.
+Fresh manifests are cached for five minutes and stale fallback is labeled. T3 0.0.32 certifies image
+attachments only; audio/file and nonexistent per-task input/stop/resume controls must remain absent.
+The owner sees the full bounded manifest; device health receives only a compact state/action.
+
+`src/t3Work.mjs` separately projects only status counts for `/v1/device/thread-output`; task IDs,
+titles, roles, models, paths, summaries, errors, output and usage never enter the device payload.
+See `docs/t3-work-graph.md` for the field map, status mapping, resource budgets, tests, and explicit
+unverified live/hardware evidence.
+
 ## Conventions
 
 - Server code is `.mjs` ESM with no build step and no dependencies beyond `@clerk/backend` — keep it that way.
@@ -664,21 +827,25 @@ deliberately not scripted.
 deployment validation), [docs/hardware-protocol.md](docs/hardware-protocol.md) (device provisioning/display/intent wire
 format), [roadmap/open-input-media-voice-environments-roadmap.md](roadmap/open-input-media-voice-environments-roadmap.md)
 (active product roadmap), and [roadmap/IMPLEMENTATION-STATUS.md](roadmap/IMPLEMENTATION-STATUS.md)
-(canonical verified progress). Milestone 0.5 is complete; Milestones 0–5 remain open.
+(canonical verified progress). Milestone 0.5 is complete; Milestones 2 and 3 are substantially
+implemented, while Milestones 0, 1, 4, and 5 remain partial pending their named deployed, live-T3,
+browser, or hardware proof.
 
 Firmware is PlatformIO C++ under four board folders; copy `include/controller_config.example.h` to
 `controller_config.h`, then `pio run`.
 
 | Folder | Board | State |
 |---|---|---|
-| `CrowPanel-ESP32-2.13-E-paper` | 2.13" e-ink, five active-low keys | Most complete gateway-connected implementation; 4 build environments; current silicon validation not recorded |
+| `CrowPanel-ESP32-2.13-E-paper` | 2.13" e-ink, five active-low keys | Most complete gateway-connected implementation; 5 build environments including hermetic capture proof; current silicon validation not recorded |
 | `vision-master-t190` | 1.9" TFT | Bring-up sketch |
 | `Waveshare-ESP32-S3-Touch-AMOLED-1.75C` | 466x466 round AMOLED touch, dual-mic array | Scaffold; pin map unverified |
-| `Hosyond-ESP32-S3-2.8-Touchscreen` | 2.8" IPS 240x320 touch, on-board mic + speaker (ES8311) | Five-screen touch UI over the shared gateway client (home/threads/send/reply/approvals) with hold-to-talk upload; 5 environments, `-controller` is the product build. Capture/display/orb/provisioning proven on silicon, the UI and every gateway call are not |
+| `Hosyond-ESP32-S3-2.8-Touchscreen` | 2.8" IPS 240x320 touch, on-board mic + speaker (ES8311) | Five-screen touch UI over the shared gateway client (home/threads/send/reply/approvals) with hold-to-talk upload; 7 environments, `-controller` is the product build. Capture/display/orb/provisioning proven on silicon, the UI and every gateway call are not |
 
 Every board is pinned to **ESP-IDF 5.5 / Arduino core 3.3** via the pioarduino platform fork. The official
 `platformio/platform-espressif32` is unmaintained at Arduino 2.0.17 / ESP-IDF 4.4, which lacks `driver/i2s_std.h`
-and cannot build the audio boards. Changing the pin means re-verifying all 11 environments.
+and cannot build the audio boards. Changing the pin means re-verifying all 15 environments. The
+canonical inventory is `firmware/build-matrix.json`; `npm run build:firmware:all` builds it from
+placeholder configs in a temporary directory so live board credentials never enter build evidence.
 
 A board **can** browse environments → projects → threads. That was untrue for most of this
 project's life — `GET /v1/device/threads` was the only list the device protocol offered — and the

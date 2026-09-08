@@ -10,9 +10,9 @@ Two decisions frame it:
 - **Wi-Fi provisioning is SoftAP first, BLE later**, both behind one on-device provisioning state
   machine so the second transport is a driver, not a rewrite.
 - **All board targets share one client layer.** The original scope named CrowPanel and T190;
-  Hosyond and Waveshare have since joined the tree. `DeviceStore`, `Provisioning`, and
-  `ThinkingOrb` are shared, but the common `GatewayClient` and thin display-adapter boundary are
-  still Phase 3 work.
+  Hosyond and Waveshare have since joined the tree. `DeviceStore`, `Provisioning`, `GatewayClient`,
+  and compact browse/operate behavior are shared; each board adapter owns only proven display,
+  input, media, and recovery wiring.
 
 Current delivery status is tracked in
 [roadmap/IMPLEMENTATION-STATUS.md](../roadmap/IMPLEMENTATION-STATUS.md). This document retains the
@@ -49,7 +49,7 @@ replaced it.
 | 6 | Onboarding marks a device "ready" with zero evidence it ever powered on — no `lastSeenAt` or heartbeat check, contradicting the operational-evidence rule every other check honours. | `buildOnboardingReadiness` [onboarding.mjs:176](../src/onboarding.mjs#L176) |
 | 7 | The wizard assumes the user already holds a claim code. There is no "power on / join setup network / read the code" beat anywhere in it. | [OnboardingPage.tsx:931](../frontend/src/features/OnboardingPage.tsx#L931) |
 | 8 | Factory-manufactured firmware ships with TLS verification disabled — not just the example header, the generated config. The device carries a long-lived bearer secret. | [manufacturing.mjs:55](../src/manufacturing.mjs#L55) |
-| 9 | The T190 tree is a bring-up sketch: it POSTs device headers at `/health`, which ignores them. No config, display, intent, or OTA loop. | [vision-master-t190/src/main.cpp:71](../firmware/vision-master-t190/src/main.cpp#L71) |
+| 9 | The original T190 sketch posted device headers at `/health`, which ignored them. It now delegates secure identity, provisioning, heartbeat, and browsing to the shared core; the checked-in build remains status-only until an external input carrier is physically verified. | [vision-master-t190/src/main.cpp](../firmware/vision-master-t190/src/main.cpp) |
 | 10 | A revoked device shows `Display poll failed / HTTP 401` forever with no on-device reset. | now handled at [main.cpp:427](../firmware/CrowPanel-ESP32-2.13-E-paper/src/main.cpp#L427) |
 
 Breaks 1, 2, 5, and 10 all have the same root cause: **the device has no writable state and no
@@ -189,10 +189,11 @@ hash, matching the existing `preprovisionDevice` pattern at [convexStore.mjs:149
 
 ### 4.5 TLS
 
-`buildFlashConfig()` stops emitting `INSECURE_SKIP_TLS_VERIFY 1`. It becomes an opt-in flag on the
-batch request (`allowInsecureTls`, default false) for bench builds only, and the factory script
-refuses it unless `ALLOW_INSECURE_TLS=1` is set explicitly. Firmware gains SNTP sync before the first
-HTTPS call, because certificate validation without a clock fails closed on every boot.
+`buildFlashConfig()` now emits `INSECURE_SKIP_TLS_VERIFY 0` by default and carries current/next root
+CA values supplied by the gateway configuration. The shared firmware starts SNTP before verified
+HTTPS and fails closed while the clock or trust root is unavailable. `allowInsecureTls` remains an
+explicit programmatic bench override; the factory batch route does not expose it. Secure/product
+build flags override even a bench header back to verified TLS.
 
 ## 5. Web changes
 
@@ -270,10 +271,16 @@ firmware/
 (status colour, a longer body, per-item menu state) that the e-ink adapter ignores. Additive only —
 the existing fields keep their meaning, so an old device and a new gateway stay compatible.
 
-The T190 sketch's `/health` POST is deleted outright; it never worked as a heartbeat.
+The T190 adapter no longer posts to `/health`. Shared `GatewayClient` owns canonical protocol-v2
+heartbeat, authentication, bounded responses, credential rotation observation, and fail-closed TLS;
+`GatewayBrowse` owns compact environment/folder/thread/control/approval/response calls. This is
+build/static-test evidence only; T190 pins, display, network, input, and flows remain unverified on
+physical hardware.
 
-Both boards get a **long-press reset**: 10 s on EXIT (CrowPanel) or the user button (T190) wipes
-Wi-Fi credentials and the config cache, keeps the device identity, and re-enters `provisioning`.
+Both adapters define a **long-press reset**: 10 s on EXIT (CrowPanel) or the verified external
+encoder button (T190) wipes Wi-Fi credentials and the config cache, keeps the device identity, and
+re-enters `provisioning`. The status-only T190 build has no user input, so recovery still requires a
+service/bench path until physical input is chosen.
 This is the recovery path for a revoked device, a moved household, or a resale. On the CrowPanel,
 EXIT already does a short-press "show me the claim code", so the two live on the same key.
 
@@ -314,17 +321,23 @@ EXIT held for 10 s wipes Wi-Fi and re-enters provisioning; a `401` becomes a `re
 that recovery. `buildNvsSeedCsv()` emits the per-device `nvs_partition_gen.py` CSV, and
 `buildFlashConfig()` no longer emits `WIFI_SSID`/`WIFI_PASSWORD`.
 
-The current tree compiles all four CrowPanel environments and all 11 environments across four board
-folders. Hosyond has exercised NVS-backed provisioning, its SoftAP portal, and BOOT recovery on
-silicon. CrowPanel EXIT recovery, T190, and Waveshare remain unvalidated on hardware.
+The canonical matrix contains 15 environments across four board folders. Current post-TLS evidence
+current code covers all four CrowPanel environments, both Waveshare shared-client builds, the secure
+Hosyond controller, and both the default and explicitly gated T190 adapter variants; a complete
+quiet-runner renewal remains open. Hosyond has exercised
+NVS-backed provisioning, its SoftAP portal, and BOOT recovery on silicon. CrowPanel EXIT recovery,
+T190, and Waveshare remain unvalidated on hardware.
 
-**Phase 3 — shared client and both boards.** `GatewayClient` + `DisplayAdapter`; e213 refactored onto
-it with no behaviour change, T190 brought up to full protocol parity. Display payload gains its
-optional richer fields. Fixes break 9.
+**Phase 3 — shared client and board adapters. Implemented in code; physical proof remains.**
+`GatewayClient` and `GatewayBrowse` own common protocol behavior. T190 now has truthful lifecycle,
+status, and capability-gated browse/operate screens; Waveshare joins the secure claim/health path
+while advertising no unproved UI/media capabilities. This fixes break 9 without pretending that a
+compile proves pins, input, display, or media.
 
-**Phase 4 — credential lifecycle and transport security.** Rotation handshake end to end,
-`POST /v1/device/credential-ack`, transfer-reset as a real consumer flow, TLS verification on by
-default, SNTP. Fixes breaks 5 and 8.
+**Phase 4 — credential lifecycle and transport security. Implemented locally; release proof
+remains.** Rotation handshake, `POST /v1/device/credential-ack`, transfer/reset behavior,
+fail-closed TLS verification, and clock bootstrap live in the shared core. Production CA injection,
+negative-certificate tests, WAN recovery, and per-board silicon evidence remain release gates.
 
 **Phase 5 — deferred.** BLE provisioning transport; asymmetric OTA manifest signatures (replacing the
 prototype shared-key HMAC); on-device claim QR rendering.

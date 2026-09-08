@@ -1,46 +1,269 @@
 # Agent Controller
 
-Cloud control plane for remote controller hardware, phone/web clients, and T3 Code environments.
+Agent Controller is a cloud control plane between remote controller hardware, a phone/web console,
+and [T3 Code](https://github.com/pingdotgg/t3code) environments running on users' machines. The
+production server should run in the cloud—preferably on Cloudflare—while T3 Code and Tailscale stay
+on each user's machine. The `@agent-controller/connector` npm package pairs local T3 with that cloud
+service over an outbound authenticated WebSocket; publication and live-cloud validation remain.
 
-The current implementation is the first vertical slice:
+Agent Controller does not run coding agents. It authenticates people, devices, and connectors;
+applies policy; persists control-plane state; and routes commands and live results between a cloud
+endpoint and the user's T3 instance.
 
-- User-scoped device registration.
-- Factory pre-provisioning with claim codes.
-- Per-device credentials.
-- Device claim, secret rotation, and revocation.
-- Device-generated setup codes for customer onboarding.
-- Device-authenticated heartbeat, diagnostics, state, and intent endpoints.
-- Discoverable device policy profiles with owner-managed profile updates.
-- T3 Code environment registration and reachability checks.
-- T3 Code snapshot, session selection, and orchestration dispatch integration.
-- Policy checks and user approval gates for prompt, media, session control, and shell input.
-- Per-command status timelines for support and owner visibility.
-- User-scoped observability summary for device presence, T3 health, command latency/failures, and media processing.
-- Redacted support diagnostics export.
-- Device media upload storage for audio/image captures, transcription state, audio transcripts, retention settings, and purge.
-- Simulated device registration script.
-- Four ESP32-S3 firmware targets with 11 compiling PlatformIO environments; CrowPanel has the most
-  complete gateway client and Hosyond has verified microphone/display hardware bring-up.
-- Factory batch provisioning and signed firmware update metadata.
-- Per-user, per-device, and factory rate limits.
-- Clerk auth and Convex storage integration.
-- React, Vite, and Tailwind operations console with route-level workspaces for control, fleet, environments, media, activity, and settings.
+The current product includes:
+
+- **Agent operation:** arbitrary text/media requests, streamed thread responses, command timelines,
+  gateway approval gates, T3 provider decisions, structured agent questions, and a bounded
+  evidence-linked T3 work inspector.
+- **T3 environments:** guided pairing, health/recovery, project and model selection, thread creation,
+  live watches, and dependency-aware removal with connector revocation, exact-label confirmation,
+  recoverable credential-free tombstones, and explicit retention purge.
+- **Controller fleet:** factory pre-provisioning, claim/onboarding, device credentials, policy
+  profiles, configuration, diagnostics, secret rotation, transfer reset, and revocation.
+- **Media and voice:** browser and device capture, a short-lived single-use phone companion,
+  truthful source provenance, bounded previews, disk or S3-compatible storage, retention,
+  transcript review, durable media jobs, and local Parakeet or provider-backed transcription.
+- **Operations:** Clerk authentication, memory/file/Convex stores, scoped rate limits, redacted support
+  diagnostics, durable privacy-minimal in-app notifications, optional encrypted Web Push,
+  explicit scheduled-worker liveness, remote-access setup, manufacturing tools, and signed
+  firmware metadata.
+- **Hardware:** four ESP32-S3 firmware targets with 15 PlatformIO environments in the current tree;
+  Hosyond has the richest touch/voice workflow and the strongest recorded on-device validation.
+
+The same action may cross the console, gateway, T3 transport, storage, and controller firmware.
+Contributors should read [AGENTS.md](AGENTS.md) for the complete-change checklist and
+[CLAUDE.md](CLAUDE.md) for detailed architecture and protocol invariants.
+
+## Product architecture priorities
+
+### Device architecture
+
+Controllers are thin, purpose-built remote surfaces. They connect directly to the cloud Agent
+Controller endpoint over authenticated HTTPS/WSS, capture input, show a compact view of the selected
+environment/project/thread, and render truthful agent state. They do not run Tailscale and do not
+connect directly to T3. The cloud service owns identity, policy, durable control-plane state, and
+routing; the paired T3 environment owns projects, threads, provider sessions, and agent output.
+
+Shared provisioning, persisted device state, gateway operations, media upload, OTA support, and orb
+rendering live in `firmware/shared/AgentControllerCore`. Each board folder supplies only its hardware
+adaptation: pins, display, touch/buttons, audio, and board-specific recovery behavior. This keeps one
+gateway contract across the four ESP32-S3 targets without pretending their hardware is identical.
+
+### Remote control
+
+Agent Controller is remote-first. Production has one stable public cloud origin for the console,
+controller API, and local connectors. T3 Code and Tailscale run on the user's machine. The connector
+CLI initiates the authenticated link to the cloud, so the user does not need to expose T3 publicly,
+open an inbound router port, or place the cloud service inside their Tailnet.
+
+The cloud service uses compact device projections, demand-driven live streams, leases,
+deduplication, idempotent commands, and explicit offline/reconnecting states. Features must work
+without shared filesystem access, baked-in localhost origins, direct cloud-to-LAN reachability, or
+permanent connectivity.
+
+### Performance and security
+
+Performance is an end-to-end budget. The gateway avoids hydrating full thread bodies for lists,
+subscriptions exist only while work is being watched, and controller endpoints return only what a
+constrained display needs. Console and orb animations must avoid sustained CPU/GPU work; firmware
+network operations must not block touch or rendering; media and transcription use bounded sizes,
+queues, retries, and concurrency. Performance-sensitive changes should include measured payload,
+latency, memory, render, frame-gap, or refresh evidence.
+
+Security follows the same boundaries. Platform users, devices, factory tooling, and local connectors
+need separate credentials and rate limits. Connector enrollment uses a short-lived, single-use code;
+its standing credential must be revocable and environment-scoped. In cloud mode, direct T3 pairing
+and transport are disabled before token exchange or outbound network I/O, so T3 URLs and tokens stay
+on the user machine. Device secrets and API tokens are hashed, self-hosted direct-mode T3 tokens are
+encrypted, media links are short-lived and scoped, support diagnostics are redacted, and delayed
+jobs re-check current device policy before dispatch. See
+[docs/auth-storage.md](docs/auth-storage.md) and
+[docs/production-security.md](docs/production-security.md) for the controls implemented today.
+Staged firmware and connector cohort operations are documented in
+[docs/release-rollouts.md](docs/release-rollouts.md); the cloud never auto-promotes a cohort or
+runs connector package-manager commands on a user's machine.
+Notification retention, cursor replay, local PWA delivery, optional encrypted Web Push configuration,
+and scheduler-health semantics are documented in
+[docs/notifications.md](docs/notifications.md).
+
+The shared firmware now fails closed with a maintained current/next CA trust set and trusted-clock
+bootstrap. Public-cloud device rollout still requires production CA injection plus physical tests
+that prove valid Cloudflare certificates are accepted and untrusted certificates are refused.
+
+## Target production topology
+
+```text
+Controller device ── HTTPS/WSS ─┐
+                                ├── Agent Controller cloud service ── durable state
+Web console ─────── HTTPS/SSE ──┤        (Cloudflare preferred)
+                                │
+User machine                    │
+  T3 Code <── local/Tailnet ── connector CLI ── outbound HTTPS/WSS ──┘
+  Tailscale
+```
+
+The intended setup flow is:
+
+1. The user runs T3 Code and Tailscale on their machine.
+2. The console creates a short-lived connector pairing code.
+3. The user runs a published `npx` connector command on the T3 machine.
+4. The connector discovers or launches T3, redeems the code, registers the environment and provider
+   catalogue, and maintains the authenticated cloud connection.
+5. Controllers and the console send commands to the cloud service; the service routes them through
+   the connector and streams results back.
+
+The connector package is `@agent-controller/connector`; the generated one-time command has this
+shape:
+
+```bash
+npx @agent-controller/connector connect --server 'https://controller.example.com' --code 'one-time-code'
+```
+
+The package exists and passes clean-pack/install tests in this repository. A protected manual
+workflow now binds an exact version, annotated tag, commit, dependency-free tarball, npm dry-run,
+OIDC trusted publication, provenance, and clean external `npm exec` verification. It has not yet
+been published to npm, so use the generated command only after a release is published and verified.
+See [docs/npm-connector-release.md](docs/npm-connector-release.md).
+
+Removal is fail-closed by default: `agent-controller-connect disconnect --revoke-cloud --yes` uses
+the connector's own scoped credential, waits for durable cloud revocation and live edge closure,
+then deletes the local service and credentials. A failed response retains local authority for a safe
+retry. `--force-local` must be stated explicitly to clean up locally without confirmed cloud
+revocation.
+
+When `DEPLOYMENT_MODE=cloud`, this connector command is the only supported T3 enrollment path. The
+legacy direct-create and code-redeem APIs are self-hosted compatibility surfaces and fail closed in
+cloud mode; connector environment edits are limited to safe metadata such as the label.
+
+### Current implementation gap
+
+The repository now includes the connector protocol/authentication realm, tokenless connector-mode
+environments, a publishable CLI package, a shared direct/connector `T3Adapter` with a cached
+versioned read-only capability manifest, and a Cloudflare Worker/Durable Object
+runtime. Direct T3 URLs remain available as an advanced self-hosted compatibility mode.
+
+The production blocker is now runtime completion and proof rather than a missing hosting shape. The
+edge Worker binds privately to a Cloudflare Container running the existing Node `node:http` control
+plane, and that Container routes connector-mode T3 operations back through a private named Worker
+entrypoint to the environment Durable Object and outbound connector. The container is
+production-gated on Convex, Clerk, TLS, encryption, and S3-compatible R2. Queue/Cron ownership,
+online revocation, request replay, and subscription recovery are implemented and covered by local
+cross-runtime tests. Deployment, hosted Queue/Service Binding behavior, and live-system proof remain.
+No Worker, Container, or npm package is claimed as deployed from this checkout.
+
+An authorized operator can qualify an isolated deployment without giving the harness deployment
+authority. `npm run qualify:staging -- --base-url 'https://staging.example.com'` checks the public
+Cloudflare health contract and exact `404` behavior for private capabilities. Supplying an explicit
+test user token and connector-backed environment adds fresh connector/T3/provider checks; a separate
+`--exercise-first-command` flag is required before it creates one test thread and waits for a
+completed agent reply. Output is redacted JSON. See
+[docs/staging-qualification.md](docs/staging-qualification.md). This tooling has only been exercised
+against hermetic loopback fixtures so far and is not hosted proof.
+
+First-time staging bootstrap and routine staging releases are separate manual-only, protected
+GitHub-environment workflows. Bootstrap creates/verifies exactly three Queues and two R2 buckets,
+breaks the reciprocal Service Binding cycle with a non-public fail-closed edge stub, provisions only
+named runtime secrets over standard input, deploys Convex/private control plane/final edge in safe
+order, and supports exact-version resume plus a narrow stub-only abort. Routine release then pins
+candidate/current commits and active Worker versions, validates the named dependencies, deploys in
+dependency order, and supports an explicit compatibility-gated rollback. Both emit redacted
+evidence. See [docs/staging-bootstrap.md](docs/staging-bootstrap.md) and
+[docs/staging-release.md](docs/staging-release.md). Neither workflow has been run, so no cloud
+resource or live deployment is claimed.
+
+Production promotion is a third manual-only boundary. It accepts only an exact forward commit whose
+staging release, qualification, hosted-capacity, security, and tracked deploy-input hashes are bound
+by one reviewed manifest no older than 72 hours. Separate protected `production` approvals gate the
+read-only dependency check, Convex/private Container phase, public edge phase, and postflight. The
+current one-instance Container configuration rolls out at 100%, so this is explicitly checkpointed
+rather than described as a canary. It never bootstraps production, writes secrets, deletes resources,
+or performs automatic rollback. See [docs/production-promotion.md](docs/production-promotion.md).
+The workflow has not been run and is not production-deployment evidence.
+
+[Cloudflare Workers now offers Node HTTP compatibility](https://developers.cloudflare.com/workers/runtime-apis/nodejs/http/),
+and [Durable Objects provide long-lived WebSocket coordination](https://developers.cloudflare.com/durable-objects/best-practices/websockets/),
+but Node compatibility does not make process-local timers, filesystem work, UDP discovery, or local
+sidecars portable. Those paths remain outside the Worker bundle and need explicit cloud adapters.
+
+### Migration readiness
+
+The target topology has moved beyond an architecture sketch: its protocol, credential, package,
+Durable Object, private Container, and connector-router seams are joined and covered by focused
+cross-runtime tests. It remains a pre-production candidate because hosted background/reconnect
+behavior, external deployment, and real T3/controller proof are incomplete.
+
+| Area | Implemented evidence | Remaining production gap |
+|---|---|---|
+| Domain and policy | Separate connector realm, short-lived tickets, immediate edge-socket revocation, tombstones, command arbiter and transport routing | Exercise revocation/policy through a deployed binding and live connector |
+| T3 integration | Direct and connector transports, HTTP/Effect RPC, ACK/Interrupt, subscriptions, reconnect replay and bounded idempotency | Prove recovery and feature parity against deployed Cloudflare and live T3 |
+| Connector enrollment | One-time codes, hash-at-rest credentials, outbound WSS package, native Keychain/Secret Service/Credential Manager adapters with atomic migration and explicit private-file fallback, safe local T3 start on macOS/Linux/Windows, transactional update with process-identity health rollback, overlap-safe ticket-acknowledged credential rotation, launchd/systemd-user plus Windows Task Scheduler lifecycle | Publish npm package; live macOS/Linux/Windows service, T3 launch/pairing, native-store, sleep, update, and rotation tests |
+| Cloud runtime | Static Assets Worker, per-environment Durable Object, hibernation/alarms, Queue/Cron/DLQ handlers, bounded long polls, private Container control plane/router, privacy-safe sampled Analytics Engine/log/trace configuration, verified non-root amd64 image, and a 16-environment/48-request local capacity gate | Deploy/rollback/hosted load, telemetry/privacy/alert delivery, and live Queue/Service Binding/R2 proof; no supported hosted capacity is claimed |
+| Durable data | Memory/file/Convex parity for connector, ticket, presence, health, provider catalogue | Deployed Convex/Worker binding and event-consumer proof |
+| Console/onboarding | Connector-first enrollment, layered health, fleet/revoke settings, recovery, a passing frontend gate, typecheck, production build, lazy feature chunks, and deterministic first-load/live-list/event-coalescing budgets | Validate the complete journey against deployed cloud and a live connector; profile representative desktop/mobile GPU, WAN, and real-stream heap behavior |
+| Controllers | Outbound shared client, verified-TLS fail-closed implementation, compact layered environment health, secure CrowPanel/Hosyond release builds, safe claim/health/recovery on Waveshare, and capability-gated T190 browsing/operate code | Configure production CA; complete negative-TLS, WAN, and real-hardware proof on every claimed surface |
+| Testing/operations | Server/package/protocol/Worker gates, deterministic resilience and capacity suites, non-root amd64 Container smoke, protected manual staging bootstrap/deploy/rollback automation, privacy-safe cloud telemetry queries/thresholds, and focused firmware builds | Execute bootstrap and rehearse deploy/rollback, then create/verify hosted dashboards and alerts, run staged WAN/rollover/load/security drills, collect CPU/memory/cold-start/cost evidence, and complete physical proof |
+
+Recommended implementation order:
+
+1. **Implemented:** architecture decisions, connector protocol, credential model, and offline limits.
+2. **Implemented:** `T3Transport` with direct compatibility and connector routing.
+3. **Implemented locally:** package, enrollment, atomic managed-service credential rotation, safe T3 auto-start and
+   transactional update/health rollback, WSS, heartbeat, resume, and backpressure.
+4. **Implemented and locally tested:** Worker/static assets and Durable Object routing.
+5. **Implemented locally:** private Worker-to-Container control plane, Container-to-edge router join,
+   and Queue/Cron background ownership; hosted Queue/Service Binding and live R2 proof remain.
+6. **Implemented and locally verified:** connector-first console, fail-closed controller TLS,
+   secure release plus CrowPanel/Waveshare builds, safe Waveshare cloud presence, and a T190
+   status/operate adapter whose input path stays compile-gated until its carrier pins are proven;
+   remaining probe/benchmark renewal and live validation remain.
+7. **Not yet proven:** hosted deploy/rollover, real sleep/wake/load/security drills, npm release, and a real
+   controller-to-cloud-to-T3 loop.
+
+Run the deterministic local capacity gate with `npm run test:capacity`. Its provisional SLO,
+concurrency budget, exact local report, rate-limit restart caveat, and hosted decision gates are in
+[docs/capacity-slo.md](docs/capacity-slo.md). Passing it does not establish Cloudflare
+`standard-1` capacity or cost.
 
 ## Roadmap status
 
-As of 2026-08-24, active-roadmap **Milestone 0.5 is complete**: dependency-aware environment
-removal, reason-specific T3 recovery, first-turn attachments, and ordered multi-attachment dispatch
-have landed. Milestones 0–5 remain open. In particular, Agent Controller still does not show the
-complete live T3 response or let the user handle T3-native approvals/questions, subagents, and
-parallel tasks. The unified composer, QuickPage input, automatic CPU-hosted Parakeet pipeline, and
-controller upload/dispatch path are also unfinished.
+Active-roadmap **Milestone 0.5 is complete**. The live-thread foundation, streamed conversation UI,
+T3-native provider approvals, structured user questions, shared composer, console-first connection,
+and most of the durable Parakeet voice pipeline have also landed. The private two-step raw media
+session path now covers browser and shared controller uploads with integrity finalization,
+restart-safe Store adapters, expiry cleanup, and explicit progress/retry/cancel UI. Milestones 1, 2,
+3, and 4 remain partial: the PWA now has a locally encoded, five-minute, single-use companion
+handoff plus bounded on-demand media previews and source provenance; hosted R2/worker proof,
+deployed phone usability, and live/hardware validation still have gaps. Milestones 0 and 5 are also
+partial: the versioned adapter/capability contract, durable request identity, T3-native work graph,
+notifications, and rollout controls have landed locally; deployed live-T3 qualification,
+representative load/security evidence, and certified per-task T3 controls remain.
 
 See the active
 [open-input/media/voice/environment roadmap](roadmap/open-input-media-voice-environments-roadmap.md)
 and its [canonical implementation ledger](roadmap/IMPLEMENTATION-STATUS.md) for verified progress,
 tests, firmware evidence, and next dependencies.
 
-## Run
+The target cloud runtime and local connector migration is specified separately in the active
+[cloud control plane and connector roadmap](roadmap/cloud-control-plane-connector-roadmap.md).
+
+## How it fits together
+
+| Surface | Responsibility | Main code |
+|---|---|---|
+| Cloud service | Auth, policy, routing, HTTP/SSE/WSS API, jobs | `src/` Node/domain service; `cloudflare/` edge runtime; `cloudflare-control-plane/` private Container wrapper |
+| Console/PWA | Operate, fleet, environments, media, activity, settings | `frontend/src/` |
+| Durable store | Production schema and Store API implementation | `convex/` |
+| Connector CLI | Bridges local T3 to the cloud over an outbound authenticated channel | `packages/connector/`; npm publication still needed |
+| Controllers | Cloud-connected board UI, provisioning, audio and display | `firmware/` |
+| T3 Code | Runs provider harnesses and owns projects, threads, and agent state | External paired environment |
+
+Local file, in-memory, and Convex storage implement the same Store API. The console receives gateway
+changes over SSE, while the gateway holds resumable T3 WebSocket subscriptions only for actively
+watched threads.
+
+## Run locally for development
+
+Prerequisite: Node.js 22 or newer. PlatformIO is additionally required for firmware builds.
 
 ```bash
 npm install
@@ -74,21 +297,15 @@ To persist local platform state:
 DATA_FILE=.data/agent-controller.json npm start
 ```
 
-## Remote Access
+## Current self-hosted remote access
 
-Use private Tailscale Serve for stable HTTPS access from your Tailnet:
+`npm run setup:tunnel` and the current Settings flow expose a locally running gateway with Tailscale
+Serve or Funnel. That is a supported development/self-hosted bridge, not the intended production
+topology. In production, the Agent Controller endpoint is already in the cloud; Tailscale belongs on
+the user machine beside T3, and the connector CLI links that private runtime to the cloud.
 
-```bash
-npm run setup:tunnel -- --mode serve --write-env
-```
-
-Use Tailscale Funnel only when the gateway must be reachable from the public internet:
-
-```bash
-npm run setup:tunnel -- --mode funnel --write-env
-```
-
-Restart Agent Controller after the command updates `.env`. The Settings workspace includes the same guided setup and disable commands. See [docs/remote-access.md](docs/remote-access.md) for the gateway-versus-T3 distinction, Clerk requirements, LAN hardware guidance, and troubleshooting.
+See [docs/remote-access.md](docs/remote-access.md) for the primary cloud-plus-connector flow and the
+separately scoped self-hosted Serve, Funnel, direct-T3, and LAN options.
 
 ## Create A Device
 
@@ -98,20 +315,39 @@ node scripts/simulate-device.mjs
 
 ## ESP32 Firmware
 
-The primary gateway-connected firmware is in:
+Four board targets are present. Environment counts below describe the current `platformio.ini`
+files; hardware evidence is tracked separately in the implementation ledger.
 
-```text
-firmware/CrowPanel-ESP32-2.13-E-paper
-```
+| Folder | Hardware | PlatformIO environments | Current role |
+|---|---|---:|---|
+| `firmware/CrowPanel-ESP32-2.13-E-paper` | 2.13-inch e-ink + keys | 5 | Mature low-power controller workflow plus hermetic capture proof |
+| `firmware/Hosyond-ESP32-S3-2.8-Touchscreen` | 240x320 touch + microphone/speaker | 7 | Primary touch/voice product and bench builds |
+| `firmware/Waveshare-ESP32-S3-Touch-AMOLED-1.75C` | Round AMOLED touch + microphones | 2 | Shared secure claim/health/recovery; all UI/media capabilities disabled until silicon proof |
+| `firmware/vision-master-t190` | 1.9-inch TFT | 1 | Shared secure status adapter; browse/operate input is gated behind verified external encoder wiring |
 
-It connects over WiFi, authenticates with the device ID/secret, polls compact display state, renders to a 2.13 inch e-ink display, reads an EC11 rotary encoder, and sends menu intents.
-Runtime defaults for the T3 environment, thread, prompt, and menu can be managed from the gateway after the device is claimed.
+Shared provisioning, persisted device state, gateway operations, media upload, OTA support, and orb
+rendering live under `firmware/shared/AgentControllerCore`.
+
+Validate the complete manifest without compiling:
 
 ```bash
-cd firmware/CrowPanel-ESP32-2.13-E-paper
-cp include/controller_config.example.h include/controller_config.h
-pio run
+npm run check:firmware-manifests
 ```
+
+Build the two named release images, or every declared environment:
+
+```bash
+npm run build:firmware
+npm run build:firmware:all
+```
+
+Both commands stage only source plus `controller_config.example.h` in a local temporary directory,
+so a live board configuration is neither read nor copied into build evidence. Each environment has
+a bounded timeout and reports dependency/setup failures separately from compile/link failures. The
+canonical 15-environment inventory is `firmware/build-matrix.json`.
+
+See [docs/firmware-build-gate.md](docs/firmware-build-gate.md) for the failure classifications,
+current compile evidence, and the limits of build-only proof.
 
 See [docs/hardware-protocol.md](docs/hardware-protocol.md) for provisioning, claim, display, media, and intent details.
 
@@ -125,9 +361,14 @@ FACTORY_TOKEN=replace-with-factory-secret \
 COUNT=10 \
 LABEL_PREFIX="Agent Controller" \
 PUBLIC_GATEWAY_URL=https://gateway.example.com \
+GATEWAY_TLS_ROOT_CA_PEM="$(< issuing-root.pem)" \
 ENABLE_OTA_APPLY=0 \
 npm run manufacture:batch
 ```
+
+Production firmware refuses HTTPS without a trusted root and valid clock. During a planned CA
+rotation, also set `GATEWAY_TLS_NEXT_ROOT_CA_PEM` so firmware carries both issuing roots before the
+gateway certificate moves. `INSECURE_SKIP_TLS_VERIFY=1` is an explicit local-bench setting only.
 
 Publish a signed firmware release manifest:
 
@@ -218,15 +459,17 @@ TRANSCRIPTION_PROVIDER=mock
 
 The mock provider produces deterministic transcripts for smoke tests. Production deployments should replace it with a real transcription worker/provider.
 
-## Register A T3 Environment
+## Connect a T3 environment today
 
-For guided local setup, run:
+Until the published connector CLI exists, a repository checkout can use:
 
 ```bash
 npm run setup:t3
 ```
 
-The setup checks for T3 Code and installs the current `t3` CLI when needed. It then walks through provider harness selection, provider authentication, local/LAN/Tailscale/custom connectivity, optional project registration, T3 launch, and gateway pairing.
+This legacy script predates the `npx` connector. It checks for T3 Code, handles provider
+and project setup, and registers a directly reachable T3 URL with the current Node gateway. It does
+not maintain the target outbound cloud connector channel.
 
 Harness selection is not restricted to OpenAI. The built-in choices are automatic detection, Codex/OpenAI, Claude Code, Cursor, OpenCode, Grok, and a custom T3 provider instance. OpenAI/Codex is only the choice used by the current Mac test.
 
@@ -293,6 +536,7 @@ curl -X POST http://127.0.0.1:3996/v1/device/intents \
   -H 'x-device-id: DEVICE_ID' \
   -H 'x-device-secret: DEVICE_SECRET' \
   -d '{
+    "clientRequestId": "dev:84d1f1d2-88984f43-a15b19c0-9238f411",
     "environmentId": "ENVIRONMENT_ID",
     "threadId": "THREAD_ID",
     "intent": {
@@ -302,6 +546,12 @@ curl -X POST http://127.0.0.1:3996/v1/device/intents \
   }'
 ```
 
+Generate a fresh `clientRequestId` for each new agent action. If the connection drops before the
+HTTP response arrives, retry the exact request with the same id; the gateway returns the original
+command (or an explicit `processing` receipt) instead of dispatching a second turn. Reusing an id
+for different input is a `409` conflict. Web clients can recover through
+`GET /v1/requests/:clientRequestId`; devices use `GET /v1/device/requests/:clientRequestId`.
+
 ## Web Dashboard
 
 The built-in dashboard supports:
@@ -310,8 +560,10 @@ The built-in dashboard supports:
 - Registering development devices, claiming factory devices, updating profiles, rotating secrets, transfer-resetting devices, and revoking devices.
 - Pairing, updating, dependency-previewing/removing, reachability-checking, and browsing T3 Code sessions.
 - Selecting any T3 project/provider instance/model and launching its first thread.
+- Watching streamed assistant/tool activity and reconnecting a live thread without losing its state.
+- Answering T3 provider approvals with the full decision set and responding to structured agent questions.
 - Uploading, deleting, and retention-managing image/audio media from phone or laptop.
-- Sending text, media, shell, status, and stop intents.
+- Composing text and ordered media requests from Operate or QuickPage, plus shell, status, and stop intents.
 - Saving and running prompt or shell macros.
 - Running saved macros from claimed hardware.
 - Approving or rejecting pending commands from claimed hardware.
@@ -321,11 +573,40 @@ The built-in dashboard supports:
 
 ## Test
 
-Run the full gate (client build, frontend typecheck, frontend tests, server tests):
+Run the full local code gate (console build/typecheck/tests, gateway tests, connector tests, and
+Cloudflare edge/private-control-plane typechecks and tests):
 
 ```bash
 npm test
 ```
+
+Run the repository credential-safety, maintained-documentation, and release Container gates separately:
+
+```bash
+npm run security:repo
+npm run check:docs
+npm run test:container
+```
+
+Run the production bundle, live-list, and SSE render-coalescing gate directly with:
+
+```bash
+npm run test:browser-performance
+```
+
+Its deterministic budgets and the latest local Chrome observation are documented in
+[docs/frontend-performance-gate.md](docs/frontend-performance-gate.md). Real mobile/GPU, WAN, and
+long-session live-stream evidence remains a separate release gate.
+
+GitHub pull requests and pushes run these boundaries as separate, credential-free jobs, including
+connector package smoke and the Docker release-image smoke. See
+[docs/ci-release-gates.md](docs/ci-release-gates.md) for the exact matrix and the hosted, live-T3,
+browser-performance, and hardware evidence that CI intentionally cannot claim.
+
+Connector publication is a separate manual `npm-release` environment operation, never a pull-request
+or push CI side effect. Its setup, exact confirmation syntax, immutable-version refusal, provenance,
+clean external verification, and rollback/deprecation limits are documented in
+[docs/npm-connector-release.md](docs/npm-connector-release.md). No npm publication is claimed here.
 
 Run one layer at a time:
 

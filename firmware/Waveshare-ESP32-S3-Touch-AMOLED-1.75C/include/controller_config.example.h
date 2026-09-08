@@ -54,17 +54,12 @@
 #define OTA_MANIFEST_VERIFY_KEY ""
 #endif
 
-// Defaults used by the on-screen quick actions.
-#define ENVIRONMENT_ID "env_replace_me"
-#define THREAD_ID "thread_replace_me"
-#define DEFAULT_AGENT_PROMPT "Continue the current task, inspect progress, and run relevant tests."
-#define DEFAULT_SHELL_COMMAND "npm test"
-
-// TLS certificate validation is disabled in this scaffold so self-hosted HTTPS gateways work
-// during bring-up. Pin the gateway certificate before production. Note that REQUIRE_TLS=1 on the
-// gateway refuses to issue a device credential over plaintext, so this only affects verification,
-// not the scheme.
-#define INSECURE_SKIP_TLS_VERIFY 1
+// HTTPS fails closed unless the cloud gateway's issuing root is configured. Concatenate a current
+// and next root during rotation. Set INSECURE_SKIP_TLS_VERIFY=1 only in a local bench config; it
+// exposes the long-lived device credential to interception.
+#define GATEWAY_TLS_ROOT_CA_PEM ""
+#define GATEWAY_TLS_NEXT_ROOT_CA_PEM ""
+#define INSECURE_SKIP_TLS_VERIFY 0
 
 // ---------------------------------------------------------------------------
 // Display: CO5300 AMOLED controller, 466x466, QSPI.
@@ -88,9 +83,11 @@
 // Double buffering costs ~868 KB of the 8 MB available.
 #define AMOLED_COLOR_DEPTH 16
 
-// Set to 0 to bring up networking and provisioning before touching the panel.
+// The safe scaffold never touches these pins. Turn this on only after the 1.75C schematic and a
+// physical display bring-up have proved the rail and bus mapping; enabling the macro alone does not
+// add a driver or advertise a display capability.
 #ifndef ENABLE_AMOLED
-#define ENABLE_AMOLED 1
+#define ENABLE_AMOLED 0
 #endif
 
 // ---------------------------------------------------------------------------

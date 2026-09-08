@@ -19,17 +19,15 @@ import {
   Server,
   ShieldCheck,
   Sparkles,
-  Wifi,
 } from "lucide-react";
-import { useEffect, useMemo, useRef, useState, type ReactNode } from "react";
+import { useEffect, useRef, useState, type ReactNode } from "react";
 
 import type { Controller } from "../controller";
+import { connectorForEnvironment } from "../connectorHealth";
 import { buildGatewayTunnelSetupCommand, type RemoteAccessMode } from "../remoteAccess";
 import {
-  buildT3SetupCommand,
   firstIncompleteStep,
   harnessOptions,
-  networkOptions,
   onboardingSteps,
 } from "../onboarding";
 import type {
@@ -54,6 +52,7 @@ import {
   RemoteAccessReadiness,
   remoteAccessReady,
 } from "./RemoteAccessReadiness";
+import { ConnectEnvironmentDialog, EnvironmentHealthStack } from "./EnvironmentsPage";
 
 interface OnboardingPageProps {
   controller: Controller;
@@ -68,13 +67,9 @@ export function OnboardingPage({ controller: c, onNavigate }: OnboardingPageProp
   const [networkMode, setNetworkMode] = useState<OnboardingNetworkMode>("local");
   const [workspacePath, setWorkspacePath] = useState("");
   const [workspaceTitle, setWorkspaceTitle] = useState("");
-  const [publicUrl, setPublicUrl] = useState("");
   const [connectionMode, setConnectionMode] = useState<"new" | "existing">("new");
   const [environmentId, setEnvironmentId] = useState("");
-  const [environmentLabel, setEnvironmentLabel] = useState("My T3 Code");
-  const [baseUrl, setBaseUrl] = useState("");
-  const [credentialType, setCredentialType] = useState<"pairingToken" | "accessToken">("pairingToken");
-  const [credential, setCredential] = useState("");
+  const [connectDialogOpen, setConnectDialogOpen] = useState(false);
   const [projectId, setProjectId] = useState("");
   const [firstPrompt, setFirstPrompt] = useState(
     "Confirm this workspace is ready, identify the project, and report the current branch.",
@@ -102,7 +97,6 @@ export function OnboardingPage({ controller: c, onNavigate }: OnboardingPageProp
     setInstanceId(c.onboarding.provider.instanceId ?? "");
     setModel(c.onboarding.provider.model ?? "");
     setNetworkMode(c.onboarding.networkMode ?? "local");
-    setPublicUrl(c.onboarding.networkUrl ?? "");
     setWorkspacePath(c.onboarding.workspace.path ?? "");
     setWorkspaceTitle(c.onboarding.workspace.title ?? "");
     setProjectId(c.onboarding.workspace.projectId ?? "");
@@ -161,19 +155,6 @@ export function OnboardingPage({ controller: c, onNavigate }: OnboardingPageProp
   const gatewayRemoteMode: RemoteAccessMode = c.remoteAccess?.tailscale.mode ?? "serve";
   const gatewayRemoteReady = remoteAccessReady(c.remoteAccess, gatewayRemoteMode);
   const gatewayTunnelCommand = buildGatewayTunnelSetupCommand(gatewayRemoteMode);
-  const setupCommand = useMemo(() => {
-    if (!workspacePath.trim()) return "";
-    return buildT3SetupCommand({
-      workspacePath: workspacePath.trim(),
-      workspaceTitle: workspaceTitle.trim() || workspaceName(workspacePath),
-      harness,
-      instanceId: instanceId.trim(),
-      model: model.trim(),
-      networkMode,
-      publicUrl: publicUrl.trim(),
-    });
-  }, [harness, instanceId, model, networkMode, publicUrl, workspacePath, workspaceTitle]);
-
   const reportStepError = (message: string) => {
     setStepError(message);
     c.setNotice({ tone: "danger", message });
@@ -220,20 +201,13 @@ export function OnboardingPage({ controller: c, onNavigate }: OnboardingPageProp
       reportStepError("Enter the workspace path on the T3 host.");
       return;
     }
-    if (networkMode === "custom" && !isHttpUrl(publicUrl)) {
-      reportStepError("Enter a valid HTTP or HTTPS URL for the custom network path.");
-      return;
-    }
     if (harness === "custom" && (!instanceId.trim() || !model.trim())) {
       reportStepError("Enter the custom provider instance and model.");
       return;
     }
-    if (!baseUrl.trim()) {
-      setBaseUrl(publicUrl.trim() || networkPlaceholder(networkMode));
-    }
     await saveAndMove("connect", {
       networkMode,
-      networkUrl: networkMode === "custom" ? publicUrl.trim() : null,
+      networkUrl: null,
       provider: {
         harness,
         instanceId: instanceId.trim() || null,
@@ -248,40 +222,17 @@ export function OnboardingPage({ controller: c, onNavigate }: OnboardingPageProp
   };
 
   const connectEnvironment = async () => {
-    if (connectionMode === "new" && (!isHttpUrl(baseUrl) || !credential.trim())) {
-      reportStepError("Enter the reachable T3 URL and credential.");
+    if (connectionMode === "new") {
+      setConnectDialogOpen(true);
       return;
     }
-    if (connectionMode === "existing" && !environmentId) {
+    if (!environmentId) {
       reportStepError("Select an existing T3 environment.");
       return;
     }
-    const submittedCredential = credential.trim();
     const result = await c.run("onboarding-connect", "T3 Code is reachable.", () => withStepError(
       async () => {
-        let nextEnvironmentId = environmentId;
-        if (connectionMode === "new") {
-          const created = await c.api<{ environment: Environment }>("/v1/t3/environments", {
-            method: "POST",
-            body: {
-              label: environmentLabel.trim() || "T3 Code",
-              baseUrl: baseUrl.trim(),
-              [credentialType]: submittedCredential,
-            },
-          });
-          nextEnvironmentId = created.environment.id;
-          setEnvironmentId(nextEnvironmentId);
-          setConnectionMode("existing");
-          await c.refreshAll();
-        } else if (submittedCredential) {
-          await c.api<{ environment: Environment }>(
-            `/v1/t3/environments/${encodeURIComponent(nextEnvironmentId)}`,
-            {
-              method: "PUT",
-              body: { [credentialType]: submittedCredential },
-            },
-          );
-        }
+        const nextEnvironmentId = environmentId;
 
         const checked = await c.api<{ environment: Environment }>(
           `/v1/t3/environments/${encodeURIComponent(nextEnvironmentId)}/check`,
@@ -302,7 +253,7 @@ export function OnboardingPage({ controller: c, onNavigate }: OnboardingPageProp
         await c.saveOnboarding({
           status: "in_progress",
           currentStep: "workspace",
-          networkUrl: checked.environment.baseUrl,
+          networkUrl: checked.environment.baseUrl ?? null,
           environmentId: nextEnvironmentId,
           workspace: {
             path: c.onboarding?.workspace.path ?? workspacePath.trim(),
@@ -313,7 +264,6 @@ export function OnboardingPage({ controller: c, onNavigate }: OnboardingPageProp
         return { checked, snapshot };
       },
     ));
-    if (submittedCredential) setCredential("");
     if (result) moveTo("workspace");
   };
 
@@ -543,6 +493,7 @@ export function OnboardingPage({ controller: c, onNavigate }: OnboardingPageProp
   }
 
   return (
+    <>
     <div className="onboarding-workspace">
       <aside className="onboarding-rail" aria-label="Setup progress">
         <div className="onboarding-rail__intro">
@@ -619,7 +570,7 @@ export function OnboardingPage({ controller: c, onNavigate }: OnboardingPageProp
               <StepLead
                 icon={Laptop}
                 title="Plan the T3 host"
-                description="Choose the provider, network path, and workspace that T3 Code will expose. Authentication stays on the host."
+                description="Choose the provider, computer, and workspace that T3 Code will use. Authentication stays on the host."
               />
 
               <div className="onboarding-section">
@@ -663,60 +614,27 @@ export function OnboardingPage({ controller: c, onNavigate }: OnboardingPageProp
               </div>
 
               <div className="onboarding-section">
-                <SectionLabel number="02" title="Network path" />
-                <div className="onboarding-choice-grid onboarding-choice-grid--four">
-                  {networkOptions.map((option) => (
-                    <ChoiceCard
-                      key={option.id}
-                      selected={networkMode === option.id}
-                      title={option.label}
-                      description={option.description}
-                      icon={option.id === "local" ? Monitor : option.id === "lan" ? Wifi : Network}
-                      onClick={() => setNetworkMode(option.id)}
-                    />
-                  ))}
+                <SectionLabel number="02" title="Computer" />
+                <div className="onboarding-choice-grid">
+                  <ChoiceCard
+                    selected={networkMode === "local"}
+                    title="Connect this computer"
+                    description="Run the connector command in a terminal on the computer where this console is open."
+                    icon={Monitor}
+                    onClick={() => setNetworkMode("local")}
+                  />
+                  <ChoiceCard
+                    selected={networkMode === "lan"}
+                    title="Connect another computer"
+                    description="Copy the enrollment command to the Mac or Linux computer that runs T3 Code."
+                    icon={Laptop}
+                    onClick={() => setNetworkMode("lan")}
+                  />
                 </div>
-                {networkMode === "custom" ? (
-                  <Field label="Public T3 URL" htmlFor="onboarding-public-url">
-                    <input
-                      id="onboarding-public-url"
-                      type="url"
-                      value={publicUrl}
-                      onChange={(event) => setPublicUrl(event.target.value)}
-                      placeholder="https://t3.example.com"
-                    />
-                  </Field>
-                ) : null}
-                {networkMode === "tailscale" ? (
-                  <div className="space-y-3 rounded-lg border border-success/20 bg-success/7 p-4">
-                    <div className="flex items-start gap-3">
-                      <ShieldCheck className="mt-0.5 size-4 shrink-0 text-success" aria-hidden="true" />
-                      <div className="space-y-1 text-xs leading-relaxed text-ink-muted">
-                        <p className="font-semibold text-ink">Private HTTPS through Tailscale Serve</p>
-                        <p>
-                          Install Tailscale and sign in on the T3 host. The generated setup command starts T3 Code with <code className="font-mono text-[11px] text-ink">--tailscale-serve</code> and prints its stable MagicDNS URL and one-time pairing credential.
-                        </p>
-                        <p>
-                          If T3 Code is already running, use <code className="font-mono text-[11px] text-ink">npx t3 pair --tailscale</code> instead, then paste the resulting HTTPS URL and token on the next step.
-                        </p>
-                        <p>
-                          The machine check below applies when T3 Code and Agent Controller run on this same host. If T3 runs elsewhere, install and sign in to Tailscale on that host too.
-                        </p>
-                      </div>
-                    </div>
-                    <RemoteAccessReadiness
-                      status={c.remoteAccess}
-                      mode="serve"
-                      compact
-                      refreshing={c.busyAction === "refresh-remote-access"}
-                      onRefresh={() => void c.run(
-                        "refresh-remote-access",
-                        "Remote access status refreshed.",
-                        () => c.loadRemoteAccess(true),
-                      )}
-                    />
-                  </div>
-                ) : null}
+                <div className="onboarding-note">
+                  <ShieldCheck className="size-4" />
+                  <span>Both choices use the same outbound connector. You do not need an inbound port, Tailnet, tunnel, or public T3 URL.</span>
+                </div>
               </div>
 
               <div className="onboarding-section">
@@ -742,24 +660,6 @@ export function OnboardingPage({ controller: c, onNavigate }: OnboardingPageProp
                 </div>
               </div>
 
-              {setupCommand ? (
-                <div className="onboarding-command">
-                  <div>
-                    <p className="eyebrow">Run on the T3 host</p>
-                    <code>{setupCommand}</code>
-                  </div>
-                  <Button
-                    size="sm"
-                    onClick={() => {
-                      void navigator.clipboard.writeText(setupCommand);
-                      c.setNotice({ tone: "success", message: "Setup command copied." });
-                    }}
-                  >
-                    <Clipboard className="size-3.5" /> Copy
-                  </Button>
-                </div>
-              ) : null}
-
               <StepError message={stepError} />
               <StepActions
                 onBack={() => moveTo("welcome")}
@@ -775,8 +675,8 @@ export function OnboardingPage({ controller: c, onNavigate }: OnboardingPageProp
             <div className="onboarding-step-pane">
               <StepLead
                 icon={Network}
-                title="Connect and verify T3 Code"
-                description="Pair the host, then prove that Agent Controller can reach its orchestration API."
+                title="Connect and verify this computer"
+                description="Enroll the outbound connector, then verify each layer from cloud to local T3."
               />
 
               {c.environments.length ? (
@@ -787,7 +687,7 @@ export function OnboardingPage({ controller: c, onNavigate }: OnboardingPageProp
                     data-active={connectionMode === "existing" || undefined}
                     onClick={() => setConnectionMode("existing")}
                   >
-                    Existing environment
+                    Connected computer
                   </button>
                   <button
                     type="button"
@@ -795,89 +695,54 @@ export function OnboardingPage({ controller: c, onNavigate }: OnboardingPageProp
                     data-active={connectionMode === "new" || undefined}
                     onClick={() => setConnectionMode("new")}
                   >
-                    New environment
+                    Connect another computer
                   </button>
                 </div>
               ) : null}
 
               {connectionMode === "existing" && c.environments.length ? (
-                <Field label="T3 environment" htmlFor="onboarding-existing-environment">
-                  <select
-                    id="onboarding-existing-environment"
-                    value={environmentId}
-                    onChange={(event) => setEnvironmentId(event.target.value)}
-                  >
-                    {c.environments.map((environment) => (
-                      <option key={environment.id} value={environment.id}>
-                        {environment.label} · {environment.status ?? "unchecked"}
-                      </option>
-                    ))}
-                  </select>
-                </Field>
+                <>
+                  <Field label="T3 computer" htmlFor="onboarding-existing-environment">
+                    <select
+                      id="onboarding-existing-environment"
+                      value={environmentId}
+                      onChange={(event) => setEnvironmentId(event.target.value)}
+                    >
+                      {c.environments.map((environment) => (
+                        <option key={environment.id} value={environment.id}>
+                          {environment.label} · {(environment.transportMode ?? "direct") === "connector" ? "connector" : "advanced direct"}
+                        </option>
+                      ))}
+                    </select>
+                  </Field>
+                  {c.environments.find((environment) => environment.id === environmentId) ? (
+                    <EnvironmentHealthStack
+                      environment={c.environments.find((environment) => environment.id === environmentId) as Environment}
+                      connector={connectorForEnvironment(c.connectors, c.environments.find((environment) => environment.id === environmentId))}
+                      cloudConnection={c.connection}
+                      proofReady={Boolean(c.onboardingReadiness?.checks.firstRunCompleted)}
+                    />
+                  ) : null}
+                </>
               ) : (
-                <div className="grid gap-3 sm:grid-cols-2">
-                  <Field label="Environment label" htmlFor="onboarding-environment-label">
-                    <input
-                      id="onboarding-environment-label"
-                      value={environmentLabel}
-                      onChange={(event) => setEnvironmentLabel(event.target.value)}
-                    />
-                  </Field>
-                  <Field label="Reachable T3 URL" htmlFor="onboarding-environment-url">
-                    <input
-                      id="onboarding-environment-url"
-                      type="url"
-                      value={baseUrl}
-                      onChange={(event) => setBaseUrl(event.target.value)}
-                      placeholder={networkPlaceholder(networkMode)}
-                    />
-                  </Field>
+                <div className="rounded-lg border border-control bg-surface-inset p-4">
+                  <p className="font-display text-base font-semibold">Enroll the T3 computer</p>
+                  <p className="mt-1 text-sm text-ink-muted">Agent Controller will create a short-lived command and wait for the connector to redeem it.</p>
+                  <Button className="mt-3" variant="primary" onClick={() => setConnectDialogOpen(true)}>
+                    <Laptop className="size-4" /> {networkMode === "local" ? "Connect this computer" : "Connect another computer"}
+                  </Button>
                 </div>
               )}
 
-              <div className="intent-switcher self-start" aria-label="Credential type">
-                <button
-                  type="button"
-                  className="intent-switcher__item"
-                  data-active={credentialType === "pairingToken" || undefined}
-                  onClick={() => setCredentialType("pairingToken")}
-                >
-                  Pairing token
-                </button>
-                <button
-                  type="button"
-                  className="intent-switcher__item"
-                  data-active={credentialType === "accessToken" || undefined}
-                  onClick={() => setCredentialType("accessToken")}
-                >
-                  Access token
-                </button>
-              </div>
-              <Field
-                label={credentialType === "pairingToken" ? "One-time pairing token" : "T3 access token"}
-                htmlFor="onboarding-environment-credential"
-                hint={connectionMode === "existing"
-                  ? "Optional. Paste a fresh credential to replace an expired or invalid saved credential."
-                  : "The credential is encrypted at rest and is never returned by the API."}
-              >
-                <textarea
-                  id="onboarding-environment-credential"
-                  rows={3}
-                  value={credential}
-                  onChange={(event) => setCredential(event.target.value)}
-                  placeholder={connectionMode === "existing" ? "Leave blank to reuse saved credential" : "Paste credential"}
-                />
-              </Field>
-
               <div className="onboarding-note">
                 <Radio className="size-4" />
-                <span>The next action pairs the environment, checks reachability, and loads its live projects.</span>
+                <span>Health stays layered: an online connector does not imply T3, a provider, or the first-run proof is ready.</span>
               </div>
 
               <StepError message={stepError} />
               <StepActions
                 onBack={() => moveTo("host")}
-                primaryLabel="Pair and verify"
+                primaryLabel={connectionMode === "new" ? "Create connect command" : "Verify and continue"}
                 primaryIcon={ShieldCheck}
                 busy={c.busyAction === "onboarding-connect"}
                 onPrimary={() => void connectEnvironment()}
@@ -1157,7 +1022,7 @@ export function OnboardingPage({ controller: c, onNavigate }: OnboardingPageProp
                 icon={Sparkles}
                 title={c.onboardingReadiness?.ready ? "Everything is connected" : "A setup item needs attention"}
                 description={c.onboardingReadiness?.ready
-                  ? "Your first T3 thread was accepted and Agent Controller has the context it needs."
+                  ? "Your first T3 thread produced an agent reply and Agent Controller has the context it needs."
                   : "Review the readiness checks below before completing setup."}
               />
 
@@ -1174,11 +1039,11 @@ export function OnboardingPage({ controller: c, onNavigate }: OnboardingPageProp
                 <ReadinessRow label="Reachable environment" ready={Boolean(c.onboardingReadiness?.checks.environmentReachable)} detail={c.onboardingReadiness?.environment?.label ?? "Not connected"} />
                 <ReadinessRow label="Workspace project" ready={Boolean(c.onboardingReadiness?.checks.workspaceSelected)} detail={c.onboarding?.workspace.title ?? c.onboarding?.workspace.projectId ?? "Not selected"} />
                 <ReadinessRow label="Provider and model" ready={Boolean(c.onboardingReadiness?.checks.providerConfigured)} detail={[c.onboarding?.provider.instanceId, c.onboarding?.provider.model].filter(Boolean).join(" · ") || "Not configured"} />
-                <ReadinessRow label="First thread" ready={Boolean(c.onboardingReadiness?.checks.firstRunDispatched)} detail={c.onboarding?.firstThreadId ?? "Not dispatched"} mono />
+                <ReadinessRow label="First agent reply" ready={Boolean(c.onboardingReadiness?.checks.firstRunCompleted)} detail={c.onboarding?.firstThreadId ?? "No completed proof thread"} mono />
                 <ReadinessRow label="Operating mode" ready={Boolean(c.onboardingReadiness?.checks.deviceReady)} detail={c.onboarding?.device.mode === "browser_only" ? "Browser only" : c.onboardingReadiness?.device?.label ?? "No controller"} />
               </div>
 
-              <div className="onboarding-section space-y-3">
+              {c.authConfig?.deploymentMode !== "cloud" ? <div className="onboarding-section space-y-3">
                 <div className="flex flex-wrap items-start justify-between gap-3">
                   <div>
                     <p className="eyebrow">Optional remote console</p>
@@ -1231,14 +1096,14 @@ export function OnboardingPage({ controller: c, onNavigate }: OnboardingPageProp
                     </Button>
                   </div>
                 )}
-              </div>
+              </div> : null}
 
               {c.onboardingReadiness?.ready ? (
                 <div className="onboarding-activation">
                   <CheckCircle2 className="size-5" />
                   <div>
                     <strong>Activation proven</strong>
-                    <p>The first agent command was accepted by T3 using the selected workspace and model.</p>
+                    <p>A matching agent reply completed the first command in the selected workspace with the selected model.</p>
                   </div>
                 </div>
               ) : null}
@@ -1266,6 +1131,17 @@ export function OnboardingPage({ controller: c, onNavigate }: OnboardingPageProp
         </div>
       </section>
     </div>
+    <ConnectEnvironmentDialog
+      controller={c}
+      open={connectDialogOpen}
+      onClose={() => setConnectDialogOpen(false)}
+      onConnected={(environment) => {
+        setEnvironmentId(environment.id);
+        setConnectionMode("existing");
+        setConnectDialogOpen(false);
+      }}
+    />
+    </>
   );
 }
 
@@ -1472,24 +1348,11 @@ function workspaceName(path: string) {
   return path.trim().split(/[\\/]/u).filter(Boolean).at(-1) ?? "My project";
 }
 
-function networkPlaceholder(mode: OnboardingNetworkMode) {
-  if (mode === "local") return "http://127.0.0.1:3773";
-  if (mode === "lan") return "http://192.168.1.25:3773";
-  if (mode === "tailscale") return "https://machine.tailnet.ts.net";
-  return "https://t3.example.com";
-}
-
 function networkLabel(mode?: OnboardingNetworkMode | null) {
-  return networkOptions.find((option) => option.id === mode)?.label ?? "Not selected";
-}
-
-function isHttpUrl(value: string) {
-  try {
-    const url = new URL(value.trim());
-    return url.protocol === "http:" || url.protocol === "https:";
-  } catch {
-    return false;
-  }
+  if (mode === "local") return "This computer";
+  if (mode === "lan") return "Another computer";
+  if (mode === "tailscale" || mode === "custom") return "Advanced direct setup";
+  return "Not selected";
 }
 
 function stepDescription(step: OnboardingStep) {
