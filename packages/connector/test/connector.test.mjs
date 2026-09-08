@@ -1,3 +1,5 @@
+import "./support/closeEvent.mjs";
+
 import assert from "node:assert/strict";
 import test from "node:test";
 import { ConnectorClient } from "../src/connector.mjs";

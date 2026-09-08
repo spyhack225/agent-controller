@@ -3,13 +3,20 @@ import { spawn } from "node:child_process";
 import { readFile } from "node:fs/promises";
 import { dirname, resolve } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
+import { createGzip } from "node:zlib";
 
 const packageRoot = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const repositoryRoot = resolve(packageRoot, "..");
 const defaultImage = "agent-controller-control-plane:local-smoke";
 const targetPlatform = "linux/amd64";
 const emulatedStartupTimeoutMs = 90_000;
-const maxImageBytes = 100 * 1024 * 1024;
+// Budget for the image as a gzip-compressed `docker save` archive. Neither `docker image inspect
+// .Size` nor the raw archive is comparable across hosts: the classic overlay2 store reports and
+// exports uncompressed layers (~227 MiB for this image, most of it the pinned
+// node:22-bookworm-slim base) while Docker Desktop's containerd snapshotter reports and exports
+// the compressed blobs (~78 MiB), so a budget on either passed locally and failed on the CI
+// runner. Compressing the archive here yields the same number everywhere, within a few percent.
+const maxImageArchiveBytes = 100 * 1024 * 1024;
 const forbiddenEnvironmentName = /(SECRET|TOKEN|PASSWORD|PRIVATE_KEY|API_KEY|CLERK|CONVEX|S3_)/u;
 const allowedContextEntries = new Set([
   "!src/",
@@ -90,7 +97,8 @@ export async function runContainerSmoke({
   assert.equal(metadata.Architecture, "amd64", "Cloudflare Containers require linux/amd64 images");
   assert.equal(metadata.Config?.User, "node");
   assert.equal(metadata.Config?.StopSignal, "SIGTERM");
-  assert.ok(metadata.Size <= maxImageBytes, `image grew beyond 100 MiB: ${metadata.Size} bytes`);
+  const archiveBytes = await measureImageArchive(image);
+  assert.ok(archiveBytes <= maxImageArchiveBytes, `compressed image archive grew beyond 100 MiB: ${archiveBytes} bytes`);
   assert.ok(metadata.Config?.ExposedPorts?.["3996/tcp"]);
   assert.ok(metadata.Config?.ExposedPorts?.["3998/tcp"]);
   for (const entry of metadata.Config?.Env ?? []) {
@@ -172,7 +180,8 @@ export async function runContainerSmoke({
       image,
       imageId: metadata.Id,
       platform: `${metadata.Os}/${metadata.Architecture}`,
-      sizeBytes: metadata.Size,
+      archiveBytes,
+      reportedSizeBytes: metadata.Size,
       runtimeUser: metadata.Config.User,
       runtimeDependencies: releaseFiles.runtimeDependencies,
       runtimePackageCount: releaseFiles.runtimePackageCount,
@@ -230,6 +239,31 @@ async function inherit(command, args) {
   const result = await run(command, args, { stdio: "inherit" });
   if (result.timedOut) throw new Error(`${command} ${args[0] ?? ""} timed out`);
   if (result.code !== 0) throw new Error(`${command} ${args[0] ?? ""} failed (${result.code})`);
+}
+
+async function measureImageArchive(image) {
+  return await new Promise((resolvePromise, rejectPromise) => {
+    const child = spawn("docker", ["save", image], { stdio: ["ignore", "pipe", "pipe"] });
+    const gzip = createGzip();
+    let bytes = 0;
+    let stderr = "";
+    const timer = setTimeout(() => {
+      child.kill("SIGKILL");
+      rejectPromise(new Error("docker save timed out"));
+    }, 300_000);
+    child.stderr.on("data", (chunk) => { stderr += chunk; });
+    child.stdout.pipe(gzip);
+    gzip.on("data", (chunk) => { bytes += chunk.length; });
+    gzip.on("error", (error) => { clearTimeout(timer); rejectPromise(error); });
+    child.on("error", (error) => { clearTimeout(timer); rejectPromise(error); });
+    child.on("close", (code) => {
+      if (code !== 0) {
+        clearTimeout(timer);
+        rejectPromise(new Error(`docker save failed (${code}): ${stderr.trim()}`));
+      }
+    });
+    gzip.on("end", () => { clearTimeout(timer); resolvePromise(bytes); });
+  });
 }
 
 async function capture(command, args, { allowFailure = false, includeStderr = false } = {}) {

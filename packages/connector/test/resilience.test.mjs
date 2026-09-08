@@ -1,3 +1,5 @@
+import "./support/closeEvent.mjs";
+
 import assert from "node:assert/strict";
 import { mkdtemp, readFile, rm, stat } from "node:fs/promises";
 import { tmpdir } from "node:os";

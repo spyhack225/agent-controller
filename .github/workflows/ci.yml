@@ -95,6 +95,8 @@ jobs:
           cache-dependency-path: package-lock.json
       - name: Install locked root dependencies
         run: npm ci --no-audit --no-fund
+      - name: Build console
+        run: npm run build:app
       - name: Typecheck durable Convex functions
         run: npm run typecheck:convex
       - name: Test gateway and local contracts
@@ -138,7 +140,11 @@ jobs:
         with:
           node-version: "22.21.1"
           cache: npm
-          cache-dependency-path: cloudflare-control-plane/package-lock.json
+          cache-dependency-path: |
+            package-lock.json
+            cloudflare-control-plane/package-lock.json
+      - name: Install locked root dependencies
+        run: npm ci --no-audit --no-fund
       - name: Install locked control-plane dependencies
         run: npm ci --prefix cloudflare-control-plane --no-audit --no-fund
       - name: Typecheck private Worker and Container boundary
