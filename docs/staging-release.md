@@ -14,11 +14,17 @@ this release workflow's read-only preflight fails and no mutation starts.
 
 ## GitHub environment setup
 
-Protect the `staging` environment with required reviewers, prevent self-review, restrict deployment
+Protect the `staging` environment with required reviewers, restrict deployment
 branches to the repository's default branch, and keep environment administrators from bypassing the
 rules. The repository workflow also verifies the dispatch ref and both source commits against the
 default branch, but repository settings remain the authority that withholds credentials before
 approval.
+
+**Reviewer policy.** "Prevent self-review" is optional and defaults to off, so a solo maintainer can
+be the sole required reviewer here and approve their own dispatch; the run still halts and waits for
+a deliberate click. Note also that when several reviewers are listed, GitHub proceeds once *one* of
+them approves, so extra names do not create two-person control. See
+[operator-setup.md](operator-setup.md) for the settings this project actually uses.
 
 Configure only these staging environment secrets:
 

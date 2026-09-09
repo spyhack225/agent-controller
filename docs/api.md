@@ -824,6 +824,30 @@ inference: it POSTs the clip over HTTP and waits on a socket, exactly as it does
 CPU inference is the supported default and a GPU is only an accelerator, which is why the timeout
 defaults to minutes and concurrency to one.
 
+**Where it runs in production, decided 2026-09-09: an operator-managed service beside the Container,
+not a connector capability.** Both were open options in the cloud roadmap's §21. The sidecar carries
+roughly 630 MB of ONNX weights and wants a long-lived process with real CPU, which is the opposite
+of what the connector is: a small, dependency-free CLI a user installs with one `npx` command on
+their own laptop, and which must stay cheap enough to leave running. Putting inference there would
+make every user's machine a transcription host, and would make the connector's install size and CPU
+profile a support problem.
+
+Three consequences for deployment, and none needs new code:
+
+- The gateway reaches the sidecar over plain HTTP at `PARAKEET_URL`, so the service must sit on a
+  private network the Container can route to, never on the public internet. It has no authentication
+  of its own; network reachability is the entire boundary.
+- The weights are an operator artifact, fetched once with `npm run parakeet:fetch` and mounted or
+  baked into whatever runs the sidecar. They are deliberately not in the Container image, which is
+  budgeted at roughly 78 MB compressed.
+- `TRANSCRIPTION_PROVIDER` unset means `disabled`, and a disabled provider fails every job
+  terminally. A deployment that forgets to name a provider has an inert voice pipeline that looks
+  configured, so completion plan item 4.6b treats naming and reaching the provider as its first
+  check.
+
+A hosted transcription API remains a drop-in alternative: the adapter boundary is the same, and only
+`TRANSCRIPTION_PROVIDER` and its credential change.
+
 | Variable | Default | Meaning |
 |---|---|---|
 | `PARAKEET_URL` | `http://127.0.0.1:8977/v1/transcribe` | The sidecar endpoint. |

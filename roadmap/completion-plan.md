@@ -52,12 +52,12 @@ or anything is published.
 | # | Task | Owner | Closes | Evidence |
 |---|---|---|---|---|
 | 0.1 | **Confirm the license.** Apache-2.0 was chosen on 2026-09-08 as a defensible default; the maintainer must ratify it or replace it before the repository is public. Root `LICENSE`, `packages/connector/LICENSE`, and both manifests already carry it. | Maintainer | CG-04, CG-10 | Written decision; `npm run pack:connector` and the release helper's license check pass |
-| 0.2 | **Rotate every credential that was ever tracked.** The bench device secret and home Wi-Fi password from the purged `controller_config.old.h` (never pushed, but present in the local backup mirror), and the previously exposed Convex gateway secret that CG-10 records as still needing external rotation. | Maintainer | CG-10 | Rotation recorded outside the repository; Convex env and `GATEWAY_CONVEX_SECRET` replaced |
-| 0.3 | **Delete the pre-rewrite mirror** `~/Documents/Claude/Projects/agent-controller-pre-oss-backup.git` once 0.2 is done. It is the last copy of those secrets. | Maintainer | CG-10 | Mirror gone |
+| 0.2 | **Deferred, tracked in [deferred-items.md](../docs/deferred-items.md).** Rotate every credential that was ever tracked. The bench device secret and home Wi-Fi password from the purged `controller_config.old.h` (never pushed, but present in the local backup mirror), and the previously exposed Convex gateway secret that CG-10 records as still needing external rotation. | Maintainer | CG-10 | Rotation recorded outside the repository; Convex env and `GATEWAY_CONVEX_SECRET` replaced |
+| 0.3 | **Deferred, tracked in [deferred-items.md](../docs/deferred-items.md).** Delete the pre-rewrite mirror `~/Documents/Claude/Projects/agent-controller-pre-oss-backup.git` once 0.2 is done. It is the last copy of those secrets. | Maintainer | CG-10 | Mirror gone |
 | 0.4 | **Move the working checkout off the cloud-synced folder** (or exclude it from File Provider sync). The status ledger, firmware gate, and this week's hollow `node_modules` all trace to sync interference. | Maintainer | Status ledger reliability | A full `npm test` completes without a worker-startup timeout |
 | 0.5 | **Update the stale ledger rows.** The two examples this row originally named are already corrected: CG-10 now records the 2026-09-08 history rewrite, and CLAUDE.md no longer calls the orb verb compare a known gap. A 2026-09-09 audit found the remaining drift elsewhere — stale test/size counts, `src/app.mjs` and Store-method figures, `DANGEROUS_SHELL_PATTERNS` and the intent-type list, a "terminal write is not implemented" note in `docs/api.md`, stale `#L` anchors and route/method names in `docs/device-setup-flow.md`, and a README claim that no vendor documentation is redistributed. | Engineer | CG-11 | `npm run check:docs` passes; rows cite the 2026-09-08 rewrite |
 | 0.6 | **Bump the pinned GitHub Actions.** Done 2026-09-09: all four moved off the deprecated Node 20 runtime, and each new SHA was re-resolved against its tag independently. | Engineer | Hygiene | CI green with no deprecation annotation. Note this only exercises `ci.yml`; the four protected workflows carry the same pins and are dispatch-only, so verify each pinned SHA resolves to its claimed tag rather than discovering a bad pin in a reviewer-gated run |
-| 0.7 | **Make the repository public** and turn on private vulnerability reporting (SECURITY.md already points there), branch protection on `main` requiring the Hermetic CI check, and tag protection for `connector-v*`. | Maintainer | CG-04 setup | Repository settings reviewed |
+| 0.7 | **Done 2026-09-09.** Repository is public; private vulnerability reporting is on; `main` requires all eight CI jobs with force-push, deletion and non-linear history refused; a ruleset protects `connector-v*` tags against update and deletion. Administrators still bypass branch protection, so the owner can push to `main` directly. | Maintainer | CG-04 setup | Verified through the GitHub API |
 
 ## Phase 1 — Accounts, environments, and secrets (Maintainer, 1 to 2 days plus provider lead time)
 
@@ -76,7 +76,7 @@ for detail.
 | 1.3 | **Convex** staging and production deployments with deploy keys | [auth-storage.md](../docs/auth-storage.md) | `npm run smoke:convex` against staging is the first check |
 | 1.4 | **Clerk** staging and production instances (secret and publishable keys) | [auth-storage.md](../docs/auth-storage.md) | Cloud mode disables dev tokens; a real Clerk user is required for qualification |
 | 1.5 | Generate the runtime secrets: T3 token encryption key, gateway Convex secret (entered identically in Cloudflare and Convex), Web Push VAPID key set and sealing key, R2 access keys | [notifications.md](../docs/notifications.md), [staging-bootstrap.md](../docs/staging-bootstrap.md) | Rotation-aware `WEB_PUSH_VAPID_KEYS` form |
-| 1.6 | GitHub environments **`staging-bootstrap`**, **`staging`**, **`npm-release`**, **`production`**: required reviewers (two for production), no self-review, no admin bypass, default-branch only | each runbook | **Name the second reviewer before starting.** With required reviewers plus prevent-self-review, whoever dispatches cannot approve, so a solo maintainer cannot run any protected workflow. This gates Phases 2, 3 and 7 entirely and has no default |
+| 1.6 | GitHub environments **`staging-bootstrap`**, **`staging`**, **`npm-release`**, **`production`**. Staging and npm-release: you are the sole reviewer with **prevent-self-review off**, so you approve your own dispatch and these are solo-operable today. Production: **prevent-self-review on** and reviewers who are not you | **Three created 2026-09-09**; secrets still unset. [operator-setup.md](../docs/operator-setup.md) §4.0 | Two GitHub facts drive this. Self-review is allowed unless you switch it off, so a solo maintainer is not blocked. And when several reviewers are listed, **one** approval is enough, so extra names never create two-person control |
 | 1.7 | **npm**: decide the final package name and scope (the `@agent-controller` organisation must exist and be owned), register the package, configure the GitHub Actions trusted publisher for `npm-connector-release.yml` and environment `npm-release`, then disable token publishing | [npm-connector-release.md](../docs/npm-connector-release.md) | Open question in the cloud roadmap §21; no `NPM_TOKEN` anywhere |
 | 1.8 | A **T3 host for staging**: one machine with T3 Code installed and a provider (Codex, Claude, OpenCode or xAI) authenticated, reachable only by its own connector | [staging-qualification.md](../docs/staging-qualification.md) | Also serves as the first clean connector host in Phase 3 |
 
@@ -140,8 +140,11 @@ representative desktop browser and a phone.
 
 ## Phase 6 — Hardware (Bench + Engineer, 6 to 10 days plus lead time)
 
-Hosyond is the only board with silicon evidence, and it has never spoken to the cloud over the
-internet. Ship the beta on Hosyond; treat the other boards as follow-on.
+All four boards are in scope, sequenced by evidence. Hosyond is the only one with silicon evidence
+and has never spoken to the cloud over the internet, so it goes first and proves the path; CrowPanel,
+Waveshare and T190 follow through the same steps once that path is known good. Keep each board's UI
+and media capabilities disabled until its own hardware proof exists, so a compile is never mistaken
+for a working peripheral.
 
 | # | Task | Closes | Evidence |
 |---|---|---|---|
@@ -170,15 +173,15 @@ These are not blocked on code. Each has a default that lets work continue.
 
 | Decision | Default if undecided | Needed by |
 |---|---|---|
-| License ratification | Apache-2.0 (in place) | Phase 0.7 |
+| License ratification | **Apache-2.0, ratified 2026-09-09** | done |
 | npm package name and scope ownership | `@agent-controller/connector` as committed | Phase 1.7 |
-| Where Parakeet inference runs | Operator-run sidecar next to the Container | Phase 4.6 |
+| Where Parakeet inference runs | **Operator-run sidecar next to the Container.** Decided 2026-09-09; not a connector capability | Phase 4.6b |
 | Singleton Container versus partitioning versus admission queue | Singleton with the provisional 16-environment budget | Phase 4.4 |
 | Console realtime stays SSE or moves to WebSocket | SSE | After beta |
 | Beta concurrency and Cloudflare cost budget | Set from the Phase 4.4 billing observation | Phase 7.4 |
-| Hardware scope for the beta | Hosyond only | Phase 6 |
+| Hardware scope for the beta | **All four boards, Hosyond first.** Decided 2026-09-09 | Phase 6 |
 | eFuse secure boot and flash encryption | Deferred; rollback drills still required | Phase 6.6 |
-| **Who is the second reviewer** on protected environments | **No default.** Prevent-self-review means a solo maintainer cannot approve their own dispatch, so Phases 2, 3 and 7 cannot run until someone else holds approval rights | Phase 1.6 |
+| **Who reviews production** | **No default, and needed only at Phase 7.** Prevent-self-review is on for production alone, so its reviewer must be someone other than you. Staging, qualification and the npm publish all run solo | Phase 7.2 |
 
 ## What "done" looks like
 

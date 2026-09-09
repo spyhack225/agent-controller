@@ -838,7 +838,9 @@ Operations: [docs/operator-setup.md](docs/operator-setup.md) is the ordered acco
 first-deployment sequence; [docs/staging-drills.md](docs/staging-drills.md) documents the scripted
 hosted qualification drills; [docs/evidence-bundles.md](docs/evidence-bundles.md) covers assembling
 the promotion and final-qualification evidence bundles.
-[roadmap/completion-plan.md](roadmap/completion-plan.md) sequences everything that remains. Milestone 0.5 is complete; Milestones 2 and 3 are substantially
+[roadmap/completion-plan.md](roadmap/completion-plan.md) sequences everything that remains.
+[docs/deferred-items.md](docs/deferred-items.md) records known non-blocking work, including two
+credential rotations that are deliberately postponed. Milestone 0.5 is complete; Milestones 2 and 3 are substantially
 implemented, while Milestones 0, 1, 4, and 5 remain partial pending their named deployed, live-T3,
 browser, or hardware proof.
 

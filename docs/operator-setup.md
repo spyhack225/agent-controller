@@ -266,25 +266,60 @@ burn a protected run, so the tables below name the environment for every secret.
 
 | Setting | staging-bootstrap | staging | npm-release | production |
 | --- | --- | --- | --- | --- |
-| Required reviewers | 1 or more | 1 or more | 1 or more | **2 or more** |
-| Prevent self-review | on | on | on | on |
+| Required reviewers | you | you | you | a second person, not you |
+| Prevent self-review | **off** | **off** | **off** | on |
 | Deployment branches | default branch only | default branch only | default branch only | default branch only |
 | Administrators can bypass | off | off | off | off |
 | Environment secrets | see 4.1 | see 4.2 | none | see 4.4 |
 
-**Decision — who reviews.** "Required reviewers" plus "prevent self-review" means the person who
-dispatches a workflow cannot approve it. A solo maintainer therefore needs a second GitHub account
-or a second human reviewer before any protected workflow can run at all. Decide this now; it is not
-discoverable until the run is already sitting in a queue. Production additionally needs two
-reviewers, and its four jobs each request approval separately by design.
+**Decision — who reviews.** Two facts about GitHub environments decide this, and an earlier revision
+of this runbook had both wrong.
+
+**Self-review is allowed unless you switch it off.** "Prevent self-review" is optional and defaults
+to off. With it off, you can be the sole required reviewer and approve your own dispatch. The gate
+still does its real job: the run halts, tells you what it is about to mutate, and waits for a
+deliberate click. What it cannot do is make a second person look. A solo maintainer is therefore
+**not** blocked from running any protected workflow.
+
+**Listing two reviewers does not require two approvals.** GitHub proceeds when *one* of the listed
+reviewers approves. Two-person control cannot be built by adding names to the list; the only way to
+guarantee someone other than the dispatcher approves is to switch prevent-self-review **on** and
+list only people who are not the dispatcher.
+
+The settings above follow from that. Staging and npm-release are solo-operable now, because staging
+is isolated and disposable and the npm package is yours. Production keeps prevent-self-review on and
+must list someone who is not you, so the one irreversible boundary in this system keeps a genuine
+second pair of eyes. Until that person exists, Phases 1 through 6 of the completion plan run solo
+and only production promotion waits.
 
 Create an environment (repeat for each of the four names):
 
 ```bash
-REVIEWER_ID="$(gh api users/REPLACE_WITH_REVIEWER_LOGIN --jq .id)"
+REPO="spyhack225/agent-controller"
+ME_ID="$(gh api user --jq .id)"
 
-for ENVIRONMENT in staging-bootstrap staging npm-release production; do
+# Staging and npm-release: you are the reviewer, and you may approve your own dispatch.
+for ENVIRONMENT in staging-bootstrap staging npm-release; do
   gh api --method PUT "repos/$REPO/environments/$ENVIRONMENT" --input - <<JSON
+{
+  "wait_timer": 0,
+  "prevent_self_review": false,
+  "can_admins_bypass": false,
+  "reviewers": [{ "type": "User", "id": $ME_ID }],
+  "deployment_branch_policy": { "protected_branches": true, "custom_branch_policies": false }
+}
+JSON
+done
+```
+
+Production is deliberately different, and is the one environment you cannot create alone. Its
+reviewer must be someone other than you, because with prevent-self-review on your own approval is
+refused and the run would sit in the queue forever:
+
+```bash
+REVIEWER_ID="$(gh api users/REPLACE_WITH_SECOND_REVIEWER_LOGIN --jq .id)"
+
+gh api --method PUT "repos/$REPO/environments/production" --input - <<JSON
 {
   "wait_timer": 0,
   "prevent_self_review": true,
@@ -293,13 +328,19 @@ for ENVIRONMENT in staging-bootstrap staging npm-release production; do
   "deployment_branch_policy": { "protected_branches": true, "custom_branch_policies": false }
 }
 JSON
-done
 ```
 
-Add the second production reviewer by repeating the `production` call with both reviewer entries in
-the `reviewers` array. If your GitHub API version rejects `can_admins_bypass`, remove that field and
+Add further production reviewers by repeating that call with more entries in the `reviewers` array;
+remember that any one of them approving is enough. If your GitHub API version rejects `can_admins_bypass`, remove that field and
 untick **Allow administrators to bypass configured protection rules** in the environment settings UI
 instead — do not leave it on.
+
+**Already done on 2026-09-09.** `staging-bootstrap`, `staging` and `npm-release` exist on
+`spyhack225/agent-controller` with the settings above: one required reviewer (the repository owner),
+prevent-self-review off, default-branch-only deployments, and no administrator bypass. Verify with
+`gh api repos/spyhack225/agent-controller/environments --jq '.environments[].name'`. Their **secrets
+are not set**, which is the remaining work in 4.1 through 4.3. `production` is deliberately absent
+until a second reviewer exists.
 
 ### 4.1 Environment `staging-bootstrap`
 
@@ -785,7 +826,7 @@ Phases 4 to 6, and none of them may be inferred from a passing resource-name che
 | --- | --- | --- |
 | License ratification | Apache-2.0, already in place | Stage 0 |
 | Staging origin: `workers.dev` or a custom domain | The repository config attaches no route, so `workers.dev` is what a deploy produces | Stage 1 |
-| Second reviewer identity (self-review is off; production needs two) | None recorded — you must choose | Stage 4 |
+| Second reviewer identity (production only; staging and npm-release are solo-operable) | None recorded — needed before Phase 7, not before Phase 2 | Stage 4 |
 | npm package name and scope | `@agent-controller/connector` as committed | Stage 4.3 |
 | Which commit is the trivial follow-on **B** for the rollback proof | None recorded; it must not touch `convex/` or Worker topology | Stage 7 |
 | Where Parakeet inference runs | Operator-run sidecar next to the Container | Phase 4, not this document |

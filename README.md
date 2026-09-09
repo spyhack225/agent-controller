@@ -667,6 +667,7 @@ from [docs/operator-setup.md](docs/operator-setup.md), which sequences the accou
 environments, secrets and first staging deployment, then
 [docs/staging-drills.md](docs/staging-drills.md) and
 [docs/evidence-bundles.md](docs/evidence-bundles.md) for hosted qualification and release evidence.
+Known non-blocking follow-ups are tracked in [docs/deferred-items.md](docs/deferred-items.md).
 
 ## License
 

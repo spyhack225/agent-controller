@@ -33,11 +33,17 @@ Before the first release:
    maintainer must also make. This workflow runs `npm publish`, so that action must be explicitly
    allowed or the registry rejects the publication step after environment approval, with nothing
    published. Do not add `NPM_TOKEN`, `NODE_AUTH_TOKEN`, or an npm auth token to GitHub.
-4. Configure the GitHub `npm-release` environment with required reviewers, prevent self-review and
+4. Configure the GitHub `npm-release` environment with required reviewers and
    administrator bypass, and restrict deployment to the default branch. Protect
    `connector-v*` tags against update and deletion.
 5. After trusted publishing works, disable token-based publishing for the npm package and revoke old
    automation tokens. Keep interactive npm owner recovery separate from Actions.
+
+**Reviewer policy.** "Prevent self-review" is optional and defaults to off, so a solo maintainer can
+be the sole required reviewer here and approve their own dispatch; the run still halts and waits for
+a deliberate click. Note also that when several reviewers are listed, GitHub proceeds once *one* of
+them approves, so extra names do not create two-person control. See
+[operator-setup.md](operator-setup.md) for the settings this project actually uses.
 
 npm trusted publishing currently requires GitHub-hosted runners, Node 22.14 or newer, and npm
 11.5.1 or newer. The workflow pins Node 22.21.1 and npm 11.5.1 and gives OIDC permission only to the

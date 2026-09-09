@@ -11,10 +11,15 @@ use the protected [`Staging release`](staging-release.md) workflow for all deplo
 
 ## Protect and scope the environment
 
-Create a GitHub environment named exactly `staging-bootstrap`. Require reviewers, prevent
-self-review, restrict deployment branches to the repository default branch, and prevent environment
+Create a GitHub environment named exactly `staging-bootstrap`. Require reviewers, restrict deployment branches to the repository default branch, and prevent environment
 administrators from bypassing the rules. Do not reuse the normal `staging` environment: bootstrap
 has resource-creation and secret-provisioning authority that routine releases do not need.
+
+**Reviewer policy.** "Prevent self-review" is optional and defaults to off, so a solo maintainer can
+be the sole required reviewer here and approve their own dispatch; the run still halts and waits for
+a deliberate click. Note also that when several reviewers are listed, GitHub proceeds once *one* of
+them approves, so extra names do not create two-person control. See
+[operator-setup.md](operator-setup.md) for the settings this project actually uses.
 
 Use an account isolated from production. The Cloudflare token must be limited to that staging
 account and only the Workers/Containers, Queues, R2, and read capabilities needed by the procedure.

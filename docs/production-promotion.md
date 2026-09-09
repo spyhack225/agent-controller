@@ -23,8 +23,16 @@ exit is never described as a canary.
 
 ## Required GitHub environment
 
-Create a `production` environment before enabling this workflow. Require at least two reviewers,
-prevent self-review, disable administrator bypass, and restrict deployments to the default branch.
+Create a `production` environment before enabling this workflow. Switch **prevent self-review on**
+and list only reviewers who are not the person dispatching, disable administrator bypass, and
+restrict deployments to the default branch.
+
+An earlier revision of this document asked for "at least two reviewers" and implied that produced
+two-person control. It does not: GitHub proceeds as soon as **one** of the listed reviewers
+approves, so a longer list adds availability, not scrutiny. The only setting that guarantees someone
+other than the dispatcher approved is prevent-self-review, which is why it is mandatory here and
+optional on the staging environments. This is the one irreversible boundary in the system, so it is
+also the one place a second person is genuinely required.
 The four protected jobs intentionally request the same environment separately; reviewers must check
 the completed prior phase before admitting the next credential-bearing job.
 
