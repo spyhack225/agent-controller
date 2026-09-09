@@ -307,6 +307,9 @@ rollback evidence remain. Runbook: [../docs/release-rollouts.md](../docs/release
 
 ## Next recommended implementation order
 
+The ordered, owner-assigned version of this list, with the evidence each step needs, is
+[completion-plan.md](completion-plan.md).
+
 1. Qualify raw upload/finalize, abandoned-session cleanup, and post-move retry through deployed R2/Convex.
 2. Qualify notification replay, optional Web Push, and scheduled-worker liveness through deployed
    Queue/Cron/Convex, browser reconnect, VAPID rotation, and provider-failure exercises.

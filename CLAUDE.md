@@ -358,9 +358,9 @@ Three refusals are the point: a settled turn yields no verb, an activity stamped
 T3 publishes no "the model is generating" activity, so a finished `tool.completed` with nothing
 after it still reports that tool — a known, uncloseable gap.
 
-**Known firmware gap:** `orbModeForAgentState()` compares against lowercase literals
-(`ThinkingOrb.cpp`), but `GatewayOperate.cpp` upper-cases `ThreadOption.status` before the orb table
-reads it, so the fallback mapper cannot match a verb until that compare is made case-insensitive.
+`orbModeForAgentState()` (`ThinkingOrb.cpp`) case-folds the word it is handed, because
+`GatewayOperate.cpp` upper-cases `ThreadOption.status` before the orb table reads it; an earlier
+revision compared lowercase literals and silently rendered every verb as the idle ring.
 
 ### Media storage and processing
 

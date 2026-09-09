@@ -657,7 +657,9 @@ node scripts/mock-t3.mjs
 See [docs/api.md](docs/api.md) for endpoint examples and the local end-to-end flow. Product work in
 progress is tracked in
 [roadmap/open-input-media-voice-environments-roadmap.md](roadmap/open-input-media-voice-environments-roadmap.md),
-with current verified state in [roadmap/IMPLEMENTATION-STATUS.md](roadmap/IMPLEMENTATION-STATUS.md).
+with current verified state in [roadmap/IMPLEMENTATION-STATUS.md](roadmap/IMPLEMENTATION-STATUS.md)
+and the ordered list of everything still outstanding in
+[roadmap/completion-plan.md](roadmap/completion-plan.md).
 
 ## License
 
