@@ -5,7 +5,7 @@ Canonical progress ledger for
 This file records what the repository can do now; the roadmap records the target and sequence.
 Anything not marked **done** is not complete.
 
-Last verified: **2026-09-08** in the current working tree. The earlier `674a8f9` evidence remains
+Last verified: **2026-09-09** in the current working tree. The earlier `674a8f9` evidence remains
 the baseline for the open-input/media initiative; the cloud workstream below is committed but has
 not been deployed anywhere.
 
@@ -14,7 +14,7 @@ not been deployed anywhere.
 | Surface | State | Current evidence | Remaining gate |
 |---|---|---|---|
 | Connector backend | partial | Separate credential/ticket realm, Store/Convex parity, connector projections, `T3Transport`, private router, bounded 25-second immediate-wake result/subscription reads, credential-scoped idempotent self-revocation with fail-closed local cleanup, managed-topology exclusion of the local ticket issuer, and reconnect recovery; focused local gates cover these contracts | Deployed binding latency/call rate, machine sleep/WAN, and live T3 parity |
-| Connector package | partial | Real npm bin and clean pack/install; manual protected release automation binds exact stable version, annotated tag, source commit and confirmation, enforces dependency-free contents/size/executable plus npm dry-run, grants OIDC only to `npm-release`, refuses immutable version reuse, requests provenance, designs clean external exact-version verification, and emits redacted evidence; native credential adapters, cross-platform T3 ownership, transactional update rollback, rotation, and platform-mocked service lifecycle remain covered locally | Commit the authoritative GitHub repository metadata, configure the npm trusted publisher/environment/tag rules, execute publication; then prove clean macOS/Linux/Windows install, service/T3/native-store/sleep/update/rotation handoff behavior |
+| Connector package | partial | Real npm bin and clean pack/install; manual protected release automation binds exact stable version, annotated tag, source commit and confirmation, enforces dependency-free contents/size/executable plus npm dry-run, grants OIDC only to `npm-release`, refuses immutable version reuse, requests provenance, designs clean external exact-version verification, and emits redacted evidence; the package manifest now carries Apache-2.0, a package-local `LICENSE`, and the `spyhack225/agent-controller` repository/homepage/bugs metadata; native credential adapters, cross-platform T3 ownership, transactional update rollback, rotation, and platform-mocked service lifecycle remain covered locally | Confirm the final public package scope/name, configure the npm trusted publisher/environment/tag rules, execute publication; then prove clean macOS/Linux/Windows install, service/T3/native-store/sleep/update/rotation handoff behavior |
 | Cloudflare edge | partial | Worker/Static Assets, per-environment Durable Object, bounded immediate-wake waits, Queue/Cron handlers, redacted terminal/exhaustion quarantine plus configured broker DLQs, revoke/reconnect recovery, and sampled privacy-safe Analytics Engine/log telemetry for request duration/outcome, DO capacity, Queue lag/retry/quarantine/DLQ risk, connector transitions, and rollouts; Wrangler/preflight sampling and binding policy plus hermetic telemetry tests are local-only | Execute isolated bootstrap and protected deploy/rollback; prove hosted ingestion/privacy, dashboards/alerts, native Queue/DLQ correlation, cron, rollover/load/security behavior |
 | Cloudflare control plane | partial | Private Worker + bounded Container wrapper + private edge-router/background joins; managed Web Push VAPID rotation/sealing secrets are name-preflighted and passed only to the private Container with its process timer disabled in favor of Queue/Cron; Container proxy telemetry distinguishes startup-wait candidates, startup timeout, and response-header timeout without request data; reproducible `linux/amd64` image (about 78 MiB as a gzip-compressed `docker save` archive under a 100 MiB budget; 227 MiB uncompressed) runs non-root and passes public/private/graceful-stop release smoke; protected bootstrap/release/rollback and redacted qualification harnesses have local coverage | Execute paid-plan bootstrap/deploy, live rollback rehearsal, qualification/binding/jobs/R2/Web Push provider, hosted telemetry privacy/alert delivery, and `standard-1` CPU/memory/cold-start/cost proof |
 | Capacity/SLO | partial | Provisional singleton budget and `npm run test:capacity`; local report qualifies 16 concurrent environments, 48 Container proxy requests, exact 32-request/16-lease/48-waiter DO bounds, fresh/warm/saturated latency, Node RSS/heap/CPU, and the process-local rate-limit restart caveat | Hosted `standard-1` saturation/soak/rollover, Redis continuity, per-hop WAN latency, availability, Cloudflare billing observation, and accepted singleton/partition decision |
@@ -35,18 +35,17 @@ workstream is marked done.
   landed, including the evidence-limited T3-native work graph, durable in-app notifications, locally
   verified rollout controls, and the expanded probed capability manifest. Hardware validation,
   deployed Web Push qualification, and live-system proof remain.
-- **Current repository gate:** the production build, frontend performance budgets, and frontend,
-  Convex, Cloudflare, and control-plane typechecks pass. The post-integration server suite passes
-  773 tests with three intentional live-S3 skips; connector passes 82; Cloudflare passes 15
-  contract, 28 Worker, 13 resilience, and 13 private-control-plane tests. The umbrella frontend run
-  passed 49 files/337 tests but one additional file never started because Vitest worker startup
-  timed out on the macOS File Provider-backed checkout; an isolated fork and thread retry failed at
-  the same pre-import boundary, with no assertion failure. The preceding complete run passed all
-  361 frontend tests, so a fresh quiet-checkout rerun remains required for a current full-green
-  `npm test` claim. `npm run smoke:convex` also passes against disposable live Convex records. The
-  browser gate checks lazy feature chunks, a bounded initial static graph, a 512-row live projection,
-  and frame-batched SSE updates; current measurements are recorded by
-  `docs/frontend-performance-gate.md` rather than duplicated as brittle totals here.
+- **Current repository gate:** `npm test` completed green on 2026-09-09 in this working tree. The
+  production build, frontend performance budgets, and the frontend, Convex, Cloudflare, and
+  control-plane typechecks pass. The server suite reports 785 tests, 782 passing and three
+  intentional live-S3 skips; connector passes 85; Cloudflare passes 16 contract, 28 Worker, 13
+  resilience, and 13 private-control-plane tests; the frontend suite passes 50 files/365 tests. The
+  earlier Vitest worker-startup timeout on the macOS File Provider-backed checkout did not recur in
+  this run, so no file was skipped. `npm run smoke:convex` also passes against disposable live
+  Convex records. The browser gate checks lazy feature chunks, a bounded initial static graph, a
+  512-row live projection, and frame-batched SSE updates; current measurements are recorded by
+  `docs/frontend-performance-gate.md` rather than duplicated as brittle totals here. All of this is
+  local code evidence; none of it is deployed, live-T3, browser, or hardware proof.
 - **Firmware baseline:** `firmware/build-matrix.json` now enumerates all 15 PlatformIO environments
   on the one pinned pioarduino toolchain, and CI checks that inventory plus secure release selection.
   Current isolated placeholder-config builds prove all four CrowPanel environments, the secure
@@ -97,9 +96,11 @@ workstream is marked done.
 - **The device UI is a real operate surface**, not a status screen: contextual action bar,
   pull-down status drawer, and environment -> folder -> thread browsing. Orb state selection is a
   total table over the vocabulary the gateway actually sends; it previously matched only one of
-  those words and rendered failed turns identically to idle ones. Four of the nine animations
-  (searching, solving, weaving, shaping) have no honest trigger yet and are deliberately unused
-  outside the `-orbbench` environment.
+  those words and rendered failed turns identically to idle ones. The four remaining animations
+  (searching, solving, weaving, shaping) now have a gateway trigger: `src/agentVerb.mjs` derives
+  them from the selected running thread's own tool activities and `refineThreadStatus()` publishes
+  them on that row's `status`, which `orbModeForAgentState()` case-folds and maps. That path is
+  covered by `test/agentVerb.test.mjs`; it has not been observed on glass.
 - **Speaker and notification LED** are implemented behind compile flags. The LED pin (GPIO42) is
   documented from four vendor sources; no LED has been lit and no sound has been heard, so both
   remain hardware-unverified.

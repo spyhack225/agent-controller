@@ -1,9 +1,11 @@
 #!/usr/bin/env node
 
+import { execFile } from "node:child_process";
 import { createHash } from "node:crypto";
 import { lstat, readFile } from "node:fs/promises";
 import { basename, dirname, join, resolve } from "node:path";
 import { pathToFileURL } from "node:url";
+import { promisify } from "node:util";
 
 export const FINAL_QUALIFICATION_SCHEMA = "agent-controller.final-qualification-manifest.v1";
 export const MAX_FINAL_EVIDENCE_AGE_MS = 14 * 24 * 60 * 60 * 1000;
@@ -129,7 +131,35 @@ export class FinalQualificationError extends Error {
   }
 }
 
-export async function verifyFinalQualification(manifestPath, { now = () => Date.now() } = {}) {
+const execFileAsync = promisify(execFile);
+
+async function gitSucceeds(args) {
+  try {
+    await execFileAsync("git", args, { cwd: process.cwd(), timeout: 15_000 });
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+// The manifest's target commit is the only field tying nine self-attested records to real code, and
+// a 40-character hex string is trivially invented. The promotion path already anchors its commit to
+// the repository (`git merge-base --is-ancestor`, scripts/promote-production.mjs); this verifier
+// checked the format alone, so a bundle naming a commit that had never existed passed. Run it from
+// the exact release checkout: the candidate must be a commit this checkout actually contains.
+export async function anchorCommitInCheckout(targetCommit) {
+  if (!(await gitSucceeds(["rev-parse", "--verify", "--quiet", `${targetCommit}^{commit}`]))) {
+    throw new FinalQualificationError("manifest_commit_unknown");
+  }
+  if (!(await gitSucceeds(["merge-base", "--is-ancestor", targetCommit, "HEAD"]))) {
+    throw new FinalQualificationError("manifest_commit_not_in_checkout");
+  }
+}
+
+export async function verifyFinalQualification(
+  manifestPath,
+  { now = () => Date.now(), anchorCommit = anchorCommitInCheckout } = {},
+) {
   const absoluteManifest = resolve(manifestPath);
   const manifest = parseJson(
     await readRegularFile(absoluteManifest, "manifest"),
@@ -138,6 +168,7 @@ export async function verifyFinalQualification(manifestPath, { now = () => Date.
   requireExactKeys(manifest, ["schema", "targetCommit", "createdAt", "evidence"], "manifest_shape_invalid");
   requireEqual(manifest.schema, FINAL_QUALIFICATION_SCHEMA, "manifest_schema_invalid");
   requireMatch(manifest.targetCommit, SHA, "manifest_commit_invalid");
+  await anchorCommit(manifest.targetCommit);
   requireFresh(manifest.createdAt, now(), "manifest_stale");
 
   const evidence = requireRecord(manifest.evidence, "manifest_evidence_invalid");

@@ -412,7 +412,7 @@ Generated firmware configs default to `ENABLE_OTA_APPLY=0`; enable OTA applicati
 
 ## Rate Limits
 
-The gateway applies fixed-window in-memory limits per user, device, and factory client. Defaults are configured in `.env.example`:
+The gateway applies fixed-window limits per user, device, factory client, and connector. Defaults are configured in `.env.example`:
 
 ```text
 RATE_LIMIT_WINDOW_MS=60000
@@ -425,7 +425,10 @@ DEVICE_READ_RATE_LIMIT=120
 DEVICE_WRITE_RATE_LIMIT=30
 ```
 
-HTTP `429` responses include `x-ratelimit-*` and `retry-after` headers. For multi-process deployments, replace the in-memory limiter with a shared store such as Redis.
+HTTP `429` responses include `x-ratelimit-*` and `retry-after` headers. The limiter backend is
+pluggable: it counts in-process by default, and setting `RATE_LIMIT_REDIS_URL` shares the window
+across processes over a dependency-free RESP client (`src/resp.mjs`). Redis-backed limiting has only
+been exercised locally.
 
 ## Clerk And Convex
 
@@ -659,10 +662,17 @@ progress is tracked in
 [roadmap/open-input-media-voice-environments-roadmap.md](roadmap/open-input-media-voice-environments-roadmap.md),
 with current verified state in [roadmap/IMPLEMENTATION-STATUS.md](roadmap/IMPLEMENTATION-STATUS.md)
 and the ordered list of everything still outstanding in
-[roadmap/completion-plan.md](roadmap/completion-plan.md).
+[roadmap/completion-plan.md](roadmap/completion-plan.md). Operators deploying this stack should start
+from [docs/operator-setup.md](docs/operator-setup.md), which sequences the accounts, protected
+environments, secrets and first staging deployment, then
+[docs/staging-drills.md](docs/staging-drills.md) and
+[docs/evidence-bundles.md](docs/evidence-bundles.md) for hosted qualification and release evidence.
 
 ## License
 
 Copyright the Agent Controller contributors. Licensed under the [Apache License, Version 2.0](LICENSE).
-Vendor hardware documentation kits are not redistributed with this repository; each board's `docs/`
-folder explains where to download them.
+The CrowPanel, Hosyond, and Waveshare vendor documentation kits are not redistributed with this
+repository; those boards' `docs/` folders hold only a README explaining where to download them. The
+`firmware/vision-master-t190/docs/` folder still tracks five Heltec reference files (datasheet,
+schematic, panel specification, and two pin/hardware images), which remain under their vendor's own
+terms rather than this repository's licence.

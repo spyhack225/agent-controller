@@ -45,7 +45,7 @@ async function fixture(t) {
 
 test("final qualification binds every product boundary to one commit and exact hash", async (t) => {
   const value = await fixture(t);
-  const result = await verifyFinalQualification(value.manifestPath, { now: () => NOW });
+  const result = await verifyFinalQualification(value.manifestPath, { now: () => NOW, anchorCommit: async () => {} });
   assert.deepEqual(result, {
     schema: FINAL_QUALIFICATION_SCHEMA,
     result: "passed",
@@ -59,7 +59,7 @@ test("missing, failed, or commit-mismatched evidence cannot close the roadmap", 
   delete value.manifest.evidence.productJourney;
   await writeFile(value.manifestPath, `${JSON.stringify(value.manifest)}\n`);
   await assert.rejects(
-    verifyFinalQualification(value.manifestPath, { now: () => NOW }),
+    verifyFinalQualification(value.manifestPath, { now: () => NOW, anchorCommit: async () => {} }),
     hasCode("manifest_evidence_incomplete"),
   );
 
@@ -73,7 +73,7 @@ test("missing, failed, or commit-mismatched evidence cannot close the roadmap", 
   second.manifest.evidence.resilience.sha256 = digest(bytes);
   await writeFile(second.manifestPath, `${JSON.stringify(second.manifest)}\n`);
   await assert.rejects(
-    verifyFinalQualification(second.manifestPath, { now: () => NOW }),
+    verifyFinalQualification(second.manifestPath, { now: () => NOW, anchorCommit: async () => {} }),
     hasCode("evidence_resilience_machine_sleep_wake_not_passed"),
   );
 
@@ -87,7 +87,7 @@ test("missing, failed, or commit-mismatched evidence cannot close the roadmap", 
   third.manifest.evidence.npmRelease.sha256 = digest(npmBytes);
   await writeFile(third.manifestPath, `${JSON.stringify(third.manifest)}\n`);
   await assert.rejects(
-    verifyFinalQualification(third.manifestPath, { now: () => NOW }),
+    verifyFinalQualification(third.manifestPath, { now: () => NOW, anchorCommit: async () => {} }),
     hasCode("evidence_npmRelease_commit_mismatch"),
   );
 });
@@ -97,7 +97,7 @@ test("evidence references are bounded, flat, regular files with exact hashes", a
   value.manifest.evidence.operations.file = "../operations.json";
   await writeFile(value.manifestPath, `${JSON.stringify(value.manifest)}\n`);
   await assert.rejects(
-    verifyFinalQualification(value.manifestPath, { now: () => NOW }),
+    verifyFinalQualification(value.manifestPath, { now: () => NOW, anchorCommit: async () => {} }),
     hasCode("evidence_operations_filename_invalid"),
   );
 
@@ -105,7 +105,7 @@ test("evidence references are bounded, flat, regular files with exact hashes", a
   second.manifest.evidence.performance.sha256 = "0".repeat(64);
   await writeFile(second.manifestPath, `${JSON.stringify(second.manifest)}\n`);
   await assert.rejects(
-    verifyFinalQualification(second.manifestPath, { now: () => NOW }),
+    verifyFinalQualification(second.manifestPath, { now: () => NOW, anchorCommit: async () => {} }),
     hasCode("evidence_performance_hash_mismatch"),
   );
 
@@ -114,7 +114,7 @@ test("evidence references are bounded, flat, regular files with exact hashes", a
   await rm(target);
   await symlink(join(third.root, third.manifest.evidence.operations.file), target);
   await assert.rejects(
-    verifyFinalQualification(third.manifestPath, { now: () => NOW }),
+    verifyFinalQualification(third.manifestPath, { now: () => NOW, anchorCommit: async () => {} }),
     hasCode("evidence_rollback_file_type_invalid"),
   );
 });
@@ -130,7 +130,7 @@ test("stale evidence and unknown fields fail closed", async (t) => {
   value.manifest.evidence.controllerHardware.sha256 = digest(bytes);
   await writeFile(value.manifestPath, `${JSON.stringify(value.manifest)}\n`);
   await assert.rejects(
-    verifyFinalQualification(value.manifestPath, { now: () => NOW }),
+    verifyFinalQualification(value.manifestPath, { now: () => NOW, anchorCommit: async () => {} }),
     hasCode("evidence_controllerHardware_stale"),
   );
 
@@ -138,7 +138,7 @@ test("stale evidence and unknown fields fail closed", async (t) => {
   second.manifest.privateNotes = "must never be accepted";
   await writeFile(second.manifestPath, `${JSON.stringify(second.manifest)}\n`);
   await assert.rejects(
-    verifyFinalQualification(second.manifestPath, { now: () => NOW }),
+    verifyFinalQualification(second.manifestPath, { now: () => NOW, anchorCommit: async () => {} }),
     hasCode("manifest_shape_invalid"),
   );
 });

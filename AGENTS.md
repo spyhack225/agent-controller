@@ -301,9 +301,10 @@ The repository gate is:
 npm test
 ```
 
-`npm test` builds the console, typechecks it, runs frontend tests, and runs server tests. There is no
-linter. Do not run bare `node --test` at the root; it incorrectly discovers browser tests without
-Vitest's jsdom setup.
+`npm test` builds the console, asserts its performance budgets, typechecks the console, Convex, the
+Cloudflare edge and the private control plane, and then runs the frontend, server, connector,
+Cloudflare edge, and control-plane suites. There is no linter. Do not run bare `node --test` at the
+root; it incorrectly discovers browser tests without Vitest's jsdom setup.
 
 For firmware, build the specific environment you changed first:
 

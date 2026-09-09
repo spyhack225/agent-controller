@@ -5,25 +5,34 @@ publish `@agent-controller/connector`. It is manual-only, publishes one exact st
 one annotated `connector-vVERSION` tag, and enters the protected `npm-release` GitHub environment
 before receiving `id-token: write`. It never reads an npm token.
 
-The workflow exists, but no publication has been executed or verified from this checkout.
+The workflow exists, but no publication has been executed or verified from this checkout. Steps 1
+and 2 of the one-time setup below are now complete; steps 3 to 5 are npm and GitHub account
+operations that remain outstanding.
 
 ## One-time setup outside the repository
 
 Before the first release:
 
-1. The maintainer must choose the repository/package license. Add the approved license text as the
-   root `LICENSE` and `packages/connector/LICENSE`, replace the connector manifest's current
-   `"license": "UNLICENSED"` with the corresponding license identifier, and add `LICENSE` to its
-   `files` allowlist. The release helper deliberately refuses an unresolved license or a tarball
-   without that file; automation must not infer this legal decision.
-2. Commit `repository` metadata in `packages/connector/package.json` whose `url` exactly names the
-   public GitHub repository and whose `directory` is `packages/connector`. The workflow derives the
-   expected URL from `GITHUB_SERVER_URL` and `GITHUB_REPOSITORY`; it will not generate or rewrite
-   package metadata after checkout. The current manifest has no authoritative repository URL, so
-   validation remains intentionally blocked until the maintainer supplies the real one.
+1. **Done on 2026-09-08.** The repository and package license is Apache-2.0: the text is at the root
+   `LICENSE` and at `packages/connector/LICENSE`, the connector manifest declares
+   `"license": "Apache-2.0"`, and `LICENSE` is in its `files` allowlist. The release helper refuses
+   an unresolved license or a tarball without that file, and now passes. The maintainer should still
+   ratify Apache-2.0 as the deliberate choice before the repository is made public; automation
+   selected a defensible default, not a legal decision.
+2. **Done on 2026-09-08.** `packages/connector/package.json` carries `repository` metadata whose
+   `url` names `https://github.com/spyhack225/agent-controller` with `directory`
+   `packages/connector`, plus matching `homepage` and `bugs`. The workflow derives the expected URL
+   from `GITHUB_SERVER_URL` and `GITHUB_REPOSITORY` and compares; it never rewrites package metadata
+   after checkout. If the package is ever published from a different repository, update the manifest
+   first or validation fails closed.
 3. In npm package settings, configure a GitHub Actions trusted publisher for the exact repository,
-   workflow filename `npm-connector-release.yml`, environment `npm-release`, and the `npm publish`
-   action. Do not add `NPM_TOKEN`, `NODE_AUTH_TOKEN`, or an npm auth token to GitHub.
+   workflow filename `npm-connector-release.yml`, and environment `npm-release`. That configuration
+   also carries an **allowed actions** setting that names which commands the publisher may run, and
+   at least one must be selected. npm sets configurations created after 3 September 2026 to allow
+   `npm stage publish` automatically; permitting direct `npm publish` is a separate choice the
+   maintainer must also make. This workflow runs `npm publish`, so that action must be explicitly
+   allowed or the registry rejects the publication step after environment approval, with nothing
+   published. Do not add `NPM_TOKEN`, `NODE_AUTH_TOKEN`, or an npm auth token to GitHub.
 4. Configure the GitHub `npm-release` environment with required reviewers, prevent self-review and
    administrator bypass, and restrict deployment to the default branch. Protect
    `connector-v*` tags against update and deletion.
@@ -36,6 +45,16 @@ publication job. Trusted publishing automatically creates provenance for a publi
 public repository; the workflow also passes `--provenance` so disabling it is never accidental. See
 the official [npm trusted publishing](https://docs.npmjs.com/trusted-publishers/) and
 [provenance](https://docs.npmjs.com/generating-provenance-statements/) documentation.
+
+This workflow does not implement npm's [staged publishing](https://docs.npmjs.com/staged-publishing/).
+Under staged publishing a maintainer must approve each submission with 2FA before the version becomes
+publicly resolvable, and an OIDC token from trusted publishing deliberately cannot perform that
+approval. The `verify-published` job resolves the exact version from the public registry within a
+bounded retry, so a staged-but-unapproved version would be reported as a failed run even though the
+publication itself succeeded — and the version number is consumed either way, because npm versions
+are immutable. Adopting staged publishing therefore means changing the publication command and
+splitting registry verification into a job dispatched after approval; it is not a configuration-only
+switch, and `npm stage publish` needs npm 11.15.0 or later rather than the 11.5.1 client pinned here.
 
 The first package registration and trusted-publisher association are npm account operations. If npm
 does not allow the trusted publisher to be attached before the first version exists, an npm owner

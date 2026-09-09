@@ -214,13 +214,13 @@ variants and the credential rotations are recorded outside the repository.
 
 ## Public release identity blockers
 
-The repository currently has no maintainer-selected `LICENSE`. The connector manifest is therefore
-truthfully `UNLICENSED`, has no package-local `LICENSE`, and has no authoritative public repository
-metadata. These are release blockers, not values automation can safely invent. The protected npm
-release helper now fails closed on all three conditions.
+Two of the three former blockers were resolved on 2026-09-08. The repository and package license is
+Apache-2.0, present at the root and at `packages/connector/LICENSE` and declared in both manifests,
+and `packages/connector/package.json` carries `repository`, `homepage` and `bugs` metadata naming
+the real public repository. The protected release helper fails closed on an unresolved license, a
+tarball without `LICENSE`, or absent repository metadata, and now passes all three.
 
-To unblock publication, the maintainer must choose the legal license, add its approved text at the
-repository root and in `packages/connector/LICENSE`, update the connector manifest's `license` and
-`files` fields, and add `repository` metadata matching the real public GitHub repository and the
-`packages/connector` directory. Then repeat the repository secret, connector pack, and protected
-release validation gates from the exact release checkout. See [npm-connector-release.md](npm-connector-release.md).
+What remains is not a repository state: the maintainer must ratify Apache-2.0 as a deliberate legal
+choice rather than an inherited default, and the npm trusted publisher, its allowed-actions setting,
+and the protected `npm-release` environment must be configured before any publication.
+See [npm-connector-release.md](npm-connector-release.md).

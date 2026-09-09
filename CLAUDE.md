@@ -19,7 +19,8 @@ server. The frontend is React 19 + Vite 8 + Tailwind 4.
 npm start                 # build client, then run gateway on http://127.0.0.1:3996
 npm run dev:server        # gateway with --watch (no client build)
 npm run dev:app           # Vite on :5173, proxies /v1 and /health to :3996
-npm test                  # build:app + typecheck:app + test:app + test:server
+npm test                  # build:app + check:frontend-performance + typecheck:{app,convex,cloud,cloud-control-plane}
+                          #   + test:{app,server,connector,cloud,cloud-control-plane}
 ```
 
 Targeted checks:
@@ -66,7 +67,7 @@ being folded into a single misleading green check.
 ### Request flow
 
 `src/server.mjs` loads config → picks a store → calls `createApp()`. Everything routes through a single `handle(req, res)`
-function in `src/app.mjs` (~1800 lines): a long `if` chain matching `req.method` + `url.pathname` (exact strings) or
+function in `src/app.mjs` (~8,300 lines): a long `if` chain matching `req.method` + `url.pathname` (exact strings) or
 `url.pathname.match(/regex/u)` for parameterized routes. **New endpoints go in that chain** — order matters, static-file
 and health routes are checked first. Handlers throw `HttpError` from `src/http.mjs`; the outer `try/catch` converts it to
 a JSON error response.
@@ -599,7 +600,7 @@ without losing data.
 - **memory** (default, no env) — `createStore()` / `createMemoryStore()` in `src/store.mjs`, the reference implementation
   and the source of truth for behavior. All tests run against it.
 - **file** — `src/fileStore.mjs` wraps the memory store and persists `exportState()` to `DATA_FILE` on every change.
-- **convex** — `src/convexStore.mjs` maps the same ~45 method names to `gatewayStore:*` Convex functions
+- **convex** — `src/convexStore.mjs` maps the same ~155 method names to `gatewayStore:*` Convex functions
   (see `DEFAULT_FUNCTIONS` at the top of that file), authenticating each call with `GATEWAY_CONVEX_SECRET`.
 
 **Adding a store method means touching all three**, plus `convex/gatewayStore.ts` and `convex/schema.ts`. The store API
@@ -635,10 +636,13 @@ once. Deliberately not `presence.online`: a controller unplugged since setup mus
 
 The core write path, in `submitIntent()` (`src/app.mjs`):
 
-1. `normalizeIntent()` (`src/intent.mjs`) validates the intent shape (`agent_prompt`, `media_prompt`, `shell_input`,
-   `session_control`, `approval_response`, `status`).
+1. `normalizeIntent()` (`src/intent.mjs`) validates the intent shape (`status`, `agent_prompt`, `audio_prompt`,
+   `camera_prompt`, `shell_input`, `terminal_input`, `session_control`, `approval_response`,
+   `user_input_response`). `media_prompt` is a *capability* name, not an intent type: `audio_prompt` and
+   `camera_prompt` both map onto it in `capabilityForIntent()`. `thread_create` is likewise a capability
+   only — `normalizeIntent()` rejects it, so `POST /v1/device/threads` is its sole entry point.
 2. `evaluateIntentPolicy()` (`src/policy.mjs`) checks the device profile's capabilities, then screens `shell_input`
-   against `DANGEROUS_SHELL_PATTERNS` (`rm -rf`, `sudo`, `git push`, `terraform apply`, …). Dangerous commands are not
+   against `SHELL_RISK_RULES` (`rm -rf`, `sudo`, `git push`, `kubectl|terraform apply`, …). Dangerous commands are not
    blocked outright — they become `requiresApproval` with risk `high` and wait for an owner decision via
    `/v1/commands/:id/approve|reject`.
 3. `buildT3Command()` (`src/t3Client.mjs`) translates the intent into T3's wire protocol (`thread.turn.start`,
@@ -794,7 +798,8 @@ unverified live/hardware evidence.
 
 ## Conventions
 
-- Server code is `.mjs` ESM with no build step and no dependencies beyond `@clerk/backend` — keep it that way.
+- Server code is `.mjs` ESM with no build step and only two runtime dependencies: `@clerk/backend`, and
+  `web-push`, which `src/webPush.mjs` alone imports. Keep it that way.
 - IDs come from `src/ids.mjs` (`createId("prefix")`); timestamps are ISO strings via `nowIso()`.
 - Server tests use `node:test` + `node:assert/strict`, spin up a real `createApp()` server on an ephemeral port, and stub
   `globalThis.fetch` to fake the T3 instance (restore it in `t.after()`). Follow the pattern at the top of
@@ -827,7 +832,13 @@ deliberately not scripted.
 deployment validation), [docs/hardware-protocol.md](docs/hardware-protocol.md) (device provisioning/display/intent wire
 format), [roadmap/open-input-media-voice-environments-roadmap.md](roadmap/open-input-media-voice-environments-roadmap.md)
 (active product roadmap), and [roadmap/IMPLEMENTATION-STATUS.md](roadmap/IMPLEMENTATION-STATUS.md)
-(canonical verified progress). Milestone 0.5 is complete; Milestones 2 and 3 are substantially
+(canonical verified progress).
+
+Operations: [docs/operator-setup.md](docs/operator-setup.md) is the ordered account, environment and
+first-deployment sequence; [docs/staging-drills.md](docs/staging-drills.md) documents the scripted
+hosted qualification drills; [docs/evidence-bundles.md](docs/evidence-bundles.md) covers assembling
+the promotion and final-qualification evidence bundles.
+[roadmap/completion-plan.md](roadmap/completion-plan.md) sequences everything that remains. Milestone 0.5 is complete; Milestones 2 and 3 are substantially
 implemented, while Milestones 0, 1, 4, and 5 remain partial pending their named deployed, live-T3,
 browser, or hardware proof.
 
@@ -837,7 +848,7 @@ Firmware is PlatformIO C++ under four board folders; copy `include/controller_co
 | Folder | Board | State |
 |---|---|---|
 | `CrowPanel-ESP32-2.13-E-paper` | 2.13" e-ink, five active-low keys | Most complete gateway-connected implementation; 5 build environments including hermetic capture proof; current silicon validation not recorded |
-| `vision-master-t190` | 1.9" TFT | Bring-up sketch |
+| `vision-master-t190` | 1.9" TFT | Shared `DeviceStore`/`Provisioning`/`GatewayClient`/`GatewayBrowse` status and environment/folder/thread/approval screens; 1 environment, whose default build compile-gates the unverified external input carrier. Display pins, input, and every network flow are unverified on silicon |
 | `Waveshare-ESP32-S3-Touch-AMOLED-1.75C` | 466x466 round AMOLED touch, dual-mic array | Scaffold; pin map unverified |
 | `Hosyond-ESP32-S3-2.8-Touchscreen` | 2.8" IPS 240x320 touch, on-board mic + speaker (ES8311) | Five-screen touch UI over the shared gateway client (home/threads/send/reply/approvals) with hold-to-talk upload; 7 environments, `-controller` is the product build. Capture/display/orb/provisioning proven on silicon, the UI and every gateway call are not |
 

@@ -41,16 +41,16 @@ replaced it.
 
 | # | Break | Where |
 |---|---|---|
-| 1 | Wi-Fi SSID/password are compile-time `#define`s written by the factory station from its own env. The factory cannot know the customer's network, so no shipped unit can connect. | `buildFlashConfig()` [manufacturing.mjs:31](../src/manufacturing.mjs#L31), `scripts/manufacture-batch.mjs` |
-| 2 | `connectWiFi()` loops forever with no timeout and no fallback. A wrong password bricks the unit until reflash. | replaced by the join timeout in [Provisioning.cpp:127](../firmware/shared/AgentControllerCore/src/Provisioning.cpp#L127) |
-| 3 | The printed claim label is invalidated by powering the device on. `rotateUnclaimedDeviceClaimCode` regenerates unconditionally, and firmware calls it on the first 403 — seconds after boot — then again every 10 minutes, so the code can change while the user is typing it. | [store.mjs:371](../src/store.mjs#L371), [main.cpp:1162](../firmware/CrowPanel-ESP32-2.13-E-paper/src/main.cpp#L1162) |
-| 4 | The QR code dead-ends. The server falls `/claim` back to `index.html`, but the SPA routes on `location.hash` and never reads `location.search`, so `?device=&code=` is silently discarded. | [app.mjs:2092](../src/app.mjs#L2092) vs [App.tsx:139](../frontend/src/App.tsx#L139) |
-| 5 | Rotated secrets can never reach the device. `rotateDeviceSecret` and `resetDeviceForTransfer` mint a new secret; the device's is a `#define`. Revoke-and-recover, resale, and compromise response all require USB reflashing. | [store.mjs:303](../src/store.mjs#L303), [store.mjs:335](../src/store.mjs#L335) |
-| 6 | Onboarding marks a device "ready" with zero evidence it ever powered on — no `lastSeenAt` or heartbeat check, contradicting the operational-evidence rule every other check honours. | `buildOnboardingReadiness` [onboarding.mjs:176](../src/onboarding.mjs#L176) |
-| 7 | The wizard assumes the user already holds a claim code. There is no "power on / join setup network / read the code" beat anywhere in it. | [OnboardingPage.tsx:931](../frontend/src/features/OnboardingPage.tsx#L931) |
-| 8 | Factory-manufactured firmware ships with TLS verification disabled — not just the example header, the generated config. The device carries a long-lived bearer secret. | [manufacturing.mjs:55](../src/manufacturing.mjs#L55) |
+| 1 | Wi-Fi SSID/password are compile-time `#define`s written by the factory station from its own env. The factory cannot know the customer's network, so no shipped unit can connect. | fixed in `buildFlashConfig()` [manufacturing.mjs:33](../src/manufacturing.mjs#L33), which now emits no Wi-Fi macros at all |
+| 2 | `connectWiFi()` loops forever with no timeout and no fallback. A wrong password bricks the unit until reflash. | replaced by the join timeout in [Provisioning.cpp:175](../firmware/shared/AgentControllerCore/src/Provisioning.cpp#L175) |
+| 3 | The printed claim label is invalidated by powering the device on. `rotateUnclaimedDeviceClaimCode` regenerates unconditionally, and firmware calls it on the first 403 — seconds after boot — then again every 10 minutes, so the code can change while the user is typing it. | replaced by `ensureUnclaimedDeviceClaimCode` [store.mjs:721](../src/store.mjs#L721); the firmware call site is [main.cpp:1198](../firmware/CrowPanel-ESP32-2.13-E-paper/src/main.cpp#L1198) |
+| 4 | The QR code dead-ends. The server falls `/claim` back to `index.html`, but the SPA routes on `location.hash` and never reads `location.search`, so `?device=&code=` is silently discarded. | now read before the hash router: [app.mjs:8233](../src/app.mjs#L8233) serves `/claim`, and [App.tsx:237](../frontend/src/App.tsx#L237) calls `readClaimLink()` |
+| 5 | Rotated secrets can never reach the device. `rotateDeviceSecret` and `resetDeviceForTransfer` mint a new secret; the device's is a `#define`. Revoke-and-recover, resale, and compromise response all require USB reflashing. | `rotateDeviceSecret` [store.mjs:527](../src/store.mjs#L527) and `resetDeviceForTransfer` [store.mjs:568](../src/store.mjs#L568) now hand the new secret to the device through the staging handshake in §4.2 |
+| 6 | Onboarding marks a device "ready" with zero evidence it ever powered on — no `lastSeenAt` or heartbeat check, contradicting the operational-evidence rule every other check honours. | `buildOnboardingReadiness` [onboarding.mjs:159](../src/onboarding.mjs#L159), which now requires `device.presence.latestActivityAt` |
+| 7 | The wizard assumes the user already holds a claim code. There is no "power on / join setup network / read the code" beat anywhere in it. | [OnboardingPage.tsx:393](../frontend/src/features/OnboardingPage.tsx#L393) |
+| 8 | Factory-manufactured firmware ships with TLS verification disabled — not just the example header, the generated config. The device carries a long-lived bearer secret. | fixed at [manufacturing.mjs:79](../src/manufacturing.mjs#L79), where `INSECURE_SKIP_TLS_VERIFY` now defaults to `0` and the CA roots are emitted alongside it |
 | 9 | The original T190 sketch posted device headers at `/health`, which ignored them. It now delegates secure identity, provisioning, heartbeat, and browsing to the shared core; the checked-in build remains status-only until an external input carrier is physically verified. | [vision-master-t190/src/main.cpp](../firmware/vision-master-t190/src/main.cpp) |
-| 10 | A revoked device shows `Display poll failed / HTTP 401` forever with no on-device reset. | now handled at [main.cpp:427](../firmware/CrowPanel-ESP32-2.13-E-paper/src/main.cpp#L427) |
+| 10 | A revoked device shows `Display poll failed / HTTP 401` forever with no on-device reset. | now handled at [main.cpp:449](../firmware/CrowPanel-ESP32-2.13-E-paper/src/main.cpp#L449) |
 
 Breaks 1, 2, 5, and 10 all have the same root cause: **the device has no writable state and no
 first-boot user interaction model.** Everything it needs to know is frozen at flash time.
@@ -148,7 +148,9 @@ Today rotation is a dead end. Target flow:
    `{"credentialRotation": {"secret": "...", "rotationId": "..."}}`. This is the one place the
    gateway returns a secret to a device, and only over the device's currently valid credential.
 3. The device writes `dev_secret_pending`, then calls
-   `POST /v1/device/credential-ack {"rotationId": "..."}` authenticated with the **new** secret.
+   `POST /v1/device/credentials/ack {"rotationId": "...", "credentialVersion": N}` authenticated
+   with the **new** secret. (The implemented route is `/v1/device/credentials/ack`, not the
+   `/v1/device/credential-ack` this design first proposed.)
 4. On ACK the gateway promotes `pendingSecretHash` to `secretHash` and clears the pending fields.
    The device promotes `dev_secret_pending` to `dev_secret`.
 5. Unacked rotations expire after 24 hours and the old secret keeps working, so a device that is
@@ -163,7 +165,7 @@ and displays a fresh claim code — a genuine consumer resale path, replacing "r
 |---|---|
 | `POST /v1/device/setup-code` | accepts `{"rotate": bool}`; returns `claimCodeExpiresAt`; no longer rotates on every call |
 | `POST /v1/device/heartbeat` | response may carry `credentialRotation` and `gatewayUrl` (for migration) |
-| `POST /v1/device/credential-ack` | **new**; device realm; completes the rotation handshake |
+| `POST /v1/device/credentials/ack` | implemented; device realm; completes the rotation handshake. `POST /v1/device/credentials/stage` stages it |
 | `GET /v1/device/config` | unchanged wire format; documented as the sole source of runtime config |
 | `POST /v1/devices/claim` | unchanged; the `/claim` landing page is a client concern |
 | `GET /v1/devices` | `presence` already present; onboarding starts consuming it |
@@ -178,12 +180,14 @@ New/changed methods, which per the storage contract means **memory + convex func
 schema** (`fileStore` wraps the memory store and inherits them automatically):
 
 - `ensureUnclaimedDeviceClaimCode({ deviceId, rotate })` — replaces `rotateUnclaimedDeviceClaimCode`
-- `beginDeviceSecretRotation({ deviceId, secretHash })` — sets the pending fields
-- `completeDeviceSecretRotation({ deviceId, rotationId })` — promotes, returns the public device
+- `stageDeviceSecret({ deviceId, ... })` — sets the pending fields (the implemented name; this
+  design first called it `beginDeviceSecretRotation`)
+- `acknowledgeDeviceSecret({ deviceId, rotationId, credentialVersion, ... })` — promotes, returns
+  the public device (first called `completeDeviceSecretRotation`)
 - device record gains `claimCodeExpiresAt`, `pendingSecretHash`, `pendingSecretIssuedAt`, `rotationId`
 
 Secret and code generation stays in Node — `convexStore.mjs` generates, hashes, and passes only the
-hash, matching the existing `preprovisionDevice` pattern at [convexStore.mjs:149](../src/convexStore.mjs#L149).
+hash, matching the existing `preprovisionDevice` pattern at [convexStore.mjs:287](../src/convexStore.mjs#L287).
 
 `publicDevice()` must strip `pendingSecretHash` alongside `secretHash` and `claimCodeHash`.
 
@@ -335,7 +339,7 @@ while advertising no unproved UI/media capabilities. This fixes break 9 without 
 compile proves pins, input, display, or media.
 
 **Phase 4 — credential lifecycle and transport security. Implemented locally; release proof
-remains.** Rotation handshake, `POST /v1/device/credential-ack`, transfer/reset behavior,
+remains.** Rotation handshake, `POST /v1/device/credentials/ack`, transfer/reset behavior,
 fail-closed TLS verification, and clock bootstrap live in the shared core. Production CA injection,
 negative-certificate tests, WAN recovery, and per-board silicon evidence remain release gates.
 
@@ -348,8 +352,8 @@ prototype shared-key HMAC); on-device claim QR rendering.
   Wi-Fi credential intake form, not an auth surface.
 - Wi-Fi credentials in NVS are only as protected as the flash. Production units need flash
   encryption enabled; without it, `esptool read_flash` recovers the network password. Same argument
-  already applies to the device secret today, where it is worse because that secret is currently
-  unrotatable.
+  already applies to the device secret, though that secret is now rotatable over the handshake in
+  §4.2 rather than only by reflashing.
 - The rotation handshake never sends a secret over an unauthenticated channel: the new secret rides a
   response to a request authenticated with the current one, and the ACK proves receipt before the old
   one is retired.

@@ -173,21 +173,21 @@ export function commandForAction(actionValue, input, environment) {
   const tag = `ac-stg-bootstrap-${input.targetCommit.slice(0, 12)}`;
   const root = input.repositoryRoot;
   switch (actionValue.kind) {
-    case "create-queue": return command(actionValue.kind, "npm", ["--prefix", "cloudflare", "exec", "wrangler", "--", "queues", "create", actionValue.resource], root, CLOUDFLARE_AUTH);
-    case "delete-queue": return command(actionValue.kind, "npm", ["--prefix", "cloudflare", "exec", "wrangler", "--", "queues", "delete", actionValue.resource], root, CLOUDFLARE_AUTH);
-    case "create-bucket": return command(actionValue.kind, "npm", ["--prefix", "cloudflare", "exec", "wrangler", "--", "r2", "bucket", "create", actionValue.resource], root, CLOUDFLARE_AUTH);
-    case "delete-bucket": return command(actionValue.kind, "npm", ["--prefix", "cloudflare", "exec", "wrangler", "--", "r2", "bucket", "delete", actionValue.resource], root, CLOUDFLARE_AUTH);
-    case "deploy-edge-stub": return command(actionValue.kind, "npm", ["--prefix", "cloudflare", "exec", "wrangler", "--", "deploy", "--config", "bootstrap/wrangler.staging.jsonc", "--strict", "--tag", tag, "--message", bootstrapMessage("stub", input)], root, CLOUDFLARE_AUTH);
-    case "delete-edge-stub": return command(actionValue.kind, "npm", ["--prefix", "cloudflare", "exec", "wrangler", "--", "delete", STAGING_SERVICES.edge, "--config", "bootstrap/wrangler.staging.jsonc", "--force"], root, CLOUDFLARE_AUTH);
-    case "deploy-control-bootstrap": return command(actionValue.kind, "npm", ["--prefix", "cloudflare-control-plane", "exec", "wrangler", "--", "deploy", "--env", "staging", "--containers-rollout", "none", "--strict", "--tag", tag, "--message", bootstrapMessage("control", input)], root, CLOUDFLARE_AUTH);
+    case "create-queue": return wranglerCommand(actionValue.kind, "cloudflare", ["queues", "create", actionValue.resource], root);
+    case "delete-queue": return wranglerCommand(actionValue.kind, "cloudflare", ["queues", "delete", actionValue.resource], root);
+    case "create-bucket": return wranglerCommand(actionValue.kind, "cloudflare", ["r2", "bucket", "create", actionValue.resource], root);
+    case "delete-bucket": return wranglerCommand(actionValue.kind, "cloudflare", ["r2", "bucket", "delete", actionValue.resource], root);
+    case "deploy-edge-stub": return wranglerCommand(actionValue.kind, "cloudflare", ["deploy", "--config", "bootstrap/wrangler.staging.jsonc", "--strict", "--tag", tag, "--message", bootstrapMessage("stub", input)], root);
+    case "delete-edge-stub": return wranglerCommand(actionValue.kind, "cloudflare", ["delete", STAGING_SERVICES.edge, "--config", "bootstrap/wrangler.staging.jsonc", "--force"], root);
+    case "deploy-control-bootstrap": return wranglerCommand(actionValue.kind, "cloudflare-control-plane", ["deploy", "--env", "staging", "--containers-rollout", "none", "--strict", "--tag", tag, "--message", bootstrapMessage("control", input)], root);
     case "put-control-secrets": {
       const bundle = runtimeSecretBundle(environment, actionValue.secretNames);
-      return { ...command(actionValue.kind, "npm", ["--prefix", "cloudflare-control-plane", "exec", "wrangler", "--", "secret", "bulk", "--env", "staging"], root, CLOUDFLARE_AUTH), stdin: JSON.stringify(bundle) };
+      return { ...wranglerCommand(actionValue.kind, "cloudflare-control-plane", ["secret", "bulk", "--env", "staging"], root), stdin: JSON.stringify(bundle) };
     }
     case "put-convex-secret": return { ...command(actionValue.kind, "npm", ["exec", "convex", "--", "env", "set", "GATEWAY_CONVEX_SECRET"], root, CONVEX_AUTH), stdin: runtimeSecret(environment, "GATEWAY_CONVEX_SECRET") };
     case "deploy-convex": return command(actionValue.kind, "npm", ["exec", "convex", "--", "deploy", "--typecheck", "enable", "--codegen", "disable", "--message", message], root, CONVEX_AUTH);
-    case "deploy-control-final": return command(actionValue.kind, "npm", ["--prefix", "cloudflare-control-plane", "exec", "wrangler", "--", "deploy", "--env", "staging", "--containers-rollout", "immediate", "--strict", "--tag", tag, "--message", message], root, CLOUDFLARE_AUTH);
-    case "deploy-edge-final": return command(actionValue.kind, "npm", ["--prefix", "cloudflare", "exec", "wrangler", "--", "deploy", "--env", "staging", "--strict", "--tag", tag, "--message", message], root, CLOUDFLARE_AUTH);
+    case "deploy-control-final": return wranglerCommand(actionValue.kind, "cloudflare-control-plane", ["deploy", "--env", "staging", "--containers-rollout", "immediate", "--strict", "--tag", tag, "--message", message], root);
+    case "deploy-edge-final": return wranglerCommand(actionValue.kind, "cloudflare", ["deploy", "--env", "staging", "--strict", "--tag", tag, "--message", message], root);
     default: throw new StagingBootstrapError("bootstrap_action_unsupported");
   }
 }
@@ -223,7 +223,7 @@ export async function inspectBootstrapState(input, dependencies = {}) {
     edgeExists ? inspectDeployment(runner, input, "cloudflare", input.expectedEdgeVersion) : null,
     controlExists ? inspectDeployment(runner, input, "cloudflare-control-plane", input.expectedControlPlaneVersion) : null,
     controlExists
-      ? runner(command("control-plane-secret-list", "npm", ["--prefix", "cloudflare-control-plane", "exec", "wrangler", "--", "secret", "list", "--env", "staging", "--format", "json"], input.repositoryRoot, CLOUDFLARE_AUTH)).then(parseSecretNames)
+      ? runner(wranglerCommand("control-plane-secret-list", "cloudflare-control-plane", ["secret", "list", "--env", "staging", "--format", "json"], input.repositoryRoot)).then(parseSecretNames)
       : [],
   ]);
   return { queues, buckets, services, edge, controlPlane, controlPlaneSecrets, convexEnvironmentNames: convexNames };
@@ -335,8 +335,8 @@ async function inspectDeployment(runner, input, packageDirectory, expectedVersio
 
 async function inspectCurrentDeployment(runner, input, packageDirectory) {
   const [deploymentOutput, versionsOutput] = await Promise.all([
-    runner(command(`${packageDirectory}-deployment-status`, "npm", ["--prefix", packageDirectory, "exec", "wrangler", "--", "deployments", "status", "--env", "staging", "--json"], input.repositoryRoot, CLOUDFLARE_AUTH)),
-    runner(command(`${packageDirectory}-version-list`, "npm", ["--prefix", packageDirectory, "exec", "wrangler", "--", "versions", "list", "--env", "staging", "--json"], input.repositoryRoot, CLOUDFLARE_AUTH)),
+    runner(wranglerCommand(`${packageDirectory}-deployment-status`, packageDirectory, ["deployments", "status", "--env", "staging", "--json"], input.repositoryRoot)),
+    runner(wranglerCommand(`${packageDirectory}-version-list`, packageDirectory, ["versions", "list", "--env", "staging", "--json"], input.repositoryRoot)),
   ]);
   let deployment;
   let versions;
@@ -375,9 +375,12 @@ async function listBuckets(fetchImpl, environment) {
 }
 
 async function listServices(fetchImpl, environment) {
-  const body = await cloudflareApi(fetchImpl, environment, "/workers/services");
+  // The documented account-level Worker collection is /workers/scripts, whose items key the Worker
+  // name as `id`. Wrangler only ever calls the singular /workers/services/<name> form, so neither a
+  // /workers/services collection nor its response shape can be relied on here.
+  const body = await cloudflareApi(fetchImpl, environment, "/workers/scripts");
   if (!Array.isArray(body.result)) throw new StagingBootstrapError("invalid_service_inventory");
-  return body.result.map((item) => item?.default_environment?.script?.service ?? item?.name ?? item?.service).filter((name) => typeof name === "string");
+  return body.result.map((item) => item?.id ?? item?.name ?? item?.service).filter((name) => typeof name === "string");
 }
 
 async function cloudflareApi(fetchImpl, environment, path) {
@@ -421,7 +424,7 @@ async function verifyFinalState(input, { runner, fetchImpl, environment }) {
     listQueues(fetchImpl, environment),
     listBuckets(fetchImpl, environment),
     listServices(fetchImpl, environment),
-    runner(command("control-plane-secret-list", "npm", ["--prefix", "cloudflare-control-plane", "exec", "wrangler", "--", "secret", "list", "--env", "staging", "--format", "json"], input.repositoryRoot, CLOUDFLARE_AUTH)),
+    runner(wranglerCommand("control-plane-secret-list", "cloudflare-control-plane", ["secret", "list", "--env", "staging", "--format", "json"], input.repositoryRoot)),
     runner(command("convex-environment-list", "npm", ["exec", "convex", "--", "env", "list", "--names-only"], input.repositoryRoot, CONVEX_AUTH)),
     inspectCurrentDeployment(runner, input, "cloudflare"),
     inspectCurrentDeployment(runner, input, "cloudflare-control-plane"),
@@ -470,6 +473,14 @@ async function writeEvidence(path, evidence) {
 
 function command(name, executable, args, cwd, secretNames = []) {
   return { name, executable, args, cwd, secretNames };
+}
+
+// `npm exec` resolves the binary from --prefix but always runs it in the caller's cwd
+// (libnpmexec run-script.js: "we always run in cwd, not --prefix"). Wrangler discovers its
+// configuration, and resolves a relative --config, from that cwd, so the child must start inside
+// the package directory rather than at the repository root.
+function wranglerCommand(name, packageDirectory, args, root) {
+  return command(name, "npm", ["exec", "wrangler", "--", ...args], join(root, packageDirectory), CLOUDFLARE_AUTH);
 }
 
 function action(kind, provider, extra = {}) { return { kind, provider, ...extra }; }

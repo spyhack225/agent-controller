@@ -16,14 +16,17 @@ does not assert machine-dependent wall-clock timings.
 
 ## Enforced production-build budgets
 
+The "current local build" column was measured on 2026-09-09 with `npm run check:frontend-performance`
+against a fresh `npm run build:app`. Re-measure it whenever the console's dependency graph changes.
+
 | Boundary | Budget | Current local build |
 | --- | ---: | ---: |
-| Initial static JavaScript | at most 560 KiB raw | 489.06 KiB |
-| Initial static JavaScript | at most 160 KiB gzip | 138.29 KiB |
+| Initial static JavaScript | at most 560 KiB raw | 495.63 KiB |
+| Initial static JavaScript | at most 160 KiB gzip | 140.39 KiB |
 | Initial static JavaScript requests | at most 4 | 3 |
-| Initial CSS | at most 40 KiB gzip | 33.36 KiB |
-| Any lazy feature chunk | at most 28 KiB gzip | 21.31 KiB (`DevicesPage`) |
-| Any feature route plus its non-initial static dependencies | at most 36 KiB gzip / 20 requests | 28.05 KiB / 18 requests (`OnboardingPage`) |
+| Initial CSS | at most 40 KiB gzip | 33.61 KiB |
+| Any lazy feature chunk | at most 28 KiB gzip | 20.92 KiB (`DevicesPage`) |
+| Any feature route plus its non-initial static dependencies | at most 36 KiB gzip / 20 requests | 27.53 KiB / 18 requests (`OnboardingPage`) |
 | Required lazy workspaces | 14 named feature chunks | 14 |
 | Live transcript projection | at most 512 rendered entries | 512 |
 | T3 work projection | at most 64 task nodes | 64 |
@@ -37,8 +40,8 @@ chunk from bypassing the route budget. Sizes are calculated from built bytes wit
 level-9 gzip, not source-file estimates.
 
 Before route splitting, the console emitted one 819,585-byte JavaScript entry (218,741 bytes gzip)
-plus the already-lazy navigation effect. The current entry graph totals 489.06 KiB raw and
-138.29 KiB gzip. Devices, Environments, Operations, onboarding, settings, media, activity,
+plus the already-lazy navigation effect. The current entry graph totals 495.63 KiB raw and
+140.39 KiB gzip. Devices, Environments, Operations, onboarding, settings, media, activity,
 actions, quick control, claim/recovery, and the three landing surfaces now load on demand.
 
 ## Streaming and long-session bounds

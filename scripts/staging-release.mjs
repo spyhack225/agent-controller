@@ -180,14 +180,13 @@ export function buildMutationPlan(input) {
   const short = input.targetCommit.slice(0, 12);
   const tag = input.operation === "rollback" ? `ac-stg-rollback-${short}` : `ac-stg-${short}`;
   const message = `agent-controller staging ${input.operation} ${input.targetCommit}`;
-  const edge = command("edge", "npm", [
-    "--prefix", "cloudflare", "exec", "wrangler", "--", "deploy", "--env", "staging",
+  const edge = wranglerCommand("edge", "cloudflare", [
+    "deploy", "--env", "staging", "--strict", "--tag", tag, "--message", message,
+  ], process.cwd());
+  const controlPlane = wranglerCommand("control-plane", "cloudflare-control-plane", [
+    "deploy", "--env", "staging", "--containers-rollout", "immediate",
     "--strict", "--tag", tag, "--message", message,
-  ], process.cwd(), CLOUDFLARE_COMMAND_SECRETS);
-  const controlPlane = command("control-plane", "npm", [
-    "--prefix", "cloudflare-control-plane", "exec", "wrangler", "--", "deploy", "--env", "staging",
-    "--containers-rollout", "immediate", "--strict", "--tag", tag, "--message", message,
-  ], process.cwd(), CLOUDFLARE_COMMAND_SECRETS);
+  ], process.cwd());
   if (input.operation === "rollback") return [edge, controlPlane];
   return [
     command("convex", "npm", [
@@ -203,14 +202,13 @@ export function buildReadOnlyPlan(repositoryRoot, tempRoot) {
     command("convex-dry-run", "npm", [
       "exec", "convex", "--", "deploy", "--dry-run", "--typecheck", "enable", "--codegen", "disable",
     ], repositoryRoot, CONVEX_COMMAND_SECRETS),
-    command("control-plane-dry-run", "npm", [
-      "--prefix", "cloudflare-control-plane", "exec", "wrangler", "--", "deploy", "--dry-run",
-      "--containers-rollout", "none", "--env", "staging", "--outdir", join(tempRoot, "control-plane"),
-    ], repositoryRoot),
-    command("edge-dry-run", "npm", [
-      "--prefix", "cloudflare", "exec", "wrangler", "--", "deploy", "--dry-run", "--env", "staging",
-      "--outdir", join(tempRoot, "edge"),
-    ], repositoryRoot),
+    wranglerCommand("control-plane-dry-run", "cloudflare-control-plane", [
+      "deploy", "--dry-run", "--containers-rollout", "none", "--env", "staging",
+      "--outdir", join(tempRoot, "control-plane"),
+    ], repositoryRoot, []),
+    wranglerCommand("edge-dry-run", "cloudflare", [
+      "deploy", "--dry-run", "--env", "staging", "--outdir", join(tempRoot, "edge"),
+    ], repositoryRoot, []),
   ];
 }
 
@@ -246,9 +244,9 @@ export async function runReadOnlyPreflight(input, dependencies = {}) {
   await mkdir(tempRoot, { recursive: true, mode: 0o700 });
   for (const step of buildReadOnlyPlan(input.repositoryRoot, tempRoot)) await runner(step);
 
-  const controlSecrets = parseSecretNames(await runner(command("control-plane-secret-list", "npm", [
-    "--prefix", "cloudflare-control-plane", "exec", "wrangler", "--", "secret", "list", "--env", "staging", "--format", "json",
-  ], input.repositoryRoot, CLOUDFLARE_COMMAND_SECRETS)));
+  const controlSecrets = parseSecretNames(await runner(wranglerCommand("control-plane-secret-list", "cloudflare-control-plane", [
+    "secret", "list", "--env", "staging", "--format", "json",
+  ], input.repositoryRoot)));
   requireNames(controlSecrets, REQUIRED_CONTROL_PLANE_SECRETS, "control_plane_secret_missing");
   const convexNames = new Set(splitLines(await runner(command("convex-environment-list", "npm", [
     "exec", "convex", "--", "env", "list", "--names-only",
@@ -421,12 +419,12 @@ function validateObservability(value, runtime) {
 
 async function readDeploymentStatus(runner, repositoryRoot, packageDirectory) {
   const [deploymentOutput, versionsOutput] = await Promise.all([
-    runner(command(`${packageDirectory}-deployment-status`, "npm", [
-      "--prefix", packageDirectory, "exec", "wrangler", "--", "deployments", "status", "--env", "staging", "--json",
-    ], repositoryRoot, CLOUDFLARE_COMMAND_SECRETS)),
-    runner(command(`${packageDirectory}-version-list`, "npm", [
-      "--prefix", packageDirectory, "exec", "wrangler", "--", "versions", "list", "--env", "staging", "--json",
-    ], repositoryRoot, CLOUDFLARE_COMMAND_SECRETS)),
+    runner(wranglerCommand(`${packageDirectory}-deployment-status`, packageDirectory, [
+      "deployments", "status", "--env", "staging", "--json",
+    ], repositoryRoot)),
+    runner(wranglerCommand(`${packageDirectory}-version-list`, packageDirectory, [
+      "versions", "list", "--env", "staging", "--json",
+    ], repositoryRoot)),
   ]);
   try {
     const deployment = JSON.parse(deploymentOutput);
@@ -618,6 +616,14 @@ async function writeEvidence(path, evidence) {
 
 function command(name, executable, args, cwd = process.cwd(), secretNames = []) {
   return { name, executable, args, cwd, capture: true, secretNames };
+}
+
+// `npm exec` resolves the binary from --prefix but always runs it in the caller's cwd
+// (libnpmexec run-script.js: "we always run in cwd, not --prefix"). Wrangler discovers its
+// configuration from that cwd, so the child must start inside the package directory rather than at
+// the repository root.
+function wranglerCommand(name, packageDirectory, args, root, secretNames = CLOUDFLARE_COMMAND_SECRETS) {
+  return command(name, "npm", ["exec", "wrangler", "--", ...args], join(root, packageDirectory), secretNames);
 }
 
 function childEnvironment(secretNames = []) {

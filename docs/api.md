@@ -1758,7 +1758,9 @@ Shell input:
 }
 ```
 
-Shell input is converted into an approval-required agent prompt. Direct terminal write is intentionally not implemented in this slice. High-risk shell input, such as destructive file operations, is stored as an `approval_required` command and must be approved by a signed-in user before dispatch.
+Shell input is converted into an approval-required agent prompt. High-risk shell input, such as destructive file operations, is stored as an `approval_required` command and must be approved by a signed-in user before dispatch.
+
+Direct terminal write is a separate `terminal_input` intent (`{"type": "terminal_input", "terminalId": "…", "data": "…"}`, optional `cwd`, at most 65,536 characters). It is deliberately hard to reach: no built-in device profile grants the `terminal_input` capability, the environment must have been paired with the `terminal:operate` scope, which standard pairing does not request, and `baseline.terminal-input` returns `requiresApproval` regardless of which policy dimension allowed it, because a raw terminal write cannot be pattern-screened. Approved writes are dispatched over the T3 WebSocket (`terminal.open` then `terminal.write`), not through orchestration dispatch.
 
 ## Command Approvals
 

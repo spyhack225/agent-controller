@@ -205,12 +205,10 @@ export async function readTrackedArtifactDigests(repositoryRoot, runner = create
 export function buildReadOnlyPlan(input, tempRoot) {
   return [
     command("convex-dry-run", "npm", ["exec", "convex", "--", "deploy", "--dry-run", "--typecheck", "enable", "--codegen", "disable"], input.repositoryRoot, CONVEX_SECRETS),
-    command("control-plane-dry-run", "npm", ["--prefix", "cloudflare-control-plane", "exec", "wrangler", "--", "deploy", "--dry-run", "--containers-rollout", "none", "--env", "production", "--outdir", join(tempRoot, "control-plane")], input.repositoryRoot),
-    command("edge-dry-run", "npm", ["--prefix", "cloudflare", "exec", "wrangler", "--", "deploy", "--dry-run", "--env", "production", "--outdir", join(tempRoot, "edge")], input.repositoryRoot),
-    command("control-plane-secrets", "npm", ["--prefix", "cloudflare-control-plane", "exec", "wrangler", "--", "secret", "list", "--env", "production", "--format", "json"], input.repositoryRoot, CF_SECRETS),
+    wranglerCommand("control-plane-dry-run", "cloudflare-control-plane", ["deploy", "--dry-run", "--containers-rollout", "none", "--env", "production", "--outdir", join(tempRoot, "control-plane")], input.repositoryRoot, []),
+    wranglerCommand("edge-dry-run", "cloudflare", ["deploy", "--dry-run", "--env", "production", "--outdir", join(tempRoot, "edge")], input.repositoryRoot, []),
+    wranglerCommand("control-plane-secrets", "cloudflare-control-plane", ["secret", "list", "--env", "production", "--format", "json"], input.repositoryRoot),
     command("convex-secrets", "npm", ["exec", "convex", "--", "env", "list", "--names-only"], input.repositoryRoot, CONVEX_SECRETS),
-    command("queues", "npm", ["--prefix", "cloudflare", "exec", "wrangler", "--", "queues", "list", "--json"], input.repositoryRoot, CF_SECRETS),
-    command("buckets", "npm", ["--prefix", "cloudflare", "exec", "wrangler", "--", "r2", "bucket", "list", "--json"], input.repositoryRoot, CF_SECRETS),
     deploymentCommand("edge-status", input.repositoryRoot, "cloudflare"),
     deploymentCommand("control-status", input.repositoryRoot, "cloudflare-control-plane"),
   ];
@@ -221,10 +219,10 @@ export function buildMutationPlan(input, phase) {
   const tag = `ac-prod-${input.targetCommit.slice(0, 12)}`;
   if (phase === "private") return [
     command("convex", "npm", ["exec", "convex", "--", "deploy", "--typecheck", "enable", "--codegen", "disable", "--message", message], input.repositoryRoot, CONVEX_SECRETS),
-    command("control-plane", "npm", ["--prefix", "cloudflare-control-plane", "exec", "wrangler", "--", "deploy", "--env", "production", "--containers-rollout", "immediate", "--strict", "--tag", tag, "--message", message], input.repositoryRoot, CF_SECRETS),
+    wranglerCommand("control-plane", "cloudflare-control-plane", ["deploy", "--env", "production", "--containers-rollout", "immediate", "--strict", "--tag", tag, "--message", message], input.repositoryRoot),
   ];
   if (phase === "edge") return [
-    command("edge", "npm", ["--prefix", "cloudflare", "exec", "wrangler", "--", "deploy", "--env", "production", "--strict", "--tag", tag, "--message", message], input.repositoryRoot, CF_SECRETS),
+    wranglerCommand("edge", "cloudflare", ["deploy", "--env", "production", "--strict", "--tag", tag, "--message", message], input.repositoryRoot),
   ];
   throw new ProductionPromotionError("phase_invalid");
 }
@@ -254,6 +252,8 @@ export async function validateLocalPromotion(input, { runner = createCommandRunn
 
 export async function runProductionPreflight(input, dependencies = {}) {
   const runner = dependencies.runner ?? createCommandRunner();
+  const fetchImpl = dependencies.fetchImpl ?? globalThis.fetch;
+  const environment = dependencies.environment ?? process.env;
   await validateLocalPromotion(input, { runner, now: dependencies.now });
   const tempRoot = resolve(dependencies.tempRoot ?? join(input.repositoryRoot, ".production-preflight"));
   await mkdir(tempRoot, { recursive: true, mode: 0o700 });
@@ -261,8 +261,12 @@ export async function runProductionPreflight(input, dependencies = {}) {
   for (const step of buildReadOnlyPlan(input, tempRoot)) outputs.set(step.name, await runner(step));
   requireNames(parseSecretNames(outputs.get("control-plane-secrets")), REQUIRED_CONTROL_PLANE_SECRETS, "control_plane_secret_missing");
   requireNames(new Set(String(outputs.get("convex-secrets") ?? "").split(/\r?\n/u).filter(Boolean)), ["GATEWAY_CONVEX_SECRET"], "convex_secret_missing");
-  requireNames(parseResourceNames(outputs.get("queues"), ["queue_name", "name"]), REQUIRED_PRODUCTION_QUEUES, "production_queue_missing");
-  requireNames(parseResourceNames(outputs.get("buckets"), ["name"]), [input.mediaBucket, input.firmwareBucket], "production_bucket_missing");
+  const [queues, buckets] = await Promise.all([
+    listCloudflareQueues(fetchImpl, environment),
+    listR2Buckets(fetchImpl, environment),
+  ]);
+  requireNames(queues, REQUIRED_PRODUCTION_QUEUES, "production_queue_missing");
+  requireNames(buckets, [input.mediaBucket, input.firmwareBucket], "production_bucket_missing");
   requireDeployment(outputs.get("edge-status"), input.currentEdgeVersion, input.currentCommit, "edge");
   requireDeployment(outputs.get("control-status"), input.currentControlVersion, input.currentCommit, "control_plane");
   return { result: "passed" };
@@ -275,7 +279,13 @@ export async function executePromotionPhase(input, phase, dependencies = {}) {
   const checks = [];
   try {
     if (phase === "private") {
-      await runProductionPreflight(input, { runner, now, tempRoot: dependencies.tempRoot });
+      await runProductionPreflight(input, {
+        runner,
+        now,
+        tempRoot: dependencies.tempRoot,
+        fetchImpl: dependencies.fetchImpl,
+        environment: dependencies.environment,
+      });
     } else {
       await runEdgeCheckpoint(input, { runner, now });
     }
@@ -388,12 +398,20 @@ function requireDeploymentCommit(raw, commit, boundary) {
   }
 }
 
-function deploymentCommand(name, root, prefix) {
-  return command(name, "npm", ["--prefix", prefix, "exec", "wrangler", "--", "deployments", "status", "--env", "production", "--json"], root, CF_SECRETS);
+function deploymentCommand(name, root, packageDirectory) {
+  return wranglerCommand(name, packageDirectory, ["deployments", "status", "--env", "production", "--json"], root);
 }
 
 function command(name, executable, args, cwd, secretNames = []) {
   return { name, executable, args, cwd, secretNames };
+}
+
+// `npm exec` resolves the binary from --prefix but always runs it in the caller's cwd
+// (libnpmexec run-script.js: "we always run in cwd, not --prefix"). Wrangler discovers its
+// configuration from that cwd, so the child must start inside the package directory rather than at
+// the repository root.
+function wranglerCommand(name, packageDirectory, args, root, secretNames = CF_SECRETS) {
+  return command(name, "npm", ["exec", "wrangler", "--", ...args], join(root, packageDirectory), secretNames);
 }
 
 function parseSecretNames(raw) {
@@ -401,10 +419,56 @@ function parseSecretNames(raw) {
   return new Set((Array.isArray(value) ? value : []).map((item) => item?.name).filter(Boolean));
 }
 
-function parseResourceNames(raw, keys) {
-  const value = parseJson(Buffer.from(String(raw ?? "")), "resource_list_json_invalid");
-  const rows = Array.isArray(value) ? value : value?.result ?? value?.buckets ?? value?.queues ?? [];
-  return new Set(rows.flatMap((item) => keys.map((key) => item?.[key])).filter(Boolean));
+// Wrangler 4.127.0 has no --json on `queues list` or `r2 bucket list`; both reject the flag with
+// "Unknown argument: json" before any network call. Read the same inventory over the documented
+// account API instead, exactly as the staging release preflight already does.
+async function listCloudflareQueues(fetchImpl, environment) {
+  const names = new Set();
+  for (let page = 1; page <= 100; page += 1) {
+    const body = await cloudflareApi(fetchImpl, environment, `/queues?page=${page}&per_page=100`);
+    if (!Array.isArray(body.result)) throw new ProductionPromotionError("invalid_queue_list_contract");
+    for (const item of body.result) if (typeof item?.queue_name === "string") names.add(item.queue_name);
+    if (page >= Number(body.result_info?.total_pages ?? 1)) return names;
+  }
+  throw new ProductionPromotionError("queue_pagination_limit_exceeded");
+}
+
+async function listR2Buckets(fetchImpl, environment) {
+  const names = new Set();
+  let cursor = null;
+  for (let page = 0; page < 100; page += 1) {
+    const suffix = cursor ? `?per_page=1000&cursor=${encodeURIComponent(cursor)}` : "?per_page=1000";
+    const body = await cloudflareApi(fetchImpl, environment, `/r2/buckets${suffix}`);
+    const buckets = body.result?.buckets;
+    if (!Array.isArray(buckets)) throw new ProductionPromotionError("invalid_r2_bucket_list_contract");
+    for (const item of buckets) if (typeof item?.name === "string") names.add(item.name);
+    cursor = body.result_info?.cursor;
+    if (!cursor) return names;
+  }
+  throw new ProductionPromotionError("r2_pagination_limit_exceeded");
+}
+
+async function cloudflareApi(fetchImpl, environment, path) {
+  const account = requireMatch(environment.CLOUDFLARE_ACCOUNT_ID, /^[0-9a-f]{32}$/u, "cloudflare_account_invalid");
+  const token = requireText(environment.CLOUDFLARE_API_TOKEN, "cloudflare_token_required");
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), 15_000);
+  try {
+    const response = await fetchImpl(`https://api.cloudflare.com/client/v4/accounts/${account}${path}`, {
+      headers: { authorization: `Bearer ${token}`, accept: "application/json" },
+      redirect: "error",
+      signal: controller.signal,
+    });
+    if (!response.ok) throw new ProductionPromotionError("cloudflare_preflight_failed");
+    const body = await response.json();
+    if (body?.success !== true) throw new ProductionPromotionError("cloudflare_preflight_failed");
+    return body;
+  } catch (error) {
+    if (error instanceof ProductionPromotionError) throw error;
+    throw new ProductionPromotionError("cloudflare_preflight_failed");
+  } finally {
+    clearTimeout(timeout);
+  }
 }
 
 function requireNames(actual, required, code) {

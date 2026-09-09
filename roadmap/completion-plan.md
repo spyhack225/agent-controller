@@ -55,14 +55,19 @@ or anything is published.
 | 0.2 | **Rotate every credential that was ever tracked.** The bench device secret and home Wi-Fi password from the purged `controller_config.old.h` (never pushed, but present in the local backup mirror), and the previously exposed Convex gateway secret that CG-10 records as still needing external rotation. | Maintainer | CG-10 | Rotation recorded outside the repository; Convex env and `GATEWAY_CONVEX_SECRET` replaced |
 | 0.3 | **Delete the pre-rewrite mirror** `~/Documents/Claude/Projects/agent-controller-pre-oss-backup.git` once 0.2 is done. It is the last copy of those secrets. | Maintainer | CG-10 | Mirror gone |
 | 0.4 | **Move the working checkout off the cloud-synced folder** (or exclude it from File Provider sync). The status ledger, firmware gate, and this week's hollow `node_modules` all trace to sync interference. | Maintainer | Status ledger reliability | A full `npm test` completes without a worker-startup timeout |
-| 0.5 | **Update the stale ledger rows.** The cloud roadmap's CG-10 text still says the two live configs are tracked; CLAUDE.md's "known firmware gap" for the orb verb compare is already fixed in `ThinkingOrb.cpp`. | Engineer | CG-11 | `npm run check:docs` passes; rows cite the 2026-09-08 rewrite |
-| 0.6 | **Bump the pinned GitHub Actions.** All four actions run on the deprecated Node 20 runtime and warn on every job; pin their current major by SHA. | Engineer | Hygiene | CI green with no deprecation annotation |
+| 0.5 | **Update the stale ledger rows.** The two examples this row originally named are already corrected: CG-10 now records the 2026-09-08 history rewrite, and CLAUDE.md no longer calls the orb verb compare a known gap. A 2026-09-09 audit found the remaining drift elsewhere — stale test/size counts, `src/app.mjs` and Store-method figures, `DANGEROUS_SHELL_PATTERNS` and the intent-type list, a "terminal write is not implemented" note in `docs/api.md`, stale `#L` anchors and route/method names in `docs/device-setup-flow.md`, and a README claim that no vendor documentation is redistributed. | Engineer | CG-11 | `npm run check:docs` passes; rows cite the 2026-09-08 rewrite |
+| 0.6 | **Bump the pinned GitHub Actions.** Done 2026-09-09: all four moved off the deprecated Node 20 runtime, and each new SHA was re-resolved against its tag independently. | Engineer | Hygiene | CI green with no deprecation annotation. Note this only exercises `ci.yml`; the four protected workflows carry the same pins and are dispatch-only, so verify each pinned SHA resolves to its claimed tag rather than discovering a bad pin in a reviewer-gated run |
 | 0.7 | **Make the repository public** and turn on private vulnerability reporting (SECURITY.md already points there), branch protection on `main` requiring the Hermetic CI check, and tag protection for `connector-v*`. | Maintainer | CG-04 setup | Repository settings reviewed |
 
 ## Phase 1 — Accounts, environments, and secrets (Maintainer, 1 to 2 days plus provider lead time)
 
 The protected workflows refuse to run until these exist. Every value is scoped to one purpose; the
 runbooks list them exactly and this plan does not repeat the tables.
+
+**Work from [operator-setup.md](../docs/operator-setup.md).** It collapses this phase and Phase 2
+into one ordered sequence, with every secret name cross-checked against the workflow that actually
+consumes it and a verification step after each stage. The per-surface runbooks remain the reference
+for detail.
 
 | # | Task | Runbook | Notes |
 |---|---|---|---|
@@ -71,7 +76,7 @@ runbooks list them exactly and this plan does not repeat the tables.
 | 1.3 | **Convex** staging and production deployments with deploy keys | [auth-storage.md](../docs/auth-storage.md) | `npm run smoke:convex` against staging is the first check |
 | 1.4 | **Clerk** staging and production instances (secret and publishable keys) | [auth-storage.md](../docs/auth-storage.md) | Cloud mode disables dev tokens; a real Clerk user is required for qualification |
 | 1.5 | Generate the runtime secrets: T3 token encryption key, gateway Convex secret (entered identically in Cloudflare and Convex), Web Push VAPID key set and sealing key, R2 access keys | [notifications.md](../docs/notifications.md), [staging-bootstrap.md](../docs/staging-bootstrap.md) | Rotation-aware `WEB_PUSH_VAPID_KEYS` form |
-| 1.6 | GitHub environments **`staging-bootstrap`**, **`staging`**, **`npm-release`**, **`production`**: required reviewers (two for production), no self-review, no admin bypass, default-branch only | each runbook | The four production jobs request the same environment separately by design |
+| 1.6 | GitHub environments **`staging-bootstrap`**, **`staging`**, **`npm-release`**, **`production`**: required reviewers (two for production), no self-review, no admin bypass, default-branch only | each runbook | **Name the second reviewer before starting.** With required reviewers plus prevent-self-review, whoever dispatches cannot approve, so a solo maintainer cannot run any protected workflow. This gates Phases 2, 3 and 7 entirely and has no default |
 | 1.7 | **npm**: decide the final package name and scope (the `@agent-controller` organisation must exist and be owned), register the package, configure the GitHub Actions trusted publisher for `npm-connector-release.yml` and environment `npm-release`, then disable token publishing | [npm-connector-release.md](../docs/npm-connector-release.md) | Open question in the cloud roadmap §21; no `NPM_TOKEN` anywhere |
 | 1.8 | A **T3 host for staging**: one machine with T3 Code installed and a provider (Codex, Claude, OpenCode or xAI) authenticated, reachable only by its own connector | [staging-qualification.md](../docs/staging-qualification.md) | Also serves as the first clean connector host in Phase 3 |
 
@@ -80,7 +85,7 @@ runbooks list them exactly and this plan does not repeat the tables.
 | # | Task | Closes | Evidence |
 |---|---|---|---|
 | 2.1 | Dispatch **staging bootstrap**: three Queues, two buckets, edge stub, secrets, Convex, private control plane, final edge | CG-07 | `agent-controller.staging-bootstrap` evidence artifact; `/health` reports every binding ready |
-| 2.2 | Dispatch **staging release** for the same commit, then once more for a trivial follow-up commit to prove routine deploy and compatible rollback | CG-07 | Two `agent-controller.staging-release.v1` artifacts, one `deploy` and one `rollback` |
+| 2.2 | Dispatch **staging release** to move from the bootstrapped commit A to a later commit B, then roll back to A. Release refuses `target == current` (`target_must_differ_from_current`), so B must be a real forward commit, and it must not touch `convex/` or either Durable Object topology or the rollback is refused as incompatible | CG-07 | Two `agent-controller.staging-release.v1` artifacts, one `deploy` and one `rollback` |
 | 2.3 | Run **qualification level 1**, the credential-free boundary: public health, cloud-mode auth config, exact `404` on every private capability | CG-07, Milestone 2 | `staging-boundary-evidence.json` |
 | 2.4 | Run **qualification level 2**, authenticated connector-first readiness, with a real Clerk user and the Phase 1.8 host enrolled through `npx` | CG-05, Milestone 2 | Readiness evidence with all five layers green |
 | 2.5 | Run **qualification level 3**, the completed first command: one thread, one prompt, a `completed` reply from a live provider | CG-05, Milestone 1 first-reply proof | `staging-first-command-evidence.json` |
@@ -106,11 +111,13 @@ observability sign-off. All of them run against the Phase 2 stack.
 |---|---|---|---|---|
 | 4.1 | **Queue/Cron ownership**: scheduled batches, controlled retry, controlled quarantine, DLQ correlation with Cloudflare's native metric, rollout reconciliation | [cloud-observability.md](../docs/cloud-observability.md) §Staging qualification | CG-01 | Redacted query results per event class |
 | 4.2 | **Online revocation** through the deployed Service Binding: socket closes, heartbeat stops, in-flight work terminalises, no ticket race, replacement enrollment succeeds | [production-security.md](../docs/production-security.md) | CG-02 | Drill record |
-| 4.3 | **Durable Object eviction and deploy rollover** with a browser and a device mid-request; durable request replay via `clientRequestId`; raw media upload retry across the rollover | [staging-release.md](../docs/staging-release.md) | CG-03, CG-12, status blocker 1 | No duplicate command, no lost receipt |
+| 4.3 | **Durable Object eviction and deploy rollover** with a browser and a device mid-request; durable request replay via `clientRequestId`; raw media upload retry across the rollover. Replay is scripted: `npm run drill:request-replay` | Engineer | CG-03, CG-12, status blocker 1 | No duplicate command, no lost receipt |
 | 4.4 | **Capacity on `standard-1`**: the seven staging decision gates in [capacity-slo.md](../docs/capacity-slo.md) (CPU/memory high-water, cold and warm start, per-hop p50/p95/p99, 16 environments × 48 requests × saturated DO, Redis continuity across restart, soak availability, a billing observation) and the singleton-versus-partition decision | [capacity-slo.md](../docs/capacity-slo.md) | CG-08, CG-12 | Capacity attestation with an accepted decision and rollback thresholds |
 | 4.5 | **Observability and privacy review**: both Analytics Engine datasets populated, dashboards and alert delivery live, every returned column and log field reviewed for paths, identifiers, content, secrets | [cloud-observability.md](../docs/cloud-observability.md) | CG-01, CG-12, Category 7 | Dashboard and alert references; a zero-finding privacy review |
-| 4.6 | **Media and voice on R2 and Convex**: raw session create/PUT/finalize, abandoned-session cleanup, retention purge, signed URL expiry, transcription through a hosted or operator-run Parakeet sidecar, notification replay after browser reconnect, Web Push delivery and VAPID rotation, scheduled-worker liveness | [notifications.md](../docs/notifications.md), [api.md](../docs/api.md) | Categories 2, 3, 6; status blocker 2 | Redacted lifecycle log per feature |
-| 4.7 | **Security drill**: TLS-only enforcement behind the proxy, rate-limit backend outage behaviour, connector credential rotation under load, browser response boundary, retention of connector results | [production-security.md](../docs/production-security.md) | CG-07 security input | Security attestation |
+| 4.6a | **Raw media lifecycle on R2:** session create, PUT, finalize, integrity refusal, abandoned-session cleanup, retention purge, signed URL expiry. Scripted: `npm run drill:media-lifecycle` | Engineer | Cat. 2, status blocker 2 | Redacted lifecycle log |
+| 4.6b | **Voice pipeline:** transcription through the Parakeet sidecar or a configured provider, review and auto-send policy at hosted scale | Engineer | Cat. 3 | Redacted job log with timings |
+| 4.6c | **Notifications and Web Push:** durable replay after browser reconnect, opt-in push delivery, VAPID rotation using the Phase 1.5 key set, scheduled-worker liveness. No push path has been exercised anywhere yet | Engineer | Cat. 6 | Delivery and rotation record |
+| 4.7 | **Security drill**: TLS-only enforcement behind the proxy, rate-limit backend outage behaviour, connector credential rotation under load, browser response boundary, retention of connector results | [production-security.md](../docs/production-security.md) | CG-07 security input | Security attestation. **No tooling or schema exists for this record, nor for 4.1 and 4.5.** 4.7 emits `agent-controller.staging-security.v1`, which Phase 7.1 hashes into the promotion manifest, so its shape must be settled before Phase 7 |
 
 Decision folded in: **where Parakeet runs in production** (connector capability or operator
 service, cloud roadmap §21). Task 4.6 cannot finish without it; the default for the first beta is
@@ -150,7 +157,8 @@ internet. Ship the beta on Hosyond; treat the other boards as follow-on.
 
 | # | Task | Closes | Evidence |
 |---|---|---|---|
-| 7.1 | Assemble the **promotion evidence bundle**: staging release, qualification, capacity and security records for one forward commit, hashed into the manifest, all under 72 hours old | CG-07 | Reviewed manifest SHA-256 |
+| 7.1 | Use `node scripts/make-evidence-bundle.mjs` ([evidence-bundles.md](../docs/evidence-bundles.md)) to assemble the **promotion evidence bundle**: staging release, qualification, capacity and security records for one forward commit, hashed into the manifest, all under 72 hours old | CG-07 | Reviewed manifest SHA-256 |
+| 7.1b | **Publish the bundle as a GitHub artifact.** Promotion downloads `evidence_artifact_name` from a completed same-repository run, but no workflow uploads a flat artifact containing the manifest plus its four evidence files: every existing upload step emits one evidence JSON under its own name. This is unwritten engineering work, and until it exists 7.2 cannot be dispatched at all | Engineer | CG-07 | A dispatchable workflow that uploads the reviewed bundle as one flat artifact |
 | 7.2 | Dispatch **production promotion** through its four checkpoints: read-only preflight, Convex plus private Container, public edge, postflight | CG-07 | `agent-controller.production-promotion.v1` artifacts; commit annotations match |
 | 7.3 | **Rollback rehearsal**: a compatible rollback through staging release, and a written incident plan for the Convex/DO-migration case the workflow refuses to automate | CG-07, Milestone 5 | Rehearsal record and plan |
 | 7.4 | **Staged cohorts** using the implemented rollout controls: internal, then browser-only owners, then voice, then connector update, then controller firmware, each with an evidence reference per transition and a recorded cancellation | Milestone 5 | Rollout ledger per cohort |
@@ -170,6 +178,7 @@ These are not blocked on code. Each has a default that lets work continue.
 | Beta concurrency and Cloudflare cost budget | Set from the Phase 4.4 billing observation | Phase 7.4 |
 | Hardware scope for the beta | Hosyond only | Phase 6 |
 | eFuse secure boot and flash encryption | Deferred; rollback drills still required | Phase 6.6 |
+| **Who is the second reviewer** on protected environments | **No default.** Prevent-self-review means a solo maintainer cannot approve their own dispatch, so Phases 2, 3 and 7 cannot run until someone else holds approval rights | Phase 1.6 |
 
 ## What "done" looks like
 

@@ -9,7 +9,12 @@ real exercises have run. It never performs a deployment, publishes a package, ca
 hardware. It only proves that reviewed records are fresh, hash-linked, complete, and bound to one
 40-character source commit.
 
-Run it from the exact release checkout:
+It anchors the candidate to real code. The manifest's `targetCommit` must be a commit the checkout
+actually contains and an ancestor of `HEAD`; a well-formed but fictional id fails with
+`manifest_commit_unknown`, and one from another line of development with
+`manifest_commit_not_in_checkout`. Before 2026-09-09 only the 40-character format was checked, which
+let a fully-filled bundle name a commit that had never existed. Run it from the exact release
+checkout:
 
 ```bash
 npm run verify:final-qualification -- /path/to/evidence/final-qualification-manifest.json
@@ -62,5 +67,8 @@ accept no free-form logs, prompts, transcripts, paths, resource identifiers, or 
 underlying detailed artifacts in their protected systems and record only the pass/fail projection
 required here.
 
-This verifier makes the final claim auditable; it does not manufacture proof. An operator must still
-perform every exercise named in the active roadmap and independently review the exact manifest hash.
+This verifier makes the final claim auditable; it does not manufacture proof. Every record is an
+operator attestation, and the verifier proves those attestations are complete, fresh, hash-linked
+and bound to a commit in this checkout, never that the exercises behind them happened. An operator
+must still perform every exercise named in the active roadmap and independently review the exact
+manifest hash, and the person who reviews a bundle should not be the person who assembled it.

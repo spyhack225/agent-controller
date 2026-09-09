@@ -1571,4 +1571,6 @@ Before shipping customer hardware:
 - Store device secrets in ESP32 NVS with a rotation path.
 - Connect the manufacturing scripts to the final factory flashing station and label/QR printer.
 - Add rate limits and per-device command quotas at the gateway.
-- Add real direct terminal-write support only after T3 permissions and approval UX are explicit.
+- Direct terminal write now exists at the gateway as the `terminal_input` intent, gated on a custom
+  profile, an environment paired with `terminal:operate`, and an always-required approval. It is
+  still not offered on this five-key device and has not been exercised against a live T3 terminal.
